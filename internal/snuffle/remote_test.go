@@ -3,6 +3,7 @@ package snuffle
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -33,7 +34,7 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 		Unit:             "requests",
 	}}}
 
-	batch, err := buildRemoteWriteBatch(req)
+	batch, err := buildRemoteWriteBatch(req, 0, 7)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -41,7 +42,7 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 		t.Fatalf("counts = series %d samples %d labels %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.exemplarCount, batch.metadataCount)
 	}
 	seriesRows := batch.seriesRows.String()
-	for _, want := range []string{`"metric_name":"http_requests_total"`, `"min_ms":1000`, `"max_ms":2000`, `"labels_json":"{`} {
+	for _, want := range []string{`"team_id":7`, `"metric_name":"http_requests_total"`, `"min_ms":1000`, `"max_ms":2000`, `"labels_json":"{`} {
 		if !strings.Contains(seriesRows, want) {
 			t.Fatalf("series rows %q do not contain %q", seriesRows, want)
 		}
@@ -73,12 +74,60 @@ func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
 			Timestamp: 1000,
 		}},
 	}}}
-	batch, err := buildRemoteWriteBatch(req)
+	batch, err := buildRemoteWriteBatch(req, 0, 0)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
 	if batch.seriesCount != 1 || batch.histogramCount != 1 || batch.sampleCount != 0 {
 		t.Fatalf("counts = series %d histograms %d samples %d", batch.seriesCount, batch.histogramCount, batch.sampleCount)
+	}
+}
+
+func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "api"}},
+		Samples: []prompb.Sample{
+			{Timestamp: 1_000, Value: 1},
+			{Timestamp: 14_999, Value: 2},
+			{Timestamp: 15_000, Value: 3},
+		},
+		Histograms: []prompb.Histogram{
+			{
+				Count:     &prompb.Histogram_CountInt{CountInt: 1},
+				Sum:       1,
+				ZeroCount: &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+				Timestamp: 14_500,
+			},
+			{
+				Count:     &prompb.Histogram_CountInt{CountInt: 2},
+				Sum:       2,
+				ZeroCount: &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+				Timestamp: 14_900,
+			},
+		},
+	}}}
+
+	batch, err := buildRemoteWriteBatch(req, 15*time.Second, 0)
+	if err != nil {
+		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
+	}
+	if batch.sampleCount != 2 {
+		t.Fatalf("sampleCount = %d, want 2", batch.sampleCount)
+	}
+	if batch.histogramCount != 1 {
+		t.Fatalf("histogramCount = %d, want 1", batch.histogramCount)
+	}
+	samples := batch.sampleRows.String()
+	for _, want := range []string{`"timestamp_ms":0`, `"value":2`, `"version":14999`, `"timestamp_ms":15000`, `"value":3`} {
+		if !strings.Contains(samples, want) {
+			t.Fatalf("sample rows %q do not contain %q", samples, want)
+		}
+	}
+	histograms := batch.histogramRows.String()
+	for _, want := range []string{`"timestamp_ms":0`, `"version":14900`} {
+		if !strings.Contains(histograms, want) {
+			t.Fatalf("histogram rows %q do not contain %q", histograms, want)
+		}
 	}
 }
 

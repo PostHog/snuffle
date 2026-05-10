@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/cespare/xxhash/v2"
 	"github.com/golang/snappy"
@@ -30,7 +31,7 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	batch, err := buildRemoteWriteBatch(&req)
+	batch, err := buildRemoteWriteBatch(&req, s.cfg.RemoteWriteInterval, s.cfg.TeamID)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
@@ -112,6 +113,7 @@ type remoteWriteBatch struct {
 }
 
 type remoteWriteSeriesRow struct {
+	TeamID     uint64 `json:"team_id"`
 	ID         uint64 `json:"id"`
 	MetricName string `json:"metric_name"`
 	LabelsJSON string `json:"labels_json"`
@@ -120,6 +122,7 @@ type remoteWriteSeriesRow struct {
 }
 
 type remoteWriteLabelIndexRow struct {
+	TeamID     uint64 `json:"team_id"`
 	MetricName string `json:"metric_name"`
 	LabelName  string `json:"label_name"`
 	LabelValue string `json:"label_value"`
@@ -127,18 +130,23 @@ type remoteWriteLabelIndexRow struct {
 }
 
 type remoteWriteSampleRow struct {
+	TeamID      uint64  `json:"team_id"`
 	TimestampMS int64   `json:"timestamp_ms"`
 	ID          uint64  `json:"id"`
 	Value       float64 `json:"value"`
+	Version     uint64  `json:"version"`
 }
 
 type remoteWriteHistogramRow struct {
+	TeamID       uint64 `json:"team_id"`
 	TimestampMS  int64  `json:"timestamp_ms"`
 	ID           uint64 `json:"id"`
 	HistogramB64 string `json:"histogram_b64"`
+	Version      uint64 `json:"version"`
 }
 
 type remoteWriteExemplarRow struct {
+	TeamID      uint64  `json:"team_id"`
 	TimestampMS int64   `json:"timestamp_ms"`
 	ID          uint64  `json:"id"`
 	Value       float64 `json:"value"`
@@ -146,26 +154,28 @@ type remoteWriteExemplarRow struct {
 }
 
 type remoteWriteMetadataRow struct {
+	TeamID           uint64 `json:"team_id"`
 	MetricFamilyName string `json:"metric_family_name"`
 	Type             string `json:"type"`
 	Unit             string `json:"unit"`
 	Help             string `json:"help"`
 }
 
-func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
+func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64) (remoteWriteBatch, error) {
 	var batch remoteWriteBatch
 	seriesByID := make(map[uint64]remoteWriteSeriesRow, len(req.GetTimeseries()))
 	labelRows := make(map[remoteWriteLabelIndexRow]struct{})
-	sampleEncoder := json.NewEncoder(&batch.sampleRows)
-	histogramEncoder := json.NewEncoder(&batch.histogramRows)
 	exemplarEncoder := json.NewEncoder(&batch.exemplarRows)
 	metadataEncoder := json.NewEncoder(&batch.metadataRows)
+	sampleRows := make(map[remoteWriteSampleKey]remoteWriteSampleRow)
+	histogramRows := make(map[remoteWriteSampleKey]remoteWriteHistogramRow)
 
 	for _, metadata := range req.GetMetadata() {
 		if metadata.GetMetricFamilyName() == "" {
 			continue
 		}
 		if err := metadataEncoder.Encode(remoteWriteMetadataRow{
+			TeamID:           teamID,
 			MetricFamilyName: metadata.GetMetricFamilyName(),
 			Type:             remoteMetadataType(metadata.GetType()),
 			Unit:             metadata.GetUnit(),
@@ -195,6 +205,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
 			}
 			outputLabels[k] = v
 			labelRows[remoteWriteLabelIndexRow{
+				TeamID:     teamID,
 				MetricName: metricName,
 				LabelName:  k,
 				LabelValue: v,
@@ -225,30 +236,40 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
 		}
 
 		for _, sample := range ts.GetSamples() {
-			observeTime(sample.Timestamp)
-			if err := sampleEncoder.Encode(remoteWriteSampleRow{
-				TimestampMS: sample.Timestamp,
+			bucketMS := bucketTimestampMS(sample.Timestamp, sampleInterval)
+			observeTime(bucketMS)
+			row := remoteWriteSampleRow{
+				TeamID:      teamID,
+				TimestampMS: bucketMS,
 				ID:          id,
 				Value:       sample.Value,
-			}); err != nil {
-				return remoteWriteBatch{}, err
+				Version:     remoteWriteVersion(sample.Timestamp),
 			}
-			batch.sampleCount++
+			key := remoteWriteSampleKey{id: id, timestampMS: bucketMS}
+			if existing, ok := sampleRows[key]; !ok || row.Version >= existing.Version {
+				sampleRows[key] = row
+			}
 		}
 		for _, histogram := range ts.GetHistograms() {
-			observeTime(histogram.Timestamp)
+			originalTimestamp := histogram.Timestamp
+			bucketMS := bucketTimestampMS(originalTimestamp, sampleInterval)
+			observeTime(bucketMS)
+			histogram.Timestamp = bucketMS
 			payload, err := histogram.Marshal()
 			if err != nil {
 				return remoteWriteBatch{}, err
 			}
-			if err := histogramEncoder.Encode(remoteWriteHistogramRow{
-				TimestampMS:  histogram.Timestamp,
+			row := remoteWriteHistogramRow{
+				TeamID:       teamID,
+				TimestampMS:  bucketMS,
 				ID:           id,
 				HistogramB64: base64.StdEncoding.EncodeToString(payload),
-			}); err != nil {
-				return remoteWriteBatch{}, err
+				Version:      remoteWriteVersion(originalTimestamp),
 			}
-			batch.histogramCount++
+			key := remoteWriteSampleKey{id: id, timestampMS: bucketMS}
+			if existing, ok := histogramRows[key]; !ok || row.Version >= existing.Version {
+				histogramRows[key] = row
+			}
 		}
 		for _, exemplar := range ts.GetExemplars() {
 			observeTime(exemplar.Timestamp)
@@ -261,6 +282,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
 				return remoteWriteBatch{}, err
 			}
 			if err := exemplarEncoder.Encode(remoteWriteExemplarRow{
+				TeamID:      teamID,
 				TimestampMS: exemplar.Timestamp,
 				ID:          id,
 				Value:       exemplar.Value,
@@ -272,6 +294,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
 		}
 
 		row := remoteWriteSeriesRow{
+			TeamID:     teamID,
 			ID:         id,
 			MetricName: metricName,
 			LabelsJSON: string(labelsJSON),
@@ -303,7 +326,26 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest) (remoteWriteBatch, error) {
 		}
 		batch.labelCount++
 	}
+	sampleEncoder := json.NewEncoder(&batch.sampleRows)
+	for _, row := range sampleRows {
+		if err := sampleEncoder.Encode(row); err != nil {
+			return remoteWriteBatch{}, err
+		}
+		batch.sampleCount++
+	}
+	histogramEncoder := json.NewEncoder(&batch.histogramRows)
+	for _, row := range histogramRows {
+		if err := histogramEncoder.Encode(row); err != nil {
+			return remoteWriteBatch{}, err
+		}
+		batch.histogramCount++
+	}
 	return batch, nil
+}
+
+type remoteWriteSampleKey struct {
+	id          uint64
+	timestampMS int64
 }
 
 func remoteMetadataType(input prompb.MetricMetadata_MetricType) string {
@@ -339,6 +381,25 @@ func stableSeriesID(lbls labels.Labels) uint64 {
 		_, _ = hash.WriteString(label.Value)
 	})
 	return hash.Sum64()
+}
+
+func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
+	step := interval.Milliseconds()
+	if step <= 0 {
+		return timestamp
+	}
+	remainder := timestamp % step
+	if remainder < 0 {
+		remainder += step
+	}
+	return timestamp - remainder
+}
+
+func remoteWriteVersion(timestamp int64) uint64 {
+	if timestamp < 0 {
+		return 0
+	}
+	return uint64(timestamp)
 }
 
 func remoteWriteLabelMap(input []prompb.Label) (map[string]string, string, error) {
@@ -379,12 +440,12 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 		return nil
 	}
 	for _, insert := range []remoteWriteInsert{
-		{batch.metadataCount, s.cfg.MetricsTable, "metric_family_name, type, unit, help, now64(3, 'UTC')", "metric_family_name String, type String, unit String, help String", &batch.metadataRows, true},
-		{batch.seriesCount, s.cfg.SeriesTable, "id, metric_name, labels_json, fromUnixTimestamp64Milli(min_ms, 'UTC'), fromUnixTimestamp64Milli(max_ms, 'UTC')", "id UInt64, metric_name String, labels_json String, min_ms Int64, max_ms Int64", &batch.seriesRows, false},
-		{batch.labelCount, s.cfg.LabelIndexTable, "metric_name, label_name, label_value, id", "metric_name String, label_name String, label_value String, id UInt64", &batch.labelIndexRows, false},
-		{batch.sampleCount, s.cfg.SamplesTable, "fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value", "timestamp_ms Int64, id UInt64, value Float64", &batch.sampleRows, false},
-		{batch.histogramCount, s.cfg.HistogramsTable, "fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, base64Decode(histogram_b64)", "timestamp_ms Int64, id UInt64, histogram_b64 String", &batch.histogramRows, true},
-		{batch.exemplarCount, s.cfg.ExemplarsTable, "fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, labels_json", "timestamp_ms Int64, id UInt64, value Float64, labels_json String", &batch.exemplarRows, true},
+		{batch.metadataCount, s.cfg.MetricsTable, "team_id, metric_family_name, type, unit, help, now64(3, 'UTC')", "team_id UInt64, metric_family_name String, type String, unit String, help String", &batch.metadataRows, true},
+		{batch.seriesCount, s.cfg.SeriesTable, "team_id, id, metric_name, labels_json, fromUnixTimestamp64Milli(min_ms, 'UTC'), fromUnixTimestamp64Milli(max_ms, 'UTC')", "team_id UInt64, id UInt64, metric_name String, labels_json String, min_ms Int64, max_ms Int64", &batch.seriesRows, false},
+		{batch.labelCount, s.cfg.LabelIndexTable, "team_id, metric_name, label_name, label_value, id", "team_id UInt64, metric_name String, label_name String, label_value String, id UInt64", &batch.labelIndexRows, false},
+		{batch.sampleCount, s.cfg.SamplesTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, version", "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, version UInt64", &batch.sampleRows, false},
+		{batch.histogramCount, s.cfg.HistogramsTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, base64Decode(histogram_b64), version", "team_id UInt64, timestamp_ms Int64, id UInt64, histogram_b64 String, version UInt64", &batch.histogramRows, true},
+		{batch.exemplarCount, s.cfg.ExemplarsTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, labels_json", "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, labels_json String", &batch.exemplarRows, true},
 	} {
 		if err := s.insertRemoteRows(ctx, insert); err != nil {
 			return err

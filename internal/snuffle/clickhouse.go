@@ -161,6 +161,10 @@ func chTimeMillis(ms int64) string {
 	return "fromUnixTimestamp64Milli(" + strconv.FormatInt(ms, 10) + ", 'UTC')"
 }
 
+func teamFilter(cfg Config) string {
+	return "team_id = " + strconv.FormatUint(cfg.TeamID, 10)
+}
+
 func formatDurationSeconds(d time.Duration) string {
 	return strconv.FormatFloat(d.Seconds(), 'f', -1, 64)
 }

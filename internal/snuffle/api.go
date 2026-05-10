@@ -77,17 +77,116 @@ func newServer(cfg Config) *Server {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/-/healthy", s.handleHealthy)
 	mux.HandleFunc("/-/ready", s.handleHealthy)
-	mux.HandleFunc("/api/v1/query", s.handleQuery)
-	mux.HandleFunc("/api/v1/query_range", s.handleQueryRange)
-	mux.HandleFunc("/api/v1/write", s.handleRemoteWrite)
-	mux.HandleFunc("/api/v1/read", s.handleRemoteRead)
-	mux.HandleFunc("/api/v1/labels", s.handleLabels)
-	mux.HandleFunc("/api/v1/label/", s.handleLabelValues)
-	mux.HandleFunc("/api/v1/series", s.handleSeries)
-	mux.HandleFunc("/api/v1/metadata", s.handleMetadata)
-	mux.HandleFunc("/api/v1/rules", s.handleRules)
-	mux.HandleFunc("/api/v1/alerts", s.handleAlerts)
-	mux.HandleFunc("/api/v1/query_exemplars", s.handleQueryExemplars)
+
+	api := s.apiRoutes()
+	mux.Handle("/api/v1/", api)
+	mux.HandleFunc("/t/", s.handleTeamPath(api))
+	mux.HandleFunc("/team/", s.handleTeamPath(api))
+}
+
+func (s *Server) apiRoutes() *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/query", s.teamHandler((*Server).handleQuery))
+	mux.HandleFunc("/api/v1/query_range", s.teamHandler((*Server).handleQueryRange))
+	mux.HandleFunc("/api/v1/write", s.teamHandler((*Server).handleRemoteWrite))
+	mux.HandleFunc("/api/v1/read", s.teamHandler((*Server).handleRemoteRead))
+	mux.HandleFunc("/api/v1/labels", s.teamHandler((*Server).handleLabels))
+	mux.HandleFunc("/api/v1/label/", s.teamHandler((*Server).handleLabelValues))
+	mux.HandleFunc("/api/v1/series", s.teamHandler((*Server).handleSeries))
+	mux.HandleFunc("/api/v1/metadata", s.teamHandler((*Server).handleMetadata))
+	mux.HandleFunc("/api/v1/rules", s.teamHandler((*Server).handleRules))
+	mux.HandleFunc("/api/v1/alerts", s.teamHandler((*Server).handleAlerts))
+	mux.HandleFunc("/api/v1/query_exemplars", s.teamHandler((*Server).handleQueryExemplars))
+	return mux
+}
+
+type requestTeamIDKey struct{}
+
+func (s *Server) teamHandler(handler func(*Server, http.ResponseWriter, *http.Request)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		teamID, err := s.teamIDFromRequest(r)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+			return
+		}
+		handler(s.withTeamID(teamID), w, r)
+	}
+}
+
+func (s *Server) handleTeamPath(api http.Handler) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		teamID, strippedPath, err := parseTeamPath(r.URL.Path)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+			return
+		}
+		if strippedPath == "" {
+			http.NotFound(w, r)
+			return
+		}
+		cloned := r.Clone(context.WithValue(r.Context(), requestTeamIDKey{}, teamID))
+		urlCopy := *r.URL
+		urlCopy.Path = strippedPath
+		urlCopy.RawPath = ""
+		cloned.URL = &urlCopy
+		api.ServeHTTP(w, cloned)
+	}
+}
+
+func parseTeamPath(path string) (uint64, string, error) {
+	for _, prefix := range []string{"/t/", "/team/"} {
+		if !strings.HasPrefix(path, prefix) {
+			continue
+		}
+		rest := strings.TrimPrefix(path, prefix)
+		parts := strings.SplitN(rest, "/", 2)
+		if len(parts) != 2 || parts[0] == "" {
+			return 0, "", fmt.Errorf("tenant path must be %s{team_id}/api/v1/...", prefix)
+		}
+		teamID, err := parseTeamID(parts[0])
+		if err != nil {
+			return 0, "", err
+		}
+		return teamID, "/" + parts[1], nil
+	}
+	return 0, "", nil
+}
+
+func (s *Server) teamIDFromRequest(r *http.Request) (uint64, error) {
+	if value, ok := r.Context().Value(requestTeamIDKey{}).(uint64); ok {
+		return value, nil
+	}
+	if s.cfg.TeamHeader != "" {
+		if value := strings.TrimSpace(r.Header.Get(s.cfg.TeamHeader)); value != "" {
+			return parseTeamID(value)
+		}
+	}
+	if s.cfg.TeamQueryParam != "" {
+		if value := strings.TrimSpace(r.URL.Query().Get(s.cfg.TeamQueryParam)); value != "" {
+			return parseTeamID(value)
+		}
+	}
+	return s.cfg.DefaultTeamID, nil
+}
+
+func parseTeamID(value string) (uint64, error) {
+	teamID, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid team_id %q", value)
+	}
+	return teamID, nil
+}
+
+func (s *Server) withTeamID(teamID uint64) *Server {
+	cfg := s.cfg
+	cfg.TeamID = teamID
+	return &Server{
+		cfg:       cfg,
+		client:    s.client,
+		queryable: NewCHQueryable(s.client, cfg),
+		engine:    s.engine,
+		parser:    s.parser,
+	}
 }
 
 func (s *Server) handleHealthy(w http.ResponseWriter, r *http.Request) {
@@ -355,14 +454,14 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	metric := r.Form.Get("metric")
-	where := ""
+	whereParts := []string{teamFilter(s.cfg)}
 	if metric != "" {
-		where = "WHERE metric_family_name = " + sqlString(metric)
+		whereParts = append(whereParts, "metric_family_name = "+sqlString(metric))
 	}
 	sql := fmt.Sprintf(
-		"SELECT metric_family_name, argMax(type, updated_at) AS type, argMax(unit, updated_at) AS unit, argMax(help, updated_at) AS help FROM %s %s GROUP BY metric_family_name ORDER BY metric_family_name%s",
+		"SELECT metric_family_name, argMax(type, updated_at) AS type, argMax(unit, updated_at) AS unit, argMax(help, updated_at) AS help FROM %s WHERE %s GROUP BY metric_family_name ORDER BY metric_family_name%s",
 		tableName(s.cfg.CHDatabase, s.cfg.MetricsTable),
-		where,
+		strings.Join(whereParts, " AND "),
 		sqlLimit(limit),
 	)
 

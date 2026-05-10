@@ -9,7 +9,13 @@ CH_PORT="${CH_PORT:-9000}"
 CH_DATABASE="${CH_DATABASE:-default}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
+TEAM_ID="${TEAM_ID:-0}"
 LOCAL_MAX_THREADS="${LOCAL_MAX_THREADS:-8}"
+
+if [[ ! "$TEAM_ID" =~ ^[0-9]+$ ]]; then
+  echo "TEAM_ID must be an unsigned integer" >&2
+  exit 1
+fi
 
 client=(clickhouse-client --host "$CH_HOST" --port "$CH_PORT" --database "$CH_DATABASE" --user "$CH_USER")
 if [[ -n "$CH_PASSWORD" ]]; then
@@ -24,6 +30,7 @@ clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
   --query "
     SELECT
+      toUInt64($TEAM_ID) AS team_id,
       series_id AS id,
       any(metric_name) AS metric_name,
       any(toJSONString(tags)) AS labels_json,
@@ -48,6 +55,7 @@ clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
   --query "
     SELECT
+      toUInt64($TEAM_ID) AS team_id,
       metric_name,
       label_name,
       label_value,
@@ -71,9 +79,11 @@ clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
   --query "
     SELECT
+      toUInt64($TEAM_ID) AS team_id,
       timestamp,
       cityHash64(toString(id)) AS id,
-      value
+      value,
+      toUInt64(toUnixTimestamp64Milli(timestamp)) AS version
     FROM file('$DATA_FILE', Parquet)
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_samples FORMAT Native"

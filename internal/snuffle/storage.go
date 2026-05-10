@@ -105,8 +105,9 @@ func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, m
 		names := map[string]struct{}{labels.MetricName: {}}
 		for _, batch := range idBatches(seriesIDs(series), q.queryable.cfg.IDChunkSize) {
 			sql := fmt.Sprintf(
-				"SELECT DISTINCT label_name FROM %s WHERE id IN (%s)",
+				"SELECT DISTINCT label_name FROM %s WHERE %s AND id IN (%s)",
 				tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+				teamFilter(q.queryable.cfg),
 				joinUint64(batch),
 			)
 			if err := q.addStringRows(ctx, names, sql, "label_name"); err != nil {
@@ -118,8 +119,9 @@ func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, m
 
 	names := map[string]struct{}{labels.MetricName: {}}
 	sql := fmt.Sprintf(
-		"SELECT DISTINCT label_name FROM %s ORDER BY label_name%s",
+		"SELECT DISTINCT label_name FROM %s WHERE %s ORDER BY label_name%s",
 		tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+		teamFilter(q.queryable.cfg),
 		sqlLimit(limit),
 	)
 	if err := q.addStringRows(ctx, names, sql, "label_name"); err != nil {
@@ -150,8 +152,9 @@ func (q *CHQuerier) LabelValues(ctx context.Context, name string, hints *storage
 		}
 		for _, batch := range idBatches(seriesIDs(series), q.queryable.cfg.IDChunkSize) {
 			sql := fmt.Sprintf(
-				"SELECT DISTINCT label_value FROM %s WHERE label_name = %s AND id IN (%s)",
+				"SELECT DISTINCT label_value FROM %s WHERE %s AND label_name = %s AND id IN (%s)",
 				tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+				teamFilter(q.queryable.cfg),
 				sqlString(name),
 				joinUint64(batch),
 			)
@@ -166,14 +169,16 @@ func (q *CHQuerier) LabelValues(ctx context.Context, name string, hints *storage
 	var sql string
 	if name == labels.MetricName {
 		sql = fmt.Sprintf(
-			"SELECT DISTINCT metric_name AS label_value FROM %s ORDER BY label_value%s",
+			"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s ORDER BY label_value%s",
 			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.SeriesTable),
+			teamFilter(q.queryable.cfg),
 			sqlLimit(limit),
 		)
 	} else {
 		sql = fmt.Sprintf(
-			"SELECT DISTINCT label_value FROM %s WHERE label_name = %s ORDER BY label_value%s",
+			"SELECT DISTINCT label_value FROM %s WHERE %s AND label_name = %s ORDER BY label_value%s",
 			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+			teamFilter(q.queryable.cfg),
 			sqlString(name),
 			sqlLimit(limit),
 		)
@@ -211,6 +216,7 @@ type seriesMeta struct {
 
 func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	where := []string{
+		teamFilter(q.queryable.cfg),
 		fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("min_time <= %s", chTimeMillis(maxt)),
 	}
@@ -330,9 +336,10 @@ func (q *CHQuerier) labelNamesFromIndex(ctx context.Context, limit int, matchers
 		return nil, false, nil
 	}
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s) SELECT DISTINCT label_name FROM %s WHERE id IN (SELECT id FROM selected_series) ORDER BY label_name%s",
+		"WITH selected_series AS (%s) SELECT DISTINCT label_name FROM %s WHERE %s AND id IN (SELECT id FROM selected_series) ORDER BY label_name%s",
 		selectedSeries,
 		tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+		teamFilter(q.queryable.cfg),
 		sqlLimit(limit),
 	)
 	names := map[string]struct{}{labels.MetricName: {}}
@@ -364,9 +371,10 @@ func (q *CHQuerier) labelValuesFromIndex(ctx context.Context, name string, limit
 		)
 	} else {
 		sql = fmt.Sprintf(
-			"WITH selected_series AS (%s) SELECT DISTINCT label_value FROM %s WHERE label_name = %s AND id IN (SELECT id FROM selected_series) ORDER BY label_value%s",
+			"WITH selected_series AS (%s) SELECT DISTINCT label_value FROM %s WHERE %s AND label_name = %s AND id IN (SELECT id FROM selected_series) ORDER BY label_value%s",
 			selectedSeries,
 			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.LabelIndexTable),
+			teamFilter(q.queryable.cfg),
 			sqlString(name),
 			sqlLimit(limit),
 		)
@@ -398,9 +406,10 @@ func seriesPreFilters(cfg Config, matchers []*labels.Matcher) []string {
 			metricGuard = " AND metric_name = " + sqlString(metric)
 		}
 		filters = append(filters, fmt.Sprintf(
-			"id %s (SELECT id FROM %s WHERE label_name = %s%s AND %s)",
+			"id %s (SELECT id FROM %s WHERE %s AND label_name = %s%s AND %s)",
 			membership,
 			tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+			teamFilter(cfg),
 			sqlString(m.Name),
 			metricGuard,
 			condition,
@@ -679,6 +688,7 @@ func histogramRowHandler(byID map[uint64]*seriesMeta) func(json.RawMessage) erro
 
 func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64) (string, bool) {
 	where := []string{
+		teamFilter(cfg),
 		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 	}
@@ -688,7 +698,7 @@ func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, max
 	}
 	where = append(where, idFilters...)
 	return fmt.Sprintf(
-		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(any(histogram)) AS histogram_b64 FROM %s WHERE %s GROUP BY id, timestamp ORDER BY id, timestamp",
+		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(argMax(histogram, version)) AS histogram_b64 FROM %s WHERE %s GROUP BY id, timestamp ORDER BY id, timestamp",
 		tableName(cfg.CHDatabase, cfg.HistogramsTable),
 		strings.Join(where, " AND "),
 	), true
@@ -696,8 +706,9 @@ func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, max
 
 func histogramsSQL(cfg Config, ids []uint64, mint, maxt int64) string {
 	return fmt.Sprintf(
-		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(any(histogram)) AS histogram_b64 FROM %s WHERE id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
+		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(argMax(histogram, version)) AS histogram_b64 FROM %s WHERE %s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
 		tableName(cfg.CHDatabase, cfg.HistogramsTable),
+		teamFilter(cfg),
 		joinUint64(ids),
 		chTimeMillis(mint),
 		chTimeMillis(maxt),
@@ -711,8 +722,9 @@ func (q *CHQuerier) loadExemplars(ctx context.Context, series []*seriesMeta, min
 	byID, ids := seriesIndex(series)
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
 		sql := fmt.Sprintf(
-			"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, any(value) AS value, any(labels_json) AS labels_json FROM %s WHERE id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
+			"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, any(value) AS value, any(labels_json) AS labels_json FROM %s WHERE %s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
 			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.ExemplarsTable),
+			teamFilter(q.queryable.cfg),
 			joinUint64(batch),
 			chTimeMillis(mint),
 			chTimeMillis(maxt),
@@ -758,6 +770,7 @@ func exemplarRowHandler(byID map[uint64]*seriesMeta) func(json.RawMessage) error
 
 func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) (string, bool) {
 	where := []string{
+		teamFilter(cfg),
 		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 	}
@@ -770,18 +783,34 @@ func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt i
 }
 
 func sampleRowsSQL(cfg Config, where string, latestOnly bool) string {
+	source := dedupedSamplesSQL(cfg, where)
 	if latestOnly {
 		return fmt.Sprintf(
-			"SELECT id, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY id ORDER BY id",
-			tableName(cfg.CHDatabase, cfg.SamplesTable),
-			where,
+			"SELECT id, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY id",
+			source,
 		)
 	}
 	return fmt.Sprintf(
-		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, any(value) AS value FROM %s WHERE %s GROUP BY id, timestamp ORDER BY id, timestamp",
+		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, value FROM (%s) ORDER BY id, timestamp",
+		source,
+	)
+}
+
+func dedupedSamplesSQL(cfg Config, where string) string {
+	return fmt.Sprintf(
+		"SELECT id, timestamp, argMax(value, version) AS value FROM %s WHERE %s GROUP BY id, timestamp",
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		where,
 	)
+}
+
+func dedupedSamplesForSelectedSeriesSQL(cfg Config, mint, maxt int64) string {
+	return dedupedSamplesSQL(cfg, strings.Join([]string{
+		teamFilter(cfg),
+		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
+		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
+		"id IN (SELECT id FROM selected_series)",
+	}, " AND "))
 }
 
 func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64) ([]string, bool) {
@@ -793,8 +822,9 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 				return nil, false
 			}
 			filters = append(filters, fmt.Sprintf(
-				"id IN (SELECT id FROM %s WHERE max_time >= %s AND min_time <= %s AND %s)",
+				"id IN (SELECT id FROM %s WHERE %s AND max_time >= %s AND min_time <= %s AND %s)",
 				tableName(cfg.CHDatabase, cfg.SeriesTable),
+				teamFilter(cfg),
 				chTimeMillis(mint),
 				chTimeMillis(maxt),
 				metricCondition,
@@ -806,9 +836,10 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 			return nil, false
 		}
 		filters = append(filters, fmt.Sprintf(
-			"id %s (SELECT id FROM %s WHERE label_name = %s AND %s)",
+			"id %s (SELECT id FROM %s WHERE %s AND label_name = %s AND %s)",
 			membership,
 			tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+			teamFilter(cfg),
 			sqlString(m.Name),
 			condition,
 		))
@@ -818,7 +849,8 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 
 func samplesSQL(cfg Config, ids []uint64, mint, maxt int64, latestOnly bool) string {
 	return sampleRowsSQL(cfg, fmt.Sprintf(
-		"id IN (%s) AND timestamp >= %s AND timestamp <= %s",
+		"%s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s",
+		teamFilter(cfg),
 		joinUint64(ids),
 		chTimeMillis(mint),
 		chTimeMillis(maxt),

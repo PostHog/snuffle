@@ -65,13 +65,12 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		return queryData{}, false, nil
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
+	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
 
 	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM %s WHERE timestamp >= %s AND timestamp <= %s AND id IN (SELECT id FROM selected_series) GROUP BY id",
+		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		source.gridExpr,
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		chTimeMillis(mint),
-		chTimeMillis(maxt),
+		sampleSource,
 	)
 	sql := fmt.Sprintf(
 		"WITH selected_series AS (%s), per_series AS (%s) SELECT selected_series.id AS id, selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY selected_series.id",
@@ -106,6 +105,7 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 		return queryData{}, false, nil
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
+	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
 	gridExpr := fmt.Sprintf(
 		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
 		chTimeMillis(shiftedStart.UnixMilli()),
@@ -114,11 +114,9 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 		formatDurationSeconds(s.cfg.LookbackDelta),
 	)
 	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM %s WHERE timestamp >= %s AND timestamp <= %s AND id IN (SELECT id FROM selected_series) GROUP BY id",
+		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		gridExpr,
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		chTimeMillis(mint),
-		chTimeMillis(maxt),
+		sampleSource,
 	)
 	sql := fmt.Sprintf(
 		"WITH selected_series AS (%s), per_series AS (%s) SELECT selected_series.id AS id, selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY selected_series.id",
@@ -286,12 +284,11 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	if !ok {
 		return queryData{}, false, nil
 	}
+	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
 	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM %s WHERE timestamp >= %s AND timestamp <= %s AND id IN (SELECT id FROM selected_series) GROUP BY id",
+		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		source.gridExpr,
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		chTimeMillis(mint),
-		chTimeMillis(maxt),
+		sampleSource,
 	)
 
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
@@ -564,12 +561,11 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 		direction = "ASC"
 	}
 	seriesLookup := topKSeriesLookupSQL(s.cfg, selector.LabelMatchers)
+	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, window.mint, window.maxt)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), top_series AS (SELECT id, argMax(value, timestamp) AS value FROM %s WHERE timestamp >= %s AND timestamp <= %s AND id IN (SELECT id FROM selected_series) GROUP BY id ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, %d AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
+		"WITH selected_series AS (%s), top_series AS (SELECT id, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, %d AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
 		selectedSeries,
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		chTimeMillis(window.mint),
-		chTimeMillis(window.maxt),
+		sampleSource,
 		direction,
 		limit,
 		evalTime.UnixMilli(),
@@ -605,7 +601,7 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 }
 
 func topKSeriesLookupSQL(cfg Config, matchers []*labels.Matcher) string {
-	where := []string{"id IN (SELECT id FROM top_series)"}
+	where := []string{teamFilter(cfg), "id IN (SELECT id FROM top_series)"}
 	where = append(where, metricNameConstraints(matchers)...)
 	return fmt.Sprintf(
 		"(SELECT id, any(metric_name) AS metric_name, any(labels_json) AS labels_json FROM (SELECT id, metric_name, labels_json FROM %s WHERE %s) GROUP BY id)",
@@ -659,16 +655,10 @@ func rangeFunctionMode(name string) (rangeFunction, bool) {
 }
 
 func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow) string {
-	table := tableName(cfg.CHDatabase, cfg.SamplesTable)
-	where := []string{
-		fmt.Sprintf("timestamp >= %s", chTimeMillis(window.mint)),
-		fmt.Sprintf("timestamp <= %s", chTimeMillis(window.maxt)),
-		"id IN (SELECT id FROM selected_series)",
-	}
+	source := dedupedSamplesForSelectedSeriesSQL(cfg, window.mint, window.maxt)
 	return fmt.Sprintf(
-		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM %s WHERE %s GROUP BY id HAVING length(pts) > 1)",
-		table,
-		strings.Join(where, " AND "),
+		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id HAVING length(pts) > 1)",
+		source,
 	)
 }
 
@@ -800,6 +790,7 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 		selectParts = []string{"id"}
 	}
 	where := []string{
+		teamFilter(cfg),
 		fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("min_time <= %s", chTimeMillis(maxt)),
 	}
@@ -830,11 +821,10 @@ func selectedSeriesProjection(selectParts []string) []string {
 }
 
 func latestSamplesForSelectedSeriesSQL(cfg Config, mint, maxt int64) string {
+	source := dedupedSamplesForSelectedSeriesSQL(cfg, mint, maxt)
 	return fmt.Sprintf(
-		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM %s WHERE timestamp >= %s AND timestamp <= %s AND id IN (SELECT id FROM selected_series) GROUP BY id",
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		chTimeMillis(mint),
-		chTimeMillis(maxt),
+		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
+		source,
 	)
 }
 
@@ -914,6 +904,7 @@ func labelIndexGroupLabelsSQL(cfg Config, matchers []*labels.Matcher, grouping [
 		))
 	}
 	where := []string{
+		teamFilter(cfg),
 		"label_name IN (" + strings.Join(names, ", ") + ")",
 	}
 	metric := exactMetricName(matchers)

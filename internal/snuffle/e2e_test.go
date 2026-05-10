@@ -22,8 +22,9 @@ import (
 )
 
 const (
-	e2eStartMS       = int64(1_700_000_000_000)
-	e2eEndMS         = int64(1_700_000_060_000)
+	e2eStartMS       = int64(1_700_000_010_000)
+	e2eEndMS         = int64(1_700_000_070_000)
+	e2eTeamID        = uint64(42)
 	e2eCounterMetric = "snuffle_e2e_requests_total"
 	e2eHistMetric    = "snuffle_e2e_latency_seconds"
 )
@@ -134,6 +135,7 @@ func e2eWriteRequest() *prompb.WriteRequest {
 				},
 				Samples: []prompb.Sample{
 					{Timestamp: e2eStartMS, Value: 10},
+					{Timestamp: e2eStartMS + 5_000, Value: 12},
 					{Timestamp: e2eEndMS, Value: 25},
 				},
 				Exemplars: []prompb.Exemplar{{
@@ -179,7 +181,7 @@ func postRemoteWrite(t *testing.T, baseURL string, req *prompb.WriteRequest) {
 	if err != nil {
 		t.Fatalf("marshal remote write: %v", err)
 	}
-	resp, err := http.Post(baseURL+"/api/v1/write", "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
+	resp, err := http.Post(baseURL+e2eAPIPath("/api/v1/write"), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
 	if err != nil {
 		t.Fatalf("post remote write: %v", err)
 	}
@@ -194,7 +196,7 @@ func assertInstantQuery(t *testing.T, baseURL string) {
 	t.Helper()
 	data := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", url.Values{
 		"query": {`sum by (job) (` + e2eCounterMetric + `)`},
-		"time":  {"1700000060"},
+		"time":  {"1700000070"},
 	})
 	if data.ResultType != "vector" || len(data.Result) != 1 {
 		t.Fatalf("instant query result = %#v", data)
@@ -211,12 +213,15 @@ func assertRangeQuery(t *testing.T, baseURL string) {
 	t.Helper()
 	data := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", url.Values{
 		"query": {e2eCounterMetric + `{job="api"} + 0`},
-		"start": {"1700000000"},
-		"end":   {"1700000060"},
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
 		"step":  {"60s"},
 	})
 	if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) != 2 {
 		t.Fatalf("range query result = %#v", data)
+	}
+	if got := sampleString(data.Result[0].Values[0]); got != "12" {
+		t.Fatalf("range query first bucket value = %q", got)
 	}
 	if got := sampleString(data.Result[0].Values[1]); got != "25" {
 		t.Fatalf("range query final value = %q", got)
@@ -226,8 +231,8 @@ func assertRangeQuery(t *testing.T, baseURL string) {
 func assertLabels(t *testing.T, baseURL string) {
 	t.Helper()
 	labels := apiGet[[]string](t, baseURL, "/api/v1/labels", url.Values{
-		"start": {"1700000000"},
-		"end":   {"1700000060"},
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
 	})
 	assertStringPresent(t, labels, "__name__")
 	assertStringPresent(t, labels, "job")
@@ -238,8 +243,8 @@ func assertLabelValues(t *testing.T, baseURL string) {
 	t.Helper()
 	values := apiGet[[]string](t, baseURL, "/api/v1/label/job/values", url.Values{
 		"match[]": {e2eCounterMetric + `{instance="host-a"}`},
-		"start":   {"1700000000"},
-		"end":     {"1700000060"},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
 	})
 	assertStringPresent(t, values, "api")
 }
@@ -248,8 +253,8 @@ func assertSeries(t *testing.T, baseURL string) {
 	t.Helper()
 	series := apiGet[[]map[string]string](t, baseURL, "/api/v1/series", url.Values{
 		"match[]": {e2eCounterMetric + `{job="api"}`},
-		"start":   {"1700000000"},
-		"end":     {"1700000060"},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
 	})
 	if len(series) != 1 || series[0][labels.MetricName] != e2eCounterMetric || series[0]["instance"] != "host-a" {
 		t.Fatalf("series result = %#v", series)
@@ -269,8 +274,8 @@ func assertExemplars(t *testing.T, baseURL string) {
 	t.Helper()
 	result := apiGet[[]exemplarQueryDTO](t, baseURL, "/api/v1/query_exemplars", url.Values{
 		"query": {e2eCounterMetric},
-		"start": {"1700000000"},
-		"end":   {"1700000060"},
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
 	})
 	if len(result) != 1 || len(result[0].Exemplars) != 1 || result[0].Exemplars[0].Labels["trace_id"] != "abc123" {
 		t.Fatalf("exemplar result = %#v", result)
@@ -284,7 +289,7 @@ func assertRemoteReadSamples(t *testing.T, baseURL string) {
 		t.Fatalf("remote read samples result = %#v", resp.Results)
 	}
 	ts := resp.Results[0].Timeseries[0]
-	if len(ts.Samples) != 2 || ts.Samples[1].Value != 25 {
+	if len(ts.Samples) != 2 || ts.Samples[0].Timestamp != e2eStartMS || ts.Samples[0].Value != 12 || ts.Samples[1].Timestamp != e2eEndMS || ts.Samples[1].Value != 25 {
 		t.Fatalf("remote read samples = %#v", ts.Samples)
 	}
 	if len(ts.Exemplars) != 1 || ts.Exemplars[0].Labels[0].Value != "abc123" {
@@ -321,7 +326,7 @@ func remoteRead(t *testing.T, baseURL, metric string) *prompb.ReadResponse {
 	if err != nil {
 		t.Fatalf("marshal remote read: %v", err)
 	}
-	httpResp, err := http.Post(baseURL+"/api/v1/read", "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
+	httpResp, err := http.Post(baseURL+e2eAPIPath("/api/v1/read"), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
 	if err != nil {
 		t.Fatalf("post remote read: %v", err)
 	}
@@ -377,7 +382,7 @@ type exemplarDTO struct {
 
 func apiGet[T any](t *testing.T, baseURL, path string, values url.Values) T {
 	t.Helper()
-	resp, err := http.Get(baseURL + path + "?" + values.Encode())
+	resp, err := http.Get(baseURL + e2eAPIPath(path) + "?" + values.Encode())
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}
@@ -394,6 +399,10 @@ func apiGet[T any](t *testing.T, baseURL, path string, values url.Values) T {
 		t.Fatalf("GET %s returned %q: %s", path, decoded.Status, decoded.Error)
 	}
 	return decoded.Data
+}
+
+func e2eAPIPath(path string) string {
+	return fmt.Sprintf("/t/%d%s", e2eTeamID, path)
 }
 
 func sampleString(value []any) string {

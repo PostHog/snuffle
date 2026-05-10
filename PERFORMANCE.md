@@ -12,6 +12,7 @@ The final large benchmark uses `scripts/seed_metrics_large.sql`:
 - 100,000 series
 - 10,000,000 samples, 100 samples per series at 15s spacing
 - 400,000 inverted label-index rows
+- tenant: `team_id = 0`
 - metric: `load_requests_total`
 - labels: `job`, `instance`, `status`, `shard`
 
@@ -21,26 +22,32 @@ For unknown incoming labels, the default should not assume hot label names.
 
 `metrics_samples`
 
-- columns: `timestamp DateTime64(3)`, `id UInt64`, `value Float64`
-- primary order: `(id, timestamp)`
+- columns: `timestamp DateTime64(3)`, `id UInt64`, `value Float64`,
+  `version UInt64`, `team_id UInt64`
+- engine: `ReplacingMergeTree(version)`
+- primary order: `(team_id, id, timestamp)`
+- remote write buckets timestamps to `REMOTE_WRITE_SAMPLE_INTERVAL`, default
+  `15s`, so the replacement key is one sample per series per bucket
 - all columns are non-null
 
 `metrics_series`
 
 - one row per time series
-- columns: `id`, `metric_name`, `labels_json String`, `min_time`, `max_time`
-- primary order: `(metric_name, id)`
-- projection: `(metric_name, id)` for metric/time pruning
-- projection: `(id)` for fetching metadata after ClickHouse has already found
-  a small set of series, such as `topk`
+- columns: `team_id`, `id`, `metric_name`, `labels_json String`, `min_time`,
+  `max_time`
+- primary order: `(team_id, metric_name, id)`
+- projection: `(team_id, id)` for fetching metadata after ClickHouse has
+  already found a small set of series, such as `topk`
 - all columns are non-null
 
 `metrics_label_index`
 
-- columns: `metric_name`, `label_name`, `label_value`, `id`
-- primary order: `(metric_name, label_name, label_value, id)`
-- projection: `(label_name, label_value, id, metric_name)` for arbitrary label lookup
-- projection: `(id, label_name, metric_name, label_value)` for fetching group labels
+- columns: `team_id`, `metric_name`, `label_name`, `label_value`, `id`
+- primary order: `(team_id, metric_name, label_name, label_value, id)`
+- projection: `(team_id, label_name, label_value, id, metric_name)` for
+  arbitrary label lookup
+- projection: `(team_id, id, label_name, metric_name, label_value)` for
+  fetching group labels
 - used for arbitrary label filtering and label metadata
 - all columns are non-null
 
@@ -50,8 +57,8 @@ labelsets. Arbitrary label filtering still goes through the inverted index.
 Cold-path companion tables:
 
 - `metrics_histograms`: native histogram samples as remote-write protobuf
-  blobs keyed by `(id, timestamp)`
-- `metrics_exemplars`: exemplar samples keyed by `(id, timestamp)`
+  blobs keyed by `(team_id, id, timestamp)` with `ReplacingMergeTree(version)`
+- `metrics_exemplars`: exemplar samples keyed by `(team_id, id, timestamp)`
 - `metrics_metadata`: latest metadata per metric family
 
 ## JSON vs Map Findings
@@ -102,6 +109,7 @@ selection, number of HTTP requests, and response materialization cost.
 Implemented storage optimizations:
 
 - exact metric/time pruning on `series`
+- tenant pruning through `team_id` in every table and query
 - arbitrary positive label matcher pruning through `label_index`
 - label-index projections for matcher lookup and group-label lookup
 - exact Prometheus matcher semantics are preserved by a final Go-side matcher
@@ -109,6 +117,8 @@ Implemented storage optimizations:
 - instant vector selectors fetch only the latest sample in the lookback window
 - sample reads use exact selected IDs against a sample table ordered by
   `(id,timestamp)` with tighter index granularity
+- sample and native-histogram reads dedupe with `argMax(..., version)` so
+  replacement is correct before ClickHouse background merges compact parts
 - broad latest-sample reads use ClickHouse subqueries instead of oversized
   `IN (...)` lists
 - plain `/query_range` selectors use `timeSeriesLastToGrid` to return one row
@@ -121,6 +131,9 @@ Implemented storage optimizations:
 - metric metadata is stored separately and never joined into the sample hot path
 - native histograms and exemplars are stored separately from float samples and
   loaded only when the request path needs them
+- remote write applies the configurable sample interval before insert; this is
+  intentionally Go-side so later tenant-specific intervals do not require
+  table-level ClickHouse expressions
 - safe instant `sum`, `avg`, `count`, `min`, `max`, `group`, `topk`, and
   `bottomk` push down to ClickHouse
 - safe aggregate-over-range-function shapes such as

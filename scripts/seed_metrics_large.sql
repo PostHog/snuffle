@@ -7,6 +7,7 @@ DROP TABLE IF EXISTS metrics_series SYNC;
 
 CREATE TABLE metrics_series
 (
+    team_id UInt64,
     id UInt64,
     metric_name LowCardinality(String),
     labels_json String,
@@ -14,65 +15,71 @@ CREATE TABLE metrics_series
     max_time DateTime64(3, 'UTC')
 )
 ENGINE = MergeTree
-ORDER BY (metric_name, id)
+ORDER BY (team_id, metric_name, id)
 SETTINGS index_granularity = 1024;
 
 ALTER TABLE metrics_series
     ADD PROJECTION by_id
     (
-        SELECT id, metric_name, labels_json, min_time, max_time
-        ORDER BY id
+        SELECT team_id, id, metric_name, labels_json, min_time, max_time
+        ORDER BY (team_id, id)
     );
 
 CREATE TABLE metrics_label_index
 (
+    team_id UInt64,
     metric_name LowCardinality(String),
     label_name LowCardinality(String),
     label_value LowCardinality(String),
     id UInt64
 )
 ENGINE = ReplacingMergeTree
-ORDER BY (metric_name, label_name, label_value, id)
+ORDER BY (team_id, metric_name, label_name, label_value, id)
 SETTINGS index_granularity = 1024, deduplicate_merge_projection_mode = 'rebuild';
 
 ALTER TABLE metrics_label_index
     ADD PROJECTION by_label_value
     (
-        SELECT metric_name, label_name, label_value, id
-        ORDER BY (label_name, label_value, id, metric_name)
+        SELECT team_id, metric_name, label_name, label_value, id
+        ORDER BY (team_id, label_name, label_value, id, metric_name)
     );
 
 ALTER TABLE metrics_label_index
     ADD PROJECTION by_id_label
     (
-        SELECT metric_name, label_name, label_value, id
-        ORDER BY (id, label_name, metric_name, label_value)
+        SELECT team_id, metric_name, label_name, label_value, id
+        ORDER BY (team_id, id, label_name, metric_name, label_value)
     );
 
 CREATE TABLE metrics_samples
 (
+    team_id UInt64,
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
-    value Float64
+    value Float64,
+    version UInt64
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (id, timestamp)
+ORDER BY (team_id, id, timestamp)
 SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_histograms
 (
+    team_id UInt64,
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
-    histogram String
+    histogram String,
+    version UInt64
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (id, timestamp)
+ORDER BY (team_id, id, timestamp)
 SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_exemplars
 (
+    team_id UInt64,
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
     value Float64,
@@ -80,11 +87,12 @@ CREATE TABLE metrics_exemplars
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (id, timestamp)
+ORDER BY (team_id, id, timestamp)
 SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_metadata
 (
+    team_id UInt64,
     metric_family_name LowCardinality(String),
     type LowCardinality(String),
     unit String,
@@ -92,17 +100,19 @@ CREATE TABLE metrics_metadata
     updated_at DateTime64(3, 'UTC')
 )
 ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY metric_family_name
+ORDER BY (team_id, metric_family_name)
 SETTINGS index_granularity = 1024;
 
 INSERT INTO metrics_series
-    (id, metric_name, labels_json, min_time, max_time)
+    (team_id, id, metric_name, labels_json, min_time, max_time)
 WITH
+    0 AS team_id,
     100000 AS series_count,
     100 AS samples_per_series,
     1700100000000 AS start_ms,
     15000 AS step_ms
 SELECT
+    team_id,
     id,
     metric_name,
     toJSONString(all_tags) AS labels_json,
@@ -125,9 +135,12 @@ FROM
 ALTER TABLE metrics_series MATERIALIZE PROJECTION by_id;
 
 INSERT INTO metrics_label_index
-    (metric_name, label_name, label_value, id)
-WITH 100000 AS series_count
+    (team_id, metric_name, label_name, label_value, id)
+WITH
+    0 AS team_id,
+    100000 AS series_count
 SELECT
+    team_id,
     metric_name,
     label_name,
     all_tags[label_name] AS label_value,
@@ -151,16 +164,19 @@ ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_label_value;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_id_label;
 
 INSERT INTO metrics_samples
-    (timestamp, id, value)
+    (team_id, timestamp, id, value, version)
 WITH
+    0 AS team_id,
     100000 AS series_count,
     100 AS samples_per_series,
     1700100000000 AS start_ms,
     15000 AS step_ms
 SELECT
+    team_id,
     fromUnixTimestamp64Milli(start_ms + step_ms * sample_index) AS timestamp,
     series_id + 1 AS id,
-    toFloat64(1000 + series_id * 100 + sample_index * (1 + series_id % 10)) AS value
+    toFloat64(1000 + series_id * 100 + sample_index * (1 + series_id % 10)) AS value,
+    toUInt64(start_ms + step_ms * sample_index) AS version
 FROM
 (
     SELECT

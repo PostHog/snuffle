@@ -1,0 +1,48 @@
+package snuffle
+
+import (
+	"net/http/httptest"
+	"testing"
+)
+
+func TestParseTeamPath(t *testing.T) {
+	teamID, path, err := parseTeamPath("/t/42/api/v1/query")
+	if err != nil {
+		t.Fatalf("parseTeamPath returned error: %v", err)
+	}
+	if teamID != 42 || path != "/api/v1/query" {
+		t.Fatalf("parseTeamPath = (%d, %q), want (42, /api/v1/query)", teamID, path)
+	}
+
+	teamID, path, err = parseTeamPath("/team/7/api/v1/read")
+	if err != nil {
+		t.Fatalf("parseTeamPath returned error: %v", err)
+	}
+	if teamID != 7 || path != "/api/v1/read" {
+		t.Fatalf("parseTeamPath = (%d, %q), want (7, /api/v1/read)", teamID, path)
+	}
+}
+
+func TestTeamIDFromRequest(t *testing.T) {
+	server := &Server{cfg: Config{
+		DefaultTeamID:  3,
+		TeamHeader:     "X-Scope-OrgID",
+		TeamQueryParam: "tenant",
+	}}
+
+	req := httptest.NewRequest("GET", "/api/v1/query", nil)
+	if got, err := server.teamIDFromRequest(req); err != nil || got != 3 {
+		t.Fatalf("default team = (%d, %v), want 3", got, err)
+	}
+
+	req = httptest.NewRequest("GET", "/api/v1/query?tenant=5", nil)
+	if got, err := server.teamIDFromRequest(req); err != nil || got != 5 {
+		t.Fatalf("query team = (%d, %v), want 5", got, err)
+	}
+
+	req = httptest.NewRequest("GET", "/api/v1/query?tenant=5", nil)
+	req.Header.Set("X-Scope-OrgID", "9")
+	if got, err := server.teamIDFromRequest(req); err != nil || got != 9 {
+		t.Fatalf("header team = (%d, %v), want 9", got, err)
+	}
+}

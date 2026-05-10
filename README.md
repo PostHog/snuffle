@@ -64,21 +64,34 @@ curl --get 'http://localhost:9091/api/v1/query_range' \
   --data-urlencode 'step=15s'
 ```
 
+For multi-tenant requests, either send `X-Team-ID` or put the tenant in the
+path:
+
+```bash
+curl -H 'X-Team-ID: 42' --get 'http://localhost:9091/api/v1/query' \
+  --data-urlencode 'query=up'
+
+curl --get 'http://localhost:9091/t/42/api/v1/query' \
+  --data-urlencode 'query=up'
+```
+
 ## Storage Layout
 
 The recommended schema is in `scripts/create_metrics_schema.sql`:
 
-- `metrics_series`: append-friendly series metadata with `id`, `metric_name`,
-  `labels_json String`, `min_time`, and `max_time`, ordered by
-  `(metric_name, id)`
-- `metrics_samples`: raw float samples with `timestamp`, `id`, and `value`,
-  partitioned by day and ordered by `(id, timestamp)`
+- `metrics_series`: append-friendly series metadata with `team_id`, `id`,
+  `metric_name`, `labels_json String`, `min_time`, and `max_time`, ordered by
+  `(team_id, metric_name, id)`
+- `metrics_samples`: float samples with `timestamp`, `id`, `value`, and
+  `version`, using `ReplacingMergeTree(version)` and ordered by
+  `(team_id, id, timestamp)`
 - `metrics_label_index`: inverted label index
-  `(metric_name, label_name, label_value, id)` for arbitrary label pruning
-- `metrics_histograms`: native histogram samples stored as remote-write protobuf
-  payloads keyed by `(id, timestamp)`
-- `metrics_exemplars`: exemplar samples keyed by `(id, timestamp)` with exemplar
-  labels in an opaque JSON string
+  `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
+  pruning
+- `metrics_histograms`: native histogram samples stored as remote-write
+  protobuf payloads with `version`, keyed by `(team_id, id, timestamp)`
+- `metrics_exemplars`: exemplar samples keyed by `(team_id, id, timestamp)`
+  with exemplar labels in an opaque JSON string
 - `metrics_metadata`: latest metric family `type`, `unit`, and `help`
 
 All hot-path columns are non-null. Missing labels are represented by absence
@@ -89,6 +102,8 @@ query path.
 ## Query Shape
 
 - arbitrary positive label filters are pruned through `label_index`
+- every ClickHouse query includes `team_id = <tenant>` before series, label,
+  sample, histogram, exemplar, or metadata pruning
 - exact Prometheus matcher semantics are preserved by a final Go-side matcher
   filter
 - instant selectors fetch only the latest sample per series in the lookback
@@ -108,6 +123,10 @@ query path.
 - remote write inserts series metadata, label-index rows, float samples,
   native histograms, exemplars, and metric metadata through ClickHouse
   `input(...) FORMAT JSONEachRow` body inserts
+- remote write snaps float sample and native histogram timestamps to
+  `REMOTE_WRITE_SAMPLE_INTERVAL` bucket starts, default `15s`; `version` keeps
+  the latest original sample in each bucket, and query SQL dedupes with
+  `argMax` so reads do not wait for background merges
 - remote read reuses the same label-pruned sample path as PromQL selectors and
   returns float samples, native histograms, and exemplars
 
@@ -136,6 +155,16 @@ Environment variables:
 - `CH_ID_CHUNK_SIZE`: selected-ID batch size, default `20000`
 - `CH_AGGREGATE_MAX_THREADS`: per-query `max_threads` for aggregate pushdowns,
   default `4`; set `0` to leave ClickHouse defaults unchanged
+- `REMOTE_WRITE_SAMPLE_INTERVAL`: remote-write sample/histogram bucket size,
+  default `15s`; set `0` to store incoming timestamps unchanged
+- `SNUFFLE_DEFAULT_TEAM_ID`: fallback tenant when no tenant is provided,
+  default `0`
+- `SNUFFLE_TEAM_HEADER`: tenant header, default `X-Team-ID`
+- `SNUFFLE_TEAM_QUERY_PARAM`: tenant query parameter, default `team_id`
+
+Tenant precedence is `/t/{team_id}/api/v1/...` or
+`/team/{team_id}/api/v1/...`, then the configured header, then the configured
+query parameter, then `SNUFFLE_DEFAULT_TEAM_ID`.
 
 ## Docker Demo
 

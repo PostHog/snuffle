@@ -75,9 +75,11 @@ func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"argMax(value, timestamp)",
+		"argMax(value, version)",
 		"`default`.`samples`",
 		"`default`.`series`",
 		"`default`.`label_index`",
+		"team_id = 0",
 		"metric_name = 'http_requests_total'",
 		"label_name = 'job'",
 		"label_value = 'api'",
@@ -147,10 +149,12 @@ func TestRangeSamplesSQLFromMatchers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"toUnixTimestamp64Milli(timestamp)",
+		"argMax(value, version)",
 		"ORDER BY id, timestamp",
 		"`default`.`samples`",
 		"`default`.`series`",
 		"`default`.`label_index`",
+		"team_id = 0",
 		"metric_name = 'http_requests_total'",
 		"label_name = 'job'",
 		"label_value = 'api'",
@@ -175,6 +179,7 @@ func TestTopKSeriesLookupSQLKeepsMetricConstraint(t *testing.T) {
 	for _, want := range []string{
 		"id IN (SELECT id FROM top_series)",
 		"`default`.`series`",
+		"team_id = 0",
 		"metric_name = 'http_requests_total'",
 	} {
 		if !strings.Contains(sql, want) {
