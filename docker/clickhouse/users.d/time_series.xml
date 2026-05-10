@@ -1,0 +1,19 @@
+<clickhouse>
+    <users>
+        <default>
+            <password></password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </default>
+    </users>
+    <profiles>
+        <default>
+            <allow_experimental_time_series_table>1</allow_experimental_time_series_table>
+            <allow_experimental_analyzer>1</allow_experimental_analyzer>
+        </default>
+    </profiles>
+</clickhouse>
