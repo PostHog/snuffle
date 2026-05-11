@@ -38,8 +38,8 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.labelCount != 2 || batch.exemplarCount != 1 || batch.metadataCount != 1 {
-		t.Fatalf("counts = series %d samples %d labels %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.exemplarCount, batch.metadataCount)
+	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.labelCount != 2 || batch.labelBitmapCount != 3 || batch.activityCount != 2 || batch.exemplarCount != 1 || batch.metadataCount != 1 {
+		t.Fatalf("counts = series %d samples %d labels %d label bitmaps %d activity %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.labelBitmapCount, batch.activityCount, batch.exemplarCount, batch.metadataCount)
 	}
 	seriesRows := batch.seriesRows.String()
 	for _, want := range []string{`"team_id":7`, `"metric_name":"http_requests_total"`, `"min_ms":1000`, `"max_ms":2000`, `"labels_json":"{`} {
@@ -55,6 +55,18 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	}
 	if strings.Contains(labelRows, labels.MetricName) {
 		t.Fatalf("label index rows should not include metric name: %q", labelRows)
+	}
+	labelBitmapRows := batch.labelBitmapRows.String()
+	for _, want := range []string{`"label_name":"job"`, `"label_name":"instance"`, `"label_name":"__name__"`} {
+		if !strings.Contains(labelBitmapRows, want) {
+			t.Fatalf("label bitmap rows %q do not contain %q", labelBitmapRows, want)
+		}
+	}
+	activityRows := batch.activityRows.String()
+	for _, want := range []string{`"metric_name":"http_requests_total"`, `"bucket_ms":1000`, `"bucket_ms":2000`} {
+		if !strings.Contains(activityRows, want) {
+			t.Fatalf("activity rows %q do not contain %q", activityRows, want)
+		}
 	}
 	if !strings.Contains(batch.exemplarRows.String(), `\"trace_id\":\"abc\"`) {
 		t.Fatalf("exemplar rows should contain exemplar labels: %q", batch.exemplarRows.String())
@@ -78,8 +90,8 @@ func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.seriesCount != 1 || batch.histogramCount != 1 || batch.sampleCount != 0 {
-		t.Fatalf("counts = series %d histograms %d samples %d", batch.seriesCount, batch.histogramCount, batch.sampleCount)
+	if batch.seriesCount != 1 || batch.histogramCount != 1 || batch.sampleCount != 0 || batch.labelBitmapCount != 1 || batch.activityCount != 1 {
+		t.Fatalf("counts = series %d histograms %d samples %d label bitmaps %d activity %d", batch.seriesCount, batch.histogramCount, batch.sampleCount, batch.labelBitmapCount, batch.activityCount)
 	}
 }
 
@@ -116,6 +128,9 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	}
 	if batch.histogramCount != 1 {
 		t.Fatalf("histogramCount = %d, want 1", batch.histogramCount)
+	}
+	if batch.activityCount != 2 {
+		t.Fatalf("activityCount = %d, want 2", batch.activityCount)
 	}
 	samples := batch.sampleRows.String()
 	for _, want := range []string{`"timestamp_ms":0`, `"value":2`, `"version":14999`, `"timestamp_ms":15000`, `"value":3`} {

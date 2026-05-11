@@ -12,8 +12,11 @@ type Config struct {
 	CHPassword          string
 	CHDatabase          string
 	SeriesTable         string
+	SeriesKeysTable     string
 	SamplesTable        string
 	LabelIndexTable     string
+	LabelPostingsTable  string
+	ActivityTable       string
 	MetricsTable        string
 	HistogramsTable     string
 	ExemplarsTable      string
@@ -40,8 +43,11 @@ func ConfigFromEnv() Config {
 		CHPassword:          os.Getenv("CH_PASSWORD"),
 		CHDatabase:          getenv("CH_DATABASE", "default"),
 		SeriesTable:         getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", "metrics_series")),
+		SeriesKeysTable:     getenv("CH_SERIES_KEYS_TABLE", "metrics_series_keys"),
 		SamplesTable:        getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", "metrics_samples")),
 		LabelIndexTable:     getenv("CH_LABEL_INDEX_TABLE", "metrics_label_index"),
+		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", "metrics_label_postings"),
+		ActivityTable:       getenv("CH_ACTIVITY_TABLE", "metrics_series_activity"),
 		MetricsTable:        getenv("CH_METRICS_TABLE", "metrics_metadata"),
 		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", "metrics_histograms"),
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", "metrics_exemplars"),

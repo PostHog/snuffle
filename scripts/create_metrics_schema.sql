@@ -2,6 +2,9 @@ DROP TABLE IF EXISTS metrics_samples SYNC;
 DROP TABLE IF EXISTS metrics_histograms SYNC;
 DROP TABLE IF EXISTS metrics_exemplars SYNC;
 DROP TABLE IF EXISTS metrics_metadata SYNC;
+DROP TABLE IF EXISTS metrics_series_activity SYNC;
+DROP TABLE IF EXISTS metrics_label_postings SYNC;
+DROP TABLE IF EXISTS metrics_series_keys SYNC;
 DROP TABLE IF EXISTS metrics_label_index SYNC;
 DROP TABLE IF EXISTS metrics_series SYNC;
 
@@ -25,6 +28,16 @@ ALTER TABLE metrics_series
         ORDER BY (team_id, id)
     );
 
+CREATE TABLE metrics_series_keys
+(
+    team_id UInt64,
+    id UInt64,
+    bitmap_id UInt64
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (team_id, id)
+SETTINGS index_granularity = 1024;
+
 CREATE TABLE metrics_label_index
 (
     team_id UInt64,
@@ -36,6 +49,18 @@ CREATE TABLE metrics_label_index
 ENGINE = ReplacingMergeTree
 ORDER BY (team_id, metric_name, label_name, label_value, id)
 SETTINGS index_granularity = 1024, deduplicate_merge_projection_mode = 'rebuild';
+
+CREATE TABLE metrics_label_postings
+(
+    team_id UInt64,
+    metric_name LowCardinality(String),
+    label_name LowCardinality(String),
+    label_value String,
+    ids AggregateFunction(groupBitmap, UInt64)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (team_id, metric_name, label_name, label_value)
+SETTINGS index_granularity = 128;
 
 ALTER TABLE metrics_label_index
     ADD PROJECTION by_label_value
@@ -63,6 +88,18 @@ ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (team_id, id, timestamp)
 SETTINGS index_granularity = 1024;
+
+CREATE TABLE metrics_series_activity
+(
+    team_id UInt64,
+    metric_name LowCardinality(String),
+    bucket DateTime64(3, 'UTC'),
+    ids AggregateFunction(groupBitmap, UInt64)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMMDD(bucket)
+ORDER BY (team_id, metric_name, bucket)
+SETTINGS index_granularity = 128;
 
 CREATE TABLE metrics_histograms
 (

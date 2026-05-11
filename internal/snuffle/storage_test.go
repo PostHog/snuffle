@@ -165,6 +165,37 @@ func TestRangeSamplesSQLFromMatchers(t *testing.T) {
 	}
 }
 
+func TestRangeSamplesSQLIgnoresNoopLabelMatcher(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SeriesTable:     "series",
+		SamplesTable:    "samples",
+		LabelIndexTable: "label_index",
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "node_cpu_seconds_total"),
+		labels.MustNewMatcher(labels.MatchRegexp, "type", ".*"),
+		labels.MustNewMatcher(labels.MatchEqual, "ready", "true"),
+	}
+
+	sql, ok := samplesSQLFromMatchers(cfg, matchers, 1000, 2000, false)
+	if !ok {
+		t.Fatal("samplesSQLFromMatchers returned ok=false")
+	}
+	if strings.Contains(sql, "label_name = 'type'") {
+		t.Fatalf("SQL %q should not push noop matcher", sql)
+	}
+	for _, want := range []string{
+		"metric_name = 'node_cpu_seconds_total'",
+		"label_name = 'ready'",
+		"label_value = 'true'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
 func TestTopKSeriesLookupSQLKeepsMetricConstraint(t *testing.T) {
 	cfg := Config{
 		CHDatabase:  "default",

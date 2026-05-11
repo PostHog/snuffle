@@ -47,6 +47,9 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		return s.tryFastSelectorRangeQuery(ctx, selector, start, end, step, stepMillis)
 	}
 	if aggregate, ok := expr.(*parser.AggregateExpr); ok {
+		if data, ok, err := s.tryFastNestedCountRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
+			return data, ok, err
+		}
 		if data, ok, err := s.tryFastAggregateRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
 			return data, ok, err
 		}
@@ -73,7 +76,7 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		sampleSource,
 	)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), per_series AS (%s) SELECT selected_series.id AS id, selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY selected_series.id",
+		"WITH selected_series AS (%s), per_series AS (%s) SELECT id, metric_name, labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY id",
 		selectedSeries,
 		perSeries,
 	)
@@ -119,7 +122,7 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 		sampleSource,
 	)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), per_series AS (%s) SELECT selected_series.id AS id, selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY selected_series.id",
+		"WITH selected_series AS (%s), per_series AS (%s) SELECT id, metric_name, labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY id",
 		selectedSeries,
 		perSeries,
 	)
@@ -272,6 +275,9 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	if !ok {
 		return queryData{}, false, nil
 	}
+	if data, ok, err := s.tryFastAggregateRangeUnionQuery(ctx, expr, start, end, step, stepMillis, aggSQL); ok || err != nil {
+		return data, ok, err
+	}
 
 	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr.Expr, start, end, step)
 	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
@@ -284,15 +290,56 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	if !ok {
 		return queryData{}, false, nil
 	}
+	return s.queryFastAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, source.gridExpr, mint, maxt, start, stepMillis, aggSQL)
+}
+
+func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64, aggSQL string) (queryData, bool, error) {
+	selectors, ok := orVectorSelectors(expr.Expr)
+	if !ok || len(selectors) < 2 || len(selectors) > 8 {
+		return queryData{}, false, nil
+	}
+
+	var mint int64
+	var maxt int64
+	var shiftedStart time.Time
+	var shiftedEnd time.Time
+	selectedProjection := []string{"id"}
+	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
+	selectedParts := make([]string, 0, len(selectors))
+	for i, selector := range selectors {
+		source, selectorMint, selectorMaxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
+		if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+			return queryData{}, false, nil
+		}
+		if i == 0 {
+			mint = selectorMint
+			maxt = selectorMaxt
+			shiftedStart = source.start
+			shiftedEnd = source.end
+		} else if selectorMint != mint || selectorMaxt != maxt || !source.start.Equal(shiftedStart) || !source.end.Equal(shiftedEnd) {
+			return queryData{}, false, nil
+		}
+		selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, selectorMint, selectorMaxt, selectedProjection)
+		if !ok {
+			return queryData{}, false, nil
+		}
+		selectedParts = append(selectedParts, selectedSeries)
+	}
+	selectedSeries := strings.Join(selectedParts, " UNION DISTINCT ")
+	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
+	return s.queryFastAggregateRange(ctx, expr, selectedSeries, nil, gridExpr, mint, maxt, start, stepMillis, aggSQL)
+}
+
+func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, gridExpr string, mint, maxt int64, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
 	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
-		source.gridExpr,
+		gridExpr,
 		sampleSource,
 	)
 
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, selector.LabelMatchers, expr.Grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
 	withParts := []string{
 		"selected_series AS (" + selectedSeries + ")",
 		"per_series AS (" + perSeries + ")",
@@ -353,31 +400,246 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
 }
 
+func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
+	if expr.Op != parser.COUNT || expr.Without || len(expr.Grouping) != 0 {
+		return queryData{}, false, nil
+	}
+	inner, ok := expr.Expr.(*parser.AggregateExpr)
+	if !ok || inner.Op != parser.COUNT || inner.Without || len(inner.Grouping) == 0 {
+		return queryData{}, false, nil
+	}
+	if groupingHasMetricName(inner.Grouping) {
+		return queryData{}, false, nil
+	}
+	selector, ok := inner.Expr.(*parser.VectorSelector)
+	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+		return queryData{}, false, nil
+	}
+	source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
+	if steps <= 0 {
+		return queryData{}, false, nil
+	}
+	if sql, ok := nestedCountBitmapRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
+		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+		data, err := s.queryNestedCountRangeValues(ctx, sql)
+		if err == nil {
+			return data, true, nil
+		}
+		if !missingBitmapIndexError(err) {
+			return queryData{}, true, err
+		}
+	}
+	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql, ok := nestedCountRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, selectedSeries, source.start, start, stepMillis, steps, s.cfg.LookbackDelta)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+
+	data, err := s.queryNestedCountRangeValues(ctx, sql)
+	return data, true, err
+}
+
+func (s *Server) queryNestedCountRangeValues(ctx context.Context, sql string) (queryData, error) {
+	values := make([][]any, 0, 128)
+	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
+		var row map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &row); err != nil {
+			return err
+		}
+		value, err := rawFloat(row["value"])
+		if err != nil {
+			return err
+		}
+		ts, err := rawInt64(row["ts"])
+		if err != nil {
+			return err
+		}
+		values = append(values, []any{float64(ts) / 1000, formatSample(value)})
+		return nil
+	})
+	if err != nil {
+		return queryData{}, err
+	}
+	result := []sampleResult{{Metric: map[string]string{}, Values: values}}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: result}, nil
+}
+
+func nestedCountRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, selectedSeries string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
+	groupSelect, groupBy := labelIndexGroupSQL(grouping)
+	filterGroupLabelsToSelected := exactMetricName(matchers) == ""
+	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, filterGroupLabelsToSelected)
+	if groupLabels == "" || len(groupBy) == 0 {
+		return "", false
+	}
+
+	evalMillisExpr := fmt.Sprintf("(%d + toInt64(step_idx) * %d)", evalStart.UnixMilli(), stepMillis)
+	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
+
+	return fmt.Sprintf(
+		"WITH selected_series AS (%s), group_labels AS (%s), group_intervals AS (SELECT %s, groupArray((toUnixTimestamp64Milli(min_time), toUnixTimestamp64Milli(max_time))) AS active_ranges FROM selected_series%s GROUP BY %s), active_groups AS (SELECT step_idx FROM group_intervals ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE arrayExists(x -> (tupleElement(x, 2) >= %s AND tupleElement(x, 1) <= %s), active_ranges)) SELECT %d + toInt64(step_idx) * %d AS ts, count() AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
+		selectedSeries,
+		groupLabels,
+		strings.Join(groupSelect, ", "),
+		groupJoin,
+		strings.Join(groupBy, ", "),
+		steps,
+		lookbackStartExpr,
+		evalMillisExpr,
+		outputStart.UnixMilli(),
+		stepMillis,
+	), true
+}
+
+func nestedCountBitmapRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
+	if cfg.LabelPostingsTable == "" || cfg.ActivityTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName {
+		return "", false
+	}
+	metric := exactMetricName(matchers)
+	if metric == "" {
+		return "", false
+	}
+	selectedCTEs, selectedFrom, selectedExpr, ok := bitmapSelectedIDsSQL(cfg, metric, matchers)
+	if !ok {
+		return "", false
+	}
+
+	groupColumn := quoteIdent(groupAlias(0))
+	groupName := grouping[0]
+	evalMillisExpr := fmt.Sprintf("(%d + toInt64(step_idx) * %d)", evalStart.UnixMilli(), stepMillis)
+	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
+	activityStart := evalStart.Add(-lookback)
+	activityEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
+
+	withParts := append([]string{}, selectedCTEs...)
+	withParts = append(withParts,
+		fmt.Sprintf("selected_ids AS (SELECT %s AS bm FROM %s)", selectedExpr, selectedFrom),
+		fmt.Sprintf(
+			"active_by_step AS (SELECT step_idx, groupBitmapOrState(ids) AS bm FROM %s ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE %s AND metric_name = %s AND bucket >= %s AND bucket <= %s AND toUnixTimestamp64Milli(bucket) >= %s AND toUnixTimestamp64Milli(bucket) <= %s GROUP BY step_idx)",
+			tableName(cfg.CHDatabase, cfg.ActivityTable),
+			steps,
+			teamFilter(cfg),
+			sqlString(metric),
+			chTimeMillis(activityStart.UnixMilli()),
+			chTimeMillis(activityEnd.UnixMilli()),
+			lookbackStartExpr,
+			evalMillisExpr,
+		),
+		"active_selected AS (SELECT step_idx, bitmapAnd(active_by_step.bm, selected_ids.bm) AS bm FROM active_by_step CROSS JOIN selected_ids WHERE bitmapAndCardinality(active_by_step.bm, selected_ids.bm) > 0)",
+		fmt.Sprintf(
+			"group_label_values AS (SELECT label_value AS %s, groupBitmapOrState(ids) AS bm FROM %s WHERE %s AND metric_name = %s AND label_name = %s GROUP BY label_value)",
+			groupColumn,
+			tableName(cfg.CHDatabase, cfg.LabelPostingsTable),
+			teamFilter(cfg),
+			sqlString(metric),
+			sqlString(groupName),
+		),
+		fmt.Sprintf(
+			"group_label_present AS (SELECT groupBitmapOrState(ids) AS bm FROM %s WHERE %s AND metric_name = %s AND label_name = %s)",
+			tableName(cfg.CHDatabase, cfg.LabelPostingsTable),
+			teamFilter(cfg),
+			sqlString(metric),
+			sqlString(groupName),
+		),
+		fmt.Sprintf(
+			"label_groups AS (SELECT %s, bm FROM group_label_values UNION ALL SELECT '' AS %s, bitmapAndnot(metric_ids.bm, group_label_present.bm) AS bm FROM metric_ids CROSS JOIN group_label_present)",
+			groupColumn,
+			groupColumn,
+		),
+	)
+
+	return fmt.Sprintf(
+		"WITH %s SELECT %d + toInt64(active_selected.step_idx) * %d AS ts, count() AS value FROM active_selected CROSS JOIN label_groups WHERE bitmapAndCardinality(active_selected.bm, label_groups.bm) > 0 GROUP BY active_selected.step_idx ORDER BY active_selected.step_idx",
+		strings.Join(withParts, ", "),
+		outputStart.UnixMilli(),
+		stepMillis,
+	), true
+}
+
+func bitmapSelectedIDsSQL(cfg Config, metric string, matchers []*labels.Matcher) ([]string, string, string, bool) {
+	ctes := []string{
+		fmt.Sprintf(
+			"metric_ids AS (SELECT groupBitmapOrState(ids) AS bm FROM %s WHERE %s AND metric_name = %s AND label_name = %s AND label_value = %s)",
+			tableName(cfg.CHDatabase, cfg.LabelPostingsTable),
+			teamFilter(cfg),
+			sqlString(metric),
+			sqlString(labels.MetricName),
+			sqlString(metric),
+		),
+	}
+	fromParts := []string{"metric_ids"}
+	expr := "metric_ids.bm"
+	matcherIndex := 0
+	for _, matcher := range matchers {
+		if matcher.Name == labels.MetricName || matcherIsNoop(matcher) {
+			continue
+		}
+		positive, condition, ok := bitmapMatcherCondition(matcher)
+		if !ok {
+			return nil, "", "", false
+		}
+		alias := fmt.Sprintf("matcher_%d", matcherIndex)
+		matcherIndex++
+		ctes = append(ctes, fmt.Sprintf(
+			"%s AS (SELECT groupBitmapOrState(ids) AS bm FROM %s WHERE %s AND metric_name = %s AND label_name = %s AND %s)",
+			alias,
+			tableName(cfg.CHDatabase, cfg.LabelPostingsTable),
+			teamFilter(cfg),
+			sqlString(metric),
+			sqlString(matcher.Name),
+			condition,
+		))
+		fromParts = append(fromParts, alias)
+		if positive {
+			expr = "bitmapAnd(" + expr + ", " + alias + ".bm)"
+		} else {
+			expr = "bitmapAndnot(" + expr + ", " + alias + ".bm)"
+		}
+	}
+	return ctes, strings.Join(fromParts, " CROSS JOIN "), expr, true
+}
+
+func bitmapMatcherCondition(matcher *labels.Matcher) (bool, string, bool) {
+	switch matcher.Type {
+	case labels.MatchEqual, labels.MatchRegexp:
+		_, condition, ok := positiveLabelIndexMembershipCondition(matcher)
+		return true, condition, ok
+	case labels.MatchNotEqual, labels.MatchNotRegexp:
+		condition, ok := negativeLabelIndexCondition(matcher)
+		return false, condition, ok
+	default:
+		return false, "", false
+	}
+}
+
+func missingBitmapIndexError(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "UNKNOWN_TABLE") || strings.Contains(message, "Unknown table") || strings.Contains(message, "doesn't exist")
+}
+
+type selectorGridSource struct {
+	start time.Time
+	end   time.Time
+}
+
 type aggregateRangeSource struct {
 	gridExpr string
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
 	if selector, ok := expr.(*parser.VectorSelector); ok {
-		if selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil {
+		source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
+		if !ok {
 			return aggregateRangeSource{}, nil, 0, 0, false
 		}
-		offset := selector.OriginalOffset
-		if offset == 0 {
-			offset = selector.Offset
-		}
-		shiftedStart := start.Add(-offset)
-		shiftedEnd := end.Add(-offset)
-		mint := shiftedStart.Add(-s.cfg.LookbackDelta).UnixMilli()
-		maxt := shiftedEnd.UnixMilli()
-		gridExpr := fmt.Sprintf(
-			"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
-			chTimeMillis(shiftedStart.UnixMilli()),
-			chTimeMillis(shiftedEnd.UnixMilli()),
-			formatDurationSeconds(step),
-			formatDurationSeconds(s.cfg.LookbackDelta),
-		)
-		return aggregateRangeSource{gridExpr: gridExpr}, selector, mint, maxt, true
+		return aggregateRangeSource{gridExpr: lastGridExpr(source.start, source.end, step, s.cfg.LookbackDelta)}, selector, mint, maxt, true
 	}
 
 	call, ok := expr.(*parser.Call)
@@ -417,6 +679,31 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", rangeSeconds, gridExpr)
 	}
 	return aggregateRangeSource{gridExpr: gridExpr}, selector, mint, maxt, true
+}
+
+func selectorRangeGridSource(cfg Config, selector *parser.VectorSelector, start, end time.Time, step time.Duration) (selectorGridSource, int64, int64, bool) {
+	if selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil {
+		return selectorGridSource{}, 0, 0, false
+	}
+	offset := selector.OriginalOffset
+	if offset == 0 {
+		offset = selector.Offset
+	}
+	shiftedStart := start.Add(-offset)
+	shiftedEnd := end.Add(-offset)
+	mint := shiftedStart.Add(-cfg.LookbackDelta).UnixMilli()
+	maxt := shiftedEnd.UnixMilli()
+	return selectorGridSource{start: shiftedStart, end: shiftedEnd}, mint, maxt, true
+}
+
+func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
+	return fmt.Sprintf(
+		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
+		chTimeMillis(start.UnixMilli()),
+		chTimeMillis(end.UnixMilli()),
+		formatDurationSeconds(step),
+		formatDurationSeconds(lookback),
+	)
 }
 
 func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
@@ -770,6 +1057,30 @@ func matchersPushdownSafe(matchers []*labels.Matcher) bool {
 	return len(matchers) > 0
 }
 
+func orVectorSelectors(expr parser.Expr) ([]*parser.VectorSelector, bool) {
+	switch e := expr.(type) {
+	case *parser.ParenExpr:
+		return orVectorSelectors(e.Expr)
+	case *parser.VectorSelector:
+		return []*parser.VectorSelector{e}, true
+	case *parser.BinaryExpr:
+		if e.Op != parser.LOR || e.VectorMatching == nil || e.VectorMatching.Card != parser.CardManyToMany {
+			return nil, false
+		}
+		left, ok := orVectorSelectors(e.LHS)
+		if !ok {
+			return nil, false
+		}
+		right, ok := orVectorSelectors(e.RHS)
+		if !ok {
+			return nil, false
+		}
+		return append(left, right...), true
+	default:
+		return nil, false
+	}
+}
+
 func matcherIsNoop(m *labels.Matcher) bool {
 	if m.Type != labels.MatchRegexp {
 		return false
@@ -796,7 +1107,7 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 	}
 	where = append(where, seriesPreFilters(cfg, matchers)...)
 	return fmt.Sprintf(
-		"SELECT %s FROM (SELECT id, metric_name, labels_json FROM %s WHERE %s) GROUP BY id",
+		"SELECT %s FROM (SELECT id, metric_name, labels_json, min_time, max_time FROM %s WHERE %s) GROUP BY id",
 		strings.Join(selectedSeriesProjection(selectParts), ", "),
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
@@ -813,6 +1124,10 @@ func selectedSeriesProjection(selectParts []string) []string {
 			projected = append(projected, "any(metric_name) AS metric_name")
 		case "labels_json":
 			projected = append(projected, "any(labels_json) AS labels_json")
+		case "min_time":
+			projected = append(projected, "min(min_time) AS min_time")
+		case "max_time":
+			projected = append(projected, "max(max_time) AS max_time")
 		default:
 			projected = append(projected, part)
 		}
@@ -870,6 +1185,10 @@ func groupingHasMetricName(grouping []string) bool {
 }
 
 func labelIndexGroupLabelsSQL(cfg Config, matchers []*labels.Matcher, grouping []string) (string, string) {
+	return labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, true)
+}
+
+func labelIndexGroupLabelsSQLWithSelectedFilter(cfg Config, matchers []*labels.Matcher, grouping []string, filterToSelected bool) (string, string) {
 	labelGroups := make([]struct {
 		index int
 		name  string
@@ -911,7 +1230,7 @@ func labelIndexGroupLabelsSQL(cfg Config, matchers []*labels.Matcher, grouping [
 	if metric != "" {
 		where = append(where, "metric_name = "+sqlString(metric))
 	}
-	if metric == "" || !metricOnlyMatchers(matchers) {
+	if filterToSelected && (metric == "" || !metricOnlyMatchers(matchers)) {
 		where = append(where, "id IN (SELECT id FROM selected_series)")
 	}
 	return fmt.Sprintf(

@@ -2,6 +2,9 @@ DROP TABLE IF EXISTS metrics_samples SYNC;
 DROP TABLE IF EXISTS metrics_histograms SYNC;
 DROP TABLE IF EXISTS metrics_exemplars SYNC;
 DROP TABLE IF EXISTS metrics_metadata SYNC;
+DROP TABLE IF EXISTS metrics_series_activity SYNC;
+DROP TABLE IF EXISTS metrics_label_postings SYNC;
+DROP TABLE IF EXISTS metrics_series_keys SYNC;
 DROP TABLE IF EXISTS metrics_label_index SYNC;
 DROP TABLE IF EXISTS metrics_series SYNC;
 
@@ -25,6 +28,16 @@ ALTER TABLE metrics_series
         ORDER BY (team_id, id)
     );
 
+CREATE TABLE metrics_series_keys
+(
+    team_id UInt64,
+    id UInt64,
+    bitmap_id UInt64
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (team_id, id)
+SETTINGS index_granularity = 1024;
+
 CREATE TABLE metrics_label_index
 (
     team_id UInt64,
@@ -36,6 +49,18 @@ CREATE TABLE metrics_label_index
 ENGINE = ReplacingMergeTree
 ORDER BY (team_id, metric_name, label_name, label_value, id)
 SETTINGS index_granularity = 1024, deduplicate_merge_projection_mode = 'rebuild';
+
+CREATE TABLE metrics_label_postings
+(
+    team_id UInt64,
+    metric_name LowCardinality(String),
+    label_name LowCardinality(String),
+    label_value String,
+    ids AggregateFunction(groupBitmap, UInt64)
+)
+ENGINE = AggregatingMergeTree
+ORDER BY (team_id, metric_name, label_name, label_value)
+SETTINGS index_granularity = 128;
 
 ALTER TABLE metrics_label_index
     ADD PROJECTION by_label_value
@@ -63,6 +88,18 @@ ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (team_id, id, timestamp)
 SETTINGS index_granularity = 1024;
+
+CREATE TABLE metrics_series_activity
+(
+    team_id UInt64,
+    metric_name LowCardinality(String),
+    bucket DateTime64(3, 'UTC'),
+    ids AggregateFunction(groupBitmap, UInt64)
+)
+ENGINE = AggregatingMergeTree
+PARTITION BY toYYYYMMDD(bucket)
+ORDER BY (team_id, metric_name, bucket)
+SETTINGS index_granularity = 128;
 
 CREATE TABLE metrics_histograms
 (
@@ -134,6 +171,18 @@ FROM
 
 ALTER TABLE metrics_series MATERIALIZE PROJECTION by_id;
 
+INSERT INTO metrics_series_keys
+SELECT
+    team_id,
+    id,
+    row_number() OVER (PARTITION BY team_id ORDER BY id) AS bitmap_id
+FROM
+(
+    SELECT team_id, id
+    FROM metrics_series
+    GROUP BY team_id, id
+);
+
 INSERT INTO metrics_label_index
     (team_id, metric_name, label_name, label_value, id)
 WITH
@@ -163,6 +212,33 @@ ARRAY JOIN mapKeys(all_tags) AS label_name;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_label_value;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_id_label;
 
+INSERT INTO metrics_label_postings
+SELECT
+    idx.team_id,
+    idx.metric_name,
+    idx.label_name,
+    idx.label_value,
+    groupBitmapState(keys.bitmap_id) AS ids
+FROM metrics_label_index AS idx
+INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value;
+
+INSERT INTO metrics_label_postings
+SELECT
+    series.team_id,
+    series.metric_name,
+    '__name__' AS label_name,
+    series.metric_name AS label_value,
+    groupBitmapState(keys.bitmap_id) AS ids
+FROM
+(
+    SELECT team_id, id, any(metric_name) AS metric_name
+    FROM metrics_series
+    GROUP BY team_id, id
+) AS series
+INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+GROUP BY series.team_id, series.metric_name;
+
 INSERT INTO metrics_samples
     (team_id, timestamp, id, value, version)
 WITH
@@ -184,3 +260,23 @@ FROM
         number % samples_per_series AS sample_index
     FROM numbers(series_count * samples_per_series)
 );
+
+INSERT INTO metrics_series_activity
+SELECT
+    samples.team_id,
+    series.metric_name,
+    toStartOfInterval(samples.timestamp, INTERVAL 15 SECOND) AS bucket,
+    groupBitmapState(series.bitmap_id) AS ids
+FROM metrics_samples AS samples
+INNER JOIN
+(
+    SELECT series.team_id, series.id, series.metric_name, keys.bitmap_id
+    FROM
+    (
+        SELECT team_id, id, any(metric_name) AS metric_name
+        FROM metrics_series
+        GROUP BY team_id, id
+    ) AS series
+    INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+) AS series USING (team_id, id)
+GROUP BY samples.team_id, series.metric_name, samples.timestamp;

@@ -273,7 +273,7 @@ func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt in
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", q.queryable.cfg.MaxSeries)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), latest AS (%s) SELECT selected_series.id AS id, selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, toUnixTimestamp64Milli(latest.ts_col) AS ts, latest.value AS value FROM latest ANY INNER JOIN selected_series USING id ORDER BY id",
+		"WITH selected_series AS (%s), latest AS (%s) SELECT id, metric_name, labels_json, toUnixTimestamp64Milli(latest.ts_col) AS ts, latest.value AS value FROM latest ANY INNER JOIN selected_series USING id ORDER BY id",
 		selectedSeries,
 		latestSamplesForSelectedSeriesSQL(q.queryable.cfg, mint, maxt),
 	)
@@ -816,6 +816,9 @@ func dedupedSamplesForSelectedSeriesSQL(cfg Config, mint, maxt int64) string {
 func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64) ([]string, bool) {
 	var filters []string
 	for _, m := range matchers {
+		if matcherIsNoop(m) {
+			continue
+		}
 		if m.Name == labels.MetricName {
 			metricCondition, ok := metricMatcherCondition(m)
 			if !ok {

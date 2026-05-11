@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -25,6 +26,7 @@ type Server struct {
 	queryable *CHQueryable
 	engine    *promql.Engine
 	parser    parser.Parser
+	keyMu     sync.Mutex
 }
 
 func Run(cfg Config) error {

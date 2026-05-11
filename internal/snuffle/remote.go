@@ -98,18 +98,22 @@ func readSnappyProto(r *http.Request, dst interface{ Unmarshal([]byte) error }, 
 }
 
 type remoteWriteBatch struct {
-	seriesRows     bytes.Buffer
-	labelIndexRows bytes.Buffer
-	sampleRows     bytes.Buffer
-	histogramRows  bytes.Buffer
-	exemplarRows   bytes.Buffer
-	metadataRows   bytes.Buffer
-	seriesCount    int
-	labelCount     int
-	sampleCount    int
-	histogramCount int
-	exemplarCount  int
-	metadataCount  int
+	seriesRows       bytes.Buffer
+	labelIndexRows   bytes.Buffer
+	labelBitmapRows  bytes.Buffer
+	activityRows     bytes.Buffer
+	sampleRows       bytes.Buffer
+	histogramRows    bytes.Buffer
+	exemplarRows     bytes.Buffer
+	metadataRows     bytes.Buffer
+	seriesCount      int
+	labelCount       int
+	labelBitmapCount int
+	activityCount    int
+	sampleCount      int
+	histogramCount   int
+	exemplarCount    int
+	metadataCount    int
 }
 
 type remoteWriteSeriesRow struct {
@@ -126,6 +130,13 @@ type remoteWriteLabelIndexRow struct {
 	MetricName string `json:"metric_name"`
 	LabelName  string `json:"label_name"`
 	LabelValue string `json:"label_value"`
+	ID         uint64 `json:"id"`
+}
+
+type remoteWriteActivityRow struct {
+	TeamID     uint64 `json:"team_id"`
+	MetricName string `json:"metric_name"`
+	BucketMS   int64  `json:"bucket_ms"`
 	ID         uint64 `json:"id"`
 }
 
@@ -165,6 +176,8 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 	var batch remoteWriteBatch
 	seriesByID := make(map[uint64]remoteWriteSeriesRow, len(req.GetTimeseries()))
 	labelRows := make(map[remoteWriteLabelIndexRow]struct{})
+	labelBitmapRows := make(map[remoteWriteLabelIndexRow]struct{})
+	activityRows := make(map[remoteWriteActivityRow]struct{})
 	exemplarEncoder := json.NewEncoder(&batch.exemplarRows)
 	metadataEncoder := json.NewEncoder(&batch.metadataRows)
 	sampleRows := make(map[remoteWriteSampleKey]remoteWriteSampleRow)
@@ -211,7 +224,21 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 				LabelValue: v,
 				ID:         id,
 			}] = struct{}{}
+			labelBitmapRows[remoteWriteLabelIndexRow{
+				TeamID:     teamID,
+				MetricName: metricName,
+				LabelName:  k,
+				LabelValue: v,
+				ID:         id,
+			}] = struct{}{}
 		}
+		labelBitmapRows[remoteWriteLabelIndexRow{
+			TeamID:     teamID,
+			MetricName: metricName,
+			LabelName:  labels.MetricName,
+			LabelValue: metricName,
+			ID:         id,
+		}] = struct{}{}
 		labelsJSON, err := json.Marshal(outputLabels)
 		if err != nil {
 			return remoteWriteBatch{}, err
@@ -249,6 +276,12 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			if existing, ok := sampleRows[key]; !ok || row.Version >= existing.Version {
 				sampleRows[key] = row
 			}
+			activityRows[remoteWriteActivityRow{
+				TeamID:     teamID,
+				MetricName: metricName,
+				BucketMS:   bucketMS,
+				ID:         id,
+			}] = struct{}{}
 		}
 		for _, histogram := range ts.GetHistograms() {
 			originalTimestamp := histogram.Timestamp
@@ -270,6 +303,12 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			if existing, ok := histogramRows[key]; !ok || row.Version >= existing.Version {
 				histogramRows[key] = row
 			}
+			activityRows[remoteWriteActivityRow{
+				TeamID:     teamID,
+				MetricName: metricName,
+				BucketMS:   bucketMS,
+				ID:         id,
+			}] = struct{}{}
 		}
 		for _, exemplar := range ts.GetExemplars() {
 			observeTime(exemplar.Timestamp)
@@ -325,6 +364,20 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			return remoteWriteBatch{}, err
 		}
 		batch.labelCount++
+	}
+	labelBitmapEncoder := json.NewEncoder(&batch.labelBitmapRows)
+	for row := range labelBitmapRows {
+		if err := labelBitmapEncoder.Encode(row); err != nil {
+			return remoteWriteBatch{}, err
+		}
+		batch.labelBitmapCount++
+	}
+	activityEncoder := json.NewEncoder(&batch.activityRows)
+	for row := range activityRows {
+		if err := activityEncoder.Encode(row); err != nil {
+			return remoteWriteBatch{}, err
+		}
+		batch.activityCount++
 	}
 	sampleEncoder := json.NewEncoder(&batch.sampleRows)
 	for _, row := range sampleRows {
@@ -436,44 +489,84 @@ func prompbLabelMap(input []prompb.Label, kind string) (map[string]string, error
 }
 
 func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBatch) error {
-	if batch.seriesCount == 0 && batch.sampleCount == 0 && batch.histogramCount == 0 && batch.exemplarCount == 0 && batch.metadataCount == 0 {
+	if batch.seriesCount == 0 && batch.sampleCount == 0 && batch.histogramCount == 0 && batch.exemplarCount == 0 && batch.metadataCount == 0 && batch.labelBitmapCount == 0 && batch.activityCount == 0 {
 		return nil
 	}
 	for _, insert := range []remoteWriteInsert{
-		{batch.metadataCount, s.cfg.MetricsTable, "team_id, metric_family_name, type, unit, help, now64(3, 'UTC')", "team_id UInt64, metric_family_name String, type String, unit String, help String", &batch.metadataRows, true},
-		{batch.seriesCount, s.cfg.SeriesTable, "team_id, id, metric_name, labels_json, fromUnixTimestamp64Milli(min_ms, 'UTC'), fromUnixTimestamp64Milli(max_ms, 'UTC')", "team_id UInt64, id UInt64, metric_name String, labels_json String, min_ms Int64, max_ms Int64", &batch.seriesRows, false},
-		{batch.labelCount, s.cfg.LabelIndexTable, "team_id, metric_name, label_name, label_value, id", "team_id UInt64, metric_name String, label_name String, label_value String, id UInt64", &batch.labelIndexRows, false},
-		{batch.sampleCount, s.cfg.SamplesTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, version", "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, version UInt64", &batch.sampleRows, false},
-		{batch.histogramCount, s.cfg.HistogramsTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, base64Decode(histogram_b64), version", "team_id UInt64, timestamp_ms Int64, id UInt64, histogram_b64 String, version UInt64", &batch.histogramRows, true},
-		{batch.exemplarCount, s.cfg.ExemplarsTable, "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, labels_json", "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, labels_json String", &batch.exemplarRows, true},
+		{count: batch.metadataCount, table: s.cfg.MetricsTable, selectExpr: "team_id, metric_family_name, type, unit, help, now64(3, 'UTC')", input: "team_id UInt64, metric_family_name String, type String, unit String, help String", rows: &batch.metadataRows, optional: true},
+		{count: batch.seriesCount, table: s.cfg.SeriesTable, selectExpr: "team_id, id, metric_name, labels_json, fromUnixTimestamp64Milli(min_ms, 'UTC'), fromUnixTimestamp64Milli(max_ms, 'UTC')", input: "team_id UInt64, id UInt64, metric_name String, labels_json String, min_ms Int64, max_ms Int64", rows: &batch.seriesRows},
+		{count: batch.labelCount, table: s.cfg.LabelIndexTable, selectExpr: "team_id, metric_name, label_name, label_value, id", input: "team_id UInt64, metric_name String, label_name String, label_value String, id UInt64", rows: &batch.labelIndexRows},
+		{count: batch.sampleCount, table: s.cfg.SamplesTable, selectExpr: "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, version", input: "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, version UInt64", rows: &batch.sampleRows},
+		{count: batch.histogramCount, table: s.cfg.HistogramsTable, selectExpr: "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, base64Decode(histogram_b64), version", input: "team_id UInt64, timestamp_ms Int64, id UInt64, histogram_b64 String, version UInt64", rows: &batch.histogramRows, optional: true},
+		{count: batch.exemplarCount, table: s.cfg.ExemplarsTable, selectExpr: "team_id, fromUnixTimestamp64Milli(timestamp_ms, 'UTC'), id, value, labels_json", input: "team_id UInt64, timestamp_ms Int64, id UInt64, value Float64, labels_json String", rows: &batch.exemplarRows, optional: true},
 	} {
 		if err := s.insertRemoteRows(ctx, insert); err != nil {
 			return err
+		}
+	}
+	if batch.labelBitmapCount > 0 || batch.activityCount > 0 {
+		s.keyMu.Lock()
+		defer s.keyMu.Unlock()
+		if err := s.ensureSeriesKeys(ctx, batch); err != nil {
+			return err
+		}
+		for _, insert := range []remoteWriteInsert{
+			{count: batch.labelBitmapCount, table: s.cfg.LabelPostingsTable, selectExpr: "team_id, metric_name, label_name, label_value, groupBitmapState(bitmap_id)", input: "team_id UInt64, metric_name String, label_name String, label_value String, id UInt64", rows: &batch.labelBitmapRows, optional: true, groupBy: "team_id, metric_name, label_name, label_value", joinSeriesKeys: true},
+			{count: batch.activityCount, table: s.cfg.ActivityTable, selectExpr: "team_id, metric_name, fromUnixTimestamp64Milli(bucket_ms, 'UTC'), groupBitmapState(bitmap_id)", input: "team_id UInt64, metric_name String, bucket_ms Int64, id UInt64", rows: &batch.activityRows, optional: true, groupBy: "team_id, metric_name, bucket_ms", joinSeriesKeys: true},
+		} {
+			if err := s.insertRemoteRows(ctx, insert); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
 type remoteWriteInsert struct {
-	count      int
-	table      string
-	selectExpr string
-	input      string
-	rows       *bytes.Buffer
-	optional   bool
+	count          int
+	table          string
+	selectExpr     string
+	input          string
+	rows           *bytes.Buffer
+	optional       bool
+	groupBy        string
+	joinSeriesKeys bool
 }
 
 func (s *Server) insertRemoteRows(ctx context.Context, insert remoteWriteInsert) error {
 	if insert.count == 0 || insert.optional && insert.table == "" {
 		return nil
 	}
-	sql := fmt.Sprintf(
-		"INSERT INTO %s SELECT %s FROM input(%s) FORMAT JSONEachRow",
-		tableName(s.cfg.CHDatabase, insert.table),
-		insert.selectExpr,
-		sqlString(insert.input),
-	)
+	source := "input(" + sqlString(insert.input) + ") AS input_rows"
+	if insert.joinSeriesKeys {
+		if s.cfg.SeriesKeysTable == "" {
+			return nil
+		}
+		source += " INNER JOIN " + tableName(s.cfg.CHDatabase, s.cfg.SeriesKeysTable) + " USING (team_id, id)"
+	}
+	sql := fmt.Sprintf("INSERT INTO %s SELECT %s FROM %s", tableName(s.cfg.CHDatabase, insert.table), insert.selectExpr, source)
+	if insert.groupBy != "" {
+		sql += " GROUP BY " + insert.groupBy
+	}
+	sql += " FORMAT JSONEachRow"
 	return s.client.ExecWithBody(ctx, sql, bytes.NewReader(insert.rows.Bytes()))
+}
+
+func (s *Server) ensureSeriesKeys(ctx context.Context, batch remoteWriteBatch) error {
+	if s.cfg.SeriesKeysTable == "" || batch.seriesCount == 0 || batch.labelBitmapCount == 0 && batch.activityCount == 0 {
+		return nil
+	}
+	input := "team_id UInt64, id UInt64, metric_name String, labels_json String, min_ms Int64, max_ms Int64"
+	sql := fmt.Sprintf(
+		"INSERT INTO %s WITH existing AS (SELECT ifNull(max(bitmap_id), 0) AS base FROM %s WHERE %s), incoming AS (SELECT DISTINCT team_id, id FROM input(%s) WHERE (team_id, id) NOT IN (SELECT team_id, id FROM %s WHERE %s)) SELECT team_id, id, base + row_number() OVER (PARTITION BY team_id ORDER BY id) AS bitmap_id FROM incoming CROSS JOIN existing FORMAT JSONEachRow",
+		tableName(s.cfg.CHDatabase, s.cfg.SeriesKeysTable),
+		tableName(s.cfg.CHDatabase, s.cfg.SeriesKeysTable),
+		teamFilter(s.cfg),
+		sqlString(input),
+		tableName(s.cfg.CHDatabase, s.cfg.SeriesKeysTable),
+		teamFilter(s.cfg),
+	)
+	return s.client.ExecWithBody(ctx, sql, bytes.NewReader(batch.seriesRows.Bytes()))
 }
 
 func remoteReadAcceptsSamples(req *prompb.ReadRequest) bool {

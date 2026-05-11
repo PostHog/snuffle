@@ -11,6 +11,8 @@ CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 TEAM_ID="${TEAM_ID:-0}"
 LOCAL_MAX_THREADS="${LOCAL_MAX_THREADS:-8}"
+BUILD_BITMAP_INDEXES="${BUILD_BITMAP_INDEXES:-1}"
+ACTIVITY_BUCKET_SECONDS="${ACTIVITY_BUCKET_SECONDS:-15}"
 
 if [[ ! "$TEAM_ID" =~ ^[0-9]+$ ]]; then
   echo "TEAM_ID must be an unsigned integer" >&2
@@ -50,6 +52,23 @@ clickhouse-local \
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_series FORMAT Native"
 
+if [[ "$BUILD_BITMAP_INDEXES" != "0" ]]; then
+  echo "Building metrics_series_keys"
+  "${client[@]}" --query "
+    INSERT INTO metrics_series_keys
+    SELECT
+      team_id,
+      id,
+      row_number() OVER (PARTITION BY team_id ORDER BY id) AS bitmap_id
+    FROM
+    (
+      SELECT team_id, id
+      FROM metrics_series
+      GROUP BY team_id, id
+    )
+  "
+fi
+
 echo "Loading metrics_label_index from $TAGS_FILE"
 clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
@@ -70,9 +89,41 @@ clickhouse-local \
       FROM file('$TAGS_FILE', Parquet)
       ARRAY JOIN mapKeys(tags) AS label_name
     )
-    GROUP BY metric_name, label_name, label_value, series_id
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_label_index FORMAT Native"
+
+if [[ "$BUILD_BITMAP_INDEXES" != "0" ]]; then
+  echo "Building metrics_label_postings"
+  "${client[@]}" --query "
+    INSERT INTO metrics_label_postings
+    SELECT
+      idx.team_id,
+      idx.metric_name,
+      idx.label_name,
+      idx.label_value,
+      groupBitmapState(keys.bitmap_id) AS ids
+    FROM metrics_label_index AS idx
+    INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+    GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value
+  "
+  "${client[@]}" --query "
+    INSERT INTO metrics_label_postings
+    SELECT
+      series.team_id,
+      series.metric_name,
+      '__name__' AS label_name,
+      series.metric_name AS label_value,
+      groupBitmapState(keys.bitmap_id) AS ids
+    FROM
+    (
+      SELECT team_id, id, any(metric_name) AS metric_name
+      FROM metrics_series
+      GROUP BY team_id, id
+    ) AS series
+    INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+    GROUP BY series.team_id, series.metric_name
+  "
+fi
 
 echo "Loading metrics_samples from $DATA_FILE"
 clickhouse-local \
@@ -88,6 +139,31 @@ clickhouse-local \
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_samples FORMAT Native"
 
+if [[ "$BUILD_BITMAP_INDEXES" != "0" ]]; then
+  echo "Building metrics_series_activity"
+  "${client[@]}" --query "
+    INSERT INTO metrics_series_activity
+    SELECT
+      samples.team_id,
+      series.metric_name,
+      toStartOfInterval(samples.timestamp, INTERVAL $ACTIVITY_BUCKET_SECONDS SECOND) AS bucket,
+      groupBitmapState(series.bitmap_id) AS ids
+    FROM metrics_samples AS samples
+    INNER JOIN
+    (
+      SELECT series.team_id, series.id, series.metric_name, keys.bitmap_id
+      FROM
+      (
+        SELECT team_id, id, any(metric_name) AS metric_name
+        FROM metrics_series
+        GROUP BY team_id, id
+      ) AS series
+      INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+    ) AS series USING (team_id, id)
+    GROUP BY samples.team_id, series.metric_name, samples.timestamp
+  "
+fi
+
 echo "Finished ingest. Table sizes:"
 "${client[@]}" --query "
   SELECT
@@ -95,7 +171,7 @@ echo "Finished ingest. Table sizes:"
     formatReadableQuantity(sum(rows)) AS rows,
     formatReadableSize(sum(bytes_on_disk)) AS bytes
   FROM system.parts
-  WHERE active AND database = currentDatabase() AND table IN ('metrics_series', 'metrics_label_index', 'metrics_samples', 'metrics_histograms', 'metrics_exemplars', 'metrics_metadata')
+  WHERE active AND database = currentDatabase() AND table IN ('metrics_series', 'metrics_series_keys', 'metrics_label_index', 'metrics_label_postings', 'metrics_samples', 'metrics_series_activity', 'metrics_histograms', 'metrics_exemplars', 'metrics_metadata')
   GROUP BY table
   ORDER BY table
   FORMAT PrettyCompact
