@@ -183,7 +183,7 @@ func postRemoteWrite(t *testing.T, baseURL string, req *prompb.WriteRequest) {
 	if err != nil {
 		t.Fatalf("marshal remote write: %v", err)
 	}
-	resp, err := http.Post(baseURL+e2eAPIPath("/api/v1/write"), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
+	resp, err := http.Post(baseURL+e2eAPIPath("/write"), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
 	if err != nil {
 		t.Fatalf("post remote write: %v", err)
 	}

@@ -3,6 +3,7 @@ package snuffle
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,9 @@ type Config struct {
 	ExemplarsTable      string
 	HTTPHost            string
 	HTTPPort            string
+	APIPathPrefix       string
+	RemoteWritePath     string
+	RemoteReadPath      string
 	CHTimeout           time.Duration
 	QueryTimeout        time.Duration
 	LookbackDelta       time.Duration
@@ -36,6 +40,7 @@ type Config struct {
 }
 
 func ConfigFromEnv() Config {
+	apiPathPrefix := normalizeHTTPPath(getenv("SNUFFLE_API_PATH_PREFIX", "/api/v1"), "/api/v1")
 	return Config{
 		CHURL:               getenv("CH_URL", "http://localhost:8123/"),
 		CHUser:              getenv("CH_USER", "default"),
@@ -51,6 +56,9 @@ func ConfigFromEnv() Config {
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", "metrics_exemplars"),
 		HTTPHost:            getenv("SIDECAR_HOST", "0.0.0.0"),
 		HTTPPort:            getenv("SIDECAR_PORT", "9091"),
+		APIPathPrefix:       apiPathPrefix,
+		RemoteWritePath:     normalizeHTTPPath(getenv("SNUFFLE_REMOTE_WRITE_PATH", "/write"), "/write"),
+		RemoteReadPath:      normalizeHTTPPath(os.Getenv("SNUFFLE_REMOTE_READ_PATH"), joinHTTPPath(apiPathPrefix, "/read")),
 		CHTimeout:           envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
 		QueryTimeout:        envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
 		LookbackDelta:       envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),
@@ -71,6 +79,32 @@ func getenv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+func normalizeHTTPPath(path, fallback string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		path = fallback
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	if path != "/" {
+		path = strings.TrimRight(path, "/")
+	}
+	return path
+}
+
+func joinHTTPPath(prefix, suffix string) string {
+	prefix = normalizeHTTPPath(prefix, "/")
+	suffix = normalizeHTTPPath(suffix, "/")
+	if prefix == "/" {
+		return suffix
+	}
+	if suffix == "/" {
+		return prefix
+	}
+	return strings.TrimRight(prefix, "/") + "/" + strings.TrimLeft(suffix, "/")
 }
 
 func envInt(key string, fallback, min int) int {

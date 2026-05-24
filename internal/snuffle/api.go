@@ -42,7 +42,7 @@ func Run(cfg Config) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
+	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "api_path_prefix", server.apiPathPrefix(), "remote_write_path", server.remoteWritePath(), "remote_read_path", server.remoteReadPath(), "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
 	return srv.ListenAndServe()
 }
 
@@ -84,25 +84,46 @@ func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/-/ready", s.handleHealthy)
 
 	api := s.apiRoutes()
-	mux.Handle("/api/v1/", api)
+	mux.Handle("/", api)
 	mux.HandleFunc("/t/", s.handleTeamPath(api))
 	mux.HandleFunc("/team/", s.handleTeamPath(api))
 }
 
 func (s *Server) apiRoutes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/v1/query", s.teamHandler((*Server).handleQuery))
-	mux.HandleFunc("/api/v1/query_range", s.teamHandler((*Server).handleQueryRange))
-	mux.HandleFunc("/api/v1/write", s.teamHandler((*Server).handleRemoteWrite))
-	mux.HandleFunc("/api/v1/read", s.teamHandler((*Server).handleRemoteRead))
-	mux.HandleFunc("/api/v1/labels", s.teamHandler((*Server).handleLabels))
-	mux.HandleFunc("/api/v1/label/", s.teamHandler((*Server).handleLabelValues))
-	mux.HandleFunc("/api/v1/series", s.teamHandler((*Server).handleSeries))
-	mux.HandleFunc("/api/v1/metadata", s.teamHandler((*Server).handleMetadata))
-	mux.HandleFunc("/api/v1/rules", s.teamHandler((*Server).handleRules))
-	mux.HandleFunc("/api/v1/alerts", s.teamHandler((*Server).handleAlerts))
-	mux.HandleFunc("/api/v1/query_exemplars", s.teamHandler((*Server).handleQueryExemplars))
+	apiPathPrefix := s.apiPathPrefix()
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/query"), s.teamHandler((*Server).handleQuery))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/query_range"), s.teamHandler((*Server).handleQueryRange))
+	mux.HandleFunc(s.remoteWritePath(), s.teamHandler((*Server).handleRemoteWrite))
+	mux.HandleFunc(s.remoteReadPath(), s.teamHandler((*Server).handleRemoteRead))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/labels"), s.teamHandler((*Server).handleLabels))
+	mux.HandleFunc(s.labelValuesPathPrefix(), s.teamHandler((*Server).handleLabelValues))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/series"), s.teamHandler((*Server).handleSeries))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/metadata"), s.teamHandler((*Server).handleMetadata))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/rules"), s.teamHandler((*Server).handleRules))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/alerts"), s.teamHandler((*Server).handleAlerts))
+	mux.HandleFunc(joinHTTPPath(apiPathPrefix, "/query_exemplars"), s.teamHandler((*Server).handleQueryExemplars))
 	return mux
+}
+
+func (s *Server) apiPathPrefix() string {
+	return normalizeHTTPPath(s.cfg.APIPathPrefix, "/api/v1")
+}
+
+func (s *Server) remoteWritePath() string {
+	return normalizeHTTPPath(s.cfg.RemoteWritePath, "/write")
+}
+
+func (s *Server) remoteReadPath() string {
+	return normalizeHTTPPath(s.cfg.RemoteReadPath, joinHTTPPath(s.apiPathPrefix(), "/read"))
+}
+
+func (s *Server) labelValuesPathPrefix() string {
+	path := joinHTTPPath(s.apiPathPrefix(), "/label")
+	if path != "/" && !strings.HasSuffix(path, "/") {
+		path += "/"
+	}
+	return path
 }
 
 type requestTeamIDKey struct{}
@@ -146,7 +167,7 @@ func parseTeamPath(path string) (uint64, string, error) {
 		rest := strings.TrimPrefix(path, prefix)
 		parts := strings.SplitN(rest, "/", 2)
 		if len(parts) != 2 || parts[0] == "" {
-			return 0, "", fmt.Errorf("tenant path must be %s{team_id}/api/v1/...", prefix)
+			return 0, "", fmt.Errorf("tenant path must be %s{team_id}/...", prefix)
 		}
 		teamID, err := parseTeamID(parts[0])
 		if err != nil {
@@ -351,11 +372,12 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLabelValues(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(r.URL.Path, "/api/v1/label/") || !strings.HasSuffix(r.URL.Path, "/values") {
+	labelPathPrefix := s.labelValuesPathPrefix()
+	if !strings.HasPrefix(r.URL.Path, labelPathPrefix) || !strings.HasSuffix(r.URL.Path, "/values") {
 		http.NotFound(w, r)
 		return
 	}
-	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/v1/label/"), "/values")
+	name := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, labelPathPrefix), "/values")
 	name = strings.Trim(name, "/")
 	if name == "" {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("missing label name"))
