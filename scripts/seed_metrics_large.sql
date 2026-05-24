@@ -4,7 +4,6 @@ DROP TABLE IF EXISTS metrics_exemplars SYNC;
 DROP TABLE IF EXISTS metrics_metadata SYNC;
 DROP TABLE IF EXISTS metrics_series_activity SYNC;
 DROP TABLE IF EXISTS metrics_label_postings SYNC;
-DROP TABLE IF EXISTS metrics_series_keys SYNC;
 DROP TABLE IF EXISTS metrics_label_index SYNC;
 DROP TABLE IF EXISTS metrics_series SYNC;
 
@@ -12,6 +11,7 @@ CREATE TABLE metrics_series
 (
     team_id UInt64,
     id UInt64,
+    bitmap_id UInt64,
     metric_name LowCardinality(String),
     labels_json String,
     min_time DateTime64(3, 'UTC'),
@@ -24,19 +24,9 @@ SETTINGS index_granularity = 1024;
 ALTER TABLE metrics_series
     ADD PROJECTION by_id
     (
-        SELECT team_id, id, metric_name, labels_json, min_time, max_time
+        SELECT team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time
         ORDER BY (team_id, id)
     );
-
-CREATE TABLE metrics_series_keys
-(
-    team_id UInt64,
-    id UInt64,
-    bitmap_id UInt64
-)
-ENGINE = ReplacingMergeTree
-ORDER BY (team_id, id)
-SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_label_index
 (
@@ -141,7 +131,7 @@ ORDER BY (team_id, metric_family_name)
 SETTINGS index_granularity = 1024;
 
 INSERT INTO metrics_series
-    (team_id, id, metric_name, labels_json, min_time, max_time)
+    (team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time)
 WITH
     0 AS team_id,
     100000 AS series_count,
@@ -151,6 +141,7 @@ WITH
 SELECT
     team_id,
     id,
+    id AS bitmap_id,
     metric_name,
     toJSONString(all_tags) AS labels_json,
     fromUnixTimestamp64Milli(start_ms) AS min_time,
@@ -170,18 +161,6 @@ FROM
 );
 
 ALTER TABLE metrics_series MATERIALIZE PROJECTION by_id;
-
-INSERT INTO metrics_series_keys
-SELECT
-    team_id,
-    id,
-    row_number() OVER (PARTITION BY team_id ORDER BY id) AS bitmap_id
-FROM
-(
-    SELECT team_id, id
-    FROM metrics_series
-    GROUP BY team_id, id
-);
 
 INSERT INTO metrics_label_index
     (team_id, metric_name, label_name, label_value, id)
@@ -218,9 +197,14 @@ SELECT
     idx.metric_name,
     idx.label_name,
     idx.label_value,
-    groupBitmapState(keys.bitmap_id) AS ids
+    groupBitmapState(series.bitmap_id) AS ids
 FROM metrics_label_index AS idx
-INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+INNER JOIN
+(
+    SELECT team_id, id, max(bitmap_id) AS bitmap_id
+    FROM metrics_series
+    GROUP BY team_id, id
+) AS series USING (team_id, id)
 GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value;
 
 INSERT INTO metrics_label_postings
@@ -229,14 +213,13 @@ SELECT
     series.metric_name,
     '__name__' AS label_name,
     series.metric_name AS label_value,
-    groupBitmapState(keys.bitmap_id) AS ids
+    groupBitmapState(series.bitmap_id) AS ids
 FROM
 (
-    SELECT team_id, id, any(metric_name) AS metric_name
+    SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
     FROM metrics_series
     GROUP BY team_id, id
 ) AS series
-INNER JOIN metrics_series_keys AS keys USING (team_id, id)
 GROUP BY series.team_id, series.metric_name;
 
 INSERT INTO metrics_samples
@@ -270,13 +253,8 @@ SELECT
 FROM metrics_samples AS samples
 INNER JOIN
 (
-    SELECT series.team_id, series.id, series.metric_name, keys.bitmap_id
-    FROM
-    (
-        SELECT team_id, id, any(metric_name) AS metric_name
-        FROM metrics_series
-        GROUP BY team_id, id
-    ) AS series
-    INNER JOIN metrics_series_keys AS keys USING (team_id, id)
+    SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
+    FROM metrics_series
+    GROUP BY team_id, id
 ) AS series USING (team_id, id)
-GROUP BY samples.team_id, series.metric_name, samples.timestamp;
+GROUP BY samples.team_id, series.metric_name, toStartOfInterval(samples.timestamp, INTERVAL 15 SECOND);

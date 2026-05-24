@@ -41,11 +41,12 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.labelCount != 2 || batch.labelBitmapCount != 3 || batch.activityCount != 2 || batch.exemplarCount != 1 || batch.metadataCount != 1 {
 		t.Fatalf("counts = series %d samples %d labels %d label bitmaps %d activity %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.labelBitmapCount, batch.activityCount, batch.exemplarCount, batch.metadataCount)
 	}
-	seriesRows := batch.seriesRows.String()
-	for _, want := range []string{`"team_id":7`, `"metric_name":"http_requests_total"`, `"min_ms":1000`, `"max_ms":2000`, `"labels_json":"{`} {
-		if !strings.Contains(seriesRows, want) {
-			t.Fatalf("series rows %q do not contain %q", seriesRows, want)
-		}
+	if len(batch.seriesRecords) != 1 {
+		t.Fatalf("seriesRecords length = %d, want 1", len(batch.seriesRecords))
+	}
+	seriesRow := batch.seriesRecords[0]
+	if seriesRow.TeamID != 7 || seriesRow.MetricName != "http_requests_total" || seriesRow.MinMS != 1000 || seriesRow.MaxMS != 2000 || !strings.HasPrefix(seriesRow.LabelsJSON, "{") {
+		t.Fatalf("unexpected series row: %#v", seriesRow)
 	}
 	labelRows := batch.labelIndexRows.String()
 	for _, want := range []string{`"label_name":"job"`, `"label_name":"instance"`} {
@@ -56,17 +57,13 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if strings.Contains(labelRows, labels.MetricName) {
 		t.Fatalf("label index rows should not include metric name: %q", labelRows)
 	}
-	labelBitmapRows := batch.labelBitmapRows.String()
-	for _, want := range []string{`"label_name":"job"`, `"label_name":"instance"`, `"label_name":"__name__"`} {
-		if !strings.Contains(labelBitmapRows, want) {
-			t.Fatalf("label bitmap rows %q do not contain %q", labelBitmapRows, want)
+	for _, want := range []string{"job", "instance", labels.MetricName} {
+		if !remoteWriteLabelRowsContain(batch.labelBitmapRows, want) {
+			t.Fatalf("label bitmap rows %#v do not contain %q", batch.labelBitmapRows, want)
 		}
 	}
-	activityRows := batch.activityRows.String()
-	for _, want := range []string{`"metric_name":"http_requests_total"`, `"bucket_ms":1000`, `"bucket_ms":2000`} {
-		if !strings.Contains(activityRows, want) {
-			t.Fatalf("activity rows %q do not contain %q", activityRows, want)
-		}
+	if !remoteWriteActivityRowsContain(batch.activityRecords, "http_requests_total", 1000) || !remoteWriteActivityRowsContain(batch.activityRecords, "http_requests_total", 2000) {
+		t.Fatalf("unexpected activity rows: %#v", batch.activityRecords)
 	}
 	if !strings.Contains(batch.exemplarRows.String(), `\"trace_id\":\"abc\"`) {
 		t.Fatalf("exemplar rows should contain exemplar labels: %q", batch.exemplarRows.String())
@@ -74,6 +71,24 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if !strings.Contains(batch.metadataRows.String(), `"type":"counter"`) {
 		t.Fatalf("metadata rows should contain metadata: %q", batch.metadataRows.String())
 	}
+}
+
+func remoteWriteLabelRowsContain(rows []remoteWriteLabelIndexRow, want string) bool {
+	for _, row := range rows {
+		if row.LabelName == want {
+			return true
+		}
+	}
+	return false
+}
+
+func remoteWriteActivityRowsContain(rows []remoteWriteActivityRow, metricName string, bucketMS int64) bool {
+	for _, row := range rows {
+		if row.MetricName == metricName && row.BucketMS == bucketMS {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
@@ -143,6 +158,45 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 		if !strings.Contains(histograms, want) {
 			t.Fatalf("histogram rows %q do not contain %q", histograms, want)
 		}
+	}
+}
+
+func TestSeriesBitmapIDLookupSQLUsesSeriesTable(t *testing.T) {
+	cfg := Config{CHDatabase: "default", SeriesTable: "metrics_series", TeamID: 42}
+	sql := seriesBitmapIDLookupSQL(cfg, []uint64{11, 22}, true)
+	for _, want := range []string{"metrics_series", "bitmap_id", "team_id = 42", "id IN (11,22)", "UNION ALL"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("lookup SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "series_keys") {
+		t.Fatalf("lookup SQL should not use the removed series key table: %q", sql)
+	}
+}
+
+func TestBitmapRowsUseAssignedBitmapIDs(t *testing.T) {
+	seriesRows := []remoteWriteSeriesRow{{
+		TeamID:     7,
+		ID:         99,
+		MetricName: "up",
+		LabelsJSON: "{}",
+		MinMS:      1000,
+		MaxMS:      1000,
+	}}
+	encodedSeries, err := seriesRowsWithBitmapIDs(seriesRows, map[uint64]uint64{99: 3})
+	if err != nil {
+		t.Fatalf("seriesRowsWithBitmapIDs returned error: %v", err)
+	}
+	if !strings.Contains(encodedSeries.String(), `"bitmap_id":3`) {
+		t.Fatalf("series row did not include assigned bitmap id: %q", encodedSeries.String())
+	}
+
+	labelRows, err := labelBitmapRowsWithBitmapIDs([]remoteWriteLabelIndexRow{{TeamID: 7, MetricName: "up", LabelName: labels.MetricName, LabelValue: "up", ID: 99}}, map[uint64]uint64{99: 3})
+	if err != nil {
+		t.Fatalf("labelBitmapRowsWithBitmapIDs returned error: %v", err)
+	}
+	if !strings.Contains(labelRows.String(), `"bitmap_id":3`) || strings.Contains(labelRows.String(), `"id":99`) {
+		t.Fatalf("label bitmap row should contain bitmap_id only: %q", labelRows.String())
 	}
 }
 

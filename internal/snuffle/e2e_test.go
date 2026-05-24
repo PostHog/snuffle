@@ -57,7 +57,6 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg.CHURL = chURL
 	cfg.CHDatabase = dbName
 	cfg.SeriesTable = "metrics_series"
-	cfg.SeriesKeysTable = "metrics_series_keys"
 	cfg.SamplesTable = "metrics_samples"
 	cfg.LabelIndexTable = "metrics_label_index"
 	cfg.LabelPostingsTable = "metrics_label_postings"
