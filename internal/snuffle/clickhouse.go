@@ -66,11 +66,11 @@ type clickHouseRow interface {
 
 func (c *ClickHouseClient) QueryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) error {
 	if c.connErr != nil {
-		return c.connErr
+		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
 	result, err := c.conn.Query(ctx, sql)
 	if err != nil {
-		return err
+		return fmt.Errorf("start clickhouse query: %w", err)
 	}
 	defer result.Close()
 
@@ -81,28 +81,35 @@ func (c *ClickHouseClient) QueryRows(ctx context.Context, sql string, handle fun
 	for result.Next() {
 		rowCount++
 		if err := handle(result); err != nil {
-			return err
+			return fmt.Errorf("handle clickhouse query row %d: %w", rowCount, err)
 		}
 	}
-	return result.Err()
+	if err := result.Err(); err != nil {
+		return fmt.Errorf("read clickhouse query result after %d rows: %w", rowCount, err)
+	}
+	return nil
 }
 
 func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
 	if c.connErr != nil {
-		return c.connErr
+		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
-	return c.conn.Exec(ctx, sql)
+	if err := c.conn.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("execute clickhouse statement: %w", err)
+	}
+	return nil
 }
 
 type clickHouseBatch = driver.Batch
 
 func (c *ClickHouseClient) InsertColumns(ctx context.Context, sql string, appendColumns func(clickHouseBatch) (int, error)) error {
 	if c.connErr != nil {
-		return c.connErr
+		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
+	ctx = clickhouse.Context(ctx, clickhouse.WithAsync(false))
 	batch, err := c.conn.PrepareBatch(ctx, sql)
 	if err != nil {
-		return err
+		return fmt.Errorf("prepare native async insert (async_insert=1 wait_for_async_insert=0): %w", err)
 	}
 	sent := false
 	defer func() {
@@ -112,14 +119,17 @@ func (c *ClickHouseClient) InsertColumns(ctx context.Context, sql string, append
 	}()
 	count, err := appendColumns(batch)
 	if err != nil {
-		return err
+		return fmt.Errorf("append native insert columns: %w", err)
 	}
 	if count == 0 {
 		sent = true
-		return batch.Close()
+		if err := batch.Close(); err != nil {
+			return fmt.Errorf("close empty native insert batch: %w", err)
+		}
+		return nil
 	}
 	if err := batch.Send(); err != nil {
-		return err
+		return fmt.Errorf("send native async insert (async_insert=1 wait_for_async_insert=0 rows=%d): %w", count, err)
 	}
 	sent = true
 	recordClickHouseWrite(ctx, int64(count))

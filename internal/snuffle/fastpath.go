@@ -420,12 +420,10 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 	if sql, ok := nestedCountBitmapRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
 		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 		data, err := s.queryNestedCountRangeValues(ctx, sql)
-		if err == nil {
-			return data, true, nil
-		}
-		if !missingBitmapIndexError(err) {
+		if err != nil {
 			return queryData{}, true, err
 		}
+		return data, true, nil
 	}
 	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
 	if !ok {
@@ -604,11 +602,6 @@ func bitmapMatcherCondition(matcher *labels.Matcher) (bool, string, bool) {
 	default:
 		return false, "", false
 	}
-}
-
-func missingBitmapIndexError(err error) bool {
-	message := err.Error()
-	return strings.Contains(message, "UNKNOWN_TABLE") || strings.Contains(message, "Unknown table") || strings.Contains(message, "doesn't exist")
 }
 
 type selectorGridSource struct {

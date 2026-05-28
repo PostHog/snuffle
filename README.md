@@ -80,10 +80,10 @@ curl --get 'http://localhost:9091/t/42/api/v1/query' \
 The recommended schema is in `scripts/create_metrics_schema.sql`:
 
 - `metrics_series`: append-friendly series metadata with `team_id`, `id`,
-  dense `bitmap_id`, `metric_name`, `labels_json String`, `min_time`, and
-  `max_time`, ordered by `(team_id, metric_name, id)`
-- `metrics_samples`: float samples with `timestamp`, `id`, `value`, and
-  `version`, using `ReplacingMergeTree(version)` and ordered by
+  `metric_name`, `labels_json String`, `min_time`, and `max_time`, ordered by
+  `(team_id, metric_name, id)`
+- `metrics_samples`: float samples with `metric_name`, `timestamp`, `id`,
+  `value`, and `version`, using `ReplacingMergeTree(version)` and ordered by
   `(team_id, id, timestamp)`
 - `metrics_label_index`: inverted label index
   `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
@@ -91,7 +91,8 @@ The recommended schema is in `scripts/create_metrics_schema.sql`:
 - `metrics_label_postings` and `metrics_series_activity`: bitmap indexes used
   by generic count/cardinality fast paths and maintained by materialized views
 - `metrics_histograms`: native histogram samples stored as remote-write
-  protobuf payloads with `version`, keyed by `(team_id, id, timestamp)`
+  protobuf payloads with `metric_name` and `version`, keyed by
+  `(team_id, id, timestamp)`
 - `metrics_exemplars`: exemplar samples keyed by `(team_id, id, timestamp)`
   with exemplar labels in an opaque JSON string
 - `metrics_metadata`: latest metric family `type`, `unit`, and `help`

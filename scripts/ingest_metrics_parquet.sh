@@ -41,7 +41,6 @@ clickhouse-local \
     SELECT
       team_id,
       id,
-      row_number() OVER (PARTITION BY team_id ORDER BY id) AS bitmap_id,
       metric_name,
       labels_json,
       min_time,
@@ -98,12 +97,31 @@ clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
   --query "
     SELECT
-      toUInt64($TEAM_ID) AS team_id,
-      timestamp,
-      cityHash64(toString(id)) AS id,
-      value,
-      toUInt64(toUnixTimestamp64Milli(timestamp)) AS version
-    FROM file('$DATA_FILE', Parquet)
+      data.team_id,
+      series.metric_name,
+      data.timestamp,
+      data.id,
+      data.value,
+      data.version
+    FROM
+    (
+      SELECT
+        toUInt64($TEAM_ID) AS team_id,
+        timestamp,
+        cityHash64(toString(id)) AS id,
+        value,
+        toUInt64(toUnixTimestamp64Milli(timestamp)) AS version
+      FROM file('$DATA_FILE', Parquet)
+    ) AS data
+    ANY INNER JOIN
+    (
+      SELECT
+        toUInt64($TEAM_ID) AS team_id,
+        cityHash64(toString(id)) AS id,
+        any(metric_name) AS metric_name
+      FROM file('$TAGS_FILE', Parquet)
+      GROUP BY team_id, id
+    ) AS series USING (team_id, id)
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_samples FORMAT Native"
 

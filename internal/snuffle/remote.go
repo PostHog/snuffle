@@ -10,7 +10,6 @@ import (
 	"math"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -122,16 +121,6 @@ type remoteWriteSeriesRow struct {
 	MaxMS      int64
 }
 
-type remoteWriteSeriesInsertRow struct {
-	TeamID     uint64
-	ID         uint64
-	BitmapID   uint64
-	MetricName string
-	LabelsJSON string
-	MinMS      int64
-	MaxMS      int64
-}
-
 type remoteWriteLabelIndexRow struct {
 	TeamID     uint64
 	MetricName string
@@ -142,6 +131,7 @@ type remoteWriteLabelIndexRow struct {
 
 type remoteWriteSampleRow struct {
 	TeamID      uint64
+	MetricName  string
 	TimestampMS int64
 	ID          uint64
 	Value       float64
@@ -150,6 +140,7 @@ type remoteWriteSampleRow struct {
 
 type remoteWriteHistogramRow struct {
 	TeamID      uint64
+	MetricName  string
 	TimestampMS int64
 	ID          uint64
 	Histogram   []byte
@@ -233,6 +224,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			observeTime(bucketMS)
 			row := remoteWriteSampleRow{
 				TeamID:      teamID,
+				MetricName:  metricName,
 				TimestampMS: bucketMS,
 				ID:          id,
 				Value:       sample.Value,
@@ -254,6 +246,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			}
 			row := remoteWriteHistogramRow{
 				TeamID:      teamID,
+				MetricName:  metricName,
 				TimestampMS: bucketMS,
 				ID:          id,
 				Histogram:   payload,
@@ -474,56 +467,79 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 	if batch.seriesCount == 0 && batch.sampleCount == 0 && batch.histogramCount == 0 && batch.exemplarCount == 0 && batch.metadataCount == 0 {
 		return nil
 	}
+	batchSummary := remoteWriteBatchSummary(batch)
 	if batch.seriesCount > 0 {
-		s.keyMu.Lock()
-		assigned, err := s.assignSeriesBitmapIDs(ctx, batch.seriesRecords)
-		if err == nil {
-			err = s.insertRemoteSeriesRows(ctx, batch.seriesRecords, assigned)
-		}
-		s.keyMu.Unlock()
-		if err != nil {
-			return err
+		started := time.Now()
+		if err := s.insertRemoteSeriesRows(ctx, batch.seriesRecords); err != nil {
+			return remoteWritePhaseError("insert series", s.cfg.SeriesTable, batch.seriesCount, s.cfg.CHTimeout, batchSummary, started, err)
 		}
 	}
+	started := time.Now()
 	if err := s.insertRemoteMetadataRows(ctx, batch.metadataRows); err != nil {
-		return err
+		return remoteWritePhaseError("insert metadata", s.cfg.MetricsTable, len(batch.metadataRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
+	started = time.Now()
 	if err := s.insertRemoteLabelIndexRows(ctx, batch.labelIndexRows); err != nil {
-		return err
+		return remoteWritePhaseError("insert label index", s.cfg.LabelIndexTable, len(batch.labelIndexRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
+	started = time.Now()
 	if err := s.insertRemoteSampleRows(ctx, batch.sampleRows); err != nil {
-		return err
+		return remoteWritePhaseError("insert samples", s.cfg.SamplesTable, len(batch.sampleRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
+	started = time.Now()
 	if err := s.insertRemoteHistogramRows(ctx, batch.histogramRows); err != nil {
-		return err
+		return remoteWritePhaseError("insert histograms", s.cfg.HistogramsTable, len(batch.histogramRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
+	started = time.Now()
 	if err := s.insertRemoteExemplarRows(ctx, batch.exemplarRows); err != nil {
-		return err
+		return remoteWritePhaseError("insert exemplars", s.cfg.ExemplarsTable, len(batch.exemplarRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
 	return nil
 }
 
-func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow, bitmapIDs map[uint64]uint64) error {
+func remoteWriteBatchSummary(batch remoteWriteBatch) string {
+	return fmt.Sprintf(
+		"series=%d labels=%d samples=%d histograms=%d exemplars=%d metadata=%d",
+		batch.seriesCount,
+		batch.labelCount,
+		batch.sampleCount,
+		batch.histogramCount,
+		batch.exemplarCount,
+		batch.metadataCount,
+	)
+}
+
+func remoteWritePhaseError(phase, table string, rows int, timeout time.Duration, batchSummary string, started time.Time, err error) error {
+	if err == nil {
+		return nil
+	}
+	elapsed := time.Since(started).Round(time.Millisecond)
+	details := fmt.Sprintf("after %s (clickhouse_timeout=%s table=%s rows=%d batch=%s)", elapsed, timeout, table, rows, batchSummary)
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("remote write %s timed out %s: %w", phase, details, err)
+	case errors.Is(err, context.Canceled):
+		return fmt.Errorf("remote write %s canceled %s: %w", phase, details, err)
+	default:
+		return fmt.Errorf("remote write %s failed %s: %w", phase, details, err)
+	}
+}
+
+func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
-	insertRows, err := seriesRowsWithBitmapIDs(rows, bitmapIDs)
-	if err != nil {
-		return err
-	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time)", tableName(s.cfg.CHDatabase, s.cfg.SeriesTable))
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, id, metric_name, labels_json, min_time, max_time)", tableName(s.cfg.CHDatabase, s.cfg.SeriesTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
-		teamIDs := make([]uint64, len(insertRows))
-		ids := make([]uint64, len(insertRows))
-		bitmapIDs := make([]uint64, len(insertRows))
-		metricNames := make([]string, len(insertRows))
-		labelsJSON := make([]string, len(insertRows))
-		minTimes := make([]int64, len(insertRows))
-		maxTimes := make([]int64, len(insertRows))
-		for i, row := range insertRows {
+		teamIDs := make([]uint64, len(rows))
+		ids := make([]uint64, len(rows))
+		metricNames := make([]string, len(rows))
+		labelsJSON := make([]string, len(rows))
+		minTimes := make([]int64, len(rows))
+		maxTimes := make([]int64, len(rows))
+		for i, row := range rows {
 			teamIDs[i] = row.TeamID
 			ids[i] = row.ID
-			bitmapIDs[i] = row.BitmapID
 			metricNames[i] = row.MetricName
 			labelsJSON[i] = row.LabelsJSON
 			minTimes[i] = row.MinMS
@@ -535,22 +551,19 @@ func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteS
 		if err := batch.Column(1).Append(ids); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(2).Append(bitmapIDs); err != nil {
+		if err := batch.Column(2).Append(metricNames); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(3).Append(metricNames); err != nil {
+		if err := batch.Column(3).Append(labelsJSON); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(4).Append(labelsJSON); err != nil {
+		if err := batch.Column(4).Append(minTimes); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(5).Append(minTimes); err != nil {
+		if err := batch.Column(5).Append(maxTimes); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(6).Append(maxTimes); err != nil {
-			return 0, err
-		}
-		return len(insertRows), nil
+		return len(rows), nil
 	})
 }
 
@@ -595,15 +608,17 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, rows []remoteWriteS
 	if len(rows) == 0 {
 		return nil
 	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, timestamp, id, value, version)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, id, value, version)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		teamIDs := make([]uint64, len(rows))
+		metricNames := make([]string, len(rows))
 		timestamps := make([]int64, len(rows))
 		ids := make([]uint64, len(rows))
 		values := make([]float64, len(rows))
 		versions := make([]uint64, len(rows))
 		for i, row := range rows {
 			teamIDs[i] = row.TeamID
+			metricNames[i] = row.MetricName
 			timestamps[i] = row.TimestampMS
 			ids[i] = row.ID
 			values[i] = row.Value
@@ -612,16 +627,19 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, rows []remoteWriteS
 		if err := batch.Column(0).Append(teamIDs); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(1).Append(timestamps); err != nil {
+		if err := batch.Column(1).Append(metricNames); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(2).Append(ids); err != nil {
+		if err := batch.Column(2).Append(timestamps); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(3).Append(values); err != nil {
+		if err := batch.Column(3).Append(ids); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(4).Append(versions); err != nil {
+		if err := batch.Column(4).Append(values); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(5).Append(versions); err != nil {
 			return 0, err
 		}
 		return len(rows), nil
@@ -632,15 +650,17 @@ func (s *Server) insertRemoteHistogramRows(ctx context.Context, rows []remoteWri
 	if len(rows) == 0 || s.cfg.HistogramsTable == "" {
 		return nil
 	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, timestamp, id, histogram, version)", tableName(s.cfg.CHDatabase, s.cfg.HistogramsTable))
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, id, histogram, version)", tableName(s.cfg.CHDatabase, s.cfg.HistogramsTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		teamIDs := make([]uint64, len(rows))
+		metricNames := make([]string, len(rows))
 		timestamps := make([]int64, len(rows))
 		ids := make([]uint64, len(rows))
 		histograms := make([][]byte, len(rows))
 		versions := make([]uint64, len(rows))
 		for i, row := range rows {
 			teamIDs[i] = row.TeamID
+			metricNames[i] = row.MetricName
 			timestamps[i] = row.TimestampMS
 			ids[i] = row.ID
 			histograms[i] = row.Histogram
@@ -649,16 +669,19 @@ func (s *Server) insertRemoteHistogramRows(ctx context.Context, rows []remoteWri
 		if err := batch.Column(0).Append(teamIDs); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(1).Append(timestamps); err != nil {
+		if err := batch.Column(1).Append(metricNames); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(2).Append(ids); err != nil {
+		if err := batch.Column(2).Append(timestamps); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(3).Append(histograms); err != nil {
+		if err := batch.Column(3).Append(ids); err != nil {
 			return 0, err
 		}
-		if err := batch.Column(4).Append(versions); err != nil {
+		if err := batch.Column(4).Append(histograms); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(5).Append(versions); err != nil {
 			return 0, err
 		}
 		return len(rows), nil
@@ -742,113 +765,6 @@ func (s *Server) insertRemoteMetadataRows(ctx context.Context, rows []remoteWrit
 		}
 		return len(rows), nil
 	})
-}
-
-func (s *Server) assignSeriesBitmapIDs(ctx context.Context, rows []remoteWriteSeriesRow) (map[uint64]uint64, error) {
-	ids := uniqueRemoteWriteSeriesIDs(rows)
-	if len(ids) == 0 {
-		return nil, nil
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-
-	if s.bitmapMax == nil {
-		s.bitmapMax = make(map[uint64]uint64)
-	}
-	bitmapIDs := make(map[uint64]uint64, len(ids))
-	maxBitmapID, haveMax := s.bitmapMax[s.cfg.TeamID]
-	includeMax := !haveMax
-	for _, batch := range idBatches(ids, s.cfg.IDChunkSize) {
-		sql := seriesBitmapIDLookupSQL(s.cfg, batch, includeMax)
-		includeMax = false
-		if err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-			var kind string
-			var id uint64
-			var bitmapID uint64
-			if err := row.Scan(&kind, &id, &bitmapID); err != nil {
-				return err
-			}
-			if kind == "max" {
-				maxBitmapID = bitmapID
-				haveMax = true
-				return nil
-			}
-			bitmapIDs[id] = bitmapID
-			if bitmapID > maxBitmapID {
-				maxBitmapID = bitmapID
-			}
-			return nil
-		}); err != nil {
-			return nil, err
-		}
-	}
-	if !haveMax {
-		maxBitmapID = 0
-	}
-
-	nextBitmapID := maxBitmapID + 1
-	for _, id := range ids {
-		if _, ok := bitmapIDs[id]; ok {
-			continue
-		}
-		bitmapIDs[id] = nextBitmapID
-		nextBitmapID++
-	}
-	if nextBitmapID > 0 {
-		s.bitmapMax[s.cfg.TeamID] = nextBitmapID - 1
-	}
-	return bitmapIDs, nil
-}
-
-func uniqueRemoteWriteSeriesIDs(rows []remoteWriteSeriesRow) []uint64 {
-	seen := make(map[uint64]struct{}, len(rows))
-	ids := make([]uint64, 0, len(rows))
-	for _, row := range rows {
-		if _, ok := seen[row.ID]; ok {
-			continue
-		}
-		seen[row.ID] = struct{}{}
-		ids = append(ids, row.ID)
-	}
-	return ids
-}
-
-func seriesBitmapIDLookupSQL(cfg Config, ids []uint64, includeMax bool) string {
-	table := tableName(cfg.CHDatabase, cfg.SeriesTable)
-	parts := make([]string, 0, 2)
-	if includeMax {
-		parts = append(parts, fmt.Sprintf(
-			"SELECT 'max' AS kind, toUInt64(0) AS id, toUInt64(ifNull(max(bitmap_id), 0)) AS bitmap_id FROM %s WHERE %s",
-			table,
-			teamFilter(cfg),
-		))
-	}
-	parts = append(parts, fmt.Sprintf(
-		"SELECT 'series' AS kind, id, max(bitmap_id) AS bitmap_id FROM %s WHERE %s AND id IN (%s) GROUP BY id",
-		table,
-		teamFilter(cfg),
-		joinUint64(ids),
-	))
-	return strings.Join(parts, " UNION ALL ")
-}
-
-func seriesRowsWithBitmapIDs(rows []remoteWriteSeriesRow, bitmapIDs map[uint64]uint64) ([]remoteWriteSeriesInsertRow, error) {
-	result := make([]remoteWriteSeriesInsertRow, 0, len(rows))
-	for _, row := range rows {
-		bitmapID, ok := bitmapIDs[row.ID]
-		if !ok {
-			return nil, fmt.Errorf("missing bitmap id for series %d", row.ID)
-		}
-		result = append(result, remoteWriteSeriesInsertRow{
-			TeamID:     row.TeamID,
-			ID:         row.ID,
-			BitmapID:   bitmapID,
-			MetricName: row.MetricName,
-			LabelsJSON: row.LabelsJSON,
-			MinMS:      row.MinMS,
-			MaxMS:      row.MaxMS,
-		})
-	}
-	return result, nil
 }
 
 func remoteReadAcceptsSamples(req *prompb.ReadRequest) bool {

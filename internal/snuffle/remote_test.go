@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"context"
 	"math"
 	"strings"
 	"testing"
@@ -103,6 +104,9 @@ func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
 	if len(batch.sampleRows) != 1 || math.IsNaN(batch.sampleRows[0].Value) || batch.sampleRows[0].Value != 2 || batch.sampleRows[0].TimestampMS != 2000 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
+	if batch.sampleRows[0].MetricName != "up" {
+		t.Fatalf("sample rows should carry metric name for activity MVs: %#v", batch.sampleRows)
+	}
 	for _, row := range batch.labelIndexRows {
 		if row.LabelValue == "gone" {
 			t.Fatalf("all-NaN series should not produce label rows: %#v", batch.labelIndexRows)
@@ -132,6 +136,9 @@ func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
 	}
 	if len(batch.histogramRows) != 1 || len(batch.histogramRows[0].Histogram) == 0 {
 		t.Fatalf("unexpected histogram rows: %#v", batch.histogramRows)
+	}
+	if batch.histogramRows[0].MetricName != "latency" {
+		t.Fatalf("histogram rows should carry metric name for activity MVs: %#v", batch.histogramRows)
 	}
 }
 
@@ -182,34 +189,28 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	}
 }
 
-func TestSeriesBitmapIDLookupSQLUsesSeriesTable(t *testing.T) {
-	cfg := Config{CHDatabase: "default", SeriesTable: "metrics_series", TeamID: 42}
-	sql := seriesBitmapIDLookupSQL(cfg, []uint64{11, 22}, true)
-	for _, want := range []string{"metrics_series", "bitmap_id", "team_id = 42", "id IN (11,22)", "UNION ALL"} {
-		if !strings.Contains(sql, want) {
-			t.Fatalf("lookup SQL %q does not contain %q", sql, want)
+func TestRemoteWritePhaseErrorIncludesUsefulContext(t *testing.T) {
+	err := remoteWritePhaseError(
+		"insert samples",
+		"metrics_samples",
+		123,
+		30*time.Second,
+		"series=1 labels=2 samples=123 histograms=0 exemplars=0 metadata=0",
+		time.Now().Add(-1500*time.Millisecond),
+		context.DeadlineExceeded,
+	)
+	got := err.Error()
+	for _, want := range []string{
+		"remote write insert samples timed out",
+		"clickhouse_timeout=30s",
+		"table=metrics_samples",
+		"rows=123",
+		"batch=series=1 labels=2 samples=123 histograms=0 exemplars=0 metadata=0",
+		"context deadline exceeded",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("error %q does not contain %q", got, want)
 		}
-	}
-	if strings.Contains(sql, "series_keys") {
-		t.Fatalf("lookup SQL should not use the removed series key table: %q", sql)
-	}
-}
-
-func TestBitmapRowsUseAssignedBitmapIDs(t *testing.T) {
-	seriesRows := []remoteWriteSeriesRow{{
-		TeamID:     7,
-		ID:         99,
-		MetricName: "up",
-		LabelsJSON: "{}",
-		MinMS:      1000,
-		MaxMS:      1000,
-	}}
-	insertRows, err := seriesRowsWithBitmapIDs(seriesRows, map[uint64]uint64{99: 3})
-	if err != nil {
-		t.Fatalf("seriesRowsWithBitmapIDs returned error: %v", err)
-	}
-	if len(insertRows) != 1 || insertRows[0].BitmapID != 3 || insertRows[0].ID != 99 {
-		t.Fatalf("series row did not include assigned bitmap id: %#v", insertRows)
 	}
 }
 

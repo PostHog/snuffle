@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -26,8 +25,6 @@ type Server struct {
 	queryable *CHQueryable
 	engine    *promql.Engine
 	parser    parser.Parser
-	keyMu     *sync.Mutex
-	bitmapMax map[uint64]uint64
 }
 
 func Run(cfg Config) error {
@@ -74,8 +71,6 @@ func newServer(cfg Config) *Server {
 		queryable: queryable,
 		engine:    engine,
 		parser:    parser.NewParser(parser.Options{}),
-		keyMu:     &sync.Mutex{},
-		bitmapMax: make(map[uint64]uint64),
 	}
 }
 
@@ -206,8 +201,6 @@ func (s *Server) withTeamID(teamID uint64) *Server {
 		queryable: NewCHQueryable(s.client, cfg),
 		engine:    s.engine,
 		parser:    s.parser,
-		keyMu:     s.keyMu,
-		bitmapMax: s.bitmapMax,
 	}
 }
 

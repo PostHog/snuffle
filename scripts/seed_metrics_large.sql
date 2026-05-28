@@ -15,7 +15,6 @@ CREATE TABLE metrics_series
 (
     team_id UInt64,
     id UInt64,
-    bitmap_id UInt64,
     metric_name LowCardinality(String),
     labels_json String,
     min_time DateTime64(3, 'UTC'),
@@ -28,7 +27,7 @@ SETTINGS index_granularity = 1024;
 ALTER TABLE metrics_series
     ADD PROJECTION by_id
     (
-        SELECT team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time
+        SELECT team_id, id, metric_name, labels_json, min_time, max_time
         ORDER BY (team_id, id)
     );
 
@@ -73,6 +72,7 @@ ALTER TABLE metrics_label_index
 CREATE TABLE metrics_samples
 (
     team_id UInt64,
+    metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
     value Float64,
@@ -98,6 +98,7 @@ SETTINGS index_granularity = 128;
 CREATE TABLE metrics_histograms
 (
     team_id UInt64,
+    metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
     histogram String,
@@ -140,43 +141,40 @@ SELECT
     metric_name,
     '__name__' AS label_name,
     metric_name AS label_value,
-    groupBitmapState(bitmap_id) AS ids
+    groupBitmapState(id) AS ids
 FROM metrics_series
 GROUP BY team_id, metric_name;
 
 CREATE MATERIALIZED VIEW metrics_label_postings_from_label_index_mv TO metrics_label_postings AS
 SELECT
-    idx.team_id,
-    idx.metric_name,
-    idx.label_name,
-    idx.label_value,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM metrics_label_index AS idx
-INNER JOIN metrics_series AS series USING (team_id, id)
-GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value;
+    team_id,
+    metric_name,
+    label_name,
+    label_value,
+    groupBitmapState(id) AS ids
+FROM metrics_label_index
+GROUP BY team_id, metric_name, label_name, label_value;
 
 CREATE MATERIALIZED VIEW metrics_series_activity_from_samples_mv TO metrics_series_activity AS
 SELECT
-    samples.team_id,
-    series.metric_name,
-    samples.timestamp AS bucket,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM metrics_samples AS samples
-INNER JOIN metrics_series AS series USING (team_id, id)
-GROUP BY samples.team_id, series.metric_name, samples.timestamp;
+    team_id,
+    metric_name,
+    timestamp AS bucket,
+    groupBitmapState(id) AS ids
+FROM metrics_samples
+GROUP BY team_id, metric_name, timestamp;
 
 CREATE MATERIALIZED VIEW metrics_series_activity_from_histograms_mv TO metrics_series_activity AS
 SELECT
-    histograms.team_id,
-    series.metric_name,
-    histograms.timestamp AS bucket,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM metrics_histograms AS histograms
-INNER JOIN metrics_series AS series USING (team_id, id)
-GROUP BY histograms.team_id, series.metric_name, histograms.timestamp;
+    team_id,
+    metric_name,
+    timestamp AS bucket,
+    groupBitmapState(id) AS ids
+FROM metrics_histograms
+GROUP BY team_id, metric_name, timestamp;
 
 INSERT INTO metrics_series
-    (team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time)
+    (team_id, id, metric_name, labels_json, min_time, max_time)
 WITH
     0 AS team_id,
     100000 AS series_count,
@@ -186,7 +184,6 @@ WITH
 SELECT
     team_id,
     id,
-    id AS bitmap_id,
     metric_name,
     toJSONString(all_tags) AS labels_json,
     fromUnixTimestamp64Milli(start_ms) AS min_time,
@@ -237,7 +234,7 @@ ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_label_value;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_id_label;
 
 INSERT INTO metrics_samples
-    (team_id, timestamp, id, value, version)
+    (team_id, metric_name, timestamp, id, value, version)
 WITH
     0 AS team_id,
     100000 AS series_count,
@@ -246,6 +243,7 @@ WITH
     15000 AS step_ms
 SELECT
     team_id,
+    'load_requests_total' AS metric_name,
     fromUnixTimestamp64Milli(start_ms + step_ms * sample_index) AS timestamp,
     series_id + 1 AS id,
     toFloat64(1000 + series_id * 100 + sample_index * (1 + series_id % 10)) AS value,
