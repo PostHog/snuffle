@@ -1,135 +1,136 @@
 package snuffle
 
 import (
-	"bufio"
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
-	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
 type ClickHouseClient struct {
-	cfg         Config
-	endpoint    string
-	endpointErr error
-	httpClient  *http.Client
+	conn    clickhouse.Conn
+	connErr error
 }
 
 func NewClickHouseClient(cfg Config) *ClickHouseClient {
-	endpoint, err := clickHouseEndpoint(cfg)
-	return &ClickHouseClient{
-		cfg:         cfg,
-		endpoint:    endpoint,
-		endpointErr: err,
-		httpClient: &http.Client{
-			Timeout: cfg.CHTimeout,
-			Transport: &http.Transport{
-				MaxIdleConns:        512,
-				MaxIdleConnsPerHost: 256,
-				MaxConnsPerHost:     256,
-				IdleConnTimeout:     90 * time.Second,
-			},
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Protocol: clickhouse.Native,
+		Addr:     clickHouseAddrs(cfg),
+		Auth: clickhouse.Auth{
+			Database: cfg.CHDatabase,
+			Username: cfg.CHUser,
+			Password: cfg.CHPassword,
 		},
+		Settings: clickhouse.Settings{
+			"allow_experimental_time_series_aggregate_functions": 1,
+		},
+		Compression:     &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
+		DialTimeout:     cfg.CHTimeout,
+		MaxOpenConns:    32,
+		MaxIdleConns:    8,
+		ConnMaxLifetime: time.Hour,
+	})
+	return &ClickHouseClient{
+		conn:    conn,
+		connErr: err,
 	}
 }
 
-func clickHouseEndpoint(cfg Config) (string, error) {
-	u, err := url.Parse(cfg.CHURL)
-	if err != nil {
-		return "", fmt.Errorf("parse CH_URL: %w", err)
+func clickHouseAddrs(cfg Config) []string {
+	addr := strings.TrimSpace(cfg.CHAddr)
+	if addr == "" {
+		addr = "localhost:9000"
 	}
-	q := u.Query()
-	if cfg.CHDatabase != "" {
-		q.Set("database", cfg.CHDatabase)
+	parts := strings.Split(addr, ",")
+	addrs := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			addrs = append(addrs, part)
+		}
 	}
-	u.RawQuery = q.Encode()
-	return u.String(), nil
+	if len(addrs) == 0 {
+		return []string{"localhost:9000"}
+	}
+	return addrs
 }
 
-func (c *ClickHouseClient) QueryJSONEachRow(ctx context.Context, sql string, handle func(json.RawMessage) error) error {
-	if !strings.Contains(strings.ToUpper(sql), "FORMAT JSONEACHROW") {
-		sql += "\nFORMAT JSONEachRow"
+type clickHouseRow interface {
+	Scan(dest ...any) error
+}
+
+func (c *ClickHouseClient) QueryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) error {
+	if c.connErr != nil {
+		return c.connErr
 	}
-	resp, err := c.doQuery(ctx, sql, "text/plain; charset=utf-8", nil)
+	result, err := c.conn.Query(ctx, sql)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
+	defer result.Close()
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
-	var rows int64
+	var rowCount int64
 	defer func() {
-		recordClickHouseRead(ctx, rows)
+		recordClickHouseRead(ctx, rowCount)
 	}()
-	for scanner.Scan() {
-		line := bytes.TrimSpace(scanner.Bytes())
-		if len(line) == 0 {
-			continue
-		}
-		rows++
-		if err := handle(json.RawMessage(line)); err != nil {
+	for result.Next() {
+		rowCount++
+		if err := handle(result); err != nil {
 			return err
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
+	return result.Err()
 }
 
-func (c *ClickHouseClient) ExecWithBody(ctx context.Context, sql string, body io.Reader) error {
-	resp, err := c.doQuery(ctx, sql, "text/plain; charset=utf-8", body)
+func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
+	if c.connErr != nil {
+		return c.connErr
+	}
+	return c.conn.Exec(ctx, sql)
+}
+
+type clickHouseBatch = driver.Batch
+
+func (c *ClickHouseClient) InsertColumns(ctx context.Context, sql string, appendColumns func(clickHouseBatch) (int, error)) error {
+	if c.connErr != nil {
+		return c.connErr
+	}
+	batch, err := c.conn.PrepareBatch(ctx, sql)
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	_, _ = io.Copy(io.Discard, resp.Body)
+	sent := false
+	defer func() {
+		if !sent {
+			_ = batch.Close()
+		}
+	}()
+	count, err := appendColumns(batch)
+	if err != nil {
+		return err
+	}
+	if count == 0 {
+		sent = true
+		return batch.Close()
+	}
+	if err := batch.Send(); err != nil {
+		return err
+	}
+	sent = true
+	recordClickHouseWrite(ctx, int64(count))
 	return nil
-}
-
-func (c *ClickHouseClient) doQuery(ctx context.Context, sql, contentType string, body io.Reader) (*http.Response, error) {
-	if c.endpointErr != nil {
-		return nil, c.endpointErr
-	}
-	var requestBody io.Reader
-	if body == nil {
-		requestBody = strings.NewReader(sql)
-	} else {
-		requestBody = io.MultiReader(strings.NewReader(sql+"\n"), body)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, requestBody)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", contentType)
-	if c.cfg.CHUser != "" {
-		req.SetBasicAuth(c.cfg.CHUser, c.cfg.CHPassword)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		defer resp.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, fmt.Errorf("clickhouse status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-	return resp, nil
 }
 
 func (c *ClickHouseClient) Ping(ctx context.Context) error {
-	return c.QueryJSONEachRow(ctx, "SELECT 1 AS ok FORMAT JSONEachRow", func(raw json.RawMessage) error {
-		return nil
-	})
+	if c.connErr != nil {
+		return c.connErr
+	}
+	return c.conn.Ping(ctx)
 }
 
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

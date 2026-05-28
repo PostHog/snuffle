@@ -1,3 +1,7 @@
+DROP TABLE IF EXISTS metrics_series_activity_from_histograms_mv SYNC;
+DROP TABLE IF EXISTS metrics_series_activity_from_samples_mv SYNC;
+DROP TABLE IF EXISTS metrics_label_postings_from_label_index_mv SYNC;
+DROP TABLE IF EXISTS metrics_label_postings_from_series_mv SYNC;
 DROP TABLE IF EXISTS metrics_samples SYNC;
 DROP TABLE IF EXISTS metrics_histograms SYNC;
 DROP TABLE IF EXISTS metrics_exemplars SYNC;
@@ -33,7 +37,7 @@ CREATE TABLE metrics_label_index
     team_id UInt64,
     metric_name LowCardinality(String),
     label_name LowCardinality(String),
-    label_value LowCardinality(String),
+    label_value String,
     id UInt64
 )
 ENGINE = ReplacingMergeTree
@@ -130,6 +134,47 @@ ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (team_id, metric_family_name)
 SETTINGS index_granularity = 1024;
 
+CREATE MATERIALIZED VIEW metrics_label_postings_from_series_mv TO metrics_label_postings AS
+SELECT
+    team_id,
+    metric_name,
+    '__name__' AS label_name,
+    metric_name AS label_value,
+    groupBitmapState(bitmap_id) AS ids
+FROM metrics_series
+GROUP BY team_id, metric_name;
+
+CREATE MATERIALIZED VIEW metrics_label_postings_from_label_index_mv TO metrics_label_postings AS
+SELECT
+    idx.team_id,
+    idx.metric_name,
+    idx.label_name,
+    idx.label_value,
+    groupBitmapState(series.bitmap_id) AS ids
+FROM metrics_label_index AS idx
+INNER JOIN metrics_series AS series USING (team_id, id)
+GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value;
+
+CREATE MATERIALIZED VIEW metrics_series_activity_from_samples_mv TO metrics_series_activity AS
+SELECT
+    samples.team_id,
+    series.metric_name,
+    samples.timestamp AS bucket,
+    groupBitmapState(series.bitmap_id) AS ids
+FROM metrics_samples AS samples
+INNER JOIN metrics_series AS series USING (team_id, id)
+GROUP BY samples.team_id, series.metric_name, samples.timestamp;
+
+CREATE MATERIALIZED VIEW metrics_series_activity_from_histograms_mv TO metrics_series_activity AS
+SELECT
+    histograms.team_id,
+    series.metric_name,
+    histograms.timestamp AS bucket,
+    groupBitmapState(series.bitmap_id) AS ids
+FROM metrics_histograms AS histograms
+INNER JOIN metrics_series AS series USING (team_id, id)
+GROUP BY histograms.team_id, series.metric_name, histograms.timestamp;
+
 INSERT INTO metrics_series
     (team_id, id, bitmap_id, metric_name, labels_json, min_time, max_time)
 WITH
@@ -191,37 +236,6 @@ ARRAY JOIN mapKeys(all_tags) AS label_name;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_label_value;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_id_label;
 
-INSERT INTO metrics_label_postings
-SELECT
-    idx.team_id,
-    idx.metric_name,
-    idx.label_name,
-    idx.label_value,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM metrics_label_index AS idx
-INNER JOIN
-(
-    SELECT team_id, id, max(bitmap_id) AS bitmap_id
-    FROM metrics_series
-    GROUP BY team_id, id
-) AS series USING (team_id, id)
-GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value;
-
-INSERT INTO metrics_label_postings
-SELECT
-    series.team_id,
-    series.metric_name,
-    '__name__' AS label_name,
-    series.metric_name AS label_value,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM
-(
-    SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
-    FROM metrics_series
-    GROUP BY team_id, id
-) AS series
-GROUP BY series.team_id, series.metric_name;
-
 INSERT INTO metrics_samples
     (team_id, timestamp, id, value, version)
 WITH
@@ -243,18 +257,3 @@ FROM
         number % samples_per_series AS sample_index
     FROM numbers(series_count * samples_per_series)
 );
-
-INSERT INTO metrics_series_activity
-SELECT
-    samples.team_id,
-    series.metric_name,
-    toStartOfInterval(samples.timestamp, INTERVAL 15 SECOND) AS bucket,
-    groupBitmapState(series.bitmap_id) AS ids
-FROM metrics_samples AS samples
-INNER JOIN
-(
-    SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
-    FROM metrics_series
-    GROUP BY team_id, id
-) AS series USING (team_id, id)
-GROUP BY samples.team_id, series.metric_name, toStartOfInterval(samples.timestamp, INTERVAL 15 SECOND);

@@ -38,7 +38,7 @@ go run ./cmd/snuffle
 Example against the metrics schema:
 
 ```bash
-CH_URL=http://localhost:8123 \
+CH_ADDR=localhost:9000 \
 CH_DATABASE=default \
 CH_SERIES_TABLE=metrics_series \
 CH_SAMPLES_TABLE=metrics_samples \
@@ -89,7 +89,7 @@ The recommended schema is in `scripts/create_metrics_schema.sql`:
   `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
   pruning
 - `metrics_label_postings` and `metrics_series_activity`: bitmap indexes used
-  by generic count/cardinality fast paths
+  by generic count/cardinality fast paths and maintained by materialized views
 - `metrics_histograms`: native histogram samples stored as remote-write
   protobuf payloads with `version`, keyed by `(team_id, id, timestamp)`
 - `metrics_exemplars`: exemplar samples keyed by `(team_id, id, timestamp)`
@@ -124,7 +124,7 @@ query path.
 - `/series` avoids loading samples
 - remote write inserts series metadata, label-index rows, float samples,
   native histograms, exemplars, and metric metadata through ClickHouse
-  `input(...) FORMAT JSONEachRow` body inserts
+  native protocol batches
 - remote write snaps float sample and native histogram timestamps to
   `REMOTE_WRITE_SAMPLE_INTERVAL` bucket starts, default `15s`; `version` keeps
   the latest original sample in each bucket, and query SQL dedupes with
@@ -136,7 +136,8 @@ query path.
 
 Environment variables:
 
-- `CH_URL`: ClickHouse HTTP URL, default `http://localhost:8123/`
+- `CH_ADDR`: ClickHouse native address, default `localhost:9000`; accepts a
+  comma-separated list for multiple replicas
 - `CH_USER`: ClickHouse user, default `default`
 - `CH_PASSWORD`: ClickHouse password
 - `CH_DATABASE`: database, default `default`
@@ -147,7 +148,7 @@ Environment variables:
 - `CH_EXEMPLARS_TABLE`: exemplar table, default `metrics_exemplars`
 - `CH_METRICS_TABLE`: metric metadata table, default
   `metrics_metadata`
-- `CH_TIMEOUT_SECONDS`: ClickHouse HTTP timeout, default `30`
+- `CH_TIMEOUT_SECONDS`: ClickHouse timeout, default `30`
 - `SIDECAR_HOST`: listen host, default `0.0.0.0`
 - `SIDECAR_PORT`: listen port, default `9091`
 - `PROMQL_QUERY_TIMEOUT_SECONDS`: query timeout, default `30`
@@ -185,7 +186,7 @@ docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/creat
 Run the sidecar:
 
 ```bash
-CH_URL=http://localhost:8123 \
+CH_ADDR=localhost:9000 \
 CH_DATABASE=default \
 CH_SERIES_TABLE=metrics_series \
 CH_SAMPLES_TABLE=metrics_samples \

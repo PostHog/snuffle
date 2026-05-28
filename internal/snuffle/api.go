@@ -490,20 +490,18 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 	result := map[string][]metadataResult{}
-	err = s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row struct {
-			MetricFamilyName string `json:"metric_family_name"`
-			Type             string `json:"type"`
-			Unit             string `json:"unit"`
-			Help             string `json:"help"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err = s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var metricFamilyName string
+		var typ string
+		var unit string
+		var help string
+		if err := row.Scan(&metricFamilyName, &typ, &unit, &help); err != nil {
 			return err
 		}
-		result[row.MetricFamilyName] = []metadataResult{{
-			Type: row.Type,
-			Help: row.Help,
-			Unit: row.Unit,
+		result[metricFamilyName] = []metadataResult{{
+			Type: typ,
+			Help: help,
+			Unit: unit,
 		}}
 		return nil
 	})

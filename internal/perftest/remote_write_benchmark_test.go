@@ -1,20 +1,19 @@
 package snuffle
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/golang/snappy"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
@@ -29,7 +28,7 @@ func BenchmarkRemoteWriteFromClickHouse(b *testing.B) {
 	ctx, cancel := context.WithTimeout(context.Background(), envDuration("REMOTE_WRITE_SOURCE_TIMEOUT", 5*time.Minute))
 	defer cancel()
 
-	series, sampleCount, err := loadRemoteWriteSourceSeries(ctx, client)
+	series, sampleCount, err := loadRemoteWriteSourceSeries(ctx)
 	if err != nil {
 		b.Fatalf("load source series: %v", err)
 	}
@@ -63,22 +62,27 @@ func BenchmarkRemoteWriteFromClickHouse(b *testing.B) {
 	b.ReportMetric(float64(len(series)), "series/op")
 }
 
-func loadRemoteWriteSourceSeries(ctx context.Context, client *http.Client) ([]prompb.TimeSeries, int, error) {
-	chURL := envString("REMOTE_WRITE_SOURCE_CH_URL", "http://localhost:8123/")
+func loadRemoteWriteSourceSeries(ctx context.Context) ([]prompb.TimeSeries, int, error) {
+	chAddr := envString("REMOTE_WRITE_SOURCE_CH_ADDR", "localhost:9000")
 	database := envString("REMOTE_WRITE_SOURCE_DATABASE", "snuffle_perf")
+	user := envString("REMOTE_WRITE_SOURCE_USER", "default")
+	password := os.Getenv("REMOTE_WRITE_SOURCE_PASSWORD")
 	teamID := envString("REMOTE_WRITE_SOURCE_TEAM_ID", "42")
 	metric := envString("REMOTE_WRITE_SOURCE_METRIC", "ClickHouseMetrics_Query")
 	start := envString("REMOTE_WRITE_SOURCE_START", "1778398980000")
 	end := envString("REMOTE_WRITE_SOURCE_END", "1778402580000")
 	limit := envInt("REMOTE_WRITE_SOURCE_SERIES_LIMIT", 500, 1)
 
-	endpoint, err := url.Parse(chURL)
+	conn, err := clickhouse.Open(&clickhouse.Options{
+		Protocol:    clickhouse.Native,
+		Addr:        []string{chAddr},
+		Auth:        clickhouse.Auth{Database: database, Username: user, Password: password},
+		Compression: &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
+	})
 	if err != nil {
 		return nil, 0, err
 	}
-	q := endpoint.Query()
-	q.Set("database", database)
-	endpoint.RawQuery = q.Encode()
+	defer conn.Close()
 
 	sql := fmt.Sprintf(`
 WITH selected_series AS
@@ -110,34 +114,24 @@ points AS
 )
 SELECT selected_series.selected_metric_name AS metric_name,
        selected_series.labels_json AS labels_json,
-       groupArray((toUnixTimestamp64Milli(timestamp), value)) AS samples
+       groupArray(toUnixTimestamp64Milli(timestamp)) AS timestamps,
+       groupArray(value) AS values
 FROM points
 INNER JOIN selected_series USING id
-GROUP BY id, metric_name, labels_json
-FORMAT JSONEachRow`,
+GROUP BY id, metric_name, labels_json`,
 		teamID, sqlStringLiteral(metric), start, end, limit, teamID, start, end)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), strings.NewReader(sql))
+	rows, err := conn.Query(ctx, sql)
 	if err != nil {
 		return nil, 0, err
 	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
-		return nil, 0, fmt.Errorf("clickhouse status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
+	defer rows.Close()
 
 	var series []prompb.TimeSeries
 	sampleCount := 0
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
-	for scanner.Scan() {
+	for rows.Next() {
 		var row remoteWriteSourceRow
-		if err := json.Unmarshal(scanner.Bytes(), &row); err != nil {
+		if err := rows.Scan(&row.MetricName, &row.LabelsJSON, &row.Timestamps, &row.Values); err != nil {
 			return nil, 0, err
 		}
 		ts, err := row.timeSeries()
@@ -147,50 +141,38 @@ FORMAT JSONEachRow`,
 		sampleCount += len(ts.Samples)
 		series = append(series, ts)
 	}
-	if err := scanner.Err(); err != nil {
+	if err := rows.Close(); err != nil {
 		return nil, 0, err
 	}
-	return series, sampleCount, nil
+	return series, sampleCount, rows.Err()
 }
 
 type remoteWriteSourceRow struct {
-	MetricName string             `json:"metric_name"`
-	LabelsJSON json.RawMessage    `json:"labels_json"`
-	Samples    []remoteWritePoint `json:"samples"`
+	MetricName string
+	LabelsJSON string
+	Timestamps []int64
+	Values     []float64
 }
 
-type remoteWritePoint struct {
-	Timestamp int64
-	Value     float64
-}
-
-func (p *remoteWritePoint) UnmarshalJSON(raw []byte) error {
-	var tuple []json.RawMessage
-	if err := json.Unmarshal(raw, &tuple); err != nil {
+func parseJSONMap(raw string, target map[string]string) error {
+	if err := json.Unmarshal([]byte(raw), &target); err == nil {
+		return nil
+	}
+	var encoded string
+	if err := json.Unmarshal([]byte(raw), &encoded); err != nil {
 		return err
 	}
-	if len(tuple) != 2 {
-		return fmt.Errorf("sample tuple has %d elements", len(tuple))
+	if encoded == "" {
+		return nil
 	}
-	if err := json.Unmarshal(tuple[0], &p.Timestamp); err != nil {
-		return err
-	}
-	return json.Unmarshal(tuple[1], &p.Value)
+	return json.Unmarshal([]byte(encoded), &target)
 }
 
 func (r remoteWriteSourceRow) timeSeries() (prompb.TimeSeries, error) {
 	labelMap := map[string]string{}
-	if len(r.LabelsJSON) > 0 && string(r.LabelsJSON) != "null" {
-		if err := json.Unmarshal(r.LabelsJSON, &labelMap); err != nil {
-			var encoded string
-			if err2 := json.Unmarshal(r.LabelsJSON, &encoded); err2 != nil {
-				return prompb.TimeSeries{}, err
-			}
-			if encoded != "" {
-				if err := json.Unmarshal([]byte(encoded), &labelMap); err != nil {
-					return prompb.TimeSeries{}, err
-				}
-			}
+	if r.LabelsJSON != "" {
+		if err := parseJSONMap(r.LabelsJSON, labelMap); err != nil {
+			return prompb.TimeSeries{}, err
 		}
 	}
 	labelMap[labels.MetricName] = r.MetricName
@@ -201,17 +183,20 @@ func (r remoteWriteSourceRow) timeSeries() (prompb.TimeSeries, error) {
 	sort.Strings(names)
 	ts := prompb.TimeSeries{
 		Labels:  make([]prompb.Label, 0, len(names)),
-		Samples: make([]prompb.Sample, 0, len(r.Samples)),
+		Samples: make([]prompb.Sample, 0, len(r.Timestamps)),
 	}
 	for _, name := range names {
 		ts.Labels = append(ts.Labels, prompb.Label{Name: name, Value: labelMap[name]})
 	}
-	sort.Slice(r.Samples, func(i, j int) bool {
-		return r.Samples[i].Timestamp < r.Samples[j].Timestamp
-	})
-	for _, sample := range r.Samples {
-		ts.Samples = append(ts.Samples, prompb.Sample{Timestamp: sample.Timestamp, Value: sample.Value})
+	if len(r.Timestamps) != len(r.Values) {
+		return prompb.TimeSeries{}, fmt.Errorf("timestamp/value length mismatch: %d/%d", len(r.Timestamps), len(r.Values))
 	}
+	for i, timestamp := range r.Timestamps {
+		ts.Samples = append(ts.Samples, prompb.Sample{Timestamp: timestamp, Value: r.Values[i]})
+	}
+	sort.Slice(ts.Samples, func(i, j int) bool {
+		return ts.Samples[i].Timestamp < ts.Samples[j].Timestamp
+	})
 	return ts, nil
 }
 

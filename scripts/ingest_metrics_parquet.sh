@@ -12,7 +12,6 @@ CH_PASSWORD="${CH_PASSWORD:-}"
 TEAM_ID="${TEAM_ID:-0}"
 LOCAL_MAX_THREADS="${LOCAL_MAX_THREADS:-8}"
 BUILD_BITMAP_INDEXES="${BUILD_BITMAP_INDEXES:-1}"
-ACTIVITY_BUCKET_SECONDS="${ACTIVITY_BUCKET_SECONDS:-15}"
 
 if [[ ! "$TEAM_ID" =~ ^[0-9]+$ ]]; then
   echo "TEAM_ID must be an unsigned integer" >&2
@@ -26,6 +25,14 @@ fi
 
 echo "Creating metrics_* tables in ${CH_DATABASE}"
 "${client[@]}" --multiquery < "$ROOT_DIR/scripts/create_metrics_schema.sql"
+if [[ "$BUILD_BITMAP_INDEXES" == "0" ]]; then
+  "${client[@]}" --multiquery "
+    DROP TABLE IF EXISTS metrics_series_activity_from_histograms_mv SYNC;
+    DROP TABLE IF EXISTS metrics_series_activity_from_samples_mv SYNC;
+    DROP TABLE IF EXISTS metrics_label_postings_from_label_index_mv SYNC;
+    DROP TABLE IF EXISTS metrics_label_postings_from_series_mv SYNC;
+  "
+fi
 
 echo "Loading metrics_series from $TAGS_FILE"
 clickhouse-local \
@@ -86,43 +93,6 @@ clickhouse-local \
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_label_index FORMAT Native"
 
-if [[ "$BUILD_BITMAP_INDEXES" != "0" ]]; then
-  echo "Building metrics_label_postings"
-  "${client[@]}" --query "
-    INSERT INTO metrics_label_postings
-    SELECT
-      idx.team_id,
-      idx.metric_name,
-      idx.label_name,
-      idx.label_value,
-      groupBitmapState(series.bitmap_id) AS ids
-    FROM metrics_label_index AS idx
-    INNER JOIN
-    (
-      SELECT team_id, id, max(bitmap_id) AS bitmap_id
-      FROM metrics_series
-      GROUP BY team_id, id
-    ) AS series USING (team_id, id)
-    GROUP BY idx.team_id, idx.metric_name, idx.label_name, idx.label_value
-  "
-  "${client[@]}" --query "
-    INSERT INTO metrics_label_postings
-    SELECT
-      series.team_id,
-      series.metric_name,
-      '__name__' AS label_name,
-      series.metric_name AS label_value,
-      groupBitmapState(series.bitmap_id) AS ids
-    FROM
-    (
-      SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
-      FROM metrics_series
-      GROUP BY team_id, id
-    ) AS series
-    GROUP BY series.team_id, series.metric_name
-  "
-fi
-
 echo "Loading metrics_samples from $DATA_FILE"
 clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
@@ -136,26 +106,6 @@ clickhouse-local \
     FROM file('$DATA_FILE', Parquet)
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_samples FORMAT Native"
-
-if [[ "$BUILD_BITMAP_INDEXES" != "0" ]]; then
-  echo "Building metrics_series_activity"
-  "${client[@]}" --query "
-    INSERT INTO metrics_series_activity
-    SELECT
-      samples.team_id,
-      series.metric_name,
-      toStartOfInterval(samples.timestamp, INTERVAL $ACTIVITY_BUCKET_SECONDS SECOND) AS bucket,
-      groupBitmapState(series.bitmap_id) AS ids
-    FROM metrics_samples AS samples
-    INNER JOIN
-    (
-      SELECT team_id, id, any(metric_name) AS metric_name, max(bitmap_id) AS bitmap_id
-      FROM metrics_series
-      GROUP BY team_id, id
-    ) AS series USING (team_id, id)
-    GROUP BY samples.team_id, series.metric_name, toStartOfInterval(samples.timestamp, INTERVAL $ACTIVITY_BUCKET_SECONDS SECOND)
-  "
-fi
 
 echo "Finished ingest. Table sizes:"
 "${client[@]}" --query "

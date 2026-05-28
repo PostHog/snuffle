@@ -2,7 +2,6 @@ package snuffle
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -139,33 +138,29 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 
 func (s *Server) queryRangeGridResults(ctx context.Context, sql string, matchers []*labels.Matcher, start, end time.Time, stepMillis int64) ([]sampleResult, error) {
 	results := make([]sampleResult, 0, 1024)
-	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row struct {
-			MetricName string            `json:"metric_name"`
-			LabelsJSON json.RawMessage   `json:"labels_json"`
-			Vals       []json.RawMessage `json:"vals"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var id uint64
+		var metricName string
+		var labelsJSON string
+		var vals []*float64
+		if err := row.Scan(&id, &metricName, &labelsJSON, &vals); err != nil {
 			return err
 		}
-		metric, ok, err := metricLabelMap(row.MetricName, row.LabelsJSON, matchers)
+		_ = id
+		metric, ok, err := metricLabelMap(metricName, []byte(labelsJSON), matchers)
 		if err != nil || !ok {
 			return err
 		}
-		values := make([][]any, 0, len(row.Vals))
-		for i, rawValue := range row.Vals {
-			if string(rawValue) == "null" {
+		values := make([][]any, 0, len(vals))
+		for i, value := range vals {
+			if value == nil {
 				continue
 			}
 			ts := start.UnixMilli() + int64(i)*stepMillis
 			if ts > end.UnixMilli() {
 				break
 			}
-			value, err := rawFloat(rawValue)
-			if err != nil {
-				return err
-			}
-			values = append(values, []any{float64(ts) / 1000, formatSample(value)})
+			values = append(values, []any{float64(ts) / 1000, formatSample(*value)})
 		}
 		if len(values) > 0 {
 			results = append(results, sampleResult{Metric: metric, Values: values})
@@ -244,7 +239,7 @@ func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.Aggreg
 
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, strconv.FormatInt(evalTime.UnixMilli(), 10)+" AS ts")
+	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
 	selectParts = append(selectParts, aggSQL+" AS value")
 
 	source := aggregateSourceSQL("latest", expr.Grouping, groupJoin)
@@ -350,7 +345,7 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, fmt.Sprintf("%d + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
+	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
 	selectParts = append(selectParts, aggSQL+" AS value")
 
 	groupByParts := append([]string{}, groupBy...)
@@ -371,20 +366,19 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 
 	results := make([]sampleResult, 0, 128)
 	seen := make(map[string]int, 128)
-	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		groupValues := make([]string, len(expr.Grouping))
+		var ts int64
+		var value float64
+		dest := make([]any, 0, len(groupValues)+2)
+		for i := range groupValues {
+			dest = append(dest, &groupValues[i])
+		}
+		dest = append(dest, &ts, &value)
+		if err := row.Scan(dest...); err != nil {
 			return err
 		}
-		value, err := rawFloat(row["value"])
-		if err != nil {
-			return err
-		}
-		ts, err := rawInt64(row["ts"])
-		if err != nil {
-			return err
-		}
-		metric, key := groupingMetricAndKey(row, expr.Grouping)
+		metric, key := groupingMetricAndKeyValues(groupValues, expr.Grouping)
 		idx, ok := seen[key]
 		if !ok {
 			idx = len(results)
@@ -449,17 +443,10 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 
 func (s *Server) queryNestedCountRangeValues(ctx context.Context, sql string) (queryData, error) {
 	values := make([][]any, 0, 128)
-	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return err
-		}
-		value, err := rawFloat(row["value"])
-		if err != nil {
-			return err
-		}
-		ts, err := rawInt64(row["ts"])
-		if err != nil {
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var ts int64
+		var value float64
+		if err := row.Scan(&ts, &value); err != nil {
 			return err
 		}
 		values = append(values, []any{float64(ts) / 1000, formatSample(value)})
@@ -484,7 +471,7 @@ func nestedCountRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []stri
 	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
 
 	return fmt.Sprintf(
-		"WITH selected_series AS (%s), group_labels AS (%s), group_intervals AS (SELECT %s, groupArray((toUnixTimestamp64Milli(min_time), toUnixTimestamp64Milli(max_time))) AS active_ranges FROM selected_series%s GROUP BY %s), active_groups AS (SELECT step_idx FROM group_intervals ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE arrayExists(x -> (tupleElement(x, 2) >= %s AND tupleElement(x, 1) <= %s), active_ranges)) SELECT %d + toInt64(step_idx) * %d AS ts, count() AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
+		"WITH selected_series AS (%s), group_labels AS (%s), group_intervals AS (SELECT %s, groupArray((toUnixTimestamp64Milli(min_time), toUnixTimestamp64Milli(max_time))) AS active_ranges FROM selected_series%s GROUP BY %s), active_groups AS (SELECT step_idx FROM group_intervals ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE arrayExists(x -> (tupleElement(x, 2) >= %s AND tupleElement(x, 1) <= %s), active_ranges)) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
 		selectedSeries,
 		groupLabels,
 		strings.Join(groupSelect, ", "),
@@ -556,7 +543,7 @@ func nestedCountBitmapRangeSQL(cfg Config, matchers []*labels.Matcher, grouping 
 	)
 
 	return fmt.Sprintf(
-		"WITH %s SELECT %d + toInt64(active_selected.step_idx) * %d AS ts, count() AS value FROM active_selected CROSS JOIN label_groups WHERE bitmapAndCardinality(active_selected.bm, label_groups.bm) > 0 GROUP BY active_selected.step_idx ORDER BY active_selected.step_idx",
+		"WITH %s SELECT toInt64(%d) + toInt64(active_selected.step_idx) * %d AS ts, toFloat64(count()) AS value FROM active_selected CROSS JOIN label_groups WHERE bitmapAndCardinality(active_selected.bm, label_groups.bm) > 0 GROUP BY active_selected.step_idx ORDER BY active_selected.step_idx",
 		strings.Join(withParts, ", "),
 		outputStart.UnixMilli(),
 		stepMillis,
@@ -746,7 +733,7 @@ func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser
 	}
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, strconv.FormatInt(evalTime.UnixMilli(), 10)+" AS ts")
+	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
 	selectParts = append(selectParts, aggSQL+" AS value")
 
 	source := aggregateSourceSQL("per_series", expr.Grouping, groupJoin)
@@ -771,21 +758,20 @@ func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser
 
 func (s *Server) queryInstantAggregateResults(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
 	results := make([]sampleResult, 0, 128)
-	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return err
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		groupValues := make([]string, len(grouping))
+		var ts int64
+		var value float64
+		dest := make([]any, 0, len(groupValues)+2)
+		for i := range groupValues {
+			dest = append(dest, &groupValues[i])
 		}
-		value, err := rawFloat(row["value"])
-		if err != nil {
-			return err
-		}
-		ts, err := rawInt64(row["ts"])
-		if err != nil {
+		dest = append(dest, &ts, &value)
+		if err := row.Scan(dest...); err != nil {
 			return err
 		}
 		results = append(results, sampleResult{
-			Metric: groupingMetric(row, grouping),
+			Metric: groupingMetricValues(groupValues, grouping),
 			Value:  []any{float64(ts) / 1000, formatSample(value)},
 		})
 		return nil
@@ -793,16 +779,16 @@ func (s *Server) queryInstantAggregateResults(ctx context.Context, sql string, g
 	return results, err
 }
 
-func groupingMetric(row map[string]json.RawMessage, grouping []string) map[string]string {
-	metric, _ := groupingMetricAndKey(row, grouping)
+func groupingMetricValues(values []string, grouping []string) map[string]string {
+	metric, _ := groupingMetricAndKeyValues(values, grouping)
 	return metric
 }
 
-func groupingMetricAndKey(row map[string]json.RawMessage, grouping []string) (map[string]string, string) {
+func groupingMetricAndKeyValues(values []string, grouping []string) (map[string]string, string) {
 	metric := make(map[string]string, len(grouping))
 	keyParts := make([]string, 0, len(grouping)*2)
 	for i, name := range grouping {
-		value, _ := rawString(row[groupAlias(i)])
+		value := values[i]
 		if value != "" {
 			metric[name] = value
 		}
@@ -850,7 +836,7 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 	seriesLookup := topKSeriesLookupSQL(s.cfg, selector.LabelMatchers)
 	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, window.mint, window.maxt)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), top_series AS (SELECT id, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, %d AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
+		"WITH selected_series AS (%s), top_series AS (SELECT id, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, toInt64(%d) AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
 		selectedSeries,
 		sampleSource,
 		direction,
@@ -861,23 +847,21 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 	)
 
 	results := make([]sampleResult, 0, limit)
-	err := s.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row struct {
-			MetricName string          `json:"metric_name"`
-			LabelsJSON json.RawMessage `json:"labels_json"`
-			TS         int64           `json:"ts"`
-			Value      float64         `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var metricName string
+		var labelsJSON string
+		var ts int64
+		var value float64
+		if err := row.Scan(&metricName, &labelsJSON, &ts, &value); err != nil {
 			return err
 		}
-		metric, _, err := metricLabelMap(row.MetricName, row.LabelsJSON, nil)
+		metric, _, err := metricLabelMap(metricName, []byte(labelsJSON), nil)
 		if err != nil {
 			return err
 		}
 		results = append(results, sampleResult{
 			Metric: metric,
-			Value:  []any{float64(row.TS) / 1000, formatSample(row.Value)},
+			Value:  []any{float64(ts) / 1000, formatSample(value)},
 		})
 		return nil
 	})
@@ -995,7 +979,7 @@ func aggregateSQL(expr *parser.AggregateExpr, valueColumn string) (string, bool)
 	case parser.AVG:
 		return "avg(" + valueColumn + ")", true
 	case parser.COUNT:
-		return "count()", true
+		return "toFloat64(count())", true
 	case parser.MIN:
 		return "min(" + valueColumn + ")", true
 	case parser.MAX:
@@ -1243,40 +1227,4 @@ func labelIndexGroupLabelsSQLWithSelectedFilter(cfg Config, matchers []*labels.M
 
 func groupAlias(index int) string {
 	return fmt.Sprintf("__group_%d", index)
-}
-
-func rawFloat(raw json.RawMessage) (float64, error) {
-	var n float64
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return n, nil
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, err
-	}
-	return strconv.ParseFloat(s, 64)
-}
-
-func rawInt64(raw json.RawMessage) (int64, error) {
-	var n int64
-	if err := json.Unmarshal(raw, &n); err == nil {
-		return n, nil
-	}
-	var f float64
-	if err := json.Unmarshal(raw, &f); err == nil {
-		return int64(f), nil
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return 0, err
-	}
-	return strconv.ParseInt(s, 10, 64)
-}
-
-func rawString(raw json.RawMessage) (string, error) {
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s, nil
-	}
-	return string(raw), nil
 }

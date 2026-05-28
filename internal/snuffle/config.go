@@ -7,7 +7,7 @@ import (
 )
 
 type Config struct {
-	CHURL               string
+	CHAddr              string
 	CHUser              string
 	CHPassword          string
 	CHDatabase          string
@@ -37,7 +37,7 @@ type Config struct {
 
 func ConfigFromEnv() Config {
 	return Config{
-		CHURL:               getenv("CH_URL", "http://localhost:8123/"),
+		CHAddr:              getenv("CH_ADDR", "localhost:9000"),
 		CHUser:              getenv("CH_USER", "default"),
 		CHPassword:          os.Getenv("CH_PASSWORD"),
 		CHDatabase:          getenv("CH_DATABASE", "default"),

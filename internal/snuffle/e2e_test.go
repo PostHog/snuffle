@@ -37,24 +37,24 @@ func TestEndToEndClickHouse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	chURL := e2eClickHouseURL(getenv("SNUFFLE_E2E_CH_URL", "http://localhost:8123/"))
+	chAddr := getenv("SNUFFLE_E2E_CH_ADDR", "localhost:9000")
 	dbName := fmt.Sprintf("snuffle_e2e_%d", time.Now().UnixNano())
 	rootCfg := ConfigFromEnv()
-	rootCfg.CHURL = chURL
+	rootCfg.CHAddr = chAddr
 	rootCfg.CHDatabase = ""
 	rootCfg.CHTimeout = 10 * time.Second
 	rootClient := NewClickHouseClient(rootCfg)
-	if err := rootClient.ExecWithBody(ctx, "CREATE DATABASE "+quoteIdent(dbName), nil); err != nil {
+	if err := rootClient.Exec(ctx, "CREATE DATABASE "+quoteIdent(dbName)); err != nil {
 		t.Fatalf("create e2e database: %v", err)
 	}
 	defer func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cleanupCancel()
-		_ = rootClient.ExecWithBody(cleanupCtx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" SYNC", nil)
+		_ = rootClient.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" SYNC")
 	}()
 
 	cfg := ConfigFromEnv()
-	cfg.CHURL = chURL
+	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
 	cfg.SeriesTable = "metrics_series"
 	cfg.SamplesTable = "metrics_samples"
@@ -100,21 +100,10 @@ func createMetricsSchema(t *testing.T, ctx context.Context, client *ClickHouseCl
 		if statement == "" {
 			continue
 		}
-		if err := client.ExecWithBody(ctx, statement, nil); err != nil {
+		if err := client.Exec(ctx, statement); err != nil {
 			t.Fatalf("execute schema statement %q: %v", statement, err)
 		}
 	}
-}
-
-func e2eClickHouseURL(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return rawURL
-	}
-	query := parsed.Query()
-	query.Set("allow_experimental_time_series_aggregate_functions", "1")
-	parsed.RawQuery = query.Encode()
-	return parsed.String()
 }
 
 func repoRoot(t *testing.T) string {

@@ -2,7 +2,6 @@ package snuffle
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -110,7 +109,7 @@ func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, m
 				teamFilter(q.queryable.cfg),
 				joinUint64(batch),
 			)
-			if err := q.addStringRows(ctx, names, sql, "label_name"); err != nil {
+			if err := q.addStringRows(ctx, names, sql); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -124,7 +123,7 @@ func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, m
 		teamFilter(q.queryable.cfg),
 		sqlLimit(limit),
 	)
-	if err := q.addStringRows(ctx, names, sql, "label_name"); err != nil {
+	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, nil, err
 	}
 	return sortedLimited(names, limit), nil, nil
@@ -158,7 +157,7 @@ func (q *CHQuerier) LabelValues(ctx context.Context, name string, hints *storage
 				sqlString(name),
 				joinUint64(batch),
 			)
-			if err := q.addStringRows(ctx, values, sql, "label_value"); err != nil {
+			if err := q.addStringRows(ctx, values, sql); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -183,20 +182,16 @@ func (q *CHQuerier) LabelValues(ctx context.Context, name string, hints *storage
 			sqlLimit(limit),
 		)
 	}
-	if err := q.addStringRows(ctx, values, sql, "label_value"); err != nil {
+	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, nil, err
 	}
 	return sortedLimited(values, limit), nil, nil
 }
 
-func (q *CHQuerier) addStringRows(ctx context.Context, values map[string]struct{}, sql, field string) error {
-	return q.queryable.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return err
-		}
-		value, err := rawString(row[field])
-		if err != nil {
+func (q *CHQuerier) addStringRows(ctx context.Context, values map[string]struct{}, sql string) error {
+	return q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var value string
+		if err := row.Scan(&value); err != nil {
 			return err
 		}
 		values[value] = struct{}{}
@@ -230,16 +225,14 @@ func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers
 	)
 
 	series := make([]*seriesMeta, 0, 1024)
-	err := q.queryable.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row struct {
-			ID         uint64          `json:"id"`
-			MetricName string          `json:"metric_name"`
-			LabelsJSON json.RawMessage `json:"labels_json"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var id uint64
+		var metricName string
+		var labelsJSON string
+		if err := row.Scan(&id, &metricName, &labelsJSON); err != nil {
 			return err
 		}
-		labelMap, ok, err := metricLabelMap(row.MetricName, row.LabelsJSON, matchers)
+		labelMap, ok, err := metricLabelMap(metricName, json.RawMessage(labelsJSON), matchers)
 		if err != nil {
 			return err
 		}
@@ -247,8 +240,8 @@ func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers
 			return nil
 		}
 		series = append(series, &seriesMeta{
-			id:         row.ID,
-			metricName: row.MetricName,
+			id:         id,
+			metricName: metricName,
 			labelMap:   labelMap,
 			labels:     labels.FromMap(labelMap),
 		})
@@ -279,18 +272,16 @@ func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt in
 	)
 
 	series := make([]*seriesMeta, 0, 1024)
-	err := q.queryable.client.QueryJSONEachRow(ctx, sql, func(raw json.RawMessage) error {
-		var row struct {
-			ID         uint64          `json:"id"`
-			MetricName string          `json:"metric_name"`
-			LabelsJSON json.RawMessage `json:"labels_json"`
-			TS         int64           `json:"ts"`
-			Value      float64         `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var id uint64
+		var metricName string
+		var labelsJSON string
+		var ts int64
+		var value float64
+		if err := row.Scan(&id, &metricName, &labelsJSON, &ts, &value); err != nil {
 			return err
 		}
-		labelMap, ok, err := metricLabelMap(row.MetricName, row.LabelsJSON, matchers)
+		labelMap, ok, err := metricLabelMap(metricName, json.RawMessage(labelsJSON), matchers)
 		if err != nil {
 			return err
 		}
@@ -298,11 +289,11 @@ func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt in
 			return nil
 		}
 		series = append(series, &seriesMeta{
-			id:         row.ID,
-			metricName: row.MetricName,
+			id:         id,
+			metricName: metricName,
 			labelMap:   labelMap,
 			labels:     labels.FromMap(labelMap),
-			samples:    []samplePoint{{t: row.TS, v: row.Value}},
+			samples:    []samplePoint{{t: ts, v: value}},
 		})
 		return nil
 	})
@@ -343,7 +334,7 @@ func (q *CHQuerier) labelNamesFromIndex(ctx context.Context, limit int, matchers
 		sqlLimit(limit),
 	)
 	names := map[string]struct{}{labels.MetricName: {}}
-	if err := q.addStringRows(ctx, names, sql, "label_name"); err != nil {
+	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, true, err
 	}
 	return sortedLimited(names, limit), true, nil
@@ -380,7 +371,7 @@ func (q *CHQuerier) labelValuesFromIndex(ctx context.Context, name string, limit
 		)
 	}
 	values := make(map[string]struct{})
-	if err := q.addStringRows(ctx, values, sql, "label_value"); err != nil {
+	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, true, err
 	}
 	return sortedLimited(values, limit), true, nil
@@ -609,13 +600,13 @@ func (q *CHQuerier) loadSamples(ctx context.Context, series []*seriesMeta, mint,
 
 	if len(series) > q.queryable.cfg.IDChunkSize {
 		if sql, ok := samplesSQLFromMatchers(q.queryable.cfg, matchers, mint, maxt, latestOnly); ok {
-			return q.queryable.client.QueryJSONEachRow(ctx, sql, sampleRowHandler(byID))
+			return q.queryable.client.QueryRows(ctx, sql, sampleRowHandler(byID))
 		}
 	}
 
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
 		sql := samplesSQL(q.queryable.cfg, batch, mint, maxt, latestOnly)
-		err := q.queryable.client.QueryJSONEachRow(ctx, sql, sampleRowHandler(byID))
+		err := q.queryable.client.QueryRows(ctx, sql, sampleRowHandler(byID))
 		if err != nil {
 			return err
 		}
@@ -623,18 +614,16 @@ func (q *CHQuerier) loadSamples(ctx context.Context, series []*seriesMeta, mint,
 	return nil
 }
 
-func sampleRowHandler(byID map[uint64]*seriesMeta) func(json.RawMessage) error {
-	return func(raw json.RawMessage) error {
-		var row struct {
-			ID    uint64  `json:"id"`
-			TS    int64   `json:"ts"`
-			Value float64 `json:"value"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+func sampleRowHandler(byID map[uint64]*seriesMeta) func(clickHouseRow) error {
+	return func(row clickHouseRow) error {
+		var id uint64
+		var ts int64
+		var value float64
+		if err := row.Scan(&id, &ts, &value); err != nil {
 			return err
 		}
-		if s := byID[row.ID]; s != nil {
-			s.samples = append(s.samples, samplePoint{t: row.TS, v: row.Value})
+		if s := byID[id]; s != nil {
+			s.samples = append(s.samples, samplePoint{t: ts, v: value})
 		}
 		return nil
 	}
@@ -648,39 +637,33 @@ func (q *CHQuerier) loadHistograms(ctx context.Context, series []*seriesMeta, mi
 
 	if len(series) > q.queryable.cfg.IDChunkSize {
 		if sql, ok := histogramsSQLFromMatchers(q.queryable.cfg, matchers, mint, maxt); ok {
-			return q.queryable.client.QueryJSONEachRow(ctx, sql, histogramRowHandler(byID))
+			return q.queryable.client.QueryRows(ctx, sql, histogramRowHandler(byID))
 		}
 	}
 
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
 		sql := histogramsSQL(q.queryable.cfg, batch, mint, maxt)
-		if err := q.queryable.client.QueryJSONEachRow(ctx, sql, histogramRowHandler(byID)); err != nil {
+		if err := q.queryable.client.QueryRows(ctx, sql, histogramRowHandler(byID)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func histogramRowHandler(byID map[uint64]*seriesMeta) func(json.RawMessage) error {
-	return func(raw json.RawMessage) error {
-		var row struct {
-			ID           uint64 `json:"id"`
-			TS           int64  `json:"ts"`
-			HistogramB64 string `json:"histogram_b64"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
-			return err
-		}
-		payload, err := base64.StdEncoding.DecodeString(row.HistogramB64)
-		if err != nil {
+func histogramRowHandler(byID map[uint64]*seriesMeta) func(clickHouseRow) error {
+	return func(row clickHouseRow) error {
+		var id uint64
+		var ts int64
+		var payload []byte
+		if err := row.Scan(&id, &ts, &payload); err != nil {
 			return err
 		}
 		var h prompb.Histogram
 		if err := h.Unmarshal(payload); err != nil {
 			return err
 		}
-		if s := byID[row.ID]; s != nil {
-			s.histograms = append(s.histograms, histogramPoint{t: row.TS, h: h})
+		if s := byID[id]; s != nil {
+			s.histograms = append(s.histograms, histogramPoint{t: ts, h: h})
 		}
 		return nil
 	}
@@ -698,7 +681,7 @@ func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, max
 	}
 	where = append(where, idFilters...)
 	return fmt.Sprintf(
-		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(argMax(histogram, version)) AS histogram_b64 FROM %s WHERE %s GROUP BY id, timestamp ORDER BY id, timestamp",
+		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, argMax(histogram, version) AS histogram FROM %s WHERE %s GROUP BY id, timestamp ORDER BY id, timestamp",
 		tableName(cfg.CHDatabase, cfg.HistogramsTable),
 		strings.Join(where, " AND "),
 	), true
@@ -706,7 +689,7 @@ func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, max
 
 func histogramsSQL(cfg Config, ids []uint64, mint, maxt int64) string {
 	return fmt.Sprintf(
-		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, base64Encode(argMax(histogram, version)) AS histogram_b64 FROM %s WHERE %s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
+		"SELECT id, toUnixTimestamp64Milli(timestamp) AS ts, argMax(histogram, version) AS histogram FROM %s WHERE %s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s GROUP BY id, timestamp ORDER BY id, timestamp",
 		tableName(cfg.CHDatabase, cfg.HistogramsTable),
 		teamFilter(cfg),
 		joinUint64(ids),
@@ -729,38 +712,36 @@ func (q *CHQuerier) loadExemplars(ctx context.Context, series []*seriesMeta, min
 			chTimeMillis(mint),
 			chTimeMillis(maxt),
 		)
-		if err := q.queryable.client.QueryJSONEachRow(ctx, sql, exemplarRowHandler(byID)); err != nil {
+		if err := q.queryable.client.QueryRows(ctx, sql, exemplarRowHandler(byID)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func exemplarRowHandler(byID map[uint64]*seriesMeta) func(json.RawMessage) error {
-	return func(raw json.RawMessage) error {
-		var row struct {
-			ID         uint64          `json:"id"`
-			TS         int64           `json:"ts"`
-			Value      float64         `json:"value"`
-			LabelsJSON json.RawMessage `json:"labels_json"`
-		}
-		if err := json.Unmarshal(raw, &row); err != nil {
+func exemplarRowHandler(byID map[uint64]*seriesMeta) func(clickHouseRow) error {
+	return func(row clickHouseRow) error {
+		var id uint64
+		var ts int64
+		var value float64
+		var labelsJSON string
+		if err := row.Scan(&id, &ts, &value, &labelsJSON); err != nil {
 			return err
 		}
-		parsedLabels, err := parseLabelsJSON(row.LabelsJSON)
+		parsedLabels, err := parseLabelsJSON(json.RawMessage(labelsJSON))
 		if err != nil {
 			return err
 		}
 		lbls := labels.FromMap(parsedLabels)
-		if s := byID[row.ID]; s != nil {
+		if s := byID[id]; s != nil {
 			s.exemplars = append(s.exemplars, exemplarPoint{
-				t:      row.TS,
-				value:  row.Value,
+				t:      ts,
+				value:  value,
 				labels: lbls,
 				pb: prompb.Exemplar{
 					Labels:    labelsToPrompb(lbls),
-					Value:     row.Value,
-					Timestamp: row.TS,
+					Value:     value,
+					Timestamp: ts,
 				},
 			})
 		}
