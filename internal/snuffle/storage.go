@@ -304,6 +304,9 @@ func (q *CHQuerier) selectActiveSeriesJSON(ctx context.Context, mint, maxt int64
 }
 
 func seriesTimeFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
+	if metric := exactMetricName(matchers); metric != "" && cfg.SamplesTable != "" {
+		return []string{"id IN (" + activeSeriesIDsSQL(cfg, matchers, mint, maxt) + ")"}
+	}
 	if cfg.ActivityTable == "" {
 		return []string{
 			fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
@@ -330,7 +333,7 @@ func activeSeriesIDsSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64
 	}
 	where = append(where, metricNameConstraints(matchers)...)
 	return fmt.Sprintf(
-		"SELECT arrayJoin(bitmapToArray(groupBitmapOrState(ids))) AS id FROM %s WHERE %s",
+		"SELECT DISTINCT arrayJoin(ids) AS id FROM %s WHERE %s",
 		tableName(cfg.CHDatabase, cfg.ActivityTable),
 		strings.Join(where, " AND "),
 	)

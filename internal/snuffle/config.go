@@ -3,6 +3,7 @@ package snuffle
 import (
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -33,6 +34,7 @@ type Config struct {
 	DefaultTeamID       uint64
 	TeamHeader          string
 	TeamQueryParam      string
+	Pprof               bool
 }
 
 func ConfigFromEnv() Config {
@@ -44,8 +46,8 @@ func ConfigFromEnv() Config {
 		SeriesTable:         getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", "metrics_series")),
 		SamplesTable:        getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", "metrics_samples")),
 		LabelIndexTable:     getenv("CH_LABEL_INDEX_TABLE", "metrics_label_index"),
-		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", "metrics_label_postings"),
-		ActivityTable:       getenv("CH_ACTIVITY_TABLE", "metrics_series_activity"),
+		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", ""),
+		ActivityTable:       getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:        getenv("CH_METRICS_TABLE", "metrics_metadata"),
 		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", "metrics_histograms"),
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", "metrics_exemplars"),
@@ -63,6 +65,7 @@ func ConfigFromEnv() Config {
 		DefaultTeamID:       envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0),
 		TeamHeader:          getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:      getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
+		Pprof:               envBool("SNUFFLE_PPROF", false),
 	}
 }
 
@@ -95,6 +98,20 @@ func envUint64(key string, fallback uint64) uint64 {
 		return fallback
 	}
 	return parsed
+}
+
+func envBool(key string, fallback bool) bool {
+	value := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch value {
+	case "":
+		return fallback
+	case "1", "true", "yes", "y", "on":
+		return true
+	case "0", "false", "no", "n", "off":
+		return false
+	default:
+		return fallback
+	}
 }
 
 func envDurationSeconds(key string, fallback time.Duration) time.Duration {

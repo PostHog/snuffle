@@ -190,3 +190,51 @@ func TestNestedCountBitmapRangeSQLUsesPostingBitmaps(t *testing.T) {
 		}
 	}
 }
+
+func TestNestedCountSamplesRangeSQLUsesSamplesAndLabelIndex(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SamplesTable:    "samples",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		LookbackDelta:   5 * time.Minute,
+		TeamID:          42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count(node_cpu_seconds_total{type=~".*", ready=~"true"}) by (cpu))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	start := time.Unix(1778398980, 0).UTC()
+	stepMillis := time.Minute.Milliseconds()
+	sql, ok := nestedCountSamplesRangeSQL(cfg, selector.LabelMatchers, inner.Grouping, start, start, stepMillis, 61, cfg.LookbackDelta)
+	if !ok {
+		t.Fatal("nestedCountSamplesRangeSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"`default`.`samples`",
+		"`default`.`label_index`",
+		"metric_name = 'node_cpu_seconds_total'",
+		"label_name = 'ready'",
+		"label_name = 'cpu'",
+		"active_ids AS",
+		"active_groups AS",
+		"range(toUInt64(61))",
+		"GROUP BY step_idx, id",
+		"ANY LEFT JOIN",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"series_activity", "label_postings", "groupBitmap"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}

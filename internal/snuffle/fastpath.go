@@ -477,6 +477,14 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 	if steps <= 0 {
 		return queryData{}, false, nil
 	}
+	if sql, ok := nestedCountSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
+		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+		data, err := s.queryNestedCountRangeValues(ctx, sql)
+		if err != nil {
+			return queryData{}, true, err
+		}
+		return data, true, nil
+	}
 	if sql, ok := nestedCountBitmapRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
 		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 		data, err := s.queryNestedCountRangeValues(ctx, sql)
@@ -497,6 +505,58 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 
 	data, err := s.queryNestedCountRangeValues(ctx, sql)
 	return data, true, err
+}
+
+func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
+	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName {
+		return "", false
+	}
+	metric := exactMetricName(matchers)
+	if metric == "" {
+		return "", false
+	}
+	idFilters, ok := sampleIDFiltersFromMatchers(cfg, matchers, evalStart.UnixMilli(), outputStart.UnixMilli()+((steps-1)*stepMillis))
+	if !ok {
+		return "", false
+	}
+
+	evalMillisExpr := fmt.Sprintf("(%d + toInt64(step_idx) * %d)", evalStart.UnixMilli(), stepMillis)
+	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
+	sampleStart := evalStart.Add(-lookback)
+	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
+	sampleWhere := []string{
+		teamFilter(cfg),
+		"metric_name = " + sqlString(metric),
+		"timestamp >= " + chTimeMillis(sampleStart.UnixMilli()),
+		"timestamp <= " + chTimeMillis(sampleEnd.UnixMilli()),
+	}
+	sampleWhere = append(sampleWhere, idFilters...)
+
+	groupName := grouping[0]
+	groupColumn := quoteIdent(groupAlias(0))
+	groupLabels := fmt.Sprintf(
+		"SELECT id, label_value AS %s FROM %s WHERE %s AND metric_name = %s AND label_name = %s",
+		groupColumn,
+		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+		teamFilter(cfg),
+		sqlString(metric),
+		sqlString(groupName),
+	)
+
+	return fmt.Sprintf(
+		"WITH active_ids AS (SELECT step_idx, id FROM (SELECT id, toUnixTimestamp64Milli(timestamp) AS ts FROM %s WHERE %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE ts >= %s AND ts <= %s GROUP BY step_idx, id), active_groups AS (SELECT step_idx, ifNull(%s, '') AS %s FROM active_ids ANY LEFT JOIN (%s) AS group_labels USING id GROUP BY step_idx, %s) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
+		steps,
+		lookbackStartExpr,
+		evalMillisExpr,
+		groupColumn,
+		groupColumn,
+		groupLabels,
+		groupColumn,
+		outputStart.UnixMilli(),
+		stepMillis,
+	), true
 }
 
 func (s *Server) queryNestedCountRangeValues(ctx context.Context, sql string) (queryData, error) {
@@ -567,13 +627,13 @@ func nestedCountBitmapRangeSQL(cfg Config, matchers []*labels.Matcher, grouping 
 	withParts = append(withParts,
 		fmt.Sprintf("selected_ids AS (SELECT %s AS bm FROM %s)", selectedExpr, selectedFrom),
 		fmt.Sprintf(
-			"active_by_step AS (SELECT step_idx, groupBitmapOrState(ids) AS bm FROM %s ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE %s AND metric_name = %s AND bucket >= %s AND bucket <= %s AND toUnixTimestamp64Milli(bucket) >= %s AND toUnixTimestamp64Milli(bucket) <= %s GROUP BY step_idx)",
+			"active_by_step AS (SELECT step_idx, groupBitmapState(id) AS bm FROM (SELECT bucket, arrayJoin(ids) AS id FROM %s WHERE %s AND metric_name = %s AND bucket >= %s AND bucket <= %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE toUnixTimestamp64Milli(bucket) >= %s AND toUnixTimestamp64Milli(bucket) <= %s GROUP BY step_idx)",
 			tableName(cfg.CHDatabase, cfg.ActivityTable),
-			steps,
 			teamFilter(cfg),
 			sqlString(metric),
 			chTimeMillis(activityStart.UnixMilli()),
 			chTimeMillis(activityEnd.UnixMilli()),
+			steps,
 			lookbackStartExpr,
 			evalMillisExpr,
 		),

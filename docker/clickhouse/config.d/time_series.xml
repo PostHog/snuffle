@@ -2,5 +2,6 @@
     <logger>
         <level>information</level>
     </logger>
+    <background_pool_size>2</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>16</background_merges_mutations_concurrency_ratio>
 </clickhouse>
-

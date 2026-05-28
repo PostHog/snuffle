@@ -88,8 +88,6 @@ The recommended schema is in `scripts/create_metrics_schema.sql`:
 - `metrics_label_index`: inverted label index
   `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
   pruning
-- `metrics_label_postings` and `metrics_series_activity`: bitmap indexes used
-  by generic count/cardinality fast paths and maintained by materialized views
 - `metrics_histograms`: native histogram samples stored as remote-write
   protobuf payloads with `metric_name` and `version`, keyed by
   `(team_id, id, timestamp)`

@@ -44,18 +44,6 @@ ENGINE = ReplacingMergeTree
 ORDER BY (team_id, metric_name, label_name, label_value, id)
 SETTINGS index_granularity = 1024, deduplicate_merge_projection_mode = 'rebuild';
 
-CREATE TABLE metrics_label_postings
-(
-    team_id UInt64,
-    metric_name LowCardinality(String),
-    label_name LowCardinality(String),
-    label_value String,
-    ids AggregateFunction(groupBitmap, UInt64)
-)
-ENGINE = AggregatingMergeTree
-ORDER BY (team_id, metric_name, label_name, label_value)
-SETTINGS index_granularity = 128;
-
 ALTER TABLE metrics_label_index
     ADD PROJECTION by_label_value
     (
@@ -83,18 +71,6 @@ ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (team_id, metric_name, id, timestamp)
 SETTINGS index_granularity = 1024;
-
-CREATE TABLE metrics_series_activity
-(
-    team_id UInt64,
-    metric_name LowCardinality(String),
-    bucket DateTime64(3, 'UTC'),
-    ids AggregateFunction(groupBitmap, UInt64)
-)
-ENGINE = AggregatingMergeTree
-PARTITION BY toYYYYMMDD(bucket)
-ORDER BY (team_id, metric_name, bucket)
-SETTINGS index_granularity = 128;
 
 CREATE TABLE metrics_histograms
 (
@@ -136,16 +112,6 @@ ENGINE = ReplacingMergeTree(updated_at)
 ORDER BY (team_id, metric_family_name)
 SETTINGS index_granularity = 1024;
 
-CREATE MATERIALIZED VIEW metrics_label_postings_from_series_mv TO metrics_label_postings AS
-SELECT
-    team_id,
-    metric_name,
-    '__name__' AS label_name,
-    metric_name AS label_value,
-    groupBitmapState(id) AS ids
-FROM metrics_series
-GROUP BY team_id, metric_name;
-
 CREATE MATERIALIZED VIEW metrics_label_index_from_series_mv TO metrics_label_index AS
 SELECT
     team_id,
@@ -155,31 +121,3 @@ SELECT
     id
 FROM metrics_series
 ARRAY JOIN JSONExtractKeysAndValues(labels_json, 'String') AS label_pair;
-
-CREATE MATERIALIZED VIEW metrics_label_postings_from_label_index_mv TO metrics_label_postings AS
-SELECT
-    team_id,
-    metric_name,
-    label_name,
-    label_value,
-    groupBitmapState(id) AS ids
-FROM metrics_label_index
-GROUP BY team_id, metric_name, label_name, label_value;
-
-CREATE MATERIALIZED VIEW metrics_series_activity_from_samples_mv TO metrics_series_activity AS
-SELECT
-    team_id,
-    metric_name,
-    timestamp AS bucket,
-    groupBitmapState(id) AS ids
-FROM metrics_samples
-GROUP BY team_id, metric_name, timestamp;
-
-CREATE MATERIALIZED VIEW metrics_series_activity_from_histograms_mv TO metrics_series_activity AS
-SELECT
-    team_id,
-    metric_name,
-    timestamp AS bucket,
-    groupBitmapState(id) AS ids
-FROM metrics_histograms
-GROUP BY team_id, metric_name, timestamp;

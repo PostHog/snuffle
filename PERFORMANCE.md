@@ -104,12 +104,13 @@ Lower is better. A value under `1.0` means the current run is faster overall.
 
 ### Current Reference Result
 
-The latest accepted local run used the default TSBS settings and wrote about
-24.24 million rows:
+The latest accepted local run used the default TSBS settings, the local
+ClickHouse container capped at 2 CPUs, and wrote about 24.24 million rows:
 
-- ingest: about `1.07M rows/s`
-- query geomean: about `15.7 ms`
-- query total average: about `129 ms`
+- ingest: about `2.16M rows/s`
+- query geomean: about `114 ms`
+- query total average: about `1.60 s` across 11 scenarios, including nested
+  counts
 
 Treat these as regression numbers for this development machine, not as capacity
 claims for production hardware.
@@ -333,6 +334,15 @@ bridge therefore avoids `Map` for labels.
 These commands are useful for ad-hoc checks, but `make perf-test` is the
 accepted regression benchmark.
 
+To capture a sidecar CPU profile during a replay, start `snuffle` with
+`SNUFFLE_PPROF=1` and collect:
+
+```bash
+curl -fsS 'http://127.0.0.1:9091/debug/pprof/profile?seconds=45' \
+  -o .perf/snuffle.cpu.pprof
+go tool pprof -top .perf/snuffle.cpu.pprof
+```
+
 For the older hand-seeded large profile:
 
 ```bash
@@ -357,8 +367,6 @@ The Go sidecar uses Prometheus's native PromQL engine and the metrics schema:
 - `metrics_series`
 - `metrics_samples`
 - `metrics_label_index`
-- `metrics_label_postings`
-- `metrics_series_activity`
 - `metrics_histograms`
 - `metrics_exemplars`
 - `metrics_metadata`
@@ -373,6 +381,11 @@ Implemented storage optimizations:
 - tenant pruning through `team_id` in every table and query
 - arbitrary positive label matcher pruning through `label_index`
 - label-index projections for matcher lookup and group-label lookup
+- sample and label posting bitmap materialization is not on the default write
+  path; exact metric active-series checks read the samples table directly
+- exact-metric nested counts read the samples table directly for the query
+  window and join `label_index`, avoiding stale series bounds and expensive
+  bitmap intersections
 - exact Prometheus matcher semantics are preserved by a final Go-side matcher
   filter
 - instant aggregate/topk paths read the exact remote-write bucket when

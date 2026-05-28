@@ -171,6 +171,86 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	}
 }
 
+func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: labels.MetricName, Value: "up"},
+			{Name: "instance", Value: "host-1"},
+			{Name: "job", Value: "api"},
+		},
+		Samples: []prompb.Sample{
+			{Timestamp: 1_000, Value: 1},
+			{Timestamp: 16_000, Value: 2},
+			{Timestamp: 17_000, Value: math.NaN()},
+		},
+	}}}
+	payload, err := req.Marshal()
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	batch, ok, err := buildRemoteWriteBatchFromProto(payload, 15*time.Second, 7)
+	if err != nil {
+		t.Fatalf("buildRemoteWriteBatchFromProto returned error: %v", err)
+	}
+	if !ok {
+		t.Fatal("buildRemoteWriteBatchFromProto did not use fast path")
+	}
+	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.histogramCount != 0 || batch.exemplarCount != 0 || batch.metadataCount != 0 {
+		t.Fatalf("counts = series %d samples %d histograms %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.histogramCount, batch.exemplarCount, batch.metadataCount)
+	}
+	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 1 || got.Versions[0] != 1000 {
+		t.Fatalf("unexpected first sample columns: %#v", got)
+	}
+	if got := batch.sampleColumns; got.Timestamps[1] != 15000 || got.Values[1] != 2 || got.Versions[1] != 16000 {
+		t.Fatalf("unexpected second sample columns: %#v", got)
+	}
+	if got := batch.seriesRecords[0]; got.TeamID != 7 || got.MetricName != "up" || got.MinMS != 0 || got.MaxMS != 15000 || len(got.Labels) != 0 || got.LabelsJSON != "" {
+		t.Fatalf("unexpected series row: %#v", got)
+	}
+	if err := populateSeriesLabelsJSONFromProto(batch.fastProto, batch.seriesRecords); err != nil {
+		t.Fatalf("populate fast labels json: %v", err)
+	}
+	if got := batch.seriesRecords[0].LabelsJSON; !strings.Contains(got, `"instance":"host-1"`) || !strings.Contains(got, `"job":"api"`) || strings.Contains(got, "__name__") {
+		t.Fatalf("unexpected fast labels json: %s", got)
+	}
+}
+
+func TestBuildRemoteWriteBatchFromProtoFallsBackForComplexMessages(t *testing.T) {
+	for name, req := range map[string]*prompb.WriteRequest{
+		"metadata": {
+			Metadata: []prompb.MetricMetadata{{MetricFamilyName: "up", Type: prompb.MetricMetadata_GAUGE}},
+		},
+		"histogram": {
+			Timeseries: []prompb.TimeSeries{{
+				Labels: []prompb.Label{{Name: labels.MetricName, Value: "latency"}},
+				Histograms: []prompb.Histogram{{
+					Count:     &prompb.Histogram_CountInt{CountInt: 1},
+					Sum:       1,
+					ZeroCount: &prompb.Histogram_ZeroCountInt{ZeroCountInt: 1},
+					Timestamp: 1000,
+				}},
+			}},
+		},
+		"exemplar": {
+			Timeseries: []prompb.TimeSeries{{
+				Labels:    []prompb.Label{{Name: labels.MetricName, Value: "up"}},
+				Exemplars: []prompb.Exemplar{{Value: 1, Timestamp: 1000}},
+			}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			payload, err := req.Marshal()
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			if _, ok, err := buildRemoteWriteBatchFromProto(payload, 15*time.Second, 0); err != nil || ok {
+				t.Fatalf("buildRemoteWriteBatchFromProto = ok %v err %v, want fallback without error", ok, err)
+			}
+		})
+	}
+}
+
 func TestRemoteWritePhaseErrorIncludesUsefulContext(t *testing.T) {
 	err := remoteWritePhaseError(
 		"insert samples",

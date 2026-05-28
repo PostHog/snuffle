@@ -11,7 +11,6 @@ CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 TEAM_ID="${TEAM_ID:-0}"
 LOCAL_MAX_THREADS="${LOCAL_MAX_THREADS:-8}"
-BUILD_BITMAP_INDEXES="${BUILD_BITMAP_INDEXES:-1}"
 
 if [[ ! "$TEAM_ID" =~ ^[0-9]+$ ]]; then
   echo "TEAM_ID must be an unsigned integer" >&2
@@ -25,15 +24,6 @@ fi
 
 echo "Creating metrics_* tables in ${CH_DATABASE}"
 "${client[@]}" --multiquery < "$ROOT_DIR/scripts/create_metrics_schema.sql"
-if [[ "$BUILD_BITMAP_INDEXES" == "0" ]]; then
-  "${client[@]}" --multiquery "
-    DROP TABLE IF EXISTS metrics_series_activity_from_histograms_mv SYNC;
-    DROP TABLE IF EXISTS metrics_series_activity_from_samples_mv SYNC;
-    DROP TABLE IF EXISTS metrics_label_postings_from_label_index_mv SYNC;
-    DROP TABLE IF EXISTS metrics_label_postings_from_series_mv SYNC;
-  "
-fi
-
 echo "Loading metrics_series from $TAGS_FILE"
 clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \
@@ -109,7 +99,7 @@ echo "Finished ingest. Table sizes:"
     formatReadableQuantity(sum(rows)) AS rows,
     formatReadableSize(sum(bytes_on_disk)) AS bytes
   FROM system.parts
-  WHERE active AND database = currentDatabase() AND table IN ('metrics_series', 'metrics_label_index', 'metrics_label_postings', 'metrics_samples', 'metrics_series_activity', 'metrics_histograms', 'metrics_exemplars', 'metrics_metadata')
+  WHERE active AND database = currentDatabase() AND table IN ('metrics_series', 'metrics_label_index', 'metrics_samples', 'metrics_histograms', 'metrics_exemplars', 'metrics_metadata')
   GROUP BY table
   ORDER BY table
   FORMAT PrettyCompact

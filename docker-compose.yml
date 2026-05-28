@@ -2,6 +2,7 @@ services:
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: snuffle-clickhouse
+    cpus: 2.0
     environment:
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: ""

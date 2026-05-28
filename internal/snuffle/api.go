@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math"
 	"net/http"
+	"net/http/pprof"
 	"sort"
 	"strconv"
 	"strings"
@@ -80,11 +81,28 @@ func newServer(cfg Config) *Server {
 func (s *Server) routes(mux *http.ServeMux) {
 	mux.HandleFunc("/-/healthy", s.handleHealthy)
 	mux.HandleFunc("/-/ready", s.handleHealthy)
+	if s.cfg.Pprof {
+		registerPprofRoutes(mux)
+	}
 
 	api := s.apiRoutes()
 	mux.Handle("/api/v1/", api)
 	mux.HandleFunc("/t/", s.handleTeamPath(api))
 	mux.HandleFunc("/team/", s.handleTeamPath(api))
+}
+
+func registerPprofRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/debug/pprof/", pprof.Index)
+	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	mux.Handle("/debug/pprof/allocs", pprof.Handler("allocs"))
+	mux.Handle("/debug/pprof/block", pprof.Handler("block"))
+	mux.Handle("/debug/pprof/goroutine", pprof.Handler("goroutine"))
+	mux.Handle("/debug/pprof/heap", pprof.Handler("heap"))
+	mux.Handle("/debug/pprof/mutex", pprof.Handler("mutex"))
+	mux.Handle("/debug/pprof/threadcreate", pprof.Handler("threadcreate"))
 }
 
 func (s *Server) apiRoutes() *http.ServeMux {
