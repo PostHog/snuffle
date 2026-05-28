@@ -9,9 +9,6 @@ paths for common high-cardinality query shapes. It does not call ClickHouse
 
 ## Supported Endpoints
 
-By default the Prometheus API prefix is `/api/v1` and the remote-write path is
-`/write`. Both can be configured.
-
 - `GET|POST /api/v1/query`
 - `GET|POST /api/v1/query_range`
 - `GET|POST /api/v1/labels`
@@ -19,7 +16,7 @@ By default the Prometheus API prefix is `/api/v1` and the remote-write path is
 - `GET|POST /api/v1/series`
 - `GET|POST /api/v1/metadata`
 - `GET|POST /api/v1/query_exemplars`
-- `POST /write`
+- `POST /api/v1/write`
 - `POST /api/v1/read`
 - `GET /-/healthy`
 - `GET /-/ready`
@@ -153,10 +150,6 @@ Environment variables:
 - `CH_TIMEOUT_SECONDS`: ClickHouse HTTP timeout, default `30`
 - `SIDECAR_HOST`: listen host, default `0.0.0.0`
 - `SIDECAR_PORT`: listen port, default `9091`
-- `SNUFFLE_API_PATH_PREFIX`: Prometheus API path prefix, default `/api/v1`
-- `SNUFFLE_REMOTE_WRITE_PATH`: remote-write path, default `/write`
-- `SNUFFLE_REMOTE_READ_PATH`: remote-read path, default
-  `<SNUFFLE_API_PATH_PREFIX>/read`
 - `PROMQL_QUERY_TIMEOUT_SECONDS`: query timeout, default `30`
 - `PROMQL_LOOKBACK_DELTA`: lookback delta, default `5m`
 - `PROMQL_MAX_SAMPLES`: Prometheus engine sample limit, default `50000000`
@@ -171,10 +164,9 @@ Environment variables:
 - `SNUFFLE_TEAM_HEADER`: tenant header, default `X-Team-ID`
 - `SNUFFLE_TEAM_QUERY_PARAM`: tenant query parameter, default `team_id`
 
-Tenant precedence is `/t/{team_id}/...` or `/team/{team_id}/...`, then the
-configured header, then the configured query parameter, then
-`SNUFFLE_DEFAULT_TEAM_ID`. For example, the defaults accept
-`/t/42/api/v1/query` and `/t/42/write`.
+Tenant precedence is `/t/{team_id}/api/v1/...` or
+`/team/{team_id}/api/v1/...`, then the configured header, then the configured
+query parameter, then `SNUFFLE_DEFAULT_TEAM_ID`.
 
 ## Docker Demo
 

@@ -38,39 +38,3 @@ func TestConfigFromEnvTeamSettings(t *testing.T) {
 		t.Fatalf("TeamQueryParam = %q", cfg.TeamQueryParam)
 	}
 }
-
-func TestConfigFromEnvEndpointPaths(t *testing.T) {
-	t.Setenv("SNUFFLE_API_PATH_PREFIX", "")
-	t.Setenv("SNUFFLE_REMOTE_WRITE_PATH", "")
-	t.Setenv("SNUFFLE_REMOTE_READ_PATH", "")
-
-	cfg := ConfigFromEnv()
-	if cfg.APIPathPrefix != "/api/v1" {
-		t.Fatalf("default APIPathPrefix = %q, want /api/v1", cfg.APIPathPrefix)
-	}
-	if cfg.RemoteWritePath != "/write" {
-		t.Fatalf("default RemoteWritePath = %q, want /write", cfg.RemoteWritePath)
-	}
-	if cfg.RemoteReadPath != "/api/v1/read" {
-		t.Fatalf("default RemoteReadPath = %q, want /api/v1/read", cfg.RemoteReadPath)
-	}
-
-	t.Setenv("SNUFFLE_API_PATH_PREFIX", "prom")
-	t.Setenv("SNUFFLE_REMOTE_WRITE_PATH", "ingest/")
-	cfg = ConfigFromEnv()
-	if cfg.APIPathPrefix != "/prom" {
-		t.Fatalf("configured APIPathPrefix = %q, want /prom", cfg.APIPathPrefix)
-	}
-	if cfg.RemoteWritePath != "/ingest" {
-		t.Fatalf("configured RemoteWritePath = %q, want /ingest", cfg.RemoteWritePath)
-	}
-	if cfg.RemoteReadPath != "/prom/read" {
-		t.Fatalf("derived RemoteReadPath = %q, want /prom/read", cfg.RemoteReadPath)
-	}
-
-	t.Setenv("SNUFFLE_REMOTE_READ_PATH", "remote-read")
-	cfg = ConfigFromEnv()
-	if cfg.RemoteReadPath != "/remote-read" {
-		t.Fatalf("configured RemoteReadPath = %q, want /remote-read", cfg.RemoteReadPath)
-	}
-}

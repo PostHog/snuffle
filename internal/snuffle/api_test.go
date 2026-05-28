@@ -1,9 +1,7 @@
 package snuffle
 
 import (
-	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
@@ -47,51 +45,4 @@ func TestTeamIDFromRequest(t *testing.T) {
 	if got, err := server.teamIDFromRequest(req); err != nil || got != 9 {
 		t.Fatalf("header team = (%d, %v), want 9", got, err)
 	}
-}
-
-func TestEndpointPathsDefaultRemoteWrite(t *testing.T) {
-	mux := http.NewServeMux()
-	(&Server{}).routes(mux)
-
-	if status := routeStatus(mux, http.MethodPost, "/write"); status != http.StatusBadRequest {
-		t.Fatalf("POST /write status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if status := routeStatus(mux, http.MethodPost, "/api/v1/write"); status != http.StatusNotFound {
-		t.Fatalf("POST /api/v1/write status = %d, want %d", status, http.StatusNotFound)
-	}
-	if status := routeStatus(mux, http.MethodGet, "/api/v1/query"); status != http.StatusBadRequest {
-		t.Fatalf("GET /api/v1/query status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if status := routeStatus(mux, http.MethodPost, "/t/42/write"); status != http.StatusBadRequest {
-		t.Fatalf("POST /t/42/write status = %d, want %d", status, http.StatusBadRequest)
-	}
-}
-
-func TestEndpointPathsCustom(t *testing.T) {
-	server := &Server{cfg: Config{
-		APIPathPrefix:   "prometheus",
-		RemoteWritePath: "ingest",
-	}}
-	mux := http.NewServeMux()
-	server.routes(mux)
-
-	if status := routeStatus(mux, http.MethodGet, "/prometheus/query"); status != http.StatusBadRequest {
-		t.Fatalf("GET /prometheus/query status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if status := routeStatus(mux, http.MethodPost, "/ingest"); status != http.StatusBadRequest {
-		t.Fatalf("POST /ingest status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if status := routeStatus(mux, http.MethodPost, "/t/42/ingest"); status != http.StatusBadRequest {
-		t.Fatalf("POST /t/42/ingest status = %d, want %d", status, http.StatusBadRequest)
-	}
-	if status := routeStatus(mux, http.MethodGet, "/api/v1/query"); status != http.StatusNotFound {
-		t.Fatalf("GET /api/v1/query status = %d, want %d", status, http.StatusNotFound)
-	}
-}
-
-func routeStatus(handler http.Handler, method, path string) int {
-	req := httptest.NewRequest(method, path, strings.NewReader("not-snappy"))
-	rec := httptest.NewRecorder()
-	handler.ServeHTTP(rec, req)
-	return rec.Code
 }
