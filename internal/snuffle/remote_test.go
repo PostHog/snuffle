@@ -40,25 +40,18 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.labelCount != 2 || batch.exemplarCount != 1 || batch.metadataCount != 1 {
-		t.Fatalf("counts = series %d samples %d labels %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.exemplarCount, batch.metadataCount)
+	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.exemplarCount != 1 || batch.metadataCount != 1 {
+		t.Fatalf("counts = series %d samples %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.exemplarCount, batch.metadataCount)
 	}
 	if len(batch.seriesRecords) != 1 {
 		t.Fatalf("seriesRecords length = %d, want 1", len(batch.seriesRecords))
 	}
+	if err := populateSeriesLabelsJSON(batch.seriesRecords); err != nil {
+		t.Fatalf("populate labels json: %v", err)
+	}
 	seriesRow := batch.seriesRecords[0]
 	if seriesRow.TeamID != 7 || seriesRow.MetricName != "http_requests_total" || seriesRow.MinMS != 1000 || seriesRow.MaxMS != 2000 || !strings.HasPrefix(seriesRow.LabelsJSON, "{") {
 		t.Fatalf("unexpected series row: %#v", seriesRow)
-	}
-	for _, want := range []string{"job", "instance"} {
-		if !remoteWriteLabelRowsContain(batch.labelIndexRows, want) {
-			t.Fatalf("label rows %#v do not contain %q", batch.labelIndexRows, want)
-		}
-	}
-	for _, row := range batch.labelIndexRows {
-		if row.LabelName == labels.MetricName {
-			t.Fatalf("label index rows should not include metric name: %#v", batch.labelIndexRows)
-		}
 	}
 	if len(batch.exemplarRows) != 1 || !strings.Contains(batch.exemplarRows[0].LabelsJSON, `"trace_id":"abc"`) {
 		t.Fatalf("exemplar rows should contain exemplar labels: %#v", batch.exemplarRows)
@@ -66,15 +59,6 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	if len(batch.metadataRows) != 1 || batch.metadataRows[0].Type != "counter" {
 		t.Fatalf("metadata rows should contain metadata: %#v", batch.metadataRows)
 	}
-}
-
-func remoteWriteLabelRowsContain(rows []remoteWriteLabelIndexRow, want string) bool {
-	for _, row := range rows {
-		if row.LabelName == want {
-			return true
-		}
-	}
-	return false
 }
 
 func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
@@ -98,19 +82,14 @@ func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.seriesCount != 1 || batch.sampleCount != 1 || batch.labelCount != 1 {
-		t.Fatalf("counts = series %d samples %d labels %d", batch.seriesCount, batch.sampleCount, batch.labelCount)
+	if batch.seriesCount != 1 || batch.sampleCount != 1 {
+		t.Fatalf("counts = series %d samples %d", batch.seriesCount, batch.sampleCount)
 	}
 	if len(batch.sampleRows) != 1 || math.IsNaN(batch.sampleRows[0].Value) || batch.sampleRows[0].Value != 2 || batch.sampleRows[0].TimestampMS != 2000 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
 	if batch.sampleRows[0].MetricName != "up" {
 		t.Fatalf("sample rows should carry metric name for activity MVs: %#v", batch.sampleRows)
-	}
-	for _, row := range batch.labelIndexRows {
-		if row.LabelValue == "gone" {
-			t.Fatalf("all-NaN series should not produce label rows: %#v", batch.labelIndexRows)
-		}
 	}
 	if len(batch.seriesRecords) != 1 || batch.seriesRecords[0].MinMS != 2000 || batch.seriesRecords[0].MaxMS != 2000 {
 		t.Fatalf("unexpected series records: %#v", batch.seriesRecords)
@@ -170,21 +149,24 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.sampleCount != 2 {
-		t.Fatalf("sampleCount = %d, want 2", batch.sampleCount)
+	if batch.sampleCount != 3 {
+		t.Fatalf("sampleCount = %d, want 3", batch.sampleCount)
 	}
-	if batch.histogramCount != 1 {
-		t.Fatalf("histogramCount = %d, want 1", batch.histogramCount)
+	if batch.histogramCount != 2 {
+		t.Fatalf("histogramCount = %d, want 2", batch.histogramCount)
 	}
-	if len(batch.sampleRows) != 2 ||
+	if len(batch.sampleRows) != 3 ||
 		batch.sampleRows[0].TimestampMS != 0 ||
-		batch.sampleRows[0].Value != 2 ||
-		batch.sampleRows[0].Version != 14999 ||
-		batch.sampleRows[1].TimestampMS != 15000 ||
-		batch.sampleRows[1].Value != 3 {
+		batch.sampleRows[0].Value != 1 ||
+		batch.sampleRows[0].Version != 1000 ||
+		batch.sampleRows[1].TimestampMS != 0 ||
+		batch.sampleRows[1].Value != 2 ||
+		batch.sampleRows[1].Version != 14999 ||
+		batch.sampleRows[2].TimestampMS != 15000 ||
+		batch.sampleRows[2].Value != 3 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
-	if len(batch.histogramRows) != 1 || batch.histogramRows[0].TimestampMS != 0 || batch.histogramRows[0].Version != 14900 {
+	if len(batch.histogramRows) != 2 || batch.histogramRows[0].TimestampMS != 0 || batch.histogramRows[0].Version != 14500 || batch.histogramRows[1].TimestampMS != 0 || batch.histogramRows[1].Version != 14900 {
 		t.Fatalf("unexpected histogram rows: %#v", batch.histogramRows)
 	}
 }
@@ -195,7 +177,7 @@ func TestRemoteWritePhaseErrorIncludesUsefulContext(t *testing.T) {
 		"metrics_samples",
 		123,
 		30*time.Second,
-		"series=1 labels=2 samples=123 histograms=0 exemplars=0 metadata=0",
+		"series=1 samples=123 histograms=0 exemplars=0 metadata=0",
 		time.Now().Add(-1500*time.Millisecond),
 		context.DeadlineExceeded,
 	)
@@ -205,7 +187,7 @@ func TestRemoteWritePhaseErrorIncludesUsefulContext(t *testing.T) {
 		"clickhouse_timeout=30s",
 		"table=metrics_samples",
 		"rows=123",
-		"batch=series=1 labels=2 samples=123 histograms=0 exemplars=0 metadata=0",
+		"batch=series=1 samples=123 histograms=0 exemplars=0 metadata=0",
 		"context deadline exceeded",
 	} {
 		if !strings.Contains(got, want) {
@@ -236,6 +218,17 @@ func TestStableSeriesID(t *testing.T) {
 	}
 	if stableSeriesID(first) == stableSeriesID(different) {
 		t.Fatal("series fingerprint should change when labels change")
+	}
+	got, metricName, err := remoteWriteSeriesIdentity([]prompb.Label{
+		{Name: "instance", Value: "host-1"},
+		{Name: labels.MetricName, Value: "up"},
+		{Name: "job", Value: "api"},
+	})
+	if err != nil {
+		t.Fatalf("remoteWriteSeriesIdentity returned error: %v", err)
+	}
+	if metricName != "up" || got != stableSeriesID(first) {
+		t.Fatalf("remoteWriteSeriesIdentity = (%d, %q), want (%d, up)", got, metricName, stableSeriesID(first))
 	}
 }
 

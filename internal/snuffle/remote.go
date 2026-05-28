@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -98,14 +99,12 @@ func readSnappyProto(r *http.Request, dst interface{ Unmarshal([]byte) error }, 
 }
 
 type remoteWriteBatch struct {
-	labelIndexRows []remoteWriteLabelIndexRow
 	sampleRows     []remoteWriteSampleRow
 	histogramRows  []remoteWriteHistogramRow
 	exemplarRows   []remoteWriteExemplarRow
 	metadataRows   []remoteWriteMetadataRow
 	seriesRecords  []remoteWriteSeriesRow
 	seriesCount    int
-	labelCount     int
 	sampleCount    int
 	histogramCount int
 	exemplarCount  int
@@ -117,16 +116,9 @@ type remoteWriteSeriesRow struct {
 	ID         uint64
 	MetricName string
 	LabelsJSON string
+	Labels     []prompb.Label
 	MinMS      int64
 	MaxMS      int64
-}
-
-type remoteWriteLabelIndexRow struct {
-	TeamID     uint64
-	MetricName string
-	LabelName  string
-	LabelValue string
-	ID         uint64
 }
 
 type remoteWriteSampleRow struct {
@@ -167,9 +159,6 @@ type remoteWriteMetadataRow struct {
 func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64) (remoteWriteBatch, error) {
 	var batch remoteWriteBatch
 	seriesByID := make(map[uint64]remoteWriteSeriesRow, len(req.GetTimeseries()))
-	labelRows := make(map[remoteWriteLabelIndexRow]struct{})
-	sampleRows := make(map[remoteWriteSampleKey]remoteWriteSampleRow)
-	histogramRows := make(map[remoteWriteSampleKey]remoteWriteHistogramRow)
 	updatedAtMS := time.Now().UnixMilli()
 
 	for _, metadata := range req.GetMetadata() {
@@ -191,12 +180,10 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			continue
 		}
 
-		labelMap, metricName, err := remoteWriteLabelMap(ts.GetLabels())
+		id, metricName, err := remoteWriteSeriesIdentity(ts.GetLabels())
 		if err != nil {
 			return remoteWriteBatch{}, err
 		}
-		lbls := labels.FromMap(labelMap)
-		id := stableSeriesID(lbls)
 
 		var minMS int64
 		var maxMS int64
@@ -222,18 +209,14 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			}
 			bucketMS := bucketTimestampMS(sample.Timestamp, sampleInterval)
 			observeTime(bucketMS)
-			row := remoteWriteSampleRow{
+			batch.sampleRows = append(batch.sampleRows, remoteWriteSampleRow{
 				TeamID:      teamID,
 				MetricName:  metricName,
 				TimestampMS: bucketMS,
 				ID:          id,
 				Value:       sample.Value,
 				Version:     remoteWriteVersion(sample.Timestamp),
-			}
-			key := remoteWriteSampleKey{id: id, timestampMS: bucketMS}
-			if existing, ok := sampleRows[key]; !ok || row.Version >= existing.Version {
-				sampleRows[key] = row
-			}
+			})
 		}
 		for _, histogram := range ts.GetHistograms() {
 			originalTimestamp := histogram.Timestamp
@@ -244,18 +227,14 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			if err != nil {
 				return remoteWriteBatch{}, err
 			}
-			row := remoteWriteHistogramRow{
+			batch.histogramRows = append(batch.histogramRows, remoteWriteHistogramRow{
 				TeamID:      teamID,
 				MetricName:  metricName,
 				TimestampMS: bucketMS,
 				ID:          id,
 				Histogram:   payload,
 				Version:     remoteWriteVersion(originalTimestamp),
-			}
-			key := remoteWriteSampleKey{id: id, timestampMS: bucketMS}
-			if existing, ok := histogramRows[key]; !ok || row.Version >= existing.Version {
-				histogramRows[key] = row
-			}
+			})
 		}
 		for _, exemplar := range ts.GetExemplars() {
 			if math.IsNaN(exemplar.Value) {
@@ -281,30 +260,11 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		if !haveTime {
 			continue
 		}
-		outputLabels := make(map[string]string, len(labelMap)-1)
-		for k, v := range labelMap {
-			if k == labels.MetricName {
-				continue
-			}
-			outputLabels[k] = v
-			labelRows[remoteWriteLabelIndexRow{
-				TeamID:     teamID,
-				MetricName: metricName,
-				LabelName:  k,
-				LabelValue: v,
-				ID:         id,
-			}] = struct{}{}
-		}
-		labelsJSON, err := json.Marshal(outputLabels)
-		if err != nil {
-			return remoteWriteBatch{}, err
-		}
-
 		row := remoteWriteSeriesRow{
 			TeamID:     teamID,
 			ID:         id,
 			MetricName: metricName,
-			LabelsJSON: string(labelsJSON),
+			Labels:     ts.GetLabels(),
 			MinMS:      minMS,
 			MaxMS:      maxMS,
 		}
@@ -322,58 +282,13 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 	for _, row := range seriesByID {
 		batch.seriesRecords = append(batch.seriesRecords, row)
 	}
-	for row := range labelRows {
-		batch.labelIndexRows = append(batch.labelIndexRows, row)
-	}
-	for _, row := range sampleRows {
-		batch.sampleRows = append(batch.sampleRows, row)
-	}
-	for _, row := range histogramRows {
-		batch.histogramRows = append(batch.histogramRows, row)
-	}
 	sort.Slice(batch.seriesRecords, func(i, j int) bool { return batch.seriesRecords[i].ID < batch.seriesRecords[j].ID })
-	sort.Slice(batch.labelIndexRows, func(i, j int) bool {
-		a, b := batch.labelIndexRows[i], batch.labelIndexRows[j]
-		if a.TeamID != b.TeamID {
-			return a.TeamID < b.TeamID
-		}
-		if a.MetricName != b.MetricName {
-			return a.MetricName < b.MetricName
-		}
-		if a.LabelName != b.LabelName {
-			return a.LabelName < b.LabelName
-		}
-		if a.LabelValue != b.LabelValue {
-			return a.LabelValue < b.LabelValue
-		}
-		return a.ID < b.ID
-	})
-	sort.Slice(batch.sampleRows, func(i, j int) bool {
-		a, b := batch.sampleRows[i], batch.sampleRows[j]
-		if a.ID != b.ID {
-			return a.ID < b.ID
-		}
-		return a.TimestampMS < b.TimestampMS
-	})
-	sort.Slice(batch.histogramRows, func(i, j int) bool {
-		a, b := batch.histogramRows[i], batch.histogramRows[j]
-		if a.ID != b.ID {
-			return a.ID < b.ID
-		}
-		return a.TimestampMS < b.TimestampMS
-	})
 	batch.seriesCount = len(batch.seriesRecords)
-	batch.labelCount = len(batch.labelIndexRows)
 	batch.sampleCount = len(batch.sampleRows)
 	batch.histogramCount = len(batch.histogramRows)
 	batch.exemplarCount = len(batch.exemplarRows)
 	batch.metadataCount = len(batch.metadataRows)
 	return batch, nil
-}
-
-type remoteWriteSampleKey struct {
-	id          uint64
-	timestampMS int64
 }
 
 func remoteMetadataType(input prompb.MetricMetadata_MetricType) string {
@@ -411,6 +326,81 @@ func stableSeriesID(lbls labels.Labels) uint64 {
 	return hash.Sum64()
 }
 
+func remoteWriteSeriesIdentity(input []prompb.Label) (uint64, string, error) {
+	if len(input) == 0 {
+		return 0, "", errors.New("remote write time series has no labels")
+	}
+	lbls := input
+	if !prompbLabelsSorted(input) {
+		lbls = append([]prompb.Label(nil), input...)
+		sort.Slice(lbls, func(i, j int) bool {
+			return lbls[i].Name < lbls[j].Name
+		})
+	}
+
+	hash := xxhash.New()
+	var length [8]byte
+	var metricName string
+	var previous string
+	for i, label := range lbls {
+		if label.Name == "" {
+			return 0, "", errors.New("remote write label name must not be empty")
+		}
+		if i > 0 && label.Name == previous {
+			return 0, "", fmt.Errorf("duplicate remote write label %q", label.Name)
+		}
+		previous = label.Name
+		if label.Name == labels.MetricName {
+			metricName = label.Value
+		}
+		binary.LittleEndian.PutUint64(length[:], uint64(len(label.Name)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.WriteString(label.Name)
+		binary.LittleEndian.PutUint64(length[:], uint64(len(label.Value)))
+		_, _ = hash.Write(length[:])
+		_, _ = hash.WriteString(label.Value)
+	}
+	if metricName == "" {
+		return 0, "", errors.New("remote write time series is missing __name__")
+	}
+	return hash.Sum64(), metricName, nil
+}
+
+func prompbLabelsSorted(input []prompb.Label) bool {
+	for i := 1; i < len(input); i++ {
+		if input[i-1].Name > input[i].Name {
+			return false
+		}
+	}
+	return true
+}
+
+func labelsJSONFromPrompb(input []prompb.Label) (string, error) {
+	if len(input) == 0 {
+		return "{}", nil
+	}
+	buf := make([]byte, 0, len(input)*32)
+	buf = append(buf, '{')
+	first := true
+	for _, label := range input {
+		if label.Name == labels.MetricName {
+			continue
+		}
+		if label.Name == "" {
+			return "", errors.New("remote write label name must not be empty")
+		}
+		if !first {
+			buf = append(buf, ',')
+		}
+		first = false
+		buf = strconv.AppendQuote(buf, label.Name)
+		buf = append(buf, ':')
+		buf = strconv.AppendQuote(buf, label.Value)
+	}
+	buf = append(buf, '}')
+	return string(buf), nil
+}
+
 func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
 	step := interval.Milliseconds()
 	if step <= 0 {
@@ -428,21 +418,6 @@ func remoteWriteVersion(timestamp int64) uint64 {
 		return 0
 	}
 	return uint64(timestamp)
-}
-
-func remoteWriteLabelMap(input []prompb.Label) (map[string]string, string, error) {
-	if len(input) == 0 {
-		return nil, "", errors.New("remote write time series has no labels")
-	}
-	labelMap, err := prompbLabelMap(input, "remote write label")
-	if err != nil {
-		return nil, "", err
-	}
-	metricName := labelMap[labels.MetricName]
-	if metricName == "" {
-		return nil, "", errors.New("remote write time series is missing __name__")
-	}
-	return labelMap, metricName, nil
 }
 
 func remoteWriteAuxLabelMap(input []prompb.Label) (map[string]string, error) {
@@ -469,18 +444,17 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 	}
 	batchSummary := remoteWriteBatchSummary(batch)
 	if batch.seriesCount > 0 {
-		started := time.Now()
-		if err := s.insertRemoteSeriesRows(ctx, batch.seriesRecords); err != nil {
-			return remoteWritePhaseError("insert series", s.cfg.SeriesTable, batch.seriesCount, s.cfg.CHTimeout, batchSummary, started, err)
+		inserted, err := s.insertMissingRemoteSeriesRows(ctx, batch.seriesRecords, batchSummary)
+		if err != nil {
+			return err
 		}
+		batch.seriesRecords = nil
+		batch.seriesCount = inserted
+		batchSummary = remoteWriteBatchSummary(batch)
 	}
 	started := time.Now()
 	if err := s.insertRemoteMetadataRows(ctx, batch.metadataRows); err != nil {
 		return remoteWritePhaseError("insert metadata", s.cfg.MetricsTable, len(batch.metadataRows), s.cfg.CHTimeout, batchSummary, started, err)
-	}
-	started = time.Now()
-	if err := s.insertRemoteLabelIndexRows(ctx, batch.labelIndexRows); err != nil {
-		return remoteWritePhaseError("insert label index", s.cfg.LabelIndexTable, len(batch.labelIndexRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
 	started = time.Now()
 	if err := s.insertRemoteSampleRows(ctx, batch.sampleRows); err != nil {
@@ -497,11 +471,46 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 	return nil
 }
 
+func (s *Server) insertMissingRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow, batchSummary string) (int, error) {
+	started := time.Now()
+	newRows, err := s.filterNewSeriesRows(ctx, rows)
+	if err != nil {
+		return 0, remoteWritePhaseError("lookup existing series", s.cfg.SeriesTable, len(rows), s.cfg.CHTimeout, batchSummary, started, err)
+	}
+	if len(newRows) == 0 {
+		return 0, nil
+	}
+
+	if s.seriesMu != nil {
+		s.seriesMu.Lock()
+		defer s.seriesMu.Unlock()
+	}
+
+	started = time.Now()
+	newRows, err = s.filterNewSeriesRows(ctx, newRows)
+	if err != nil {
+		return 0, remoteWritePhaseError("recheck existing series", s.cfg.SeriesTable, len(newRows), s.cfg.CHTimeout, batchSummary, started, err)
+	}
+	if len(newRows) == 0 {
+		return 0, nil
+	}
+
+	started = time.Now()
+	if err := populateSeriesLabelsJSON(newRows); err != nil {
+		return 0, remoteWritePhaseError("encode new series labels", s.cfg.SeriesTable, len(newRows), s.cfg.CHTimeout, batchSummary, started, err)
+	}
+
+	started = time.Now()
+	if err := s.insertRemoteSeriesRows(ctx, newRows); err != nil {
+		return 0, remoteWritePhaseError("insert series", s.cfg.SeriesTable, len(newRows), s.cfg.CHTimeout, batchSummary, started, err)
+	}
+	return len(newRows), nil
+}
+
 func remoteWriteBatchSummary(batch remoteWriteBatch) string {
 	return fmt.Sprintf(
-		"series=%d labels=%d samples=%d histograms=%d exemplars=%d metadata=%d",
+		"series=%d samples=%d histograms=%d exemplars=%d metadata=%d",
 		batch.seriesCount,
-		batch.labelCount,
 		batch.sampleCount,
 		batch.histogramCount,
 		batch.exemplarCount,
@@ -525,12 +534,60 @@ func remoteWritePhaseError(phase, table string, rows int, timeout time.Duration,
 	}
 }
 
+func populateSeriesLabelsJSON(rows []remoteWriteSeriesRow) error {
+	for i := range rows {
+		if rows[i].LabelsJSON != "" {
+			continue
+		}
+		labelsJSON, err := labelsJSONFromPrompb(rows[i].Labels)
+		if err != nil {
+			return err
+		}
+		rows[i].LabelsJSON = labelsJSON
+	}
+	return nil
+}
+
+func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow) ([]remoteWriteSeriesRow, error) {
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	ids := make([]uint64, len(rows))
+	for i, row := range rows {
+		ids[i] = row.ID
+	}
+	existing := make(map[uint64]struct{}, len(rows))
+	sql := fmt.Sprintf(
+		"SELECT DISTINCT series.id FROM %s AS series INNER JOIN remote_write_series_ids AS lookup USING id WHERE series.team_id = %d",
+		tableName(s.cfg.CHDatabase, s.cfg.SeriesTable),
+		s.cfg.TeamID,
+	)
+	if err := s.client.QueryRowsWithExternalUInt64s(ctx, "remote_write_series_ids", "id", ids, sql, func(row clickHouseRow) error {
+		var id uint64
+		if err := row.Scan(&id); err != nil {
+			return err
+		}
+		existing[id] = struct{}{}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	newRows := rows[:0]
+	for _, row := range rows {
+		if _, ok := existing[row.ID]; ok {
+			continue
+		}
+		newRows = append(newRows, row)
+	}
+	return newRows, nil
+}
+
 func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow) error {
 	if len(rows) == 0 {
 		return nil
 	}
 	sql := fmt.Sprintf("INSERT INTO %s (team_id, id, metric_name, labels_json, min_time, max_time)", tableName(s.cfg.CHDatabase, s.cfg.SeriesTable))
-	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+	return s.client.InsertColumnsSync(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		teamIDs := make([]uint64, len(rows))
 		ids := make([]uint64, len(rows))
 		metricNames := make([]string, len(rows))
@@ -561,43 +618,6 @@ func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteS
 			return 0, err
 		}
 		if err := batch.Column(5).Append(maxTimes); err != nil {
-			return 0, err
-		}
-		return len(rows), nil
-	})
-}
-
-func (s *Server) insertRemoteLabelIndexRows(ctx context.Context, rows []remoteWriteLabelIndexRow) error {
-	if len(rows) == 0 {
-		return nil
-	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, label_name, label_value, id)", tableName(s.cfg.CHDatabase, s.cfg.LabelIndexTable))
-	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
-		teamIDs := make([]uint64, len(rows))
-		metricNames := make([]string, len(rows))
-		labelNames := make([]string, len(rows))
-		labelValues := make([]string, len(rows))
-		ids := make([]uint64, len(rows))
-		for i, row := range rows {
-			teamIDs[i] = row.TeamID
-			metricNames[i] = row.MetricName
-			labelNames[i] = row.LabelName
-			labelValues[i] = row.LabelValue
-			ids[i] = row.ID
-		}
-		if err := batch.Column(0).Append(teamIDs); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(1).Append(metricNames); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(2).Append(labelNames); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(3).Append(labelValues); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(4).Append(ids); err != nil {
 			return 0, err
 		}
 		return len(rows), nil

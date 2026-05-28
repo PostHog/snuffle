@@ -1,0 +1,160 @@
+{
+  "version": 1,
+  "generated_at": "2026-05-28T14:51:53Z",
+  "source": {
+    "name": "tsbs",
+    "version": "v0.0.0-20260527045238-8323e59c7402",
+    "use_case": "devops",
+    "scale": "1000",
+    "start": "2016-01-01T00:00:00Z",
+    "end": "2016-01-01T01:00:00Z",
+    "interval": "15s",
+    "seed": "1",
+    "workers": "16",
+    "batch_size": "250000",
+    "query_concurrency": "10",
+    "query_benchtime": "50x"
+  },
+  "ingest": {
+    "rows": 24240000,
+    "duration_ms": 25344,
+    "metric_rate": 956437.2833165885,
+    "row_rate": 956437.2833165885
+  },
+  "query": {
+    "scenario_count": 8,
+    "geomean_avg_ms": 18.898153345789137,
+    "total_avg_ms": 159.39800000000002
+  },
+  "benchmarks": [
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_avg_by_environment",
+      "iterations": 50,
+      "avg_ms": 19.07,
+      "metrics": {
+        "B/op": 7884,
+        "allocs/op": 77,
+        "avg_ms": 19.07,
+        "max_ms": 25.58,
+        "ns/op": 2058076,
+        "p50_ms": 19.59,
+        "p95_ms": 23.26,
+        "p99_ms": 25.58,
+        "response_bytes/op": 321
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_label_values_hostname",
+      "iterations": 50,
+      "avg_ms": 9.448,
+      "metrics": {
+        "B/op": 35545,
+        "allocs/op": 93,
+        "avg_ms": 9.448,
+        "max_ms": 12.8,
+        "ns/op": 1004881,
+        "p50_ms": 9.596,
+        "p95_ms": 10.78,
+        "p99_ms": 12.8,
+        "response_bytes/op": 10920
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_one_series",
+      "iterations": 50,
+      "avg_ms": 17.88,
+      "metrics": {
+        "B/op": 8693,
+        "allocs/op": 81,
+        "avg_ms": 17.88,
+        "max_ms": 24.2,
+        "ns/op": 1875913,
+        "p50_ms": 16.91,
+        "p95_ms": 22.66,
+        "p99_ms": 24.2,
+        "response_bytes/op": 328
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_range_selector",
+      "iterations": 50,
+      "avg_ms": 27.45,
+      "metrics": {
+        "B/op": 8846,
+        "allocs/op": 79,
+        "avg_ms": 27.45,
+        "max_ms": 38.82,
+        "ns/op": 2831873,
+        "p50_ms": 27.22,
+        "p95_ms": 37.98,
+        "p99_ms": 38.82,
+        "response_bytes/op": 673
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_range_sum_by_region",
+      "iterations": 50,
+      "avg_ms": 25.8,
+      "metrics": {
+        "B/op": 18309,
+        "allocs/op": 88,
+        "avg_ms": 25.8,
+        "max_ms": 36.03,
+        "ns/op": 2687366,
+        "p50_ms": 25.95,
+        "p95_ms": 30.8,
+        "p99_ms": 36.03,
+        "response_bytes/op": 4086
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_series_metric",
+      "iterations": 50,
+      "avg_ms": 14.5,
+      "metrics": {
+        "B/op": 495855,
+        "allocs/op": 117,
+        "avg_ms": 14.5,
+        "max_ms": 20.45,
+        "ns/op": 1799384,
+        "p50_ms": 14.03,
+        "p95_ms": 18.11,
+        "p99_ms": 20.45,
+        "response_bytes/op": 224915
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_sum_by_region",
+      "iterations": 50,
+      "avg_ms": 18.14,
+      "metrics": {
+        "B/op": 8729,
+        "allocs/op": 79,
+        "avg_ms": 18.14,
+        "max_ms": 24.37,
+        "ns/op": 1878158,
+        "p50_ms": 17.77,
+        "p95_ms": 23.06,
+        "p99_ms": 24.37,
+        "response_bytes/op": 639
+      }
+    },
+    {
+      "name": "BenchmarkBridgeHTTP/tsbs_topk",
+      "iterations": 50,
+      "avg_ms": 27.11,
+      "metrics": {
+        "B/op": 14408,
+        "allocs/op": 87,
+        "avg_ms": 27.11,
+        "max_ms": 48.32,
+        "ns/op": 2852603,
+        "p50_ms": 24.23,
+        "p95_ms": 45.31,
+        "p99_ms": 48.32,
+        "response_bytes/op": 2667
+      }
+    }
+  ],
+  "compare_basis": "geomean(write row-rate ratio, per-scenario query avg_ms ratios); lower is faster"
+}

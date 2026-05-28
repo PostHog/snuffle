@@ -7,4 +7,6 @@ build/
 *.egg-info/
 promql-sidecar
 *.parquet
+.perf/
 *.json
+!perf-results.json

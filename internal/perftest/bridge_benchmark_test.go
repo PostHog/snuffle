@@ -39,6 +39,32 @@ var bridgeLargeScenarios = []bridgeScenario{
 	{name: "large_series_20k", path: "/api/v1/series", params: map[string]string{"match[]": `load_requests_total{status="500"}`, "start": "1700100000", "end": "1700100135"}},
 }
 
+func bridgeTSBSScenarios() []bridgeScenario {
+	metric := envString("BRIDGE_BENCH_TSBS_METRIC", "usage_user")
+	host := envString("BRIDGE_BENCH_TSBS_HOSTNAME", "host_42")
+	eval := envString("BRIDGE_BENCH_TSBS_QUERY_TIME", "1451608185")
+	rangeStart := envString("BRIDGE_BENCH_TSBS_RANGE_START", "1451607900")
+	rangeEnd := envString("BRIDGE_BENCH_TSBS_RANGE_END", eval)
+	step := envString("BRIDGE_BENCH_TSBS_STEP", "15s")
+
+	hostSelector := fmt.Sprintf(`%s{hostname=%q}`, metric, host)
+	metricSelector := fmt.Sprintf(`%s`, metric)
+	sumByRegion := fmt.Sprintf(`sum by (region) (%s)`, metric)
+	avgByEnvironment := fmt.Sprintf(`avg by (service_environment) (%s)`, metric)
+	topk := fmt.Sprintf(`topk(10, %s)`, metric)
+
+	return []bridgeScenario{
+		{name: "tsbs_one_series", path: "/api/v1/query", params: map[string]string{"query": hostSelector, "time": eval}},
+		{name: "tsbs_sum_by_region", path: "/api/v1/query", params: map[string]string{"query": sumByRegion, "time": eval}},
+		{name: "tsbs_avg_by_environment", path: "/api/v1/query", params: map[string]string{"query": avgByEnvironment, "time": eval}},
+		{name: "tsbs_topk", path: "/api/v1/query", params: map[string]string{"query": topk, "time": eval}},
+		{name: "tsbs_range_selector", path: "/api/v1/query_range", params: map[string]string{"query": hostSelector, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_range_sum_by_region", path: "/api/v1/query_range", params: map[string]string{"query": sumByRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_series_metric", path: "/api/v1/series", params: map[string]string{"match[]": metricSelector, "start": rangeStart, "end": rangeEnd}},
+		{name: "tsbs_label_values_hostname", path: "/api/v1/label/hostname/values", params: map[string]string{"start": rangeStart, "end": rangeEnd}},
+	}
+}
+
 type bridgeFetchResult struct {
 	elapsed time.Duration
 	bytes   int
@@ -134,6 +160,8 @@ func bridgeScenarios(profile string) ([]bridgeScenario, bool) {
 		return bridgeDemoScenarios, true
 	case "large":
 		return bridgeLargeScenarios, true
+	case "tsbs":
+		return bridgeTSBSScenarios(), true
 	default:
 		return nil, false
 	}

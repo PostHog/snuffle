@@ -113,6 +113,9 @@ query path.
   window
 - selective reads use exact selected IDs; broad reads use ClickHouse subqueries
   to avoid oversized `IN (...)` lists
+- sample queries read raw replacement rows and rely on
+  `ReplacingMergeTree(version)` for duplicate cleanup, avoiding per-query
+  `argMax(value, version)` work
 - plain `/query_range` selectors use ClickHouse `timeSeriesLastToGrid` so the
   sidecar receives one row per series instead of one row per sample
 - safe `/query_range` aggregations use ClickHouse grid functions and aggregate
@@ -223,6 +226,24 @@ PROM_TSDB_BENCH_CONCURRENCY=10 \
 PROM_TSDB_BENCH_WARMUP=10 \
 go test -run '^$' -bench '^BenchmarkPrometheusTSDB$' ./internal/perftest -benchtime=100x -timeout=30m
 ```
+
+Run the TSBS devops regression benchmark:
+
+```bash
+make perf-test
+```
+
+This generates TSBS Prometheus remote-write data, replays the generated
+protobuf messages through `/api/v1/write`, runs the TSBS HTTP query profile,
+and compares the run against `perf-results.json`. Faster runs replace
+`perf-results.json`; slower runs keep the existing file and print the
+regression size. By default the target starts the local ClickHouse service from
+`docker-compose.yml` and uses a `snuffle_perf` database. The default TSBS shape
+is about 24.2M rows (`TSBS_SCALE=1000`, 1 hour, 15s interval), and the
+target refuses to record a run below `PERF_MIN_ROWS=1000000`. The TSBS module is
+pinned by default for repeatability; override `TSBS_VERSION` when intentionally
+changing datasets. Set `PERF_START_CLICKHOUSE=0`, `CH_ADDR`, and `CH_DATABASE`
+to use an existing ClickHouse/database.
 
 Run the Docker-backed integration suite:
 

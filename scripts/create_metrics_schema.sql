@@ -2,6 +2,7 @@ DROP TABLE IF EXISTS metrics_series_activity_from_histograms_mv SYNC;
 DROP TABLE IF EXISTS metrics_series_activity_from_samples_mv SYNC;
 DROP TABLE IF EXISTS metrics_label_postings_from_label_index_mv SYNC;
 DROP TABLE IF EXISTS metrics_label_postings_from_series_mv SYNC;
+DROP TABLE IF EXISTS metrics_label_index_from_series_mv SYNC;
 DROP TABLE IF EXISTS metrics_samples SYNC;
 DROP TABLE IF EXISTS metrics_histograms SYNC;
 DROP TABLE IF EXISTS metrics_exemplars SYNC;
@@ -80,7 +81,7 @@ CREATE TABLE metrics_samples
 )
 ENGINE = ReplacingMergeTree(version)
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (team_id, id, timestamp)
+ORDER BY (team_id, metric_name, id, timestamp)
 SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_series_activity
@@ -144,6 +145,16 @@ SELECT
     groupBitmapState(id) AS ids
 FROM metrics_series
 GROUP BY team_id, metric_name;
+
+CREATE MATERIALIZED VIEW metrics_label_index_from_series_mv TO metrics_label_index AS
+SELECT
+    team_id,
+    metric_name,
+    tupleElement(label_pair, 1) AS label_name,
+    tupleElement(label_pair, 2) AS label_value,
+    id
+FROM metrics_series
+ARRAY JOIN JSONExtractKeysAndValues(labels_json, 'String') AS label_pair;
 
 CREATE MATERIALIZED VIEW metrics_label_postings_from_label_index_mv TO metrics_label_postings AS
 SELECT

@@ -209,11 +209,25 @@ type seriesMeta struct {
 	exemplars  []exemplarPoint
 }
 
+type seriesJSONRow struct {
+	id     uint64
+	labels string
+}
+
 func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	return q.selectSeriesMatching(ctx, mint, maxt, false, matchers...)
+}
+
+func (q *CHQuerier) selectActiveSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	return q.selectSeriesMatching(ctx, mint, maxt, true, matchers...)
+}
+
+func (q *CHQuerier) selectSeriesMatching(ctx context.Context, mint, maxt int64, activeOnly bool, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	where := []string{
 		teamFilter(q.queryable.cfg),
-		fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
-		fmt.Sprintf("min_time <= %s", chTimeMillis(maxt)),
+	}
+	if activeOnly {
+		where = append(where, seriesTimeFilters(q.queryable.cfg, matchers, mint, maxt)...)
 	}
 	where = append(where, seriesPreFilters(q.queryable.cfg, matchers)...)
 
@@ -256,6 +270,83 @@ func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers
 	return series, nil
 }
 
+func (q *CHQuerier) selectActiveSeriesJSON(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]seriesJSONRow, bool, error) {
+	if !matchersPushdownSafe(matchers) {
+		return nil, false, nil
+	}
+	where := []string{teamFilter(q.queryable.cfg)}
+	where = append(where, seriesTimeFilters(q.queryable.cfg, matchers, mint, maxt)...)
+	where = append(where, seriesPreFilters(q.queryable.cfg, matchers)...)
+	labelExpr := "if(labels_json = '{}' OR labels_json = '', concat('{\"__name__\":', toJSONString(metric_name), '}'), concat('{\"__name__\":', toJSONString(metric_name), ',', substring(labels_json, 2)))"
+	sql := fmt.Sprintf(
+		"SELECT id, any(%s) AS labels_json FROM (SELECT id, metric_name, labels_json FROM %s WHERE %s) GROUP BY id LIMIT %d",
+		labelExpr,
+		tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.SeriesTable),
+		strings.Join(where, " AND "),
+		q.queryable.cfg.MaxSeries,
+	)
+	rows := make([]seriesJSONRow, 0, 1024)
+	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var out seriesJSONRow
+		if err := row.Scan(&out.id, &out.labels); err != nil {
+			return err
+		}
+		rows = append(rows, out)
+		return nil
+	})
+	if err != nil {
+		return nil, true, err
+	}
+	if len(rows) >= q.queryable.cfg.MaxSeries {
+		return nil, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	return rows, true, nil
+}
+
+func seriesTimeFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
+	if cfg.ActivityTable == "" {
+		return []string{
+			fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
+			fmt.Sprintf("min_time <= %s", chTimeMillis(maxt)),
+		}
+	}
+	return []string{"id IN (" + activeSeriesIDsSQL(cfg, matchers, mint, maxt) + ")"}
+}
+
+func activeSeriesIDsSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
+	if metric := exactMetricName(matchers); metric != "" && cfg.SamplesTable != "" {
+		activeSources := []string{
+			activeSeriesIDsFromTimedTableSQL(cfg, cfg.SamplesTable, metric, mint, maxt),
+		}
+		if cfg.HistogramsTable != "" {
+			activeSources = append(activeSources, activeSeriesIDsFromTimedTableSQL(cfg, cfg.HistogramsTable, metric, mint, maxt))
+		}
+		return strings.Join(activeSources, " UNION DISTINCT ")
+	}
+	where := []string{
+		teamFilter(cfg),
+		fmt.Sprintf("bucket >= %s", chTimeMillis(mint)),
+		fmt.Sprintf("bucket <= %s", chTimeMillis(maxt)),
+	}
+	where = append(where, metricNameConstraints(matchers)...)
+	return fmt.Sprintf(
+		"SELECT arrayJoin(bitmapToArray(groupBitmapOrState(ids))) AS id FROM %s WHERE %s",
+		tableName(cfg.CHDatabase, cfg.ActivityTable),
+		strings.Join(where, " AND "),
+	)
+}
+
+func activeSeriesIDsFromTimedTableSQL(cfg Config, table, metric string, mint, maxt int64) string {
+	return fmt.Sprintf(
+		"SELECT id FROM %s WHERE %s AND metric_name = %s AND timestamp >= %s AND timestamp <= %s GROUP BY id",
+		tableName(cfg.CHDatabase, table),
+		teamFilter(cfg),
+		sqlString(metric),
+		chTimeMillis(mint),
+		chTimeMillis(maxt),
+	)
+}
+
 func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, bool, error) {
 	if !metricOnlyMatchers(matchers) || !matchersPushdownSafe(matchers) {
 		return nil, false, nil
@@ -268,7 +359,7 @@ func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt in
 	sql := fmt.Sprintf(
 		"WITH selected_series AS (%s), latest AS (%s) SELECT id, metric_name, labels_json, toUnixTimestamp64Milli(latest.ts_col) AS ts, latest.value AS value FROM latest ANY INNER JOIN selected_series USING id ORDER BY id",
 		selectedSeries,
-		latestSamplesForSelectedSeriesSQL(q.queryable.cfg, mint, maxt),
+		latestSamplesForSelectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt),
 	)
 
 	series := make([]*seriesMeta, 0, 1024)
@@ -675,6 +766,7 @@ func histogramsSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, max
 		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 	}
+	where = append(where, metricNameConstraints(matchers)...)
 	idFilters, ok := sampleIDFiltersFromMatchers(cfg, matchers, mint, maxt)
 	if !ok {
 		return "", false
@@ -755,6 +847,7 @@ func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt i
 		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 	}
+	where = append(where, metricNameConstraints(matchers)...)
 	idFilters, ok := sampleIDFiltersFromMatchers(cfg, matchers, mint, maxt)
 	if !ok {
 		return "", false
@@ -764,7 +857,7 @@ func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt i
 }
 
 func sampleRowsSQL(cfg Config, where string, latestOnly bool) string {
-	source := dedupedSamplesSQL(cfg, where)
+	source := rawSamplesSourceSQL(cfg, where)
 	if latestOnly {
 		return fmt.Sprintf(
 			"SELECT id, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY id",
@@ -777,21 +870,23 @@ func sampleRowsSQL(cfg Config, where string, latestOnly bool) string {
 	)
 }
 
-func dedupedSamplesSQL(cfg Config, where string) string {
+func rawSamplesSourceSQL(cfg Config, where string) string {
 	return fmt.Sprintf(
-		"SELECT id, timestamp, argMax(value, version) AS value FROM %s WHERE %s GROUP BY id, timestamp",
+		"SELECT id, timestamp, value FROM %s WHERE %s",
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		where,
 	)
 }
 
-func dedupedSamplesForSelectedSeriesSQL(cfg Config, mint, maxt int64) string {
-	return dedupedSamplesSQL(cfg, strings.Join([]string{
+func samplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
+	where := []string{
 		teamFilter(cfg),
 		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
 		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 		"id IN (SELECT id FROM selected_series)",
-	}, " AND "))
+	}
+	where = append(where, metricNameConstraints(matchers)...)
+	return rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
 }
 
 func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64) ([]string, bool) {
@@ -806,11 +901,9 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 				return nil, false
 			}
 			filters = append(filters, fmt.Sprintf(
-				"id IN (SELECT id FROM %s WHERE %s AND max_time >= %s AND min_time <= %s AND %s)",
+				"id IN (SELECT id FROM %s WHERE %s AND %s)",
 				tableName(cfg.CHDatabase, cfg.SeriesTable),
 				teamFilter(cfg),
-				chTimeMillis(mint),
-				chTimeMillis(maxt),
 				metricCondition,
 			))
 			continue

@@ -75,7 +75,7 @@ func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"argMax(value, timestamp)",
-		"argMax(value, version)",
+		"SELECT id, timestamp, value",
 		"`default`.`samples`",
 		"`default`.`series`",
 		"`default`.`label_index`",
@@ -149,7 +149,7 @@ func TestRangeSamplesSQLFromMatchers(t *testing.T) {
 	}
 	for _, want := range []string{
 		"toUnixTimestamp64Milli(timestamp)",
-		"argMax(value, version)",
+		"SELECT id, timestamp, value",
 		"ORDER BY id, timestamp",
 		"`default`.`samples`",
 		"`default`.`series`",

@@ -67,7 +67,7 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		return queryData{}, false, nil
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
-	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
+	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
 
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
@@ -107,7 +107,7 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 		return queryData{}, false, nil
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
-	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
+	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
 	gridExpr := fmt.Sprintf(
 		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
 		chTimeMillis(shiftedStart.UnixMilli()),
@@ -231,7 +231,7 @@ func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.Aggreg
 	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, selector.LabelMatchers, expr.Grouping)
 	withParts := []string{
 		"selected_series AS (" + selectedSeries + ")",
-		"latest AS (" + latestSamplesForSelectedSeriesSQL(s.cfg, window.mint, window.maxt) + ")",
+		"latest AS (" + latestSamplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt) + ")",
 	}
 	if groupLabels != "" {
 		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
@@ -326,7 +326,7 @@ func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *pars
 }
 
 func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, gridExpr string, mint, maxt int64, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
-	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, mint, maxt)
+	sampleSource := samplesForSelectedSeriesSQL(s.cfg, groupMatchers, mint, maxt)
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		gridExpr,
@@ -714,7 +714,7 @@ func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser
 	if !ok {
 		return queryData{}, false, nil
 	}
-	perSeries := rangeFunctionPerSeriesSQL(s.cfg, window, fn)
+	perSeries := rangeFunctionPerSeriesSQL(s.cfg, window, selector.LabelMatchers, fn)
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
 	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, selector.LabelMatchers, expr.Grouping)
 	withParts := []string{
@@ -827,11 +827,11 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 		direction = "ASC"
 	}
 	seriesLookup := topKSeriesLookupSQL(s.cfg, selector.LabelMatchers)
-	sampleSource := dedupedSamplesForSelectedSeriesSQL(s.cfg, window.mint, window.maxt)
+	latestSource := latestSamplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), top_series AS (SELECT id, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, toInt64(%d) AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
+		"WITH selected_series AS (%s), top_series AS (SELECT id, value FROM (%s) ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, toInt64(%d) AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
 		selectedSeries,
-		sampleSource,
+		latestSource,
 		direction,
 		limit,
 		evalTime.UnixMilli(),
@@ -918,16 +918,16 @@ func rangeFunctionMode(name string) (rangeFunction, bool) {
 	}
 }
 
-func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow) string {
-	source := dedupedSamplesForSelectedSeriesSQL(cfg, window.mint, window.maxt)
+func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher) string {
+	source := samplesForSelectedSeriesSQL(cfg, matchers, window.mint, window.maxt)
 	return fmt.Sprintf(
 		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id HAVING length(pts) > 1)",
 		source,
 	)
 }
 
-func rangeFunctionPerSeriesSQL(cfg Config, window selectorWindow, fn rangeFunction) string {
-	source := rangeFunctionSampleSourceSQL(cfg, window)
+func rangeFunctionPerSeriesSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher, fn rangeFunction) string {
+	source := rangeFunctionSampleSourceSQL(cfg, window, matchers)
 	if fn.instant {
 		result := "if(last_v < prev_v, last_v, last_v - prev_v)"
 		if !fn.counter {
@@ -1079,8 +1079,9 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 	}
 	where := []string{
 		teamFilter(cfg),
-		fmt.Sprintf("max_time >= %s", chTimeMillis(mint)),
-		fmt.Sprintf("min_time <= %s", chTimeMillis(maxt)),
+	}
+	if selectedSeriesNeedsBounds(selectParts) {
+		where = append(where, seriesTimeFilters(cfg, matchers, mint, maxt)...)
 	}
 	where = append(where, seriesPreFilters(cfg, matchers)...)
 	return fmt.Sprintf(
@@ -1089,6 +1090,15 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
+}
+
+func selectedSeriesNeedsBounds(selectParts []string) bool {
+	for _, part := range selectParts {
+		if part == "min_time" || part == "max_time" {
+			return true
+		}
+	}
+	return false
 }
 
 func selectedSeriesProjection(selectParts []string) []string {
@@ -1112,8 +1122,28 @@ func selectedSeriesProjection(selectParts []string) []string {
 	return projected
 }
 
-func latestSamplesForSelectedSeriesSQL(cfg Config, mint, maxt int64) string {
-	source := dedupedSamplesForSelectedSeriesSQL(cfg, mint, maxt)
+func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
+	if cfg.RemoteWriteInterval > 0 {
+		bucket := bucketTimestampMS(maxt, cfg.RemoteWriteInterval)
+		if bucket >= mint {
+			where := []string{
+				teamFilter(cfg),
+				"timestamp = " + chTimeMillis(bucket),
+				"id IN (SELECT id FROM selected_series)",
+			}
+			where = append(where, metricNameConstraints(matchers)...)
+			source := fmt.Sprintf(
+				"SELECT id, timestamp, value, version FROM %s WHERE %s",
+				tableName(cfg.CHDatabase, cfg.SamplesTable),
+				strings.Join(where, " AND "),
+			)
+			return fmt.Sprintf(
+				"SELECT id, argMax(value, version) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
+				source,
+			)
+		}
+	}
+	source := samplesForSelectedSeriesSQL(cfg, matchers, mint, maxt)
 	return fmt.Sprintf(
 		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
 		source,

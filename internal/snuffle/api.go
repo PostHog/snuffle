@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -25,6 +26,7 @@ type Server struct {
 	queryable *CHQueryable
 	engine    *promql.Engine
 	parser    parser.Parser
+	seriesMu  *sync.Mutex
 }
 
 func Run(cfg Config) error {
@@ -71,6 +73,7 @@ func newServer(cfg Config) *Server {
 		queryable: queryable,
 		engine:    engine,
 		parser:    parser.NewParser(parser.Options{}),
+		seriesMu:  &sync.Mutex{},
 	}
 }
 
@@ -201,6 +204,7 @@ func (s *Server) withTeamID(teamID uint64) *Server {
 		queryable: NewCHQueryable(s.client, cfg),
 		engine:    s.engine,
 		parser:    s.parser,
+		seriesMu:  s.seriesMu,
 	}
 }
 
@@ -429,16 +433,25 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
-	seen := map[uint64]map[string]string{}
 	q := &CHQuerier{queryable: s.queryable, mint: start.UnixMilli(), maxt: end.UnixMilli()}
+	if rawRows, ok, err := q.activeSeriesJSONRows(ctx, start.UnixMilli(), end.UnixMilli(), matcherSets); ok || err != nil {
+		if err != nil {
+			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+			return
+		}
+		writeAPISuccessRawSeries(w, rawRows)
+		return
+	}
+
+	seen := map[uint64]map[string]string{}
 	for _, matchers := range matcherSets {
-		series, err := q.selectSeries(ctx, start.UnixMilli(), end.UnixMilli(), matchers...)
+		series, err := q.selectActiveSeries(ctx, start.UnixMilli(), end.UnixMilli(), matchers...)
 		if err != nil {
 			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
 			return
 		}
 		for _, s := range series {
-			seen[stableSeriesID(s.labels)] = s.labels.Map()
+			seen[s.id] = s.labelMap
 		}
 	}
 	result := make([]map[string]string, 0, len(seen))
@@ -446,6 +459,25 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 		result = append(result, labels)
 	}
 	writeAPISuccess(w, result)
+}
+
+func (q *CHQuerier) activeSeriesJSONRows(ctx context.Context, mint, maxt int64, matcherSets [][]*labels.Matcher) ([]seriesJSONRow, bool, error) {
+	seen := make(map[uint64]string)
+	for _, matchers := range matcherSets {
+		rows, ok, err := q.selectActiveSeriesJSON(ctx, mint, maxt, matchers...)
+		if !ok || err != nil {
+			return nil, ok, err
+		}
+		for _, row := range rows {
+			seen[row.id] = row.labels
+		}
+	}
+	rows := make([]seriesJSONRow, 0, len(seen))
+	for id, labels := range seen {
+		rows = append(rows, seriesJSONRow{id: id, labels: labels})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
+	return rows, true, nil
 }
 
 type metadataResult struct {
@@ -687,6 +719,19 @@ func histogramPointAny(point promql.HPoint) any {
 
 func writeAPISuccess(w http.ResponseWriter, data any) {
 	writeJSON(w, http.StatusOK, apiResponse{Status: "success", Data: data})
+}
+
+func writeAPISuccessRawSeries(w http.ResponseWriter, rows []seriesJSONRow) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"success","data":[`))
+	for i, row := range rows {
+		if i > 0 {
+			_, _ = w.Write([]byte{','})
+		}
+		_, _ = w.Write([]byte(row.labels))
+	}
+	_, _ = w.Write([]byte("]}\n"))
 }
 
 func writeAPIError(w http.ResponseWriter, code int, errorType string, err error) {

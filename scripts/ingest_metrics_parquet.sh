@@ -69,29 +69,6 @@ clickhouse-local \
     FORMAT Native
   " | "${client[@]}" --query "INSERT INTO metrics_series FORMAT Native"
 
-echo "Loading metrics_label_index from $TAGS_FILE"
-clickhouse-local \
-  --max_threads="$LOCAL_MAX_THREADS" \
-  --query "
-    SELECT
-      toUInt64($TEAM_ID) AS team_id,
-      metric_name,
-      label_name,
-      label_value,
-      series_id AS id
-    FROM
-    (
-      SELECT
-        metric_name,
-        label_name,
-        tags[label_name] AS label_value,
-        cityHash64(toString(id)) AS series_id
-      FROM file('$TAGS_FILE', Parquet)
-      ARRAY JOIN mapKeys(tags) AS label_name
-    )
-    FORMAT Native
-  " | "${client[@]}" --query "INSERT INTO metrics_label_index FORMAT Native"
-
 echo "Loading metrics_samples from $DATA_FILE"
 clickhouse-local \
   --max_threads="$LOCAL_MAX_THREADS" \

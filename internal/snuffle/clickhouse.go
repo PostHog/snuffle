@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
+	"github.com/ClickHouse/clickhouse-go/v2/ext"
 	"github.com/ClickHouse/clickhouse-go/v2/lib/driver"
 )
 
@@ -65,6 +66,23 @@ type clickHouseRow interface {
 }
 
 func (c *ClickHouseClient) QueryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) error {
+	return c.queryRows(ctx, sql, handle)
+}
+
+func (c *ClickHouseClient) QueryRowsWithExternalUInt64s(ctx context.Context, table, column string, values []uint64, sql string, handle func(clickHouseRow) error) error {
+	external, err := ext.NewTable(table, ext.Column(column, "UInt64"))
+	if err != nil {
+		return err
+	}
+	for _, value := range values {
+		if err := external.Append(value); err != nil {
+			return err
+		}
+	}
+	return c.queryRows(clickhouse.Context(ctx, clickhouse.WithExternalTable(external)), sql, handle)
+}
+
+func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) error {
 	if c.connErr != nil {
 		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
@@ -103,13 +121,25 @@ func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
 type clickHouseBatch = driver.Batch
 
 func (c *ClickHouseClient) InsertColumns(ctx context.Context, sql string, appendColumns func(clickHouseBatch) (int, error)) error {
+	return c.insertColumns(ctx, sql, true, appendColumns)
+}
+
+func (c *ClickHouseClient) InsertColumnsSync(ctx context.Context, sql string, appendColumns func(clickHouseBatch) (int, error)) error {
+	return c.insertColumns(ctx, sql, false, appendColumns)
+}
+
+func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async bool, appendColumns func(clickHouseBatch) (int, error)) error {
 	if c.connErr != nil {
 		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
-	ctx = clickhouse.Context(ctx, clickhouse.WithAsync(false))
+	insertMode := "native insert"
+	if async {
+		ctx = clickhouse.Context(ctx, clickhouse.WithAsync(false))
+		insertMode = "native async insert (async_insert=1 wait_for_async_insert=0)"
+	}
 	batch, err := c.conn.PrepareBatch(ctx, sql)
 	if err != nil {
-		return fmt.Errorf("prepare native async insert (async_insert=1 wait_for_async_insert=0): %w", err)
+		return fmt.Errorf("prepare %s: %w", insertMode, err)
 	}
 	sent := false
 	defer func() {
@@ -124,12 +154,12 @@ func (c *ClickHouseClient) InsertColumns(ctx context.Context, sql string, append
 	if count == 0 {
 		sent = true
 		if err := batch.Close(); err != nil {
-			return fmt.Errorf("close empty native insert batch: %w", err)
+			return fmt.Errorf("close empty %s batch: %w", insertMode, err)
 		}
 		return nil
 	}
 	if err := batch.Send(); err != nil {
-		return fmt.Errorf("send native async insert (async_insert=1 wait_for_async_insert=0 rows=%d): %w", count, err)
+		return fmt.Errorf("send %s rows=%d: %w", insertMode, count, err)
 	}
 	sent = true
 	recordClickHouseWrite(ctx, int64(count))
