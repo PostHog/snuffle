@@ -20,6 +20,9 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 
 	switch e := expr.(type) {
 	case *parser.AggregateExpr:
+		if data, ok, err := s.tryFastNestedCountInstantQuery(ctx, e, evalTime); ok || err != nil {
+			return data, ok, err
+		}
 		if data, ok, err := s.tryFastAggregate(ctx, e, evalTime); ok || err != nil {
 			return data, ok, err
 		}
@@ -455,17 +458,7 @@ func (s *Server) queryAggregateRangeRows(ctx context.Context, sql string, groupi
 }
 
 func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	if expr.Op != parser.COUNT || expr.Without || len(expr.Grouping) != 0 {
-		return queryData{}, false, nil
-	}
-	inner, ok := expr.Expr.(*parser.AggregateExpr)
-	if !ok || inner.Op != parser.COUNT || inner.Without || len(inner.Grouping) == 0 {
-		return queryData{}, false, nil
-	}
-	if groupingHasMetricName(inner.Grouping) {
-		return queryData{}, false, nil
-	}
-	selector, ok := inner.Expr.(*parser.VectorSelector)
+	inner, selector, ok := nestedCountSelector(expr)
 	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
 		return queryData{}, false, nil
 	}
@@ -476,6 +469,14 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
 	if steps <= 0 {
 		return queryData{}, false, nil
+	}
+	if sql, ok := nestedCountTimestampSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
+		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+		data, err := s.queryNestedCountRangeValues(ctx, sql)
+		if err != nil {
+			return queryData{}, true, err
+		}
+		return data, true, nil
 	}
 	if sql, ok := nestedCountSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
 		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
@@ -507,6 +508,123 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 	return data, true, err
 }
 
+func (s *Server) tryFastNestedCountInstantQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
+	inner, selector, ok := nestedCountSelector(expr)
+	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+		return queryData{}, false, nil
+	}
+	window, ok := selectorWindowFor(selector, evalTime, s.cfg.LookbackDelta)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql, ok := nestedCountSamplesInstantSQL(s.cfg, selector.LabelMatchers, inner.Grouping, window.mint, window.maxt, evalTime.UnixMilli())
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	data, err := s.queryNestedCountInstantValue(ctx, sql)
+	return data, true, err
+}
+
+func nestedCountSelector(expr *parser.AggregateExpr) (*parser.AggregateExpr, *parser.VectorSelector, bool) {
+	if expr.Op != parser.COUNT || expr.Without || len(expr.Grouping) != 0 {
+		return nil, nil, false
+	}
+	inner, ok := expr.Expr.(*parser.AggregateExpr)
+	if !ok || inner.Op != parser.COUNT || inner.Without || len(inner.Grouping) == 0 {
+		return nil, nil, false
+	}
+	if groupingHasMetricName(inner.Grouping) {
+		return nil, nil, false
+	}
+	selector, ok := inner.Expr.(*parser.VectorSelector)
+	if !ok {
+		return nil, nil, false
+	}
+	return inner, selector, true
+}
+
+func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
+	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName || steps <= 0 {
+		return "", false
+	}
+	intervalMillis := cfg.RemoteWriteInterval.Milliseconds()
+	evalStartMillis := evalStart.UnixMilli()
+	if intervalMillis <= 0 || intervalMillis > lookback.Milliseconds() {
+		return "", false
+	}
+	metric := exactMetricName(matchers)
+	if metric == "" {
+		return "", false
+	}
+	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers)
+	if !ok {
+		return "", false
+	}
+
+	evalEndMillis := evalStartMillis + (steps-1)*stepMillis
+	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
+	if stepMillis >= intervalMillis && stepMillis%intervalMillis == 0 && bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval) == evalStartMillis {
+		return nestedCountAlignedTimestampSamplesRangeSQL(cfg, metric, groupColumn, groupLabels, idFilters, evalStartMillis, outputStart.UnixMilli(), stepMillis, steps)
+	}
+
+	bucketStartMillis := bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval)
+	bucketEndMillis := bucketTimestampMS(evalEndMillis, cfg.RemoteWriteInterval)
+	sampleWhere := []string{
+		teamFilter(cfg),
+		"metric_name = " + sqlString(metric),
+		"timestamp >= " + chTimeMillis(bucketStartMillis),
+		"timestamp <= " + chTimeMillis(bucketEndMillis),
+	}
+	sampleWhere = append(sampleWhere, idFilters...)
+
+	return fmt.Sprintf(
+		"WITH group_labels AS (%s), step_map AS (SELECT toInt64(%d) + toInt64(number) * %d AS ts, intDiv(toInt64(%d) + toInt64(number) * %d, %d) * %d AS bucket_ms FROM numbers(toUInt64(%d))) SELECT ts, toFloat64(count()) AS value FROM (SELECT step_map.ts AS ts, ifNull(%s, '') AS %s FROM step_map INNER JOIN (SELECT timestamp, id FROM %s WHERE %s) AS active_samples ON active_samples.timestamp = %s ANY LEFT JOIN group_labels USING id GROUP BY ts, %s) AS active_groups GROUP BY ts ORDER BY ts",
+		groupLabels,
+		outputStart.UnixMilli(),
+		stepMillis,
+		evalStartMillis,
+		stepMillis,
+		intervalMillis,
+		intervalMillis,
+		steps,
+		groupColumn,
+		groupColumn,
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
+		chTimeMillisExpr("step_map.bucket_ms"),
+		groupColumn,
+	), true
+}
+
+func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn, groupLabels string, idFilters []string, evalStartMillis, outputStartMillis, stepMillis, steps int64) (string, bool) {
+	evalEndMillis := evalStartMillis + (steps-1)*stepMillis
+	sampleWhere := []string{
+		teamFilter(cfg),
+		"metric_name = " + sqlString(metric),
+		"timestamp >= " + chTimeMillis(evalStartMillis),
+		"timestamp <= " + chTimeMillis(evalEndMillis),
+	}
+	if stepMillis != cfg.RemoteWriteInterval.Milliseconds() {
+		sampleWhere = append(sampleWhere, fmt.Sprintf("modulo(toUnixTimestamp64Milli(timestamp) - %d, %d) = 0", evalStartMillis, stepMillis))
+	}
+	sampleWhere = append(sampleWhere, idFilters...)
+
+	return fmt.Sprintf(
+		"WITH group_labels AS (%s) SELECT ts, toFloat64(count()) AS value FROM (SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, ifNull(%s, '') AS %s FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY ts, %s) AS active_groups GROUP BY ts ORDER BY ts",
+		groupLabels,
+		outputStartMillis,
+		evalStartMillis,
+		stepMillis,
+		stepMillis,
+		groupColumn,
+		groupColumn,
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
+		groupColumn,
+	), true
+}
+
 func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
 	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName {
 		return "", false
@@ -533,15 +651,7 @@ func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	groupName := grouping[0]
-	groupColumn := quoteIdent(groupAlias(0))
-	groupLabels := fmt.Sprintf(
-		"SELECT id, label_value AS %s FROM %s WHERE %s AND metric_name = %s AND label_name = %s",
-		groupColumn,
-		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
-		teamFilter(cfg),
-		sqlString(metric),
-		sqlString(groupName),
-	)
+	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, groupName)
 
 	return fmt.Sprintf(
 		"WITH active_ids AS (SELECT step_idx, id FROM (SELECT id, toUnixTimestamp64Milli(timestamp) AS ts FROM %s WHERE %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE ts >= %s AND ts <= %s GROUP BY step_idx, id), active_groups AS (SELECT step_idx, ifNull(%s, '') AS %s FROM active_ids ANY LEFT JOIN (%s) AS group_labels USING id GROUP BY step_idx, %s) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
@@ -557,6 +667,101 @@ func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping
 		outputStart.UnixMilli(),
 		stepMillis,
 	), true
+}
+
+func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, grouping []string, mint, maxt, evalMillis int64) (string, bool) {
+	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName {
+		return "", false
+	}
+	metric := exactMetricName(matchers)
+	if metric == "" {
+		return "", false
+	}
+	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers)
+	if !ok {
+		return "", false
+	}
+
+	timeFilter := fmt.Sprintf("timestamp >= %s AND timestamp <= %s", chTimeMillis(mint), chTimeMillis(maxt))
+	if cfg.RemoteWriteInterval > 0 {
+		bucket := bucketTimestampMS(maxt, cfg.RemoteWriteInterval)
+		if bucket >= mint {
+			timeFilter = "timestamp = " + chTimeMillis(bucket)
+		}
+	}
+	sampleWhere := []string{
+		teamFilter(cfg),
+		"metric_name = " + sqlString(metric),
+		timeFilter,
+	}
+	sampleWhere = append(sampleWhere, idFilters...)
+
+	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
+	return fmt.Sprintf(
+		"WITH group_labels AS (%s) SELECT toInt64(%d) AS ts, toFloat64(count()) AS value FROM (SELECT ifNull(%s, '') AS %s FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY %s) AS active_groups",
+		groupLabels,
+		evalMillis,
+		groupColumn,
+		groupColumn,
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
+		groupColumn,
+	), true
+}
+
+func nestedCountGroupLabelsSQL(cfg Config, metric, groupName string) (string, string) {
+	groupColumn := quoteIdent(groupAlias(0))
+	return groupColumn, fmt.Sprintf(
+		"SELECT id, label_value AS %s FROM %s WHERE %s AND metric_name = %s AND label_name = %s",
+		groupColumn,
+		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+		teamFilter(cfg),
+		sqlString(metric),
+		sqlString(groupName),
+	)
+}
+
+func nonMetricSampleIDFiltersFromMatchers(cfg Config, metric string, matchers []*labels.Matcher) ([]string, bool) {
+	var filters []string
+	for _, m := range matchers {
+		if m.Name == labels.MetricName || matcherIsNoop(m) {
+			continue
+		}
+		membership, condition, ok := labelIndexMembershipCondition(m)
+		if !ok {
+			return nil, false
+		}
+		filters = append(filters, fmt.Sprintf(
+			"id %s (SELECT id FROM %s WHERE %s AND metric_name = %s AND label_name = %s AND %s)",
+			membership,
+			tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+			teamFilter(cfg),
+			sqlString(metric),
+			sqlString(m.Name),
+			condition,
+		))
+	}
+	return filters, true
+}
+
+func (s *Server) queryNestedCountInstantValue(ctx context.Context, sql string) (queryData, error) {
+	var result []sampleResult
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var ts int64
+		var value float64
+		if err := row.Scan(&ts, &value); err != nil {
+			return err
+		}
+		result = append(result, sampleResult{
+			Metric: map[string]string{},
+			Value:  []any{float64(ts) / 1000, formatSample(value)},
+		})
+		return nil
+	})
+	if err != nil {
+		return queryData{}, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeVector), Result: result}, nil
 }
 
 func (s *Server) queryNestedCountRangeValues(ctx context.Context, sql string) (queryData, error) {

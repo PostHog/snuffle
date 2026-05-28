@@ -115,6 +115,95 @@ func TestNestedCountRangeSQLUsesSeriesBounds(t *testing.T) {
 	}
 }
 
+func TestNestedCountTimestampSamplesRangeSQLUsesEvalTimestamps(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		LabelIndexTable:     "label_index",
+		RemoteWriteInterval: 15 * time.Second,
+		TeamID:              42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count(node_cpu_seconds_total{type=~".*", ready=~"true"}) by (cpu))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	start := time.Unix(1778398980, 0).UTC()
+	stepMillis := time.Minute.Milliseconds()
+	sql, ok := nestedCountTimestampSamplesRangeSQL(cfg, selector.LabelMatchers, inner.Grouping, start, start, stepMillis, 61, 5*time.Minute)
+	if !ok {
+		t.Fatal("nestedCountTimestampSamplesRangeSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"`default`.`samples`",
+		"`default`.`label_index`",
+		"metric_name = 'node_cpu_seconds_total'",
+		"label_name = 'ready'",
+		"label_name = 'cpu'",
+		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
+		"GROUP BY ts, `__group_0`",
+		"modulo(toUnixTimestamp64Milli(timestamp) - 1778398980000, 60000) = 0",
+		"SELECT ts, toFloat64(count()) AS value",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"active_ids AS", "range(toUInt64", "timeSeriesLastToGrid", "metrics_series"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
+func TestNestedCountTimestampSamplesRangeSQLBucketsUnalignedEvalTimes(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		LabelIndexTable:     "label_index",
+		RemoteWriteInterval: 15 * time.Second,
+		TeamID:              42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count(node_cpu_seconds_total{ready=~"true"}) by (cpu))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	evalStart := time.Unix(1778398987, 0).UTC()
+	outputStart := time.Unix(1778398999, 0).UTC()
+	sql, ok := nestedCountTimestampSamplesRangeSQL(cfg, selector.LabelMatchers, inner.Grouping, evalStart, outputStart, time.Minute.Milliseconds(), 61, 5*time.Minute)
+	if !ok {
+		t.Fatal("nestedCountTimestampSamplesRangeSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"step_map AS",
+		"FROM numbers(toUInt64(61))",
+		"intDiv(toInt64(1778398987000) + toInt64(number) * 60000, 15000) * 15000 AS bucket_ms",
+		"active_samples ON active_samples.timestamp = fromUnixTimestamp64Milli(step_map.bucket_ms, 'UTC')",
+		"SELECT toInt64(1778398999000) + toInt64(number) * 60000 AS ts",
+		"label_name = 'ready'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"modulo(toUnixTimestamp64Milli(timestamp)", "range(toUInt64"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
 func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
 	cfg := Config{RemoteWriteInterval: 15 * time.Second}
 	p := parser.NewParser(parser.Options{})
@@ -139,6 +228,50 @@ func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
 	selector.OriginalOffset = time.Minute
 	if exactBucketRangeSelector(cfg, selector, start, end, 15*time.Second) {
 		t.Fatal("offset selector should not use exact bucket path")
+	}
+}
+
+func TestNestedCountSamplesInstantSQLUsesLatestBucket(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		LabelIndexTable:     "label_index",
+		RemoteWriteInterval: 15 * time.Second,
+		TeamID:              42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count(node_cpu_seconds_total{ready=~"true"}) by (cpu))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	sql, ok := nestedCountSamplesInstantSQL(cfg, selector.LabelMatchers, inner.Grouping, 1778398680000, 1778398980000, 1778398980000)
+	if !ok {
+		t.Fatal("nestedCountSamplesInstantSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"`default`.`samples`",
+		"`default`.`label_index`",
+		"metric_name = 'node_cpu_seconds_total'",
+		"timestamp = fromUnixTimestamp64Milli(1778398980000, 'UTC')",
+		"label_name = 'ready'",
+		"label_name = 'cpu'",
+		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
+		"GROUP BY `__group_0`",
+		"SELECT toInt64(1778398980000) AS ts, toFloat64(count()) AS value",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"range(toUInt64", "timeSeriesLastToGrid", "metrics_series"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
 	}
 }
 
