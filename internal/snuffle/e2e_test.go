@@ -37,13 +37,14 @@ func TestEndToEndClickHouse(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	chAddr := getenv("SNUFFLE_E2E_CH_ADDR", "localhost:9000")
+	chAddr := getenv("SNUFFLE_E2E_CH_ADDR", "127.0.0.1:9000")
 	dbName := fmt.Sprintf("snuffle_e2e_%d", time.Now().UnixNano())
 	rootCfg := ConfigFromEnv()
 	rootCfg.CHAddr = chAddr
 	rootCfg.CHDatabase = ""
 	rootCfg.CHTimeout = 10 * time.Second
 	rootClient := NewClickHouseClient(rootCfg)
+	waitForClickHouse(t, ctx, rootClient)
 	if err := rootClient.Exec(ctx, "CREATE DATABASE "+quoteIdent(dbName)); err != nil {
 		t.Fatalf("create e2e database: %v", err)
 	}
@@ -87,6 +88,36 @@ func TestEndToEndClickHouse(t *testing.T) {
 	assertExemplars(t, api.URL)
 	assertRemoteReadSamples(t, api.URL)
 	assertRemoteReadHistograms(t, api.URL)
+}
+
+func waitForClickHouse(t *testing.T, ctx context.Context, client *ClickHouseClient) {
+	t.Helper()
+	if client.connErr != nil {
+		t.Fatalf("connect clickhouse: %v", client.connErr)
+	}
+
+	readyCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	var lastErr error
+	for {
+		pingCtx, pingCancel := context.WithTimeout(readyCtx, 5*time.Second)
+		err := client.Ping(pingCtx)
+		pingCancel()
+		if err == nil {
+			return
+		}
+		lastErr = err
+
+		select {
+		case <-readyCtx.Done():
+			t.Fatalf("clickhouse did not become ready: %v (last error: %v)", readyCtx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
 }
 
 func createMetricsSchema(t *testing.T, ctx context.Context, client *ClickHouseClient) {

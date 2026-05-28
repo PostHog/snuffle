@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CH_ADDR="${SNUFFLE_E2E_CH_ADDR:-localhost:9000}"
+CH_ADDR="${SNUFFLE_E2E_CH_ADDR:-127.0.0.1:9000}"
 CH_HOST="${CH_ADDR%:*}"
 CH_PORT="${CH_ADDR##*:}"
 
