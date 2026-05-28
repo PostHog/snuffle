@@ -696,7 +696,7 @@ func (q *CHQuerier) loadSamples(ctx context.Context, series []*seriesMeta, mint,
 	}
 
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
-		sql := samplesSQL(q.queryable.cfg, batch, mint, maxt, latestOnly)
+		sql := samplesSQL(q.queryable.cfg, batch, mint, maxt, latestOnly, matchers)
 		err := q.queryable.client.QueryRows(ctx, sql, sampleRowHandler(byID))
 		if err != nil {
 			return err
@@ -924,14 +924,15 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 	return filters, true
 }
 
-func samplesSQL(cfg Config, ids []uint64, mint, maxt int64, latestOnly bool) string {
-	return sampleRowsSQL(cfg, fmt.Sprintf(
-		"%s AND id IN (%s) AND timestamp >= %s AND timestamp <= %s",
+func samplesSQL(cfg Config, ids []uint64, mint, maxt int64, latestOnly bool, matchers []*labels.Matcher) string {
+	where := []string{
 		teamFilter(cfg),
-		joinUint64(ids),
-		chTimeMillis(mint),
-		chTimeMillis(maxt),
-	), latestOnly)
+		"id IN (" + joinUint64(ids) + ")",
+		"timestamp >= " + chTimeMillis(mint),
+		"timestamp <= " + chTimeMillis(maxt),
+	}
+	where = append(where, metricNameConstraints(matchers)...)
+	return sampleRowsSQL(cfg, strings.Join(where, " AND "), latestOnly)
 }
 
 func idBatches(ids []uint64, size int) [][]uint64 {

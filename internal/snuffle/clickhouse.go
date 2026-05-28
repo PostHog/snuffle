@@ -30,7 +30,6 @@ func NewClickHouseClient(cfg Config) *ClickHouseClient {
 		Settings: clickhouse.Settings{
 			"allow_experimental_time_series_aggregate_functions": 1,
 		},
-		Compression:     &clickhouse.Compression{Method: clickhouse.CompressionLZ4},
 		DialTimeout:     cfg.CHTimeout,
 		MaxOpenConns:    32,
 		MaxIdleConns:    8,
@@ -134,8 +133,8 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 	}
 	insertMode := "native insert"
 	if async {
-		ctx = clickhouse.Context(ctx, clickhouse.WithAsync(false))
-		insertMode = "native async insert (async_insert=1 wait_for_async_insert=0)"
+		ctx = clickhouse.Context(ctx, clickhouse.WithAsync(true))
+		insertMode = "native async insert (async_insert=1 wait_for_async_insert=1)"
 	}
 	batch, err := c.conn.PrepareBatch(ctx, sql)
 	if err != nil {

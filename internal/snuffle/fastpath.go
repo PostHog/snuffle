@@ -285,6 +285,9 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	if !ok {
 		return queryData{}, false, nil
 	}
+	if vectorSelector, ok := expr.Expr.(*parser.VectorSelector); ok && exactBucketRangeSelector(s.cfg, vectorSelector, start, end, step) {
+		return s.queryFastExactAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, start, end, aggSQL)
+	}
 	return s.queryFastAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, source.gridExpr, mint, maxt, start, stepMillis, aggSQL)
 }
 
@@ -364,10 +367,70 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 	)
 	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 
+	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+func (s *Server) queryFastExactAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, start, end time.Time, aggSQL string) (queryData, bool, error) {
+	where := []string{
+		teamFilter(s.cfg),
+		fmt.Sprintf("timestamp >= %s", chTimeMillis(start.UnixMilli())),
+		fmt.Sprintf("timestamp <= %s", chTimeMillis(end.UnixMilli())),
+		"id IN (SELECT id FROM selected_series)",
+	}
+	where = append(where, metricNameConstraints(groupMatchers)...)
+	samples := fmt.Sprintf(
+		"SELECT id, timestamp, value AS sample_value FROM %s WHERE %s",
+		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
+		strings.Join(where, " AND "),
+	)
+
+	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
+	withParts := []string{
+		"selected_series AS (" + selectedSeries + ")",
+		"samples AS (" + samples + ")",
+	}
+	if groupLabels != "" {
+		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
+	}
+
+	selectParts := make([]string, 0, len(groupSelect)+2)
+	selectParts = append(selectParts, groupSelect...)
+	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
+	selectParts = append(selectParts, aggSQL+" AS value")
+
+	groupByParts := append([]string{}, groupBy...)
+	groupByParts = append(groupByParts, "ts")
+	orderByParts := append([]string{}, groupBy...)
+	orderByParts = append(orderByParts, "ts")
+
+	source := aggregateSourceSQL("samples", expr.Grouping, groupJoin)
+	sql := fmt.Sprintf(
+		"WITH %s SELECT %s FROM %s GROUP BY %s ORDER BY %s",
+		strings.Join(withParts, ", "),
+		strings.Join(selectParts, ", "),
+		source,
+		strings.Join(groupByParts, ", "),
+		strings.Join(orderByParts, ", "),
+	)
+	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+
+	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+func (s *Server) queryAggregateRangeRows(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
 	results := make([]sampleResult, 0, 128)
 	seen := make(map[string]int, 128)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		groupValues := make([]string, len(expr.Grouping))
+		groupValues := make([]string, len(grouping))
 		var ts int64
 		var value float64
 		dest := make([]any, 0, len(groupValues)+2)
@@ -378,7 +441,7 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 		if err := row.Scan(dest...); err != nil {
 			return err
 		}
-		metric, key := groupingMetricAndKeyValues(groupValues, expr.Grouping)
+		metric, key := groupingMetricAndKeyValues(groupValues, grouping)
 		idx, ok := seen[key]
 		if !ok {
 			idx = len(results)
@@ -388,10 +451,7 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 		results[idx].Values = append(results[idx].Values, []any{float64(ts) / 1000, formatSample(value)})
 		return nil
 	})
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+	return results, err
 }
 
 func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
@@ -676,6 +736,23 @@ func selectorRangeGridSource(cfg Config, selector *parser.VectorSelector, start,
 	return selectorGridSource{start: shiftedStart, end: shiftedEnd}, mint, maxt, true
 }
 
+func exactBucketRangeSelector(cfg Config, selector *parser.VectorSelector, start, end time.Time, step time.Duration) bool {
+	if cfg.RemoteWriteInterval <= 0 || step != cfg.RemoteWriteInterval {
+		return false
+	}
+	if selector.OriginalOffset != 0 || selector.Offset != 0 {
+		return false
+	}
+	intervalMillis := cfg.RemoteWriteInterval.Milliseconds()
+	if intervalMillis <= 0 {
+		return false
+	}
+	startMillis := start.UnixMilli()
+	endMillis := end.UnixMilli()
+	return bucketTimestampMS(startMillis, cfg.RemoteWriteInterval) == startMillis &&
+		bucketTimestampMS(endMillis, cfg.RemoteWriteInterval) == endMillis
+}
+
 func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
 	return fmt.Sprintf(
 		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
@@ -817,7 +894,7 @@ func (s *Server) tryFastTopK(ctx context.Context, expr *parser.AggregateExpr, ev
 }
 
 func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, limit int, op parser.ItemType) (queryData, bool, error) {
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, []string{"id"})
+	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, []string{"id", "metric_name", "labels_json"})
 	if !ok {
 		return queryData{}, false, nil
 	}
@@ -826,16 +903,14 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 	if op == parser.BOTTOMK {
 		direction = "ASC"
 	}
-	seriesLookup := topKSeriesLookupSQL(s.cfg, selector.LabelMatchers)
 	latestSource := latestSamplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
 	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), top_series AS (SELECT id, value FROM (%s) ORDER BY value %s LIMIT %d) SELECT s.metric_name AS metric_name, s.labels_json AS labels_json, toInt64(%d) AS ts, top_series.value AS value FROM top_series ANY INNER JOIN %s AS s USING id ORDER BY value %s",
+		"WITH selected_series AS (%s), top_series AS (SELECT id, value FROM (%s) ORDER BY value %s LIMIT %d) SELECT selected_series.metric_name AS metric_name, selected_series.labels_json AS labels_json, toInt64(%d) AS ts, top_series.value AS value FROM top_series ANY INNER JOIN selected_series USING id ORDER BY value %s",
 		selectedSeries,
 		latestSource,
 		direction,
 		limit,
 		evalTime.UnixMilli(),
-		seriesLookup,
 		direction,
 	)
 
@@ -862,16 +937,6 @@ func (s *Server) tryLabelIndexTopK(ctx context.Context, selector *parser.VectorS
 		return queryData{}, true, err
 	}
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
-}
-
-func topKSeriesLookupSQL(cfg Config, matchers []*labels.Matcher) string {
-	where := []string{teamFilter(cfg), "id IN (SELECT id FROM top_series)"}
-	where = append(where, metricNameConstraints(matchers)...)
-	return fmt.Sprintf(
-		"(SELECT id, any(metric_name) AS metric_name, any(labels_json) AS labels_json FROM (SELECT id, metric_name, labels_json FROM %s WHERE %s) GROUP BY id)",
-		tableName(cfg.CHDatabase, cfg.SeriesTable),
-		strings.Join(where, " AND "),
-	)
 }
 
 type selectorWindow struct {

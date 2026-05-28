@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated_at": "2026-05-28T14:51:53Z",
+  "generated_at": "2026-05-28T17:15:35Z",
   "source": {
     "name": "tsbs",
     "version": "v0.0.0-20260527045238-8323e59c7402",
@@ -17,141 +17,141 @@
   },
   "ingest": {
     "rows": 24240000,
-    "duration_ms": 25344,
-    "metric_rate": 956437.2833165885,
-    "row_rate": 956437.2833165885
+    "duration_ms": 22572,
+    "metric_rate": 1073869.5499181594,
+    "row_rate": 1073869.5499181594
   },
   "query": {
     "scenario_count": 8,
-    "geomean_avg_ms": 18.898153345789137,
-    "total_avg_ms": 159.39800000000002
+    "geomean_avg_ms": 15.69593781686889,
+    "total_avg_ms": 129.292
   },
   "benchmarks": [
     {
       "name": "BenchmarkBridgeHTTP/tsbs_avg_by_environment",
       "iterations": 50,
-      "avg_ms": 19.07,
+      "avg_ms": 16.79,
       "metrics": {
         "B/op": 7884,
         "allocs/op": 77,
-        "avg_ms": 19.07,
-        "max_ms": 25.58,
-        "ns/op": 2058076,
-        "p50_ms": 19.59,
-        "p95_ms": 23.26,
-        "p99_ms": 25.58,
+        "avg_ms": 16.79,
+        "max_ms": 18.81,
+        "ns/op": 1745305,
+        "p50_ms": 17.01,
+        "p95_ms": 18.35,
+        "p99_ms": 18.81,
         "response_bytes/op": 321
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_label_values_hostname",
       "iterations": 50,
-      "avg_ms": 9.448,
+      "avg_ms": 8.672,
       "metrics": {
-        "B/op": 35545,
-        "allocs/op": 93,
-        "avg_ms": 9.448,
-        "max_ms": 12.8,
-        "ns/op": 1004881,
-        "p50_ms": 9.596,
-        "p95_ms": 10.78,
-        "p99_ms": 12.8,
+        "B/op": 34873,
+        "allocs/op": 90,
+        "avg_ms": 8.672,
+        "max_ms": 11.02,
+        "ns/op": 948554,
+        "p50_ms": 8.619,
+        "p95_ms": 10.06,
+        "p99_ms": 11.02,
         "response_bytes/op": 10920
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_one_series",
       "iterations": 50,
-      "avg_ms": 17.88,
+      "avg_ms": 16.54,
       "metrics": {
-        "B/op": 8693,
-        "allocs/op": 81,
-        "avg_ms": 17.88,
-        "max_ms": 24.2,
-        "ns/op": 1875913,
-        "p50_ms": 16.91,
-        "p95_ms": 22.66,
-        "p99_ms": 24.2,
+        "B/op": 8216,
+        "allocs/op": 79,
+        "avg_ms": 16.54,
+        "max_ms": 19.68,
+        "ns/op": 1682839,
+        "p50_ms": 16.5,
+        "p95_ms": 19,
+        "p99_ms": 19.68,
         "response_bytes/op": 328
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_range_selector",
       "iterations": 50,
-      "avg_ms": 27.45,
+      "avg_ms": 21.78,
       "metrics": {
-        "B/op": 8846,
-        "allocs/op": 79,
-        "avg_ms": 27.45,
-        "max_ms": 38.82,
-        "ns/op": 2831873,
-        "p50_ms": 27.22,
-        "p95_ms": 37.98,
-        "p99_ms": 38.82,
+        "B/op": 8660,
+        "allocs/op": 78,
+        "avg_ms": 21.78,
+        "max_ms": 25.53,
+        "ns/op": 2240060,
+        "p50_ms": 21.69,
+        "p95_ms": 24.71,
+        "p99_ms": 25.53,
         "response_bytes/op": 673
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_range_sum_by_region",
       "iterations": 50,
-      "avg_ms": 25.8,
+      "avg_ms": 18.51,
       "metrics": {
-        "B/op": 18309,
-        "allocs/op": 88,
-        "avg_ms": 25.8,
-        "max_ms": 36.03,
-        "ns/op": 2687366,
-        "p50_ms": 25.95,
-        "p95_ms": 30.8,
-        "p99_ms": 36.03,
+        "B/op": 18870,
+        "allocs/op": 91,
+        "avg_ms": 18.51,
+        "max_ms": 21.85,
+        "ns/op": 1893770,
+        "p50_ms": 18.59,
+        "p95_ms": 20.76,
+        "p99_ms": 21.85,
         "response_bytes/op": 4086
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_series_metric",
       "iterations": 50,
-      "avg_ms": 14.5,
+      "avg_ms": 13.65,
       "metrics": {
-        "B/op": 495855,
-        "allocs/op": 117,
-        "avg_ms": 14.5,
-        "max_ms": 20.45,
-        "ns/op": 1799384,
-        "p50_ms": 14.03,
-        "p95_ms": 18.11,
-        "p99_ms": 20.45,
+        "B/op": 497771,
+        "allocs/op": 125,
+        "avg_ms": 13.65,
+        "max_ms": 16.5,
+        "ns/op": 1657975,
+        "p50_ms": 13.57,
+        "p95_ms": 15.64,
+        "p99_ms": 16.5,
         "response_bytes/op": 224915
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_sum_by_region",
       "iterations": 50,
-      "avg_ms": 18.14,
+      "avg_ms": 16.97,
       "metrics": {
-        "B/op": 8729,
+        "B/op": 8688,
         "allocs/op": 79,
-        "avg_ms": 18.14,
-        "max_ms": 24.37,
-        "ns/op": 1878158,
-        "p50_ms": 17.77,
-        "p95_ms": 23.06,
-        "p99_ms": 24.37,
+        "avg_ms": 16.97,
+        "max_ms": 21.02,
+        "ns/op": 1739365,
+        "p50_ms": 17,
+        "p95_ms": 19.55,
+        "p99_ms": 21.02,
         "response_bytes/op": 639
       }
     },
     {
       "name": "BenchmarkBridgeHTTP/tsbs_topk",
       "iterations": 50,
-      "avg_ms": 27.11,
+      "avg_ms": 16.38,
       "metrics": {
-        "B/op": 14408,
-        "allocs/op": 87,
-        "avg_ms": 27.11,
-        "max_ms": 48.32,
-        "ns/op": 2852603,
-        "p50_ms": 24.23,
-        "p95_ms": 45.31,
-        "p99_ms": 48.32,
+        "B/op": 14101,
+        "allocs/op": 86,
+        "avg_ms": 16.38,
+        "max_ms": 19.19,
+        "ns/op": 1691635,
+        "p50_ms": 16.3,
+        "p95_ms": 18.5,
+        "p99_ms": 19.19,
         "response_bytes/op": 2667
       }
     }

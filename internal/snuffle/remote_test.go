@@ -196,6 +196,26 @@ func TestRemoteWritePhaseErrorIncludesUsefulContext(t *testing.T) {
 	}
 }
 
+func TestMissingSeriesIDsSQLReturnsOnlyLookupMisses(t *testing.T) {
+	cfg := Config{
+		CHDatabase:  "default",
+		SeriesTable: "series",
+		TeamID:      42,
+	}
+	sql := missingSeriesIDsSQL(cfg, "remote_write_series_ids")
+	for _, want := range []string{
+		"SELECT id",
+		"`remote_write_series_ids`",
+		"id NOT IN",
+		"`default`.`series`",
+		"team_id = 42",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
 func TestStableSeriesID(t *testing.T) {
 	first := labels.FromMap(map[string]string{
 		labels.MetricName: "up",

@@ -196,22 +196,59 @@ func TestRangeSamplesSQLIgnoresNoopLabelMatcher(t *testing.T) {
 	}
 }
 
-func TestTopKSeriesLookupSQLKeepsMetricConstraint(t *testing.T) {
+func TestSamplesSQLKeepsMetricConstraintForIDBatches(t *testing.T) {
 	cfg := Config{
-		CHDatabase:  "default",
-		SeriesTable: "series",
+		CHDatabase:   "default",
+		SamplesTable: "samples",
 	}
 	matchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
 		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
 	}
 
-	sql := topKSeriesLookupSQL(cfg, matchers)
+	sql := samplesSQL(cfg, []uint64{1, 2}, 1000, 2000, false, matchers)
 	for _, want := range []string{
-		"id IN (SELECT id FROM top_series)",
+		"`default`.`samples`",
+		"team_id = 0",
+		"id IN (1,2)",
+		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"timestamp <= fromUnixTimestamp64Milli(2000, 'UTC')",
+		"metric_name = 'http_requests_total'",
+		"ORDER BY id, timestamp",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "label_name = 'status'") {
+		t.Fatalf("small id-batch sample SQL should not redo label-index filtering: %s", sql)
+	}
+}
+
+func TestTopKSelectedSeriesCarriesLabelsAndMetricConstraint(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
+	}
+
+	sql, ok := selectedSeriesSQL(cfg, matchers, 1000, 2000, []string{"id", "metric_name", "labels_json"})
+	if !ok {
+		t.Fatal("selectedSeriesSQL returned ok=false")
+	}
+	for _, want := range []string{
 		"`default`.`series`",
+		"`default`.`label_index`",
+		"any(metric_name) AS metric_name",
+		"any(labels_json) AS labels_json",
 		"team_id = 0",
 		"metric_name = 'http_requests_total'",
+		"label_name = 'status'",
+		"label_value = '200'",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)

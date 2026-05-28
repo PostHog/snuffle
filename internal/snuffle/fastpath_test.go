@@ -115,6 +115,33 @@ func TestNestedCountRangeSQLUsesSeriesBounds(t *testing.T) {
 	}
 }
 
+func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
+	cfg := Config{RemoteWriteInterval: 15 * time.Second}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`usage_user{hostname="host_42"}`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	selector := expr.(*parser.VectorSelector)
+	start := time.Unix(1451607900, 0).UTC()
+	end := time.Unix(1451608185, 0).UTC()
+
+	if !exactBucketRangeSelector(cfg, selector, start, end, 15*time.Second) {
+		t.Fatal("aligned range should use exact bucket path")
+	}
+	if exactBucketRangeSelector(cfg, selector, start.Add(time.Millisecond), end, 15*time.Second) {
+		t.Fatal("unaligned start should not use exact bucket path")
+	}
+	if exactBucketRangeSelector(cfg, selector, start, end, 30*time.Second) {
+		t.Fatal("non-remote-write step should not use exact bucket path")
+	}
+
+	selector.OriginalOffset = time.Minute
+	if exactBucketRangeSelector(cfg, selector, start, end, 15*time.Second) {
+		t.Fatal("offset selector should not use exact bucket path")
+	}
+}
+
 func TestNestedCountBitmapRangeSQLUsesPostingBitmaps(t *testing.T) {
 	cfg := Config{
 		CHDatabase:         "default",

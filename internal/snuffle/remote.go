@@ -157,8 +157,16 @@ type remoteWriteMetadataRow struct {
 }
 
 func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64) (remoteWriteBatch, error) {
-	var batch remoteWriteBatch
-	seriesByID := make(map[uint64]remoteWriteSeriesRow, len(req.GetTimeseries()))
+	timeseriesCount := len(req.GetTimeseries())
+	sampleIntervalMS := sampleInterval.Milliseconds()
+	batch := remoteWriteBatch{
+		sampleRows:    make([]remoteWriteSampleRow, 0, timeseriesCount),
+		histogramRows: make([]remoteWriteHistogramRow, 0, timeseriesCount),
+		exemplarRows:  make([]remoteWriteExemplarRow, 0, timeseriesCount),
+		metadataRows:  make([]remoteWriteMetadataRow, 0, len(req.GetMetadata())),
+		seriesRecords: make([]remoteWriteSeriesRow, 0, timeseriesCount),
+	}
+	seriesByID := make(map[uint64]remoteWriteSeriesRow, timeseriesCount)
 	updatedAtMS := time.Now().UnixMilli()
 
 	for _, metadata := range req.GetMetadata() {
@@ -207,7 +215,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			if math.IsNaN(sample.Value) {
 				continue
 			}
-			bucketMS := bucketTimestampMS(sample.Timestamp, sampleInterval)
+			bucketMS := bucketTimestampForStepMS(sample.Timestamp, sampleIntervalMS)
 			observeTime(bucketMS)
 			batch.sampleRows = append(batch.sampleRows, remoteWriteSampleRow{
 				TeamID:      teamID,
@@ -220,7 +228,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		}
 		for _, histogram := range ts.GetHistograms() {
 			originalTimestamp := histogram.Timestamp
-			bucketMS := bucketTimestampMS(originalTimestamp, sampleInterval)
+			bucketMS := bucketTimestampForStepMS(originalTimestamp, sampleIntervalMS)
 			observeTime(bucketMS)
 			histogram.Timestamp = bucketMS
 			payload, err := histogram.Marshal()
@@ -313,7 +321,8 @@ func remoteMetadataType(input prompb.MetricMetadata_MetricType) string {
 }
 
 func stableSeriesID(lbls labels.Labels) uint64 {
-	hash := xxhash.New()
+	var hash xxhash.Digest
+	hash.Reset()
 	var length [8]byte
 	lbls.Range(func(label labels.Label) {
 		binary.LittleEndian.PutUint64(length[:], uint64(len(label.Name)))
@@ -338,7 +347,8 @@ func remoteWriteSeriesIdentity(input []prompb.Label) (uint64, string, error) {
 		})
 	}
 
-	hash := xxhash.New()
+	var hash xxhash.Digest
+	hash.Reset()
 	var length [8]byte
 	var metricName string
 	var previous string
@@ -402,7 +412,10 @@ func labelsJSONFromPrompb(input []prompb.Label) (string, error) {
 }
 
 func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
-	step := interval.Milliseconds()
+	return bucketTimestampForStepMS(timestamp, interval.Milliseconds())
+}
+
+func bucketTimestampForStepMS(timestamp, step int64) int64 {
 	if step <= 0 {
 		return timestamp
 	}
@@ -556,30 +569,41 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 	for i, row := range rows {
 		ids[i] = row.ID
 	}
-	existing := make(map[uint64]struct{}, len(rows))
-	sql := fmt.Sprintf(
-		"SELECT DISTINCT series.id FROM %s AS series INNER JOIN remote_write_series_ids AS lookup USING id WHERE series.team_id = %d",
-		tableName(s.cfg.CHDatabase, s.cfg.SeriesTable),
-		s.cfg.TeamID,
-	)
+	missing := make(map[uint64]struct{})
+	sql := missingSeriesIDsSQL(s.cfg, "remote_write_series_ids")
 	if err := s.client.QueryRowsWithExternalUInt64s(ctx, "remote_write_series_ids", "id", ids, sql, func(row clickHouseRow) error {
 		var id uint64
 		if err := row.Scan(&id); err != nil {
 			return err
 		}
-		existing[id] = struct{}{}
+		missing[id] = struct{}{}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
+	if len(missing) == 0 {
+		return nil, nil
+	}
+	if len(missing) == len(rows) {
+		return rows, nil
+	}
 	newRows := rows[:0]
 	for _, row := range rows {
-		if _, ok := existing[row.ID]; ok {
+		if _, ok := missing[row.ID]; !ok {
 			continue
 		}
 		newRows = append(newRows, row)
 	}
 	return newRows, nil
+}
+
+func missingSeriesIDsSQL(cfg Config, lookupTable string) string {
+	return fmt.Sprintf(
+		"SELECT id FROM %s WHERE id NOT IN (SELECT id FROM %s WHERE team_id = %d)",
+		quoteIdent(lookupTable),
+		tableName(cfg.CHDatabase, cfg.SeriesTable),
+		cfg.TeamID,
+	)
 }
 
 func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow) error {

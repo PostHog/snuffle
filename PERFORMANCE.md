@@ -107,12 +107,55 @@ Lower is better. A value under `1.0` means the current run is faster overall.
 The latest accepted local run used the default TSBS settings and wrote about
 24.24 million rows:
 
-- ingest: about `956k rows/s`
-- query geomean: about `18.9 ms`
-- query total average: about `159 ms`
+- ingest: about `1.07M rows/s`
+- query geomean: about `15.7 ms`
+- query total average: about `129 ms`
 
 Treat these as regression numbers for this development machine, not as capacity
 claims for production hardware.
+
+### How The Latest Performance Pass Was Measured
+
+The current `perf-results.json` was produced with the default `make perf-test`
+settings. The loop used for the recent query/write work was:
+
+1. Wait until unrelated ClickHouse compile/integration-test load had stopped.
+2. Run `make perf-test` on the current accepted code to get a clean comparison
+   point.
+3. Inspect `perf-results.json` for slow scenarios and `system.query_log` for
+   the exact generated ClickHouse SQL behind those scenarios.
+4. Probe candidate SQL manually only to decide whether a change was worth a
+   full benchmark. Manual probes used `query_duration_ms`, `read_rows`, and
+   `read_bytes`; they were not used as the accepted result.
+5. Patch the code or schema.
+6. Run `go test ./...` for correctness.
+7. Run `make perf-test` for the actual acceptance check.
+8. Keep a change only when the full harness improved the accepted JSON, or when
+   the tradeoff was explicitly understood.
+
+Examples of candidate checks from this pass:
+
+- `metrics_samples` ordered by `(team_id, metric_name, id, timestamp)` was kept
+  because it preserved the metric-pruned query wins without doubling sample
+  storage.
+- A sample-table projection sorted by metric was not kept because it improved
+  some queries but doubled sample-table storage and added write cost.
+- A metric-name skip index alone was not kept because it barely reduced rows
+  read in the actual hot query.
+- Exact-bucket instant aggregate, range aggregate, and topk reads were kept
+  because the benchmark data is regular remote-write data with
+  `REMOTE_WRITE_SAMPLE_INTERVAL=15s`.
+- Native ClickHouse compression was removed for the local benchmark path because
+  the bridge usually talks to a local ClickHouse server, where CPU is more
+  valuable than saving loopback bytes.
+- Small `id IN (...)` sample reads now keep metric-name constraints so they
+  match the `(team_id, metric_name, id, timestamp)` sample order.
+- Remote-write batch buffers are preallocated from the request size to reduce
+  Go-side slice growth during large replays.
+- Existing-series checks return only missing IDs from ClickHouse instead of
+  returning every existing ID to Go for steady-state batches.
+- Remote-write label hashing uses stack-allocated xxhash digests, and sample
+  bucket interval math is precomputed once per request.
 
 ### Iteration Workflow
 
@@ -236,7 +279,7 @@ For unknown incoming labels, the default should not assume hot label names.
 `metrics_samples`
 
 - columns: `timestamp DateTime64(3)`, `id UInt64`, `value Float64`,
-  `version UInt64`, `team_id UInt64`
+  `version UInt64`, `team_id UInt64`, `metric_name LowCardinality(String)`
 - engine: `ReplacingMergeTree(version)`
 - primary order: `(team_id, metric_name, id, timestamp)`
 - remote write buckets timestamps to `REMOTE_WRITE_SAMPLE_INTERVAL`, default
@@ -285,9 +328,12 @@ through `metrics_label_index`.
 query-planning advantage once the inverted index became the hot path. The
 bridge therefore avoids `Map` for labels.
 
-## Benchmark Harness
+## Other Manual Benchmarks
 
-Use Go benchmarks as a repeatable regression harness for query-shape changes:
+These commands are useful for ad-hoc checks, but `make perf-test` is the
+accepted regression benchmark.
+
+For the older hand-seeded large profile:
 
 ```bash
 BRIDGE_BENCH_URL=http://localhost:9091 \
@@ -297,7 +343,7 @@ BRIDGE_BENCH_WARMUP=10 \
 go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime=100x -timeout=10m
 ```
 
-For the local Prometheus TSDB comparison:
+For the local Prometheus TSDB comparison, when that fixture is available:
 
 ```bash
 PROM_TSDB_BENCH=1 \
@@ -311,6 +357,8 @@ The Go sidecar uses Prometheus's native PromQL engine and the metrics schema:
 - `metrics_series`
 - `metrics_samples`
 - `metrics_label_index`
+- `metrics_label_postings`
+- `metrics_series_activity`
 - `metrics_histograms`
 - `metrics_exemplars`
 - `metrics_metadata`
@@ -329,8 +377,12 @@ Implemented storage optimizations:
   filter
 - instant aggregate/topk paths read the exact remote-write bucket when
   `REMOTE_WRITE_SAMPLE_INTERVAL` is configured, avoiding a full lookback scan
+- exact-step range aggregates over raw selectors aggregate directly from
+  samples when the query range is aligned to `REMOTE_WRITE_SAMPLE_INTERVAL`
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
+- small selected-ID sample reads preserve metric constraints so ClickHouse can
+  use the sample-table key prefix
 - sample reads trust `ReplacingMergeTree(version)` instead of applying
   `argMax(value, version)` on every query. This is faster, but a just-retried
   duplicate sample can be visible until ClickHouse merges the replacement part.
@@ -338,6 +390,8 @@ Implemented storage optimizations:
   histograms are much colder and stored as protobuf payloads
 - broad latest-sample reads use ClickHouse subqueries instead of oversized
   `IN (...)` lists
+- topk/bottomk carries metric names and label JSON through `selected_series`,
+  avoiding a second series-table lookup for the winning IDs
 - plain `/query_range` selectors use `timeSeriesLastToGrid` to return one row
   per series with an array of step values
 - safe `/query_range` aggregates use ClickHouse grid functions and aggregate
@@ -351,6 +405,12 @@ Implemented storage optimizations:
 - remote write applies the configurable sample interval before insert; this is
   intentionally Go-side so later tenant-specific intervals do not require
   table-level ClickHouse expressions
+- remote write preallocates per-request row buffers before translating protobuf
+  timeseries into native ClickHouse columns
+- remote write asks ClickHouse for missing series IDs only, so existing series
+  batches do not stream every known ID back into Go
+- remote write avoids per-series xxhash allocation and avoids recomputing the
+  sample bucket interval for every sample
 - safe instant `sum`, `avg`, `count`, `min`, `max`, `group`, `topk`, and
   `bottomk` push down to ClickHouse
 - safe aggregate-over-range-function shapes such as
