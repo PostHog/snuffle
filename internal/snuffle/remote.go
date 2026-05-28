@@ -155,7 +155,6 @@ type remoteWriteSampleRow struct {
 	TimestampMS int64
 	ID          uint64
 	Value       float64
-	Version     uint64
 }
 
 type remoteWriteSampleColumns struct {
@@ -164,7 +163,6 @@ type remoteWriteSampleColumns struct {
 	Timestamps  []int64
 	IDs         []uint64
 	Values      []float64
-	Versions    []uint64
 }
 
 func (c remoteWriteSampleColumns) count() int {
@@ -265,7 +263,6 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 				TimestampMS: bucketMS,
 				ID:          id,
 				Value:       sample.Value,
-				Version:     remoteWriteVersion(sample.Timestamp),
 			})
 		}
 		for _, histogram := range ts.GetHistograms() {
@@ -750,7 +747,7 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 	if batchRows.sampleCount == 0 {
 		return nil
 	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, id, value, version)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, id, value)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		columns := batchRows.sampleColumns
 		if columns.count() == 0 {
@@ -760,7 +757,6 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 				Timestamps:  make([]int64, len(batchRows.sampleRows)),
 				IDs:         make([]uint64, len(batchRows.sampleRows)),
 				Values:      make([]float64, len(batchRows.sampleRows)),
-				Versions:    make([]uint64, len(batchRows.sampleRows)),
 			}
 			for i, row := range batchRows.sampleRows {
 				columns.TeamIDs[i] = row.TeamID
@@ -768,7 +764,6 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 				columns.Timestamps[i] = row.TimestampMS
 				columns.IDs[i] = row.ID
 				columns.Values[i] = row.Value
-				columns.Versions[i] = row.Version
 			}
 		}
 		return appendRemoteSampleColumns(batch, columns)
@@ -789,9 +784,6 @@ func appendRemoteSampleColumns(batch clickHouseBatch, columns remoteWriteSampleC
 		return 0, err
 	}
 	if err := batch.Column(4).Append(columns.Values); err != nil {
-		return 0, err
-	}
-	if err := batch.Column(5).Append(columns.Versions); err != nil {
 		return 0, err
 	}
 	return columns.count(), nil

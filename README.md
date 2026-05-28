@@ -83,8 +83,8 @@ The recommended schema is in `scripts/create_metrics_schema.sql`:
   `metric_name`, `labels_json String`, `min_time`, and `max_time`, ordered by
   `(team_id, metric_name, id)`
 - `metrics_samples`: float samples with `metric_name`, `timestamp`, `id`,
-  `value`, and `version`, using `ReplacingMergeTree(version)` and ordered by
-  `(team_id, id, timestamp)`
+  and `value`, using `MergeTree` and ordered by
+  `(team_id, metric_name, id, timestamp)`
 - `metrics_label_index`: inverted label index
   `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
   pruning
@@ -111,9 +111,8 @@ query path.
   window
 - selective reads use exact selected IDs; broad reads use ClickHouse subqueries
   to avoid oversized `IN (...)` lists
-- sample queries read raw replacement rows and rely on
-  `ReplacingMergeTree(version)` for duplicate cleanup, avoiding per-query
-  `argMax(value, version)` work
+- sample queries read raw rows from `MergeTree`; duplicate remote-write retries
+  are not deduped in the float sample table
 - plain `/query_range` selectors use ClickHouse `timeSeriesLastToGrid` so the
   sidecar receives one row per series instead of one row per sample
 - safe `/query_range` aggregations use ClickHouse grid functions and aggregate
@@ -128,9 +127,7 @@ query path.
   native histograms, exemplars, and metric metadata through ClickHouse
   native protocol batches
 - remote write snaps float sample and native histogram timestamps to
-  `REMOTE_WRITE_SAMPLE_INTERVAL` bucket starts, default `15s`; `version` keeps
-  the latest original sample in each bucket, and query SQL dedupes with
-  `argMax` so reads do not wait for background merges
+  `REMOTE_WRITE_SAMPLE_INTERVAL` bucket starts, default `15s`
 - remote read reuses the same label-pruned sample path as PromQL selectors and
   returns float samples, native histograms, and exemplars
 

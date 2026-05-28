@@ -1257,14 +1257,10 @@ func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, m
 				"id IN (SELECT id FROM selected_series)",
 			}
 			where = append(where, metricNameConstraints(matchers)...)
-			source := fmt.Sprintf(
-				"SELECT id, timestamp, value, version FROM %s WHERE %s",
+			return fmt.Sprintf(
+				"SELECT id, any(value) AS value, max(timestamp) AS ts_col FROM %s WHERE %s GROUP BY id",
 				tableName(cfg.CHDatabase, cfg.SamplesTable),
 				strings.Join(where, " AND "),
-			)
-			return fmt.Sprintf(
-				"SELECT id, argMax(value, version) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
-				source,
 			)
 		}
 	}

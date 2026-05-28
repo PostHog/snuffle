@@ -64,10 +64,9 @@ CREATE TABLE metrics_samples
     metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
-    value Float64,
-    version UInt64
+    value Float64
 )
-ENGINE = ReplacingMergeTree(version)
+ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (team_id, metric_name, id, timestamp)
 SETTINGS index_granularity = 1024;

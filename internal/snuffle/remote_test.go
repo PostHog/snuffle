@@ -158,10 +158,8 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	if len(batch.sampleRows) != 3 ||
 		batch.sampleRows[0].TimestampMS != 0 ||
 		batch.sampleRows[0].Value != 1 ||
-		batch.sampleRows[0].Version != 1000 ||
 		batch.sampleRows[1].TimestampMS != 0 ||
 		batch.sampleRows[1].Value != 2 ||
-		batch.sampleRows[1].Version != 14999 ||
 		batch.sampleRows[2].TimestampMS != 15000 ||
 		batch.sampleRows[2].Value != 3 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
@@ -199,10 +197,10 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.histogramCount != 0 || batch.exemplarCount != 0 || batch.metadataCount != 0 {
 		t.Fatalf("counts = series %d samples %d histograms %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.histogramCount, batch.exemplarCount, batch.metadataCount)
 	}
-	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 1 || got.Versions[0] != 1000 {
+	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 1 {
 		t.Fatalf("unexpected first sample columns: %#v", got)
 	}
-	if got := batch.sampleColumns; got.Timestamps[1] != 15000 || got.Values[1] != 2 || got.Versions[1] != 16000 {
+	if got := batch.sampleColumns; got.Timestamps[1] != 15000 || got.Values[1] != 2 {
 		t.Fatalf("unexpected second sample columns: %#v", got)
 	}
 	if got := batch.seriesRecords[0]; got.TeamID != 7 || got.MetricName != "up" || got.MinMS != 0 || got.MaxMS != 15000 || len(got.Labels) != 0 || got.LabelsJSON != "" {

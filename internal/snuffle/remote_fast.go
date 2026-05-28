@@ -6,6 +6,8 @@ import (
 	"math"
 	"time"
 	"unsafe"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 const (
@@ -20,6 +22,78 @@ type remoteWriteFastSample struct {
 	Value     float64
 }
 
+type remoteWriteFastIdentity struct {
+	hash       xxhash.Digest
+	length     [8]byte
+	stack      [512]byte
+	encoded    []byte
+	previous   string
+	metricName string
+	useStack   bool
+	labelCount int
+}
+
+func (s *remoteWriteFastIdentity) reset() {
+	s.hash.Reset()
+	s.encoded = s.stack[:0]
+	s.previous = ""
+	s.metricName = ""
+	s.useStack = true
+	s.labelCount = 0
+}
+
+func (s *remoteWriteFastIdentity) add(label remoteWriteLabel) (bool, error) {
+	if label.Name == "" {
+		return false, fmt.Errorf("remote write label name must not be empty")
+	}
+	if s.labelCount > 0 && label.Name <= s.previous {
+		if label.Name == s.previous {
+			return false, fmt.Errorf("duplicate remote write label %q", label.Name)
+		}
+		return false, nil
+	}
+	s.previous = label.Name
+	s.labelCount++
+	if label.Name == "__name__" {
+		s.metricName = label.Value
+	}
+	needed := 16 + len(label.Name) + len(label.Value)
+	if s.useStack && len(s.encoded)+needed <= cap(s.encoded) {
+		binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Name)))
+		s.encoded = append(s.encoded, s.length[:]...)
+		s.encoded = append(s.encoded, label.Name...)
+		binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Value)))
+		s.encoded = append(s.encoded, s.length[:]...)
+		s.encoded = append(s.encoded, label.Value...)
+		return true, nil
+	}
+	if s.useStack {
+		s.useStack = false
+		_, _ = s.hash.Write(s.encoded)
+		s.encoded = nil
+	}
+	binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Name)))
+	_, _ = s.hash.Write(s.length[:])
+	_, _ = s.hash.WriteString(label.Name)
+	binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Value)))
+	_, _ = s.hash.Write(s.length[:])
+	_, _ = s.hash.WriteString(label.Value)
+	return true, nil
+}
+
+func (s *remoteWriteFastIdentity) finish() (uint64, string, error) {
+	if s.labelCount == 0 {
+		return 0, "", fmt.Errorf("remote write time series has no labels")
+	}
+	if s.metricName == "" {
+		return 0, "", fmt.Errorf("remote write time series is missing __name__")
+	}
+	if s.useStack {
+		return xxhash.Sum64(s.encoded), s.metricName, nil
+	}
+	return s.hash.Sum64(), s.metricName, nil
+}
+
 func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, teamID uint64) (remoteWriteBatch, bool, error) {
 	capHint := len(data) / 256
 	if capHint < 1 {
@@ -32,7 +106,6 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 			Timestamps:  make([]int64, 0, capHint),
 			IDs:         make([]uint64, 0, capHint),
 			Values:      make([]float64, 0, capHint),
-			Versions:    make([]uint64, 0, capHint),
 		},
 		histogramRows: make([]remoteWriteHistogramRow, 0),
 		exemplarRows:  make([]remoteWriteExemplarRow, 0),
@@ -41,8 +114,8 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 		fastProto:     data,
 	}
 	seriesIndexByID := make(map[uint64]int, capHint)
-	labelScratch := make([]remoteWriteLabel, 0, 16)
 	sampleScratch := make([]remoteWriteFastSample, 0, 1)
+	var identity remoteWriteFastIdentity
 	sampleIntervalMS := sampleInterval.Milliseconds()
 
 	for i := 0; i < len(data); {
@@ -65,7 +138,7 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 			if err != nil {
 				return remoteWriteBatch{}, true, err
 			}
-			ok, err := parseFastTimeSeries(message, &batch, seriesIndexByID, &labelScratch, &sampleScratch, sampleIntervalMS, teamID)
+			ok, err := parseFastTimeSeries(message, &batch, seriesIndexByID, &identity, &sampleScratch, sampleIntervalMS, teamID)
 			if err != nil {
 				return remoteWriteBatch{}, true, err
 			}
@@ -86,12 +159,11 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 	return batch, true, nil
 }
 
-func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID map[uint64]int, labelScratch *[]remoteWriteLabel, sampleScratch *[]remoteWriteFastSample, sampleIntervalMS int64, teamID uint64) (bool, error) {
-	labels := (*labelScratch)[:0]
+func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID map[uint64]int, identity *remoteWriteFastIdentity, sampleScratch *[]remoteWriteFastSample, sampleIntervalMS int64, teamID uint64) (bool, error) {
 	samples := (*sampleScratch)[:0]
 	sawSample := false
+	identity.reset()
 	defer func() {
-		*labelScratch = labels[:0]
 		*sampleScratch = samples[:0]
 	}()
 
@@ -119,7 +191,10 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 			if err != nil {
 				return true, err
 			}
-			labels = append(labels, label)
+			ok, err := identity.add(label)
+			if err != nil || !ok {
+				return ok, err
+			}
 		case 2:
 			if wireType != protoWireBytes {
 				return true, fmt.Errorf("decode remote write timeseries protobuf: sample has wire type %d", wireType)
@@ -148,7 +223,7 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 	if !sawSample {
 		return true, nil
 	}
-	id, metricName, err := remoteWriteSeriesIdentityLabels(labels)
+	id, metricName, err := identity.finish()
 	if err != nil {
 		return true, err
 	}
@@ -171,10 +246,10 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 				maxMS = bucketMS
 			}
 		}
-		appendFastSample(batch, teamID, metricName, bucketMS, id, sample.Value, remoteWriteVersion(sample.Timestamp))
+		appendFastSample(batch, teamID, metricName, bucketMS, id, sample.Value)
 	}
 
-	addFastSeriesRecord(batch, seriesIndexByID, id, teamID, metricName, labels, minMS, maxMS)
+	addFastSeriesRecord(batch, seriesIndexByID, id, teamID, metricName, nil, minMS, maxMS)
 	return true, nil
 }
 
@@ -199,13 +274,12 @@ func addFastSeriesRecord(batch *remoteWriteBatch, indexByID map[uint64]int, id, 
 	})
 }
 
-func appendFastSample(batch *remoteWriteBatch, teamID uint64, metricName string, timestampMS int64, id uint64, value float64, version uint64) {
+func appendFastSample(batch *remoteWriteBatch, teamID uint64, metricName string, timestampMS int64, id uint64, value float64) {
 	batch.sampleColumns.TeamIDs = append(batch.sampleColumns.TeamIDs, teamID)
 	batch.sampleColumns.MetricNames = append(batch.sampleColumns.MetricNames, metricName)
 	batch.sampleColumns.Timestamps = append(batch.sampleColumns.Timestamps, timestampMS)
 	batch.sampleColumns.IDs = append(batch.sampleColumns.IDs, id)
 	batch.sampleColumns.Values = append(batch.sampleColumns.Values, value)
-	batch.sampleColumns.Versions = append(batch.sampleColumns.Versions, version)
 }
 
 func parseFastLabel(data []byte) (remoteWriteLabel, error) {

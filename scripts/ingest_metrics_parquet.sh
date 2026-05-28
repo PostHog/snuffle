@@ -68,16 +68,14 @@ clickhouse-local \
       series.metric_name,
       data.timestamp,
       data.id,
-      data.value,
-      data.version
+      data.value
     FROM
     (
       SELECT
         toUInt64($TEAM_ID) AS team_id,
         timestamp,
         cityHash64(toString(id)) AS id,
-        value,
-        toUInt64(toUnixTimestamp64Milli(timestamp)) AS version
+        value
       FROM file('$DATA_FILE', Parquet)
     ) AS data
     ANY INNER JOIN

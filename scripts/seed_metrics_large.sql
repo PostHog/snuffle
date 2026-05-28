@@ -64,10 +64,9 @@ CREATE TABLE metrics_samples
     metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC'),
     id UInt64,
-    value Float64,
-    version UInt64
+    value Float64
 )
-ENGINE = ReplacingMergeTree(version)
+ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
 ORDER BY (team_id, metric_name, id, timestamp)
 SETTINGS index_granularity = 1024;
@@ -157,7 +156,7 @@ ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_label_value;
 ALTER TABLE metrics_label_index MATERIALIZE PROJECTION by_id_label;
 
 INSERT INTO metrics_samples
-    (team_id, metric_name, timestamp, id, value, version)
+    (team_id, metric_name, timestamp, id, value)
 WITH
     0 AS team_id,
     100000 AS series_count,
@@ -169,8 +168,7 @@ SELECT
     'load_requests_total' AS metric_name,
     fromUnixTimestamp64Milli(start_ms + step_ms * sample_index) AS timestamp,
     series_id + 1 AS id,
-    toFloat64(1000 + series_id * 100 + sample_index * (1 + series_id % 10)) AS value,
-    toUInt64(start_ms + step_ms * sample_index) AS version
+    toFloat64(1000 + series_id * 100 + sample_index * (1 + series_id % 10)) AS value
 FROM
 (
     SELECT

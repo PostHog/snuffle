@@ -107,9 +107,9 @@ Lower is better. A value under `1.0` means the current run is faster overall.
 The latest accepted local run used the default TSBS settings, the local
 ClickHouse container capped at 2 CPUs, and wrote about 24.24 million rows:
 
-- ingest: about `2.16M rows/s`
-- query geomean: about `114 ms`
-- query total average: about `1.60 s` across 11 scenarios, including nested
+- ingest: about `3.17M rows/s`
+- query geomean: about `110 ms`
+- query total average: about `1.50 s` across 11 scenarios, including nested
   counts
 
 Treat these as regression numbers for this development machine, not as capacity
@@ -280,11 +280,9 @@ For unknown incoming labels, the default should not assume hot label names.
 `metrics_samples`
 
 - columns: `timestamp DateTime64(3)`, `id UInt64`, `value Float64`,
-  `version UInt64`, `team_id UInt64`, `metric_name LowCardinality(String)`
-- engine: `ReplacingMergeTree(version)`
+  `team_id UInt64`, `metric_name LowCardinality(String)`
+- engine: `MergeTree`
 - primary order: `(team_id, metric_name, id, timestamp)`
-- remote write buckets timestamps to `REMOTE_WRITE_SAMPLE_INTERVAL`, default
-  `15s`, so the replacement key is one sample per series per bucket
 - all columns are non-null
 
 `metrics_series`
@@ -396,9 +394,9 @@ Implemented storage optimizations:
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
-- sample reads trust `ReplacingMergeTree(version)` instead of applying
-  `argMax(value, version)` on every query. This is faster, but a just-retried
-  duplicate sample can be visible until ClickHouse merges the replacement part.
+- sample reads use plain `MergeTree` rows. This removes replacement merge CPU
+  from the hot ingest path; duplicate remote-write retries can produce duplicate
+  float samples.
 - native-histogram reads still dedupe with `argMax(histogram, version)` because
   histograms are much colder and stored as protobuf payloads
 - broad latest-sample reads use ClickHouse subqueries instead of oversized
