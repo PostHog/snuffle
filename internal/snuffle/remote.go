@@ -257,6 +257,13 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			}
 			bucketMS := bucketTimestampForStepMS(sample.Timestamp, sampleIntervalMS)
 			observeTime(bucketMS)
+			if len(batch.sampleRows) > 0 {
+				last := &batch.sampleRows[len(batch.sampleRows)-1]
+				if last.ID == id && last.TimestampMS == bucketMS {
+					last.Value = sample.Value
+					continue
+				}
+			}
 			batch.sampleRows = append(batch.sampleRows, remoteWriteSampleRow{
 				TeamID:      teamID,
 				MetricName:  metricName,

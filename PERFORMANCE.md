@@ -137,8 +137,8 @@ settings. The loop used for the recent query/write work was:
 Examples of candidate checks from this pass:
 
 - `metrics_samples` ordered by `(team_id, metric_name, id, timestamp)` was kept
-  because it preserved the metric-pruned query wins without doubling sample
-  storage.
+  because removing `metric_name` slowed the measured load path and hurt the
+  metric-pruned query shape.
 - A sample-table projection sorted by metric was not kept because it improved
   some queries but doubled sample-table storage and added write cost.
 - A metric-name skip index alone was not kept because it barely reduced rows

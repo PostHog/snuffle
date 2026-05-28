@@ -89,7 +89,7 @@ func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
 	if batch.sampleRows[0].MetricName != "up" {
-		t.Fatalf("sample rows should carry metric name for activity MVs: %#v", batch.sampleRows)
+		t.Fatalf("sample rows should carry metric name for inserts: %#v", batch.sampleRows)
 	}
 	if len(batch.seriesRecords) != 1 || batch.seriesRecords[0].MinMS != 2000 || batch.seriesRecords[0].MaxMS != 2000 {
 		t.Fatalf("unexpected series records: %#v", batch.seriesRecords)
@@ -149,19 +149,17 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.sampleCount != 3 {
-		t.Fatalf("sampleCount = %d, want 3", batch.sampleCount)
+	if batch.sampleCount != 2 {
+		t.Fatalf("sampleCount = %d, want 2", batch.sampleCount)
 	}
 	if batch.histogramCount != 2 {
 		t.Fatalf("histogramCount = %d, want 2", batch.histogramCount)
 	}
-	if len(batch.sampleRows) != 3 ||
+	if len(batch.sampleRows) != 2 ||
 		batch.sampleRows[0].TimestampMS != 0 ||
-		batch.sampleRows[0].Value != 1 ||
-		batch.sampleRows[1].TimestampMS != 0 ||
-		batch.sampleRows[1].Value != 2 ||
-		batch.sampleRows[2].TimestampMS != 15000 ||
-		batch.sampleRows[2].Value != 3 {
+		batch.sampleRows[0].Value != 2 ||
+		batch.sampleRows[1].TimestampMS != 15000 ||
+		batch.sampleRows[1].Value != 3 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
 	if len(batch.histogramRows) != 2 || batch.histogramRows[0].TimestampMS != 0 || batch.histogramRows[0].Version != 14500 || batch.histogramRows[1].TimestampMS != 0 || batch.histogramRows[1].Version != 14900 {
@@ -178,6 +176,7 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 		},
 		Samples: []prompb.Sample{
 			{Timestamp: 1_000, Value: 1},
+			{Timestamp: 14_000, Value: 3},
 			{Timestamp: 16_000, Value: 2},
 			{Timestamp: 17_000, Value: math.NaN()},
 		},
@@ -197,7 +196,7 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.histogramCount != 0 || batch.exemplarCount != 0 || batch.metadataCount != 0 {
 		t.Fatalf("counts = series %d samples %d histograms %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.histogramCount, batch.exemplarCount, batch.metadataCount)
 	}
-	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 1 {
+	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 3 {
 		t.Fatalf("unexpected first sample columns: %#v", got)
 	}
 	if got := batch.sampleColumns; got.Timestamps[1] != 15000 || got.Values[1] != 2 {

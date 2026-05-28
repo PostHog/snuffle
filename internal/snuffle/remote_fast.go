@@ -22,6 +22,80 @@ type remoteWriteFastSample struct {
 	Value     float64
 }
 
+type remoteWriteFastSeriesIndex struct {
+	keys   []uint64
+	values []int
+	used   []bool
+	count  int
+	mask   uint64
+}
+
+func newRemoteWriteFastSeriesIndex(capHint int) remoteWriteFastSeriesIndex {
+	size := 16
+	for size < capHint*2 {
+		size <<= 1
+	}
+	return remoteWriteFastSeriesIndex{
+		keys:   make([]uint64, size),
+		values: make([]int, size),
+		used:   make([]bool, size),
+		mask:   uint64(size - 1),
+	}
+}
+
+func (m *remoteWriteFastSeriesIndex) get(key uint64) (int, bool) {
+	slot := key & m.mask
+	for {
+		if !m.used[slot] {
+			return 0, false
+		}
+		if m.keys[slot] == key {
+			return m.values[slot], true
+		}
+		slot = (slot + 1) & m.mask
+	}
+}
+
+func (m *remoteWriteFastSeriesIndex) set(key uint64, value int) {
+	if (m.count+1)*10 >= len(m.keys)*7 {
+		m.grow()
+	}
+	slot := key & m.mask
+	for {
+		if !m.used[slot] {
+			m.used[slot] = true
+			m.keys[slot] = key
+			m.values[slot] = value
+			m.count++
+			return
+		}
+		if m.keys[slot] == key {
+			m.values[slot] = value
+			return
+		}
+		slot = (slot + 1) & m.mask
+	}
+}
+
+func (m *remoteWriteFastSeriesIndex) grow() {
+	oldKeys := m.keys
+	oldValues := m.values
+	oldUsed := m.used
+
+	size := len(oldKeys) * 2
+	m.keys = make([]uint64, size)
+	m.values = make([]int, size)
+	m.used = make([]bool, size)
+	m.count = 0
+	m.mask = uint64(size - 1)
+
+	for i, ok := range oldUsed {
+		if ok {
+			m.set(oldKeys[i], oldValues[i])
+		}
+	}
+}
+
 type remoteWriteFastIdentity struct {
 	hash       xxhash.Digest
 	length     [8]byte
@@ -113,7 +187,7 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 		seriesRecords: make([]remoteWriteSeriesRow, 0, capHint),
 		fastProto:     data,
 	}
-	seriesIndexByID := make(map[uint64]int, capHint)
+	seriesIndexByID := newRemoteWriteFastSeriesIndex(capHint)
 	sampleScratch := make([]remoteWriteFastSample, 0, 1)
 	var identity remoteWriteFastIdentity
 	sampleIntervalMS := sampleInterval.Milliseconds()
@@ -138,7 +212,7 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 			if err != nil {
 				return remoteWriteBatch{}, true, err
 			}
-			ok, err := parseFastTimeSeries(message, &batch, seriesIndexByID, &identity, &sampleScratch, sampleIntervalMS, teamID)
+			ok, err := parseFastTimeSeries(message, &batch, &seriesIndexByID, &identity, &sampleScratch, sampleIntervalMS, teamID)
 			if err != nil {
 				return remoteWriteBatch{}, true, err
 			}
@@ -159,7 +233,7 @@ func buildRemoteWriteBatchFromProto(data []byte, sampleInterval time.Duration, t
 	return batch, true, nil
 }
 
-func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID map[uint64]int, identity *remoteWriteFastIdentity, sampleScratch *[]remoteWriteFastSample, sampleIntervalMS int64, teamID uint64) (bool, error) {
+func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID *remoteWriteFastSeriesIndex, identity *remoteWriteFastIdentity, sampleScratch *[]remoteWriteFastSample, sampleIntervalMS int64, teamID uint64) (bool, error) {
 	samples := (*sampleScratch)[:0]
 	sawSample := false
 	identity.reset()
@@ -233,11 +307,13 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 
 	var minMS int64
 	var maxMS int64
-	for i, sample := range samples {
+	haveTime := false
+	for _, sample := range samples {
 		bucketMS := bucketTimestampForStepMS(sample.Timestamp, sampleIntervalMS)
-		if i == 0 {
+		if !haveTime {
 			minMS = bucketMS
 			maxMS = bucketMS
+			haveTime = true
 		} else {
 			if bucketMS < minMS {
 				minMS = bucketMS
@@ -246,6 +322,10 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 				maxMS = bucketMS
 			}
 		}
+		if count := batch.sampleColumns.count(); count > 0 && batch.sampleColumns.IDs[count-1] == id && batch.sampleColumns.Timestamps[count-1] == bucketMS {
+			batch.sampleColumns.Values[count-1] = sample.Value
+			continue
+		}
 		appendFastSample(batch, teamID, metricName, bucketMS, id, sample.Value)
 	}
 
@@ -253,8 +333,8 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID m
 	return true, nil
 }
 
-func addFastSeriesRecord(batch *remoteWriteBatch, indexByID map[uint64]int, id, teamID uint64, metricName string, labels []remoteWriteLabel, minMS, maxMS int64) {
-	if index, ok := indexByID[id]; ok {
+func addFastSeriesRecord(batch *remoteWriteBatch, indexByID *remoteWriteFastSeriesIndex, id, teamID uint64, metricName string, labels []remoteWriteLabel, minMS, maxMS int64) {
+	if index, ok := indexByID.get(id); ok {
 		existing := &batch.seriesRecords[index]
 		if minMS < existing.MinMS {
 			existing.MinMS = minMS
@@ -264,7 +344,7 @@ func addFastSeriesRecord(batch *remoteWriteBatch, indexByID map[uint64]int, id, 
 		}
 		return
 	}
-	indexByID[id] = len(batch.seriesRecords)
+	indexByID.set(id, len(batch.seriesRecords))
 	batch.seriesRecords = append(batch.seriesRecords, remoteWriteSeriesRow{
 		TeamID:     teamID,
 		ID:         id,
