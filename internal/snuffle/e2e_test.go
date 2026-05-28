@@ -229,6 +229,17 @@ func assertInstantQuery(t *testing.T, baseURL string) {
 	if got := sampleString(data.Result[0].Value); got != "25" {
 		t.Fatalf("instant query value = %q", got)
 	}
+
+	lateData := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", url.Values{
+		"query": {`sum by (job) (` + e2eCounterMetric + `)`},
+		"time":  {"1700000080"},
+	})
+	if lateData.ResultType != "vector" || len(lateData.Result) != 1 {
+		t.Fatalf("late instant query result = %#v", lateData)
+	}
+	if got := sampleString(lateData.Result[0].Value); got != "25" {
+		t.Fatalf("late instant query value = %q", got)
+	}
 }
 
 func assertRangeQuery(t *testing.T, baseURL string) {

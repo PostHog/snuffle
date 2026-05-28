@@ -682,17 +682,10 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 		return "", false
 	}
 
-	timeFilter := fmt.Sprintf("timestamp >= %s AND timestamp <= %s", chTimeMillis(mint), chTimeMillis(maxt))
-	if cfg.RemoteWriteInterval > 0 {
-		bucket := bucketTimestampMS(maxt, cfg.RemoteWriteInterval)
-		if bucket >= mint {
-			timeFilter = "timestamp = " + chTimeMillis(bucket)
-		}
-	}
 	sampleWhere := []string{
 		teamFilter(cfg),
 		"metric_name = " + sqlString(metric),
-		timeFilter,
+		fmt.Sprintf("timestamp >= %s AND timestamp <= %s", chTimeMillis(mint), chTimeMillis(maxt)),
 	}
 	sampleWhere = append(sampleWhere, idFilters...)
 
@@ -1453,23 +1446,16 @@ func selectedSeriesProjection(selectParts []string) []string {
 }
 
 func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
-	if cfg.RemoteWriteInterval > 0 {
-		bucket := bucketTimestampMS(maxt, cfg.RemoteWriteInterval)
-		if bucket >= mint {
-			where := []string{
-				teamFilter(cfg),
-				"timestamp = " + chTimeMillis(bucket),
-				"id IN (SELECT id FROM selected_series)",
-			}
-			where = append(where, metricNameConstraints(matchers)...)
-			return fmt.Sprintf(
-				"SELECT id, any(value) AS value, max(timestamp) AS ts_col FROM %s WHERE %s GROUP BY id",
-				tableName(cfg.CHDatabase, cfg.SamplesTable),
-				strings.Join(where, " AND "),
-			)
-		}
+	where := []string{
+		teamFilter(cfg),
+		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
+		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
 	}
-	source := samplesForSelectedSeriesSQL(cfg, matchers, mint, maxt)
+	where = append(where, metricNameConstraints(matchers)...)
+	if !metricOnlyMatchers(matchers) {
+		where = append(where, "id IN (SELECT id FROM selected_series)")
+	}
+	source := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
 	return fmt.Sprintf(
 		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
 		source,

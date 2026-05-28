@@ -231,7 +231,7 @@ func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
 	}
 }
 
-func TestNestedCountSamplesInstantSQLUsesLatestBucket(t *testing.T) {
+func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 	cfg := Config{
 		CHDatabase:          "default",
 		SamplesTable:        "samples",
@@ -257,7 +257,7 @@ func TestNestedCountSamplesInstantSQLUsesLatestBucket(t *testing.T) {
 		"`default`.`samples`",
 		"`default`.`label_index`",
 		"metric_name = 'node_cpu_seconds_total'",
-		"timestamp = fromUnixTimestamp64Milli(1778398980000, 'UTC')",
+		"timestamp >= fromUnixTimestamp64Milli(1778398680000, 'UTC') AND timestamp <= fromUnixTimestamp64Milli(1778398980000, 'UTC')",
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
 		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
@@ -272,6 +272,65 @@ func TestNestedCountSamplesInstantSQLUsesLatestBucket(t *testing.T) {
 		if strings.Contains(sql, notWant) {
 			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
 		}
+	}
+}
+
+func TestLatestSamplesForSelectedSeriesSQLUsesLookbackWindow(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`http_requests_total{job="api"}`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	selector := expr.(*parser.VectorSelector)
+
+	sql := latestSamplesForSelectedSeriesSQL(cfg, selector.LabelMatchers, 1000, 2000)
+	for _, want := range []string{
+		"argMax(value, timestamp)",
+		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"timestamp <= fromUnixTimestamp64Milli(2000, 'UTC')",
+		"metric_name = 'http_requests_total'",
+		"id IN (SELECT id FROM selected_series)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "timestamp = fromUnixTimestamp64Milli") {
+		t.Fatalf("instant latest SQL should not require one exact sample bucket:\n%s", sql)
+	}
+}
+
+func TestLatestSamplesForSelectedSeriesSQLSkipsSelectedIDsForMetricOnlyMatcher(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`http_requests_total`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	selector := expr.(*parser.VectorSelector)
+
+	sql := latestSamplesForSelectedSeriesSQL(cfg, selector.LabelMatchers, 1000, 2000)
+	for _, want := range []string{
+		"argMax(value, timestamp)",
+		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"timestamp <= fromUnixTimestamp64Milli(2000, 'UTC')",
+		"metric_name = 'http_requests_total'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "id IN (SELECT id FROM selected_series)") {
+		t.Fatalf("metric-only latest SQL should use the sample metric_name key directly:\n%s", sql)
 	}
 }
 
