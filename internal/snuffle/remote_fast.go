@@ -23,11 +23,12 @@ type remoteWriteFastSample struct {
 }
 
 type remoteWriteFastSeriesIndex struct {
-	keys   []uint64
-	values []int
-	used   []bool
-	count  int
-	mask   uint64
+	keys      []uint64
+	values    []int
+	count     int
+	zeroValue int
+	zeroUsed  bool
+	mask      uint64
 }
 
 func newRemoteWriteFastSeriesIndex(capHint int) remoteWriteFastSeriesIndex {
@@ -38,18 +39,21 @@ func newRemoteWriteFastSeriesIndex(capHint int) remoteWriteFastSeriesIndex {
 	return remoteWriteFastSeriesIndex{
 		keys:   make([]uint64, size),
 		values: make([]int, size),
-		used:   make([]bool, size),
 		mask:   uint64(size - 1),
 	}
 }
 
 func (m *remoteWriteFastSeriesIndex) get(key uint64) (int, bool) {
+	if key == 0 {
+		return m.zeroValue, m.zeroUsed
+	}
 	slot := key & m.mask
 	for {
-		if !m.used[slot] {
+		stored := m.keys[slot]
+		if stored == 0 {
 			return 0, false
 		}
-		if m.keys[slot] == key {
+		if stored == key {
 			return m.values[slot], true
 		}
 		slot = (slot + 1) & m.mask
@@ -57,19 +61,27 @@ func (m *remoteWriteFastSeriesIndex) get(key uint64) (int, bool) {
 }
 
 func (m *remoteWriteFastSeriesIndex) set(key uint64, value int) {
+	if key == 0 {
+		if !m.zeroUsed {
+			m.count++
+		}
+		m.zeroUsed = true
+		m.zeroValue = value
+		return
+	}
 	if (m.count+1)*10 >= len(m.keys)*7 {
 		m.grow()
 	}
 	slot := key & m.mask
 	for {
-		if !m.used[slot] {
-			m.used[slot] = true
+		stored := m.keys[slot]
+		if stored == 0 {
 			m.keys[slot] = key
 			m.values[slot] = value
 			m.count++
 			return
 		}
-		if m.keys[slot] == key {
+		if stored == key {
 			m.values[slot] = value
 			return
 		}
@@ -80,18 +92,23 @@ func (m *remoteWriteFastSeriesIndex) set(key uint64, value int) {
 func (m *remoteWriteFastSeriesIndex) grow() {
 	oldKeys := m.keys
 	oldValues := m.values
-	oldUsed := m.used
+	zeroValue := m.zeroValue
+	zeroUsed := m.zeroUsed
 
 	size := len(oldKeys) * 2
 	m.keys = make([]uint64, size)
 	m.values = make([]int, size)
-	m.used = make([]bool, size)
 	m.count = 0
+	m.zeroValue = zeroValue
+	m.zeroUsed = zeroUsed
+	if zeroUsed {
+		m.count = 1
+	}
 	m.mask = uint64(size - 1)
 
-	for i, ok := range oldUsed {
-		if ok {
-			m.set(oldKeys[i], oldValues[i])
+	for i, key := range oldKeys {
+		if key != 0 {
+			m.set(key, oldValues[i])
 		}
 	}
 }
@@ -117,28 +134,57 @@ func (s *remoteWriteFastIdentity) reset() {
 }
 
 func (s *remoteWriteFastIdentity) add(label remoteWriteLabel) (bool, error) {
-	if label.Name == "" {
+	return s.addParts(label.Name, label.Value)
+}
+
+func (s *remoteWriteFastIdentity) addProtoLabel(data []byte) (bool, error) {
+	if len(data) > 0 && data[0] == 0x0a {
+		i := 1
+		name, err := readProtoBytes(data, &i)
+		if err != nil {
+			return false, err
+		}
+		if i < len(data) && data[i] == 0x12 {
+			i++
+			value, err := readProtoBytes(data, &i)
+			if err != nil {
+				return false, err
+			}
+			if i == len(data) {
+				return s.addParts(protoUnsafeString(name), protoUnsafeString(value))
+			}
+		}
+	}
+	label, err := parseFastLabel(data)
+	if err != nil {
+		return false, err
+	}
+	return s.add(label)
+}
+
+func (s *remoteWriteFastIdentity) addParts(name, value string) (bool, error) {
+	if name == "" {
 		return false, fmt.Errorf("remote write label name must not be empty")
 	}
-	if s.labelCount > 0 && label.Name <= s.previous {
-		if label.Name == s.previous {
-			return false, fmt.Errorf("duplicate remote write label %q", label.Name)
+	if s.labelCount > 0 && name <= s.previous {
+		if name == s.previous {
+			return false, fmt.Errorf("duplicate remote write label %q", name)
 		}
 		return false, nil
 	}
-	s.previous = label.Name
+	s.previous = name
 	s.labelCount++
-	if label.Name == "__name__" {
-		s.metricName = label.Value
+	if name == "__name__" {
+		s.metricName = value
 	}
-	needed := 16 + len(label.Name) + len(label.Value)
+	needed := 16 + len(name) + len(value)
 	if s.useStack && len(s.encoded)+needed <= cap(s.encoded) {
-		binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Name)))
+		binary.LittleEndian.PutUint64(s.length[:], uint64(len(name)))
 		s.encoded = append(s.encoded, s.length[:]...)
-		s.encoded = append(s.encoded, label.Name...)
-		binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Value)))
+		s.encoded = append(s.encoded, name...)
+		binary.LittleEndian.PutUint64(s.length[:], uint64(len(value)))
 		s.encoded = append(s.encoded, s.length[:]...)
-		s.encoded = append(s.encoded, label.Value...)
+		s.encoded = append(s.encoded, value...)
 		return true, nil
 	}
 	if s.useStack {
@@ -146,12 +192,12 @@ func (s *remoteWriteFastIdentity) add(label remoteWriteLabel) (bool, error) {
 		_, _ = s.hash.Write(s.encoded)
 		s.encoded = nil
 	}
-	binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Name)))
+	binary.LittleEndian.PutUint64(s.length[:], uint64(len(name)))
 	_, _ = s.hash.Write(s.length[:])
-	_, _ = s.hash.WriteString(label.Name)
-	binary.LittleEndian.PutUint64(s.length[:], uint64(len(label.Value)))
+	_, _ = s.hash.WriteString(name)
+	binary.LittleEndian.PutUint64(s.length[:], uint64(len(value)))
 	_, _ = s.hash.Write(s.length[:])
-	_, _ = s.hash.WriteString(label.Value)
+	_, _ = s.hash.WriteString(value)
 	return true, nil
 }
 
@@ -261,11 +307,7 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID *
 			if err != nil {
 				return true, err
 			}
-			label, err := parseFastLabel(message)
-			if err != nil {
-				return true, err
-			}
-			ok, err := identity.add(label)
+			ok, err := identity.addProtoLabel(message)
 			if err != nil || !ok {
 				return ok, err
 			}
