@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +90,42 @@ func remoteWriteActivityRowsContain(rows []remoteWriteActivityRow, metricName st
 		}
 	}
 	return false
+}
+
+func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{
+			Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "api"}},
+			Samples: []prompb.Sample{
+				{Timestamp: 1_000, Value: math.NaN()},
+				{Timestamp: 2_000, Value: 2},
+			},
+		},
+		{
+			Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "gone"}},
+			Samples: []prompb.Sample{
+				{Timestamp: 3_000, Value: math.NaN()},
+			},
+		},
+	}}
+
+	batch, err := buildRemoteWriteBatch(req, 0, 0)
+	if err != nil {
+		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
+	}
+	if batch.seriesCount != 1 || batch.sampleCount != 1 || batch.labelCount != 1 || batch.labelBitmapCount != 2 || batch.activityCount != 1 {
+		t.Fatalf("counts = series %d samples %d labels %d label bitmaps %d activity %d", batch.seriesCount, batch.sampleCount, batch.labelCount, batch.labelBitmapCount, batch.activityCount)
+	}
+	samples := batch.sampleRows.String()
+	if strings.Contains(samples, "NaN") || !strings.Contains(samples, `"value":2`) || !strings.Contains(samples, `"timestamp_ms":2000`) {
+		t.Fatalf("unexpected sample rows: %q", samples)
+	}
+	if strings.Contains(batch.labelIndexRows.String(), "gone") {
+		t.Fatalf("all-NaN series should not produce label rows: %q", batch.labelIndexRows.String())
+	}
+	if len(batch.seriesRecords) != 1 || batch.seriesRecords[0].MinMS != 2000 || batch.seriesRecords[0].MaxMS != 2000 {
+		t.Fatalf("unexpected series records: %#v", batch.seriesRecords)
+	}
 }
 
 func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {

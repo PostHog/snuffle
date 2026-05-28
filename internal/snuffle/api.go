@@ -109,12 +109,27 @@ type requestTeamIDKey struct{}
 
 func (s *Server) teamHandler(handler func(*Server, http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		teamID, err := s.teamIDFromRequest(r)
+		stats := &promRequestStats{}
+		wrapped := &loggingResponseWriter{ResponseWriter: w}
+		withStats := r.WithContext(withPromRequestStats(r.Context(), stats))
+		started := time.Now()
+		var teamID uint64
+		var haveTeamID bool
+
+		logPromRequestReceived(withStats)
+		defer func() {
+			logPromRequestCompleted(withStats, wrapped, stats, started, teamID, haveTeamID)
+		}()
+
+		var err error
+		teamID, err = s.teamIDFromRequest(withStats)
 		if err != nil {
-			writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+			writeAPIError(wrapped, http.StatusBadRequest, "bad_data", err)
 			return
 		}
-		handler(s.withTeamID(teamID), w, r)
+		haveTeamID = true
+
+		handler(s.withTeamID(teamID), wrapped, withStats)
 	}
 }
 
@@ -684,7 +699,12 @@ func writeAPISuccess(w http.ResponseWriter, data any) {
 }
 
 func writeAPIError(w http.ResponseWriter, code int, errorType string, err error) {
-	writeJSON(w, code, apiResponse{Status: "error", ErrorType: errorType, Error: err.Error()})
+	recordResponseError(w, errorType, err)
+	message := ""
+	if err != nil {
+		message = err.Error()
+	}
+	writeJSON(w, code, apiResponse{Status: "error", ErrorType: errorType, Error: message})
 }
 
 func writeJSON(w http.ResponseWriter, code int, value any) {

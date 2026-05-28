@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -24,7 +25,7 @@ import (
 func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "bad_method", errors.New("method not allowed"))
 		return
 	}
 
@@ -53,7 +54,7 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleRemoteRead(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		writeHTTPError(w, http.StatusMethodNotAllowed, "bad_method", errors.New("method not allowed"))
 		return
 	}
 
@@ -239,39 +240,6 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		lbls := labels.FromMap(labelMap)
 		id := stableSeriesID(lbls)
 
-		outputLabels := make(map[string]string, len(labelMap)-1)
-		for k, v := range labelMap {
-			if k == labels.MetricName {
-				continue
-			}
-			outputLabels[k] = v
-			labelRows[remoteWriteLabelIndexRow{
-				TeamID:     teamID,
-				MetricName: metricName,
-				LabelName:  k,
-				LabelValue: v,
-				ID:         id,
-			}] = struct{}{}
-			labelBitmapRows[remoteWriteLabelIndexRow{
-				TeamID:     teamID,
-				MetricName: metricName,
-				LabelName:  k,
-				LabelValue: v,
-				ID:         id,
-			}] = struct{}{}
-		}
-		labelBitmapRows[remoteWriteLabelIndexRow{
-			TeamID:     teamID,
-			MetricName: metricName,
-			LabelName:  labels.MetricName,
-			LabelValue: metricName,
-			ID:         id,
-		}] = struct{}{}
-		labelsJSON, err := json.Marshal(outputLabels)
-		if err != nil {
-			return remoteWriteBatch{}, err
-		}
-
 		var minMS int64
 		var maxMS int64
 		var haveTime bool
@@ -291,6 +259,9 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		}
 
 		for _, sample := range ts.GetSamples() {
+			if math.IsNaN(sample.Value) {
+				continue
+			}
 			bucketMS := bucketTimestampMS(sample.Timestamp, sampleInterval)
 			observeTime(bucketMS)
 			row := remoteWriteSampleRow{
@@ -339,6 +310,9 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			}] = struct{}{}
 		}
 		for _, exemplar := range ts.GetExemplars() {
+			if math.IsNaN(exemplar.Value) {
+				continue
+			}
 			observeTime(exemplar.Timestamp)
 			exemplarLabels, err := remoteWriteAuxLabelMap(exemplar.GetLabels())
 			if err != nil {
@@ -358,6 +332,41 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 				return remoteWriteBatch{}, err
 			}
 			batch.exemplarCount++
+		}
+		if !haveTime {
+			continue
+		}
+		outputLabels := make(map[string]string, len(labelMap)-1)
+		for k, v := range labelMap {
+			if k == labels.MetricName {
+				continue
+			}
+			outputLabels[k] = v
+			labelRows[remoteWriteLabelIndexRow{
+				TeamID:     teamID,
+				MetricName: metricName,
+				LabelName:  k,
+				LabelValue: v,
+				ID:         id,
+			}] = struct{}{}
+			labelBitmapRows[remoteWriteLabelIndexRow{
+				TeamID:     teamID,
+				MetricName: metricName,
+				LabelName:  k,
+				LabelValue: v,
+				ID:         id,
+			}] = struct{}{}
+		}
+		labelBitmapRows[remoteWriteLabelIndexRow{
+			TeamID:     teamID,
+			MetricName: metricName,
+			LabelName:  labels.MetricName,
+			LabelValue: metricName,
+			ID:         id,
+		}] = struct{}{}
+		labelsJSON, err := json.Marshal(outputLabels)
+		if err != nil {
+			return remoteWriteBatch{}, err
 		}
 
 		row := remoteWriteSeriesRow{
@@ -579,7 +588,11 @@ func (s *Server) insertRemoteRows(ctx context.Context, insert remoteWriteInsert)
 		sql += " GROUP BY " + insert.groupBy
 	}
 	sql += " FORMAT JSONEachRow"
-	return s.client.ExecWithBody(ctx, sql, bytes.NewReader(insert.rows.Bytes()))
+	if err := s.client.ExecWithBody(ctx, sql, bytes.NewReader(insert.rows.Bytes())); err != nil {
+		return err
+	}
+	recordClickHouseWrite(ctx, int64(insert.count))
+	return nil
 }
 
 func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow, bitmapIDs map[uint64]uint64) error {

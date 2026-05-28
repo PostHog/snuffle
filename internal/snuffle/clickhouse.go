@@ -65,11 +65,16 @@ func (c *ClickHouseClient) QueryJSONEachRow(ctx context.Context, sql string, han
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+	var rows int64
+	defer func() {
+		recordClickHouseRead(ctx, rows)
+	}()
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
+		rows++
 		if err := handle(json.RawMessage(line)); err != nil {
 			return err
 		}
