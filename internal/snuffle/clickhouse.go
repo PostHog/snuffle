@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
@@ -16,9 +17,14 @@ import (
 type ClickHouseClient struct {
 	conn    clickhouse.Conn
 	connErr error
+	metrics *bridgeMetrics
 }
 
-func NewClickHouseClient(cfg Config) *ClickHouseClient {
+func NewClickHouseClient(cfg Config, metrics ...*bridgeMetrics) *ClickHouseClient {
+	var bridgeMetrics *bridgeMetrics
+	if len(metrics) > 0 {
+		bridgeMetrics = metrics[0]
+	}
 	conn, err := clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
 		Addr:     clickHouseAddrs(cfg),
@@ -38,6 +44,7 @@ func NewClickHouseClient(cfg Config) *ClickHouseClient {
 	return &ClickHouseClient{
 		conn:    conn,
 		connErr: err,
+		metrics: bridgeMetrics,
 	}
 }
 
@@ -81,7 +88,29 @@ func (c *ClickHouseClient) QueryRowsWithExternalUInt64s(ctx context.Context, tab
 	return c.queryRows(clickhouse.Context(ctx, clickhouse.WithExternalTable(external)), sql, handle)
 }
 
-func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) error {
+func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle func(clickHouseRow) error) (err error) {
+	started := time.Now()
+	var rowCount int64
+	var scannedRows atomic.Uint64
+	var readBytes atomic.Uint64
+	if c.metrics != nil {
+		c.metrics.clickHouseQueryInflight.Inc()
+		defer c.metrics.clickHouseQueryInflight.Dec()
+	}
+	defer func() {
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		scanned := int64(scannedRows.Load())
+		read := int64(readBytes.Load())
+		recordClickHouseRead(ctx, rowCount, scanned, read)
+		c.metrics.observeClickHouseQuery(status, time.Since(started), rowCount, scanned, read)
+	}()
+	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
+		scannedRows.Add(progress.Rows)
+		readBytes.Add(progress.Bytes)
+	}))
 	if c.connErr != nil {
 		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
@@ -91,10 +120,6 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 	}
 	defer result.Close()
 
-	var rowCount int64
-	defer func() {
-		recordClickHouseRead(ctx, rowCount)
-	}()
 	for result.Next() {
 		rowCount++
 		if err := handle(result); err != nil {
@@ -127,7 +152,26 @@ func (c *ClickHouseClient) InsertColumnsSync(ctx context.Context, sql string, ap
 	return c.insertColumns(ctx, sql, false, appendColumns)
 }
 
-func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async bool, appendColumns func(clickHouseBatch) (int, error)) error {
+func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async bool, appendColumns func(clickHouseBatch) (int, error)) (err error) {
+	started := time.Now()
+	table := insertTableName(sql)
+	mode := "sync"
+	if async {
+		mode = "async"
+	}
+	var count int
+	var writtenBytes atomic.Uint64
+	if c.metrics != nil {
+		c.metrics.clickHouseInsertInflight.Inc()
+		defer c.metrics.clickHouseInsertInflight.Dec()
+	}
+	defer func() {
+		status := "ok"
+		if err != nil {
+			status = "error"
+		}
+		c.metrics.observeClickHouseInsert(table, mode, status, time.Since(started), count, writtenBytes.Load())
+	}()
 	if c.connErr != nil {
 		return fmt.Errorf("connect clickhouse: %w", c.connErr)
 	}
@@ -136,6 +180,9 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 		ctx = clickhouse.Context(ctx, clickhouse.WithAsync(true))
 		insertMode = "native async insert (async_insert=1 wait_for_async_insert=1)"
 	}
+	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
+		writtenBytes.Add(progress.WroteBytes)
+	}))
 	batch, err := c.conn.PrepareBatch(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("prepare %s: %w", insertMode, err)
@@ -146,7 +193,7 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 			_ = batch.Close()
 		}
 	}()
-	count, err := appendColumns(batch)
+	count, err = appendColumns(batch)
 	if err != nil {
 		return fmt.Errorf("append native insert columns: %w", err)
 	}
@@ -163,6 +210,28 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 	sent = true
 	recordClickHouseWrite(ctx, int64(count))
 	return nil
+}
+
+func insertTableName(sql string) string {
+	upper := strings.ToUpper(sql)
+	const marker = "INSERT INTO "
+	index := strings.Index(upper, marker)
+	if index < 0 {
+		return "unknown"
+	}
+	rest := strings.TrimSpace(sql[index+len(marker):])
+	if rest == "" {
+		return "unknown"
+	}
+	table := rest
+	if cut := strings.IndexAny(rest, " \t\r\n("); cut >= 0 {
+		table = rest[:cut]
+	}
+	table = strings.ReplaceAll(table, "`", "")
+	if table == "" {
+		return "unknown"
+	}
+	return table
 }
 
 func (c *ClickHouseClient) Ping(ctx context.Context) error {

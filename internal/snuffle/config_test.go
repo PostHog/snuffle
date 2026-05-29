@@ -38,3 +38,25 @@ func TestConfigFromEnvTeamSettings(t *testing.T) {
 		t.Fatalf("TeamQueryParam = %q", cfg.TeamQueryParam)
 	}
 }
+
+func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
+	t.Setenv("SNUFFLE_DEFAULT_TEAM_ID", "42")
+	t.Setenv("SNUFFLE_SELF_SCRAPE_INTERVAL", "30s")
+	t.Setenv("SNUFFLE_SELF_SCRAPE_TEAM_ID", "99")
+	t.Setenv("SNUFFLE_SELF_SCRAPE_JOB", "bridge")
+	t.Setenv("SNUFFLE_SELF_SCRAPE_INSTANCE", "bridge-1:9091")
+
+	cfg := ConfigFromEnv()
+	if !cfg.SelfScrapeEnabled {
+		t.Fatalf("SelfScrapeEnabled = false, want true")
+	}
+	if cfg.SelfScrapeInterval != 30*time.Second {
+		t.Fatalf("SelfScrapeInterval = %s, want 30s", cfg.SelfScrapeInterval)
+	}
+	if cfg.SelfScrapeTeamID != 99 {
+		t.Fatalf("SelfScrapeTeamID = %d, want 99", cfg.SelfScrapeTeamID)
+	}
+	if cfg.SelfScrapeJob != "bridge" || cfg.SelfScrapeInstance != "bridge-1:9091" {
+		t.Fatalf("self scrape labels = job %q instance %q", cfg.SelfScrapeJob, cfg.SelfScrapeInstance)
+	}
+}

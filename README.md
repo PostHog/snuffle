@@ -18,6 +18,7 @@ paths for common high-cardinality query shapes. It does not call ClickHouse
 - `GET|POST /api/v1/query_exemplars`
 - `POST /api/v1/write`
 - `POST /api/v1/read`
+- `GET /metrics`
 - `GET /-/healthy`
 - `GET /-/ready`
 - compatibility stubs for `/api/v1/rules` and `/api/v1/alerts`
@@ -130,6 +131,10 @@ query path.
   `REMOTE_WRITE_SAMPLE_INTERVAL` bucket starts, default `15s`
 - remote read reuses the same label-pruned sample path as PromQL selectors and
   returns float samples, native histograms, and exemplars
+- `/metrics` exposes bridge, Go runtime, and process metrics in Prometheus
+  text format
+- the bridge self-scrapes that same registry and writes the samples into the
+  configured ClickHouse metrics tables with `job` and `instance` labels
 
 ## Configuration
 
@@ -163,6 +168,16 @@ Environment variables:
   default `0`
 - `SNUFFLE_TEAM_HEADER`: tenant header, default `X-Team-ID`
 - `SNUFFLE_TEAM_QUERY_PARAM`: tenant query parameter, default `team_id`
+- `SNUFFLE_SELF_SCRAPE_ENABLED`: write bridge `/metrics` samples downstream,
+  default `true`
+- `SNUFFLE_SELF_SCRAPE_INTERVAL`: self-scrape interval, default `15s`; set `0`
+  to disable downstream self-scrape writes while keeping `/metrics` exposed
+- `SNUFFLE_SELF_SCRAPE_TEAM_ID`: tenant used for self-scraped bridge metrics,
+  default `SNUFFLE_DEFAULT_TEAM_ID`
+- `SNUFFLE_SELF_SCRAPE_JOB`: `job` label for self-scraped bridge metrics,
+  default `snuffle`
+- `SNUFFLE_SELF_SCRAPE_INSTANCE`: `instance` label for self-scraped bridge
+  metrics, default `<hostname>:<SIDECAR_PORT>`
 
 Tenant precedence is `/t/{team_id}/api/v1/...` or
 `/team/{team_id}/api/v1/...`, then the configured header, then the configured

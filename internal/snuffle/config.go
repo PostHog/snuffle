@@ -35,9 +35,16 @@ type Config struct {
 	TeamHeader          string
 	TeamQueryParam      string
 	Pprof               bool
+	SelfScrapeEnabled   bool
+	SelfScrapeInterval  time.Duration
+	SelfScrapeTeamID    uint64
+	SelfScrapeJob       string
+	SelfScrapeInstance  string
 }
 
 func ConfigFromEnv() Config {
+	httpPort := getenv("SIDECAR_PORT", "9091")
+	defaultTeamID := envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0)
 	return Config{
 		CHAddr:              getenv("CH_ADDR", "localhost:9000"),
 		CHUser:              getenv("CH_USER", "default"),
@@ -52,7 +59,7 @@ func ConfigFromEnv() Config {
 		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", "metrics_histograms"),
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", "metrics_exemplars"),
 		HTTPHost:            getenv("SIDECAR_HOST", "0.0.0.0"),
-		HTTPPort:            getenv("SIDECAR_PORT", "9091"),
+		HTTPPort:            httpPort,
 		CHTimeout:           envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
 		QueryTimeout:        envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
 		LookbackDelta:       envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),
@@ -61,12 +68,25 @@ func ConfigFromEnv() Config {
 		IDChunkSize:         envInt("CH_ID_CHUNK_SIZE", 20000, 1),
 		AggregateThreads:    envInt("CH_AGGREGATE_MAX_THREADS", 4, 0),
 		RemoteWriteInterval: envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
-		TeamID:              envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0),
-		DefaultTeamID:       envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0),
+		TeamID:              defaultTeamID,
+		DefaultTeamID:       defaultTeamID,
 		TeamHeader:          getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:      getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
 		Pprof:               envBool("SNUFFLE_PPROF", false),
+		SelfScrapeEnabled:   envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
+		SelfScrapeInterval:  envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
+		SelfScrapeTeamID:    envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),
+		SelfScrapeJob:       getenv("SNUFFLE_SELF_SCRAPE_JOB", "snuffle"),
+		SelfScrapeInstance:  getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
 	}
+}
+
+func defaultSelfScrapeInstance(port string) string {
+	hostname, err := os.Hostname()
+	if err != nil || hostname == "" {
+		hostname = "localhost"
+	}
+	return hostname + ":" + port
 }
 
 func getenv(key, fallback string) string {

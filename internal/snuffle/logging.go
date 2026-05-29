@@ -13,6 +13,8 @@ type promRequestStatsKey struct{}
 type promRequestStats struct {
 	clickHouseQueries atomic.Int64
 	readRows          atomic.Int64
+	scannedRows       atomic.Int64
+	readBytes         atomic.Int64
 	clickHouseInserts atomic.Int64
 	writtenRows       atomic.Int64
 }
@@ -26,10 +28,12 @@ func promRequestStatsFromContext(ctx context.Context) *promRequestStats {
 	return stats
 }
 
-func recordClickHouseRead(ctx context.Context, rows int64) {
+func recordClickHouseRead(ctx context.Context, rows, scannedRows, readBytes int64) {
 	if stats := promRequestStatsFromContext(ctx); stats != nil {
 		stats.clickHouseQueries.Add(1)
 		stats.readRows.Add(rows)
+		stats.scannedRows.Add(scannedRows)
+		stats.readBytes.Add(readBytes)
 	}
 }
 
@@ -117,6 +121,8 @@ func logPromRequestCompleted(r *http.Request, w *loggingResponseWriter, stats *p
 		slog.Int64("response_bytes", w.bytes),
 		slog.Int64("clickhouse_queries", stats.clickHouseQueries.Load()),
 		slog.Int64("read_rows", stats.readRows.Load()),
+		slog.Int64("scanned_rows", stats.scannedRows.Load()),
+		slog.Int64("read_bytes", stats.readBytes.Load()),
 		slog.Int64("clickhouse_inserts", stats.clickHouseInserts.Load()),
 		slog.Int64("written_rows", stats.writtenRows.Load()),
 	)

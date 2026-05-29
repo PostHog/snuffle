@@ -20,17 +20,26 @@ import (
 )
 
 func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	status := "error"
+	var compressedBytes int
+	var decodedBytes int
+	var batch remoteWriteBatch
+	defer func() {
+		s.metrics.observeRemoteWrite(status, time.Since(started), compressedBytes, decodedBytes, batch)
+	}()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeHTTPError(w, http.StatusMethodNotAllowed, "bad_method", errors.New("method not allowed"))
 		return
 	}
 
-	decoded, err := readSnappyBody(r, "remote write")
+	decoded, compressedBytes, err := readSnappyBody(r, "remote write")
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	decodedBytes = len(decoded)
 
 	batch, ok, err := buildRemoteWriteBatchFromProto(decoded, s.cfg.RemoteWriteInterval, s.cfg.TeamID)
 	if err != nil {
@@ -58,10 +67,21 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	runtime.KeepAlive(decoded)
 
+	status = "ok"
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleRemoteRead(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	status := "error"
+	var compressedBytes int
+	var decodedBytes int
+	var responseBytes int
+	var queryCount int
+	var returnedRows remoteReadRows
+	defer func() {
+		s.metrics.observeRemoteRead(status, time.Since(started), compressedBytes, decodedBytes, responseBytes, queryCount, returnedRows)
+	}()
 	if r.Method != http.MethodPost {
 		w.Header().Set("Allow", http.MethodPost)
 		writeHTTPError(w, http.StatusMethodNotAllowed, "bad_method", errors.New("method not allowed"))
@@ -69,10 +89,13 @@ func (s *Server) handleRemoteRead(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req prompb.ReadRequest
-	if err := readSnappyProto(r, &req, "remote read"); err != nil {
+	var err error
+	decodedBytes, compressedBytes, err = readSnappyProto(r, &req, "remote read")
+	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	queryCount = len(req.GetQueries())
 	if !remoteReadAcceptsSamples(&req) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("remote read streamed chunk responses are not supported"))
 		return
@@ -90,33 +113,37 @@ func (s *Server) handleRemoteRead(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusInternalServerError, "execution", err)
 		return
 	}
+	returnedRows = countRemoteReadRows(resp)
+	encoded := snappy.Encode(nil, payload)
+	responseBytes = len(encoded)
 
 	w.Header().Set("Content-Type", "application/x-protobuf")
 	w.Header().Set("Content-Encoding", "snappy")
-	_, _ = w.Write(snappy.Encode(nil, payload))
+	status = "ok"
+	_, _ = w.Write(encoded)
 }
 
-func readSnappyProto(r *http.Request, dst interface{ Unmarshal([]byte) error }, name string) error {
-	decoded, err := readSnappyBody(r, name)
+func readSnappyProto(r *http.Request, dst interface{ Unmarshal([]byte) error }, name string) (int, int, error) {
+	decoded, compressedBytes, err := readSnappyBody(r, name)
 	if err != nil {
-		return err
+		return 0, compressedBytes, err
 	}
 	if err := dst.Unmarshal(decoded); err != nil {
-		return fmt.Errorf("decode %s protobuf: %w", name, err)
+		return len(decoded), compressedBytes, fmt.Errorf("decode %s protobuf: %w", name, err)
 	}
-	return nil
+	return len(decoded), compressedBytes, nil
 }
 
-func readSnappyBody(r *http.Request, name string) ([]byte, error) {
+func readSnappyBody(r *http.Request, name string) ([]byte, int, error) {
 	compressed, err := io.ReadAll(r.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	decoded, err := snappy.Decode(nil, compressed)
 	if err != nil {
-		return nil, fmt.Errorf("decode snappy %s request: %w", name, err)
+		return nil, len(compressed), fmt.Errorf("decode snappy %s request: %w", name, err)
 	}
-	return decoded, nil
+	return decoded, len(compressed), nil
 }
 
 type remoteWriteBatch struct {

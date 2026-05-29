@@ -28,10 +28,14 @@ type Server struct {
 	engine    *promql.Engine
 	parser    parser.Parser
 	seriesMu  *sync.Mutex
+	metrics   *bridgeMetrics
 }
 
 func Run(cfg Config) error {
 	server := newServer(cfg)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	server.startSelfScraper(ctx)
 
 	mux := http.NewServeMux()
 	server.routes(mux)
@@ -47,7 +51,8 @@ func Run(cfg Config) error {
 }
 
 func newServer(cfg Config) *Server {
-	client := NewClickHouseClient(cfg)
+	metrics := newBridgeMetrics()
+	client := NewClickHouseClient(cfg, metrics)
 	queryable := NewCHQueryable(client, cfg)
 	engine := promql.NewEngine(promql.EngineOpts{
 		Logger:               slog.Default(),
@@ -75,12 +80,14 @@ func newServer(cfg Config) *Server {
 		engine:    engine,
 		parser:    parser.NewParser(parser.Options{}),
 		seriesMu:  &sync.Mutex{},
+		metrics:   metrics,
 	}
 }
 
 func (s *Server) routes(mux *http.ServeMux) {
-	mux.HandleFunc("/-/healthy", s.handleHealthy)
-	mux.HandleFunc("/-/ready", s.handleHealthy)
+	mux.Handle("/-/healthy", s.instrumentHandler("/-/healthy", http.HandlerFunc(s.handleHealthy)))
+	mux.Handle("/-/ready", s.instrumentHandler("/-/ready", http.HandlerFunc(s.handleHealthy)))
+	mux.Handle("/metrics", s.instrumentHandler("/metrics", s.metrics.handler()))
 	if s.cfg.Pprof {
 		registerPprofRoutes(mux)
 	}
@@ -129,12 +136,21 @@ func (s *Server) teamHandler(handler func(*Server, http.ResponseWriter, *http.Re
 		wrapped := &loggingResponseWriter{ResponseWriter: w}
 		withStats := r.WithContext(withPromRequestStats(r.Context(), stats))
 		started := time.Now()
+		endpoint := normalizedEndpoint(withStats.URL.Path)
+		method := withStats.Method
 		var teamID uint64
 		var haveTeamID bool
+		if s.metrics != nil {
+			s.metrics.httpInflight.WithLabelValues(method, endpoint).Inc()
+			defer s.metrics.httpInflight.WithLabelValues(method, endpoint).Dec()
+		}
 
 		logPromRequestReceived(withStats)
 		defer func() {
 			logPromRequestCompleted(withStats, wrapped, stats, started, teamID, haveTeamID)
+			if s.metrics != nil {
+				s.metrics.observeHTTPRequest(method, endpoint, strconv.Itoa(wrapped.statusCode()), time.Since(started), wrapped.bytes)
+			}
 		}()
 
 		var err error
@@ -223,6 +239,7 @@ func (s *Server) withTeamID(teamID uint64) *Server {
 		engine:    s.engine,
 		parser:    s.parser,
 		seriesMu:  s.seriesMu,
+		metrics:   s.metrics,
 	}
 }
 
@@ -256,17 +273,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
+	queryStarted := time.Now()
 	if data, ok, err := s.tryFastInstantQuery(ctx, query, ts); ok {
+		status := "ok"
 		if err != nil {
+			status = "error"
+			s.metrics.observePromQLQuery("instant", "fastpath", status, time.Since(queryStarted), 0, 0, 0)
 			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
 			return
 		}
+		series, samples, histograms := queryDataStats(data)
+		s.metrics.observePromQLQuery("instant", "fastpath", status, time.Since(queryStarted), series, samples, histograms)
 		writeAPISuccess(w, data)
 		return
 	}
 
+	queryStarted = time.Now()
 	q, err := s.engine.NewInstantQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, ts)
 	if err != nil {
+		s.metrics.observePromQLQuery("instant", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
@@ -274,9 +299,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	result := q.Exec(ctx)
 	if result.Err != nil {
+		s.metrics.observePromQLQuery("instant", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
+	series, samples, histograms := valueStats(result.Value)
+	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
 	writeAPISuccess(w, responseDataFromValue(result.Value))
 }
 
@@ -313,17 +341,25 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
+	queryStarted := time.Now()
 	if data, ok, err := s.tryFastRangeQuery(ctx, query, start, end, step); ok {
+		status := "ok"
 		if err != nil {
+			status = "error"
+			s.metrics.observePromQLQuery("range", "fastpath", status, time.Since(queryStarted), 0, 0, 0)
 			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
 			return
 		}
+		series, samples, histograms := queryDataStats(data)
+		s.metrics.observePromQLQuery("range", "fastpath", status, time.Since(queryStarted), series, samples, histograms)
 		writeAPISuccess(w, data)
 		return
 	}
 
+	queryStarted = time.Now()
 	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {
+		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
@@ -331,9 +367,12 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 
 	result := q.Exec(ctx)
 	if result.Err != nil {
+		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
+	series, samples, histograms := valueStats(result.Value)
+	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
 	writeAPISuccess(w, responseDataFromValue(result.Value))
 }
 
