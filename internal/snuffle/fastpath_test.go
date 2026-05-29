@@ -283,6 +283,61 @@ func TestAggregateRangeSourceSQLWrapsRunningSum(t *testing.T) {
 	}
 }
 
+func TestRewriteImplicitMetricsQLSubquerySteps(t *testing.T) {
+	query := `quantile(1, sum_over_time(delta(foo{label="[5m]"}[1m])[5m]))`
+	got := rewriteImplicitMetricsQLSubquerySteps(query, 30*time.Second)
+	want := `quantile(1, sum_over_time(delta(foo{label="[5m]"}[1m])[5m:30s]))`
+	if got != want {
+		t.Fatalf("rewrite = %q, want %q", got, want)
+	}
+}
+
+func TestAggregateRangeSourceSQLWrapsSumOverTimeSubquery(t *testing.T) {
+	cfg := Config{
+		LookbackDelta: 5 * time.Minute,
+	}
+	s := newServer(cfg)
+	expr, rewritten, err := s.parseFastRangeExpr(`quantile(1, sum_over_time(delta(node_cpu_seconds_total{ready=~"true"}[1m])[5m]))`, 30*time.Second)
+	if err != nil {
+		t.Fatalf("parseFastRangeExpr returned error: %v", err)
+	}
+	if !rewritten {
+		t.Fatal("parseFastRangeExpr should rewrite the MetricsQL implicit subquery step")
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+
+	start := time.Unix(1700000000, 0).UTC()
+	end := time.Unix(1700000060, 0).UTC()
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 30*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if source.sumOverTime == nil {
+		t.Fatal("sum_over_time over a subquery should mark the range source for rollup wrapping")
+	}
+	if !source.gridStart.Equal(start.Add(-5*time.Minute)) || source.gridStep != 30*time.Second {
+		t.Fatalf("input grid = start %s step %s", source.gridStart, source.gridStep)
+	}
+	if selector == nil || selector.Name != "node_cpu_seconds_total" {
+		t.Fatalf("selector = %#v", selector)
+	}
+	if mint != 1699999640000 || maxt != 1700000060000 {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+
+	sql := rangeSourcePerSeriesSQL(source, "SELECT id, timestamp, value FROM samples")
+	for _, want := range []string{
+		"timeSeriesDeltaToGrid",
+		"arraySlice",
+		"arraySum",
+		"range(toUInt64(3))",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+}
+
 func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 	cfg := Config{
 		CHDatabase:          "default",

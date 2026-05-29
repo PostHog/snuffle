@@ -45,7 +45,7 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	if stepMillis <= 0 {
 		return queryData{}, false, nil
 	}
-	expr, err := s.parser.ParseExpr(query)
+	expr, hasMetricsQLRewrite, err := s.parseFastRangeExpr(query, step)
 	if err != nil {
 		return queryData{}, false, nil
 	}
@@ -62,13 +62,13 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	}
 	hasRunningSum := exprHasFunction(expr, "running_sum")
 	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
-	if steps < 64 && !hasRunningSum {
+	if steps < 64 && !hasRunningSum && !hasMetricsQLRewrite {
 		return queryData{}, false, nil
 	}
 	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr, start, end, step)
 	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		if hasRunningSum {
-			return queryData{}, true, errors.New("MetricsQL running_sum is only supported in fast range queries when it wraps a selector or supported range function")
+		if hasRunningSum || hasMetricsQLRewrite {
+			return queryData{}, true, errors.New("MetricsQL extensions are only supported in fast range queries when they wrap a selector or supported range function")
 		}
 		return queryData{}, false, nil
 	}
@@ -95,6 +95,114 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		return queryData{}, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
 	}
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+func (s *Server) parseFastRangeExpr(query string, step time.Duration) (parser.Expr, bool, error) {
+	expr, err := s.parser.ParseExpr(query)
+	if err == nil {
+		return expr, false, nil
+	}
+	rewritten := rewriteImplicitMetricsQLSubquerySteps(query, step)
+	if rewritten == query {
+		return nil, false, err
+	}
+	expr, err = s.parser.ParseExpr(rewritten)
+	if err != nil {
+		return nil, false, err
+	}
+	return expr, true, nil
+}
+
+func rewriteImplicitMetricsQLSubquerySteps(query string, step time.Duration) string {
+	stepText := promDuration(step)
+	if stepText == "" {
+		return query
+	}
+	var out strings.Builder
+	last := 0
+	changed := false
+	for i := 0; i < len(query); i++ {
+		switch query[i] {
+		case '"', '\'', '`':
+			i = skipQuoted(query, i)
+		case '[':
+			prev := previousNonSpace(query, i-1)
+			if prev < 0 || query[prev] != ')' {
+				continue
+			}
+			end := strings.IndexByte(query[i+1:], ']')
+			if end < 0 {
+				continue
+			}
+			end += i + 1
+			window := strings.TrimSpace(query[i+1 : end])
+			if strings.Contains(window, ":") || !looksLikeDuration(window) {
+				continue
+			}
+			out.WriteString(query[last:end])
+			out.WriteByte(':')
+			out.WriteString(stepText)
+			last = end
+			changed = true
+			i = end
+		}
+	}
+	if !changed {
+		return query
+	}
+	out.WriteString(query[last:])
+	return out.String()
+}
+
+func skipQuoted(query string, start int) int {
+	quote := query[start]
+	for i := start + 1; i < len(query); i++ {
+		if quote != '`' && query[i] == '\\' {
+			i++
+			continue
+		}
+		if query[i] == quote {
+			return i
+		}
+	}
+	return len(query) - 1
+}
+
+func previousNonSpace(query string, idx int) int {
+	for idx >= 0 {
+		switch query[idx] {
+		case ' ', '\t', '\n', '\r':
+			idx--
+		default:
+			return idx
+		}
+	}
+	return -1
+}
+
+func looksLikeDuration(value string) bool {
+	if value == "" {
+		return false
+	}
+	hasDigit := false
+	for _, r := range value {
+		if r >= '0' && r <= '9' {
+			hasDigit = true
+			continue
+		}
+		if r == '.' || r == 'y' || r == 'w' || r == 'd' || r == 'h' || r == 'm' || r == 's' {
+			continue
+		}
+		return false
+	}
+	return hasDigit
+}
+
+func promDuration(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return d.String()
 }
 
 func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
@@ -929,7 +1037,18 @@ type selectorGridSource struct {
 
 type aggregateRangeSource struct {
 	gridExpr       string
+	gridStart      time.Time
+	gridEnd        time.Time
+	gridStep       time.Duration
 	runningSumWrap bool
+	sumOverTime    *rangeSourceSumOverTime
+}
+
+type rangeSourceSumOverTime struct {
+	outputStart time.Time
+	outputEnd   time.Time
+	outputStep  time.Duration
+	window      time.Duration
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
@@ -938,7 +1057,7 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		if !ok {
 			return aggregateRangeSource{}, nil, 0, 0, false
 		}
-		return aggregateRangeSource{gridExpr: lastGridExpr(source.start, source.end, step, s.cfg.LookbackDelta)}, selector, mint, maxt, true
+		return aggregateRangeSource{gridExpr: lastGridExpr(source.start, source.end, step, s.cfg.LookbackDelta), gridStart: source.start, gridEnd: source.end, gridStep: step}, selector, mint, maxt, true
 	}
 
 	call, ok := expr.(*parser.Call)
@@ -952,6 +1071,9 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		}
 		source.runningSumWrap = true
 		return source, selector, mint, maxt, true
+	}
+	if call.Func.Name == "sum_over_time" {
+		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step)
 	}
 	fn, ok := rangeGridFunction(call.Func.Name)
 	if !ok {
@@ -985,7 +1107,33 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	if fn.increase {
 		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", rangeSeconds, gridExpr)
 	}
-	return aggregateRangeSource{gridExpr: gridExpr}, selector, mint, maxt, true
+	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step}, selector, mint, maxt, true
+}
+
+func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
+	subquery, ok := expr.(*parser.SubqueryExpr)
+	if !ok || subquery.Range <= 0 || subquery.OriginalOffset != 0 || subquery.Offset != 0 || subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
+		return aggregateRangeSource{}, nil, 0, 0, false
+	}
+	subqueryStep := subquery.Step
+	if subqueryStep <= 0 {
+		subqueryStep = step
+	}
+	if subqueryStep <= 0 {
+		return aggregateRangeSource{}, nil, 0, 0, false
+	}
+	innerStart := start.Add(-subquery.Range)
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(subquery.Expr, innerStart, end, subqueryStep)
+	if !ok {
+		return aggregateRangeSource{}, nil, 0, 0, false
+	}
+	source.sumOverTime = &rangeSourceSumOverTime{
+		outputStart: start,
+		outputEnd:   end,
+		outputStep:  step,
+		window:      subquery.Range,
+	}
+	return source, selector, mint, maxt, true
 }
 
 func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) string {
@@ -994,6 +1142,13 @@ func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) s
 		source.gridExpr,
 		sampleSource,
 	)
+	if source.sumOverTime != nil {
+		perSeries = fmt.Sprintf(
+			"SELECT id, %s AS vals FROM (%s)",
+			sumOverTimeArraySQL("vals", source.gridStart, source.gridStep, *source.sumOverTime),
+			perSeries,
+		)
+	}
 	if !source.runningSumWrap {
 		return perSeries
 	}
@@ -1012,6 +1167,44 @@ func runningSumArraySQL(valuesExpr string) string {
 		nullableIsFiniteSQL("x"),
 		valuesExpr,
 	)
+}
+
+func sumOverTimeArraySQL(valuesExpr string, inputStart time.Time, inputStep time.Duration, rollup rangeSourceSumOverTime) string {
+	inputStepMillis := inputStep.Milliseconds()
+	outputStepMillis := rollup.outputStep.Milliseconds()
+	if inputStepMillis <= 0 || outputStepMillis <= 0 {
+		return "[]"
+	}
+	outputSteps := ((rollup.outputEnd.UnixMilli() - rollup.outputStart.UnixMilli()) / outputStepMillis) + 1
+	if outputSteps <= 0 {
+		return "[]"
+	}
+	sliceExpr := func(i string) string {
+		startIdx := sumOverTimeStartIndexSQL(i, inputStart.UnixMilli(), inputStepMillis, rollup.outputStart.UnixMilli(), outputStepMillis, rollup.window.Milliseconds())
+		count := sumOverTimeCountSQL(i, valuesExpr, inputStart.UnixMilli(), inputStepMillis, rollup.outputStart.UnixMilli(), outputStepMillis, rollup.window.Milliseconds())
+		return fmt.Sprintf("arraySlice(%s, %s, %s)", valuesExpr, startIdx, count)
+	}
+	return fmt.Sprintf(
+		"arrayMap(i -> if(arraySum(arrayMap(x -> %s, %s)) = 0, NULL, arraySum(arrayMap(x -> %s, %s))), range(toUInt64(%d)))",
+		nullableIsFiniteSQL("x"),
+		sliceExpr("i"),
+		nullableValueOrZeroSQL("x"),
+		sliceExpr("i"),
+		outputSteps,
+	)
+}
+
+func sumOverTimeStartIndexSQL(i string, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis int64) string {
+	evalMillis := fmt.Sprintf("(%d + toInt64(%s) * %d)", outputStartMillis, i, outputStepMillis)
+	windowStartMillis := fmt.Sprintf("(%s - %d)", evalMillis, windowMillis)
+	return fmt.Sprintf("greatest(toInt64(1), intDiv(greatest(%s - %d, 0) + %d - 1, %d) + 1)", windowStartMillis, inputStartMillis, inputStepMillis, inputStepMillis)
+}
+
+func sumOverTimeCountSQL(i, valuesExpr string, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis int64) string {
+	evalMillis := fmt.Sprintf("(%d + toInt64(%s) * %d)", outputStartMillis, i, outputStepMillis)
+	startIdx := sumOverTimeStartIndexSQL(i, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis)
+	lastIdx := fmt.Sprintf("least(toInt64(length(%s)), intDiv(greatest(%s - %d, 0), %d) + 1)", valuesExpr, evalMillis, inputStartMillis, inputStepMillis)
+	return fmt.Sprintf("greatest(toInt64(0), %s - %s + 1)", lastIdx, startIdx)
 }
 
 func nullableValueOrZeroSQL(value string) string {

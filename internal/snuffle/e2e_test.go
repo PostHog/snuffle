@@ -83,6 +83,7 @@ func TestEndToEndClickHouse(t *testing.T) {
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
 	assertMetricsQLRunningSumQuery(t, api.URL)
+	assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
 	assertLabels(t, api.URL)
 	assertLabelValues(t, api.URL)
 	assertSeries(t, api.URL)
@@ -289,6 +290,19 @@ func assertMetricsQLRunningSumQuery(t *testing.T, baseURL string) {
 	})
 	if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) == 0 {
 		t.Fatalf("running_sum query result = %#v", data)
+	}
+}
+
+func assertMetricsQLSumOverTimeSubqueryQuery(t *testing.T, baseURL string) {
+	t.Helper()
+	data := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", url.Values{
+		"query": {`quantile(1, sum_over_time(delta(` + e2eRunningMetric + `{job="api"}[20s])[30s]))`},
+		"start": {"1700000040"},
+		"end":   {"1700000070"},
+		"step":  {"10s"},
+	})
+	if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) == 0 {
+		t.Fatalf("sum_over_time subquery result = %#v", data)
 	}
 }
 
