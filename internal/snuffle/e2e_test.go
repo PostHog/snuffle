@@ -26,6 +26,7 @@ const (
 	e2eEndMS         = int64(1_700_000_070_000)
 	e2eTeamID        = uint64(42)
 	e2eCounterMetric = "snuffle_e2e_requests_total"
+	e2eRunningMetric = "snuffle_e2e_running_total"
 	e2eHistMetric    = "snuffle_e2e_latency_seconds"
 )
 
@@ -81,6 +82,7 @@ func TestEndToEndClickHouse(t *testing.T) {
 
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
+	assertMetricsQLRunningSumQuery(t, api.URL)
 	assertLabels(t, api.URL)
 	assertLabelValues(t, api.URL)
 	assertSeries(t, api.URL)
@@ -179,6 +181,22 @@ func e2eWriteRequest() *prompb.WriteRequest {
 					Timestamp: e2eEndMS,
 				}},
 			},
+			{
+				Labels: []prompb.Label{
+					{Name: labels.MetricName, Value: e2eRunningMetric},
+					{Name: "job", Value: "api"},
+					{Name: "instance", Value: "host-a"},
+				},
+				Samples: []prompb.Sample{
+					{Timestamp: e2eStartMS, Value: 1},
+					{Timestamp: e2eStartMS + 10_000, Value: 2},
+					{Timestamp: e2eStartMS + 20_000, Value: 3},
+					{Timestamp: e2eStartMS + 30_000, Value: 4},
+					{Timestamp: e2eStartMS + 40_000, Value: 5},
+					{Timestamp: e2eStartMS + 50_000, Value: 6},
+					{Timestamp: e2eEndMS, Value: 7},
+				},
+			},
 		},
 		Metadata: []prompb.MetricMetadata{
 			{
@@ -258,6 +276,19 @@ func assertRangeQuery(t *testing.T, baseURL string) {
 	}
 	if got := sampleString(data.Result[0].Values[1]); got != "25" {
 		t.Fatalf("range query final value = %q", got)
+	}
+}
+
+func assertMetricsQLRunningSumQuery(t *testing.T, baseURL string) {
+	t.Helper()
+	data := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", url.Values{
+		"query": {`quantile(1, running_sum(delta(` + e2eRunningMetric + `{job="api"}[60s])))`},
+		"start": {"1700000060"},
+		"end":   {"1700000070"},
+		"step":  {"10s"},
+	})
+	if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) == 0 {
+		t.Fatalf("running_sum query result = %#v", data)
 	}
 }
 

@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -30,6 +31,9 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 			return data, ok, err
 		}
 	}
+	if exprHasFunction(expr, "running_sum") {
+		return queryData{}, true, errors.New("MetricsQL running_sum is only supported for range queries")
+	}
 	return queryData{}, false, nil
 }
 
@@ -56,12 +60,16 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 			return data, ok, err
 		}
 	}
+	hasRunningSum := exprHasFunction(expr, "running_sum")
 	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
-	if steps < 64 {
+	if steps < 64 && !hasRunningSum {
 		return queryData{}, false, nil
 	}
 	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr, start, end, step)
 	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+		if hasRunningSum {
+			return queryData{}, true, errors.New("MetricsQL running_sum is only supported in fast range queries when it wraps a selector or supported range function")
+		}
 		return queryData{}, false, nil
 	}
 
@@ -72,11 +80,7 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
 	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
 
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
-		source.gridExpr,
-		sampleSource,
-	)
+	perSeries := rangeSourcePerSeriesSQL(source, sampleSource)
 	sql := fmt.Sprintf(
 		"WITH selected_series AS (%s), per_series AS (%s) SELECT id, metric_name, labels_json, per_series.vals AS vals FROM per_series ANY INNER JOIN selected_series USING id ORDER BY id",
 		selectedSeries,
@@ -291,7 +295,7 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 	if vectorSelector, ok := expr.Expr.(*parser.VectorSelector); ok && exactBucketRangeSelector(s.cfg, vectorSelector, start, end, step) {
 		return s.queryFastExactAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, start, end, aggSQL)
 	}
-	return s.queryFastAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, source.gridExpr, mint, maxt, start, stepMillis, aggSQL)
+	return s.queryFastAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, source, mint, maxt, start, stepMillis, aggSQL)
 }
 
 func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64, aggSQL string) (queryData, bool, error) {
@@ -328,16 +332,12 @@ func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *pars
 	}
 	selectedSeries := strings.Join(selectedParts, " UNION DISTINCT ")
 	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
-	return s.queryFastAggregateRange(ctx, expr, selectedSeries, nil, gridExpr, mint, maxt, start, stepMillis, aggSQL)
+	return s.queryFastAggregateRange(ctx, expr, selectedSeries, nil, aggregateRangeSource{gridExpr: gridExpr}, mint, maxt, start, stepMillis, aggSQL)
 }
 
-func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, gridExpr string, mint, maxt int64, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
+func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, source aggregateRangeSource, mint, maxt int64, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
 	sampleSource := samplesForSelectedSeriesSQL(s.cfg, groupMatchers, mint, maxt)
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
-		gridExpr,
-		sampleSource,
-	)
+	perSeries := rangeSourcePerSeriesSQL(source, sampleSource)
 
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
 	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
@@ -928,7 +928,8 @@ type selectorGridSource struct {
 }
 
 type aggregateRangeSource struct {
-	gridExpr string
+	gridExpr       string
+	runningSumWrap bool
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
@@ -943,6 +944,14 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	call, ok := expr.(*parser.Call)
 	if !ok || len(call.Args) != 1 {
 		return aggregateRangeSource{}, nil, 0, 0, false
+	}
+	if call.Func.Name == "running_sum" {
+		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(call.Args[0], start, end, step)
+		if !ok {
+			return aggregateRangeSource{}, nil, 0, 0, false
+		}
+		source.runningSumWrap = true
+		return source, selector, mint, maxt, true
 	}
 	fn, ok := rangeGridFunction(call.Func.Name)
 	if !ok {
@@ -977,6 +986,40 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", rangeSeconds, gridExpr)
 	}
 	return aggregateRangeSource{gridExpr: gridExpr}, selector, mint, maxt, true
+}
+
+func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) string {
+	perSeries := fmt.Sprintf(
+		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
+		source.gridExpr,
+		sampleSource,
+	)
+	if !source.runningSumWrap {
+		return perSeries
+	}
+	return fmt.Sprintf(
+		"SELECT id, %s AS vals FROM (%s)",
+		runningSumArraySQL("vals"),
+		perSeries,
+	)
+}
+
+func runningSumArraySQL(valuesExpr string) string {
+	return fmt.Sprintf(
+		"arrayMap((running_sum, seen) -> if(seen = 0, NULL, running_sum), arrayCumSum(arrayMap(x -> %s, %s)), arrayCumSum(arrayMap(x -> %s, %s)))",
+		nullableValueOrZeroSQL("x"),
+		valuesExpr,
+		nullableIsFiniteSQL("x"),
+		valuesExpr,
+	)
+}
+
+func nullableValueOrZeroSQL(value string) string {
+	return fmt.Sprintf("if(isNull(%s), 0.0, if(isNaN(assumeNotNull(%s)), 0.0, assumeNotNull(%s)))", value, value, value)
+}
+
+func nullableIsFiniteSQL(value string) string {
+	return fmt.Sprintf("if(isNull(%s), 0, if(isNaN(assumeNotNull(%s)), 0, 1))", value, value)
 }
 
 func selectorRangeGridSource(cfg Config, selector *parser.VectorSelector, start, end time.Time, step time.Duration) (selectorGridSource, int64, int64, bool) {
@@ -1334,6 +1377,22 @@ func aggregateLimit(expr parser.Expr) (int, bool) {
 		return 0, false
 	}
 	return int(value), true
+}
+
+func exprHasFunction(expr parser.Expr, name string) bool {
+	found := false
+	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		if found {
+			return errors.New("done")
+		}
+		call, ok := node.(*parser.Call)
+		if ok && call.Func != nil && call.Func.Name == name {
+			found = true
+			return errors.New("done")
+		}
+		return nil
+	})
+	return found
 }
 
 func matchersPushdownSafe(matchers []*labels.Matcher) bool {

@@ -231,6 +231,58 @@ func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
 	}
 }
 
+func TestMetricsQLRunningSumParses(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	if _, err := p.ParseExpr(`quantile(1, running_sum(delta(node_cpu_seconds_total{ready=~"true"}[1m])))`); err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+}
+
+func TestAggregateRangeSourceSQLWrapsRunningSum(t *testing.T) {
+	cfg := Config{
+		LookbackDelta: 5 * time.Minute,
+	}
+	s := newServer(cfg)
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`quantile(1, running_sum(delta(node_cpu_seconds_total{ready=~"true"}[1m])))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, time.Unix(1700000000, 0).UTC(), time.Unix(1700000060, 0).UTC(), 15*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if !source.runningSumWrap {
+		t.Fatal("running_sum should mark the range source for cumulative wrapping")
+	}
+	if selector == nil || selector.Name != "node_cpu_seconds_total" {
+		t.Fatalf("selector = %#v", selector)
+	}
+	if mint != 1699999940000 || maxt != 1700000060000 {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+	if !strings.Contains(source.gridExpr, "timeSeriesDeltaToGrid") {
+		t.Fatalf("grid expression does not use delta grid:\n%s", source.gridExpr)
+	}
+
+	sql := rangeSourcePerSeriesSQL(source, "SELECT id, timestamp, value FROM samples")
+	for _, want := range []string{
+		"timeSeriesDeltaToGrid",
+		"arrayCumSum",
+		"assumeNotNull",
+		"if(seen = 0, NULL, running_sum)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	if got := strings.Count(sql, "timeSeriesDeltaToGrid"); got != 1 {
+		t.Fatalf("delta grid expression count = %d, want 1:\n%s", got, sql)
+	}
+}
+
 func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 	cfg := Config{
 		CHDatabase:          "default",
