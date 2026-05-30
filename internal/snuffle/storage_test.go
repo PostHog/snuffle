@@ -225,6 +225,63 @@ func TestSamplesSQLKeepsMetricConstraintForIDBatches(t *testing.T) {
 	}
 }
 
+func TestPostHogSamplesSQLAddsPhysicalKeyPredicates(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SchemaLayout:    "posthog",
+		SamplesTable:    "samples",
+		LabelIndexTable: "label_index",
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout"),
+		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
+	}
+
+	sql := samplesSQL(cfg, []uint64{1, 2}, 1000, 2000, false, matchers)
+	for _, want := range []string{
+		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfDay(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"service_name = 'checkout'",
+		"resource_fingerprint IN (1,2)",
+		"id IN (1,2)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
+func TestPostHogSamplesSQLFromMatchersDuplicatesIDFiltersOntoResourceFingerprint(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SchemaLayout:    "posthog",
+		SeriesTable:     "series",
+		SamplesTable:    "samples",
+		LabelIndexTable: "label_index",
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "job", "api"),
+	}
+
+	sql, ok := samplesSQLFromMatchers(cfg, matchers, 1000, 2000, false)
+	if !ok {
+		t.Fatal("samplesSQLFromMatchers returned ok=false")
+	}
+	for _, want := range []string{
+		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"resource_fingerprint IN (SELECT id FROM `default`.`series`",
+		"resource_fingerprint IN (SELECT id FROM `default`.`label_index`",
+		"id IN (SELECT id FROM `default`.`series`",
+		"id IN (SELECT id FROM `default`.`label_index`",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
 func TestTopKSelectedSeriesCarriesLabelsAndMetricConstraint(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",

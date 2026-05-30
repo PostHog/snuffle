@@ -327,11 +327,69 @@ func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExp
 		return queryData{}, false, nil
 	}
 
+	if data, ok, err := s.tryPostHogInstantAggregate(ctx, expr, selector, window, evalTime, aggSQL); ok || err != nil {
+		return data, ok, err
+	}
 	if data, ok, err := s.tryLabelIndexAggregate(ctx, expr, selector, window, evalTime, aggSQL); ok || err != nil {
 		return data, ok, err
 	}
 
 	return queryData{}, false, nil
+}
+
+func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
+	if !s.cfg.postHogSchemaLayout() {
+		return queryData{}, false, nil
+	}
+	groupSelect, groupBy, perIDGroupSelect, ok := postHogSampleGroupSQL(expr.Grouping)
+	if !ok {
+		return queryData{}, false, nil
+	}
+
+	where := sampleBaseFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
+	withParts := []string{}
+	if !metricOnlyMatchers(selector.LabelMatchers) {
+		selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, []string{"id"})
+		if !ok {
+			return queryData{}, false, nil
+		}
+		withParts = append(withParts, "selected_series AS ("+selectedSeries+")")
+		where = append(where, sampleSelectedSeriesFilters(s.cfg)...)
+	}
+
+	perIDSelect := []string{
+		"id",
+		"argMax(value, timestamp) AS value",
+	}
+	perIDSelect = append(perIDSelect, perIDGroupSelect...)
+	perID := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s GROUP BY id",
+		strings.Join(perIDSelect, ", "),
+		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
+		strings.Join(where, " AND "),
+	)
+
+	selectParts := make([]string, 0, len(groupSelect)+2)
+	selectParts = append(selectParts, groupSelect...)
+	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
+	selectParts = append(selectParts, aggSQL+" AS value")
+
+	sql := ""
+	if len(withParts) > 0 {
+		sql = "WITH " + strings.Join(withParts, ", ") + " "
+	}
+	sql += fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(selectParts, ", "), perID)
+	if len(groupBy) > 0 {
+		sql += " GROUP BY " + strings.Join(groupBy, ", ")
+		sql += " ORDER BY " + strings.Join(groupBy, ", ")
+	}
+	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+
+	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
 func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
@@ -486,13 +544,8 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 }
 
 func (s *Server) queryFastExactAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, start, end time.Time, aggSQL string) (queryData, bool, error) {
-	where := []string{
-		teamFilter(s.cfg),
-		fmt.Sprintf("timestamp >= %s", chTimeMillis(start.UnixMilli())),
-		fmt.Sprintf("timestamp <= %s", chTimeMillis(end.UnixMilli())),
-		"id IN (SELECT id FROM selected_series)",
-	}
-	where = append(where, metricNameConstraints(groupMatchers)...)
+	where := sampleBaseFilters(s.cfg, groupMatchers, start.UnixMilli(), end.UnixMilli())
+	where = append(where, sampleSelectedSeriesFilters(s.cfg)...)
 	samples := fmt.Sprintf(
 		"SELECT id, timestamp, value AS sample_value FROM %s WHERE %s",
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
@@ -678,12 +731,7 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 
 	bucketStartMillis := bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval)
 	bucketEndMillis := bucketTimestampMS(evalEndMillis, cfg.RemoteWriteInterval)
-	sampleWhere := []string{
-		teamFilter(cfg),
-		"metric_name = " + sqlString(metric),
-		"timestamp >= " + chTimeMillis(bucketStartMillis),
-		"timestamp <= " + chTimeMillis(bucketEndMillis),
-	}
+	sampleWhere := sampleBaseFilters(cfg, matchers, bucketStartMillis, bucketEndMillis)
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	return fmt.Sprintf(
@@ -707,12 +755,8 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 
 func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn, groupLabels string, idFilters []string, evalStartMillis, outputStartMillis, stepMillis, steps int64) (string, bool) {
 	evalEndMillis := evalStartMillis + (steps-1)*stepMillis
-	sampleWhere := []string{
-		teamFilter(cfg),
-		"metric_name = " + sqlString(metric),
-		"timestamp >= " + chTimeMillis(evalStartMillis),
-		"timestamp <= " + chTimeMillis(evalEndMillis),
-	}
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric)}
+	sampleWhere := sampleBaseFilters(cfg, matchers, evalStartMillis, evalEndMillis)
 	if stepMillis != cfg.RemoteWriteInterval.Milliseconds() {
 		sampleWhere = append(sampleWhere, fmt.Sprintf("modulo(toUnixTimestamp64Milli(timestamp) - %d, %d) = 0", evalStartMillis, stepMillis))
 	}
@@ -750,12 +794,7 @@ func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping
 	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
 	sampleStart := evalStart.Add(-lookback)
 	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
-	sampleWhere := []string{
-		teamFilter(cfg),
-		"metric_name = " + sqlString(metric),
-		"timestamp >= " + chTimeMillis(sampleStart.UnixMilli()),
-		"timestamp <= " + chTimeMillis(sampleEnd.UnixMilli()),
-	}
+	sampleWhere := sampleBaseFilters(cfg, matchers, sampleStart.UnixMilli(), sampleEnd.UnixMilli())
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	groupName := grouping[0]
@@ -790,11 +829,7 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 		return "", false
 	}
 
-	sampleWhere := []string{
-		teamFilter(cfg),
-		"metric_name = " + sqlString(metric),
-		fmt.Sprintf("timestamp >= %s AND timestamp <= %s", chTimeMillis(mint), chTimeMillis(maxt)),
-	}
+	sampleWhere := sampleBaseFilters(cfg, matchers, mint, maxt)
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
@@ -832,15 +867,15 @@ func nonMetricSampleIDFiltersFromMatchers(cfg Config, metric string, matchers []
 		if !ok {
 			return nil, false
 		}
-		filters = append(filters, fmt.Sprintf(
-			"id %s (SELECT id FROM %s WHERE %s AND metric_name = %s AND label_name = %s AND %s)",
-			membership,
+		source := fmt.Sprintf(
+			"SELECT id FROM %s WHERE %s AND metric_name = %s AND label_name = %s AND %s",
 			tableName(cfg.CHDatabase, cfg.LabelIndexTable),
 			teamFilter(cfg),
 			sqlString(metric),
 			sqlString(m.Name),
 			condition,
-		))
+		)
+		filters = append(filters, sampleIDMembershipFilters(cfg, membership, source)...)
 	}
 	return filters, true
 }
@@ -1698,14 +1733,9 @@ func selectedSeriesProjection(selectParts []string) []string {
 }
 
 func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
-	where := []string{
-		teamFilter(cfg),
-		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
-		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
-	}
-	where = append(where, metricNameConstraints(matchers)...)
+	where := sampleBaseFilters(cfg, matchers, mint, maxt)
 	if !metricOnlyMatchers(matchers) {
-		where = append(where, "id IN (SELECT id FROM selected_series)")
+		where = append(where, sampleSelectedSeriesFilters(cfg)...)
 	}
 	source := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
 	return fmt.Sprintf(
@@ -1736,6 +1766,36 @@ func labelIndexGroupSQL(grouping []string) ([]string, []string) {
 		groupBy = append(groupBy, quoteIdent(alias))
 	}
 	return selects, groupBy
+}
+
+func postHogSampleGroupSQL(grouping []string) ([]string, []string, []string, bool) {
+	selects := make([]string, 0, len(grouping))
+	groupBy := make([]string, 0, len(grouping))
+	perIDSelects := make([]string, 0, len(grouping))
+	for i, name := range grouping {
+		alias := quoteIdent(groupAlias(i))
+		expr, ok := postHogSampleGroupExpr(name)
+		if !ok {
+			return nil, nil, nil, false
+		}
+		perIDSelects = append(perIDSelects, "argMax("+expr+", timestamp) AS "+alias)
+		selects = append(selects, alias)
+		groupBy = append(groupBy, alias)
+	}
+	return selects, groupBy, perIDSelects, true
+}
+
+func postHogSampleGroupExpr(name string) (string, bool) {
+	switch name {
+	case labels.MetricName:
+		return "metric_name", true
+	case "service_name":
+		return "service_name", true
+	case "":
+		return "", false
+	default:
+		return "", false
+	}
 }
 
 func aggregateSourceSQL(base string, grouping []string, groupJoin string) string {

@@ -39,6 +39,24 @@ func TestConfigFromEnvTeamSettings(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvSchemaLayout(t *testing.T) {
+	t.Setenv("CH_SCHEMA_LAYOUT", "posthog")
+
+	cfg := ConfigFromEnv()
+	if cfg.SchemaLayout != "posthog" {
+		t.Fatalf("SchemaLayout = %q, want posthog", cfg.SchemaLayout)
+	}
+	if !cfg.SampleAttributes {
+		t.Fatalf("SampleAttributes = false, want true for posthog layout")
+	}
+
+	t.Setenv("SNUFFLE_SAMPLE_ATTRIBUTES", "0")
+	cfg = ConfigFromEnv()
+	if cfg.SampleAttributes {
+		t.Fatalf("SampleAttributes override = true, want false")
+	}
+}
+
 func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
 	t.Setenv("SNUFFLE_DEFAULT_TEAM_ID", "42")
 	t.Setenv("SNUFFLE_SELF_SCRAPE_INTERVAL", "30s")

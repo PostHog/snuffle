@@ -125,7 +125,17 @@ func waitForClickHouse(t *testing.T, ctx context.Context, client *ClickHouseClie
 
 func createMetricsSchema(t *testing.T, ctx context.Context, client *ClickHouseClient) {
 	t.Helper()
-	schema, err := os.ReadFile(filepath.Join(repoRoot(t), "scripts", "create_metrics_schema.sql"))
+	schemaPath := os.Getenv("SNUFFLE_E2E_SCHEMA_FILE")
+	if schemaPath == "" {
+		schemaName := "create_metrics_schema.sql"
+		if storageSchemaLayout(os.Getenv("CH_SCHEMA_LAYOUT")) == schemaLayoutPostHog {
+			schemaName = "create_metrics_posthog_schema.sql"
+		}
+		schemaPath = filepath.Join(repoRoot(t), "scripts", schemaName)
+	} else if !filepath.IsAbs(schemaPath) {
+		schemaPath = filepath.Join(repoRoot(t), schemaPath)
+	}
+	schema, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
 	}

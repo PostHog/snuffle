@@ -78,7 +78,10 @@ curl --get 'http://localhost:9091/t/42/api/v1/query' \
 
 ## Storage Layout
 
-The recommended schema is in `scripts/create_metrics_schema.sql`:
+Snuffle supports two first-class ClickHouse layouts. Select one with
+`CH_SCHEMA_LAYOUT=current` or `CH_SCHEMA_LAYOUT=posthog`.
+
+The default Prometheus-native schema is in `scripts/create_metrics_schema.sql`:
 
 - `metrics_series`: append-friendly series metadata with `team_id`, `id`,
   `metric_name`, `labels_json String`, `min_time`, and `max_time`, ordered by
@@ -100,6 +103,15 @@ All hot-path columns are non-null. Missing labels are represented by absence
 from the label index and label JSON object. Full labelsets are read from an
 opaque JSON string; ClickHouse does not run `JSONExtract` on labels in the
 query path.
+
+The posthog-style schema is in `scripts/create_metrics_posthog_schema.sql`.
+It keeps the same PromQL contract (`metrics_series`, `metrics_label_index`,
+and sample `id`s), but stores float samples in a wider OTel-oriented table
+ordered by `(team_id, time_bucket, service_name, metric_name,
+resource_fingerprint, timestamp)`. With `CH_SCHEMA_LAYOUT=posthog`, Snuffle
+adds sample predicates for `time_bucket`, `service_name`, and
+`resource_fingerprint` where safe, while still using the label index for exact
+PromQL matcher semantics.
 
 ## Query Shape
 
@@ -145,6 +157,8 @@ Environment variables:
 - `CH_USER`: ClickHouse user, default `default`
 - `CH_PASSWORD`: ClickHouse password
 - `CH_DATABASE`: database, default `default`
+- `CH_SCHEMA_LAYOUT`: storage layout, `current` or `posthog`, default
+  `current`
 - `CH_SERIES_TABLE`: series table, default `metrics_series`
 - `CH_SAMPLES_TABLE`: samples table, default `metrics_samples`
 - `CH_LABEL_INDEX_TABLE`: label index table, default `metrics_label_index`
@@ -164,6 +178,9 @@ Environment variables:
   default `4`; set `0` to leave ClickHouse defaults unchanged
 - `REMOTE_WRITE_SAMPLE_INTERVAL`: remote-write sample/histogram bucket size,
   default `15s`; set `0` to store incoming timestamps unchanged
+- `SNUFFLE_SAMPLE_ATTRIBUTES`: write sample label maps into
+  `attributes_map_str`; defaults to `true` for `CH_SCHEMA_LAYOUT=posthog` and
+  `false` otherwise
 - `SNUFFLE_DEFAULT_TEAM_ID`: fallback tenant when no tenant is provided,
   default `0`
 - `SNUFFLE_TEAM_HEADER`: tenant header, default `X-Team-ID`

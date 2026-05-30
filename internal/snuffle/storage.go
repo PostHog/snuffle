@@ -340,6 +340,15 @@ func activeSeriesIDsSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64
 }
 
 func activeSeriesIDsFromTimedTableSQL(cfg Config, table, metric string, mint, maxt int64) string {
+	if table == cfg.SamplesTable {
+		matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric)}
+		where := sampleBaseFilters(cfg, matchers, mint, maxt)
+		return fmt.Sprintf(
+			"SELECT id FROM %s WHERE %s GROUP BY id",
+			tableName(cfg.CHDatabase, table),
+			strings.Join(where, " AND "),
+		)
+	}
 	return fmt.Sprintf(
 		"SELECT id FROM %s WHERE %s AND metric_name = %s AND timestamp >= %s AND timestamp <= %s GROUP BY id",
 		tableName(cfg.CHDatabase, table),
@@ -845,12 +854,7 @@ func exemplarRowHandler(byID map[uint64]*seriesMeta) func(clickHouseRow) error {
 }
 
 func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) (string, bool) {
-	where := []string{
-		teamFilter(cfg),
-		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
-		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
-	}
-	where = append(where, metricNameConstraints(matchers)...)
+	where := sampleBaseFilters(cfg, matchers, mint, maxt)
 	idFilters, ok := sampleIDFiltersFromMatchers(cfg, matchers, mint, maxt)
 	if !ok {
 		return "", false
@@ -882,13 +886,8 @@ func rawSamplesSourceSQL(cfg Config, where string) string {
 }
 
 func samplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
-	where := []string{
-		teamFilter(cfg),
-		fmt.Sprintf("timestamp >= %s", chTimeMillis(mint)),
-		fmt.Sprintf("timestamp <= %s", chTimeMillis(maxt)),
-		"id IN (SELECT id FROM selected_series)",
-	}
-	where = append(where, metricNameConstraints(matchers)...)
+	where := sampleBaseFilters(cfg, matchers, mint, maxt)
+	where = append(where, sampleSelectedSeriesFilters(cfg)...)
 	return rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
 }
 
@@ -903,38 +902,34 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 			if !ok {
 				return nil, false
 			}
-			filters = append(filters, fmt.Sprintf(
-				"id IN (SELECT id FROM %s WHERE %s AND %s)",
+			source := fmt.Sprintf(
+				"SELECT id FROM %s WHERE %s AND %s",
 				tableName(cfg.CHDatabase, cfg.SeriesTable),
 				teamFilter(cfg),
 				metricCondition,
-			))
+			)
+			filters = append(filters, sampleIDMembershipFilters(cfg, "IN", source)...)
 			continue
 		}
 		membership, condition, ok := labelIndexMembershipCondition(m)
 		if !ok {
 			return nil, false
 		}
-		filters = append(filters, fmt.Sprintf(
-			"id %s (SELECT id FROM %s WHERE %s AND label_name = %s AND %s)",
-			membership,
+		source := fmt.Sprintf(
+			"SELECT id FROM %s WHERE %s AND label_name = %s AND %s",
 			tableName(cfg.CHDatabase, cfg.LabelIndexTable),
 			teamFilter(cfg),
 			sqlString(m.Name),
 			condition,
-		))
+		)
+		filters = append(filters, sampleIDMembershipFilters(cfg, membership, source)...)
 	}
 	return filters, true
 }
 
 func samplesSQL(cfg Config, ids []uint64, mint, maxt int64, latestOnly bool, matchers []*labels.Matcher) string {
-	where := []string{
-		teamFilter(cfg),
-		"id IN (" + joinUint64(ids) + ")",
-		"timestamp >= " + chTimeMillis(mint),
-		"timestamp <= " + chTimeMillis(maxt),
-	}
-	where = append(where, metricNameConstraints(matchers)...)
+	where := sampleBaseFilters(cfg, matchers, mint, maxt)
+	where = append(where, sampleExplicitIDFilters(cfg, ids)...)
 	return sampleRowsSQL(cfg, strings.Join(where, " AND "), latestOnly)
 }
 

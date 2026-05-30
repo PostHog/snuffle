@@ -36,7 +36,7 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 		Unit:             "requests",
 	}}}
 
-	batch, err := buildRemoteWriteBatch(req, 0, 7)
+	batch, err := buildRemoteWriteBatch(req, 0, 7, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
 		},
 	}}
 
-	batch, err := buildRemoteWriteBatch(req, 0, 0)
+	batch, err := buildRemoteWriteBatch(req, 0, 0, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
 			Timestamp: 1000,
 		}},
 	}}}
-	batch, err := buildRemoteWriteBatch(req, 0, 0)
+	batch, err := buildRemoteWriteBatch(req, 0, 0, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 		},
 	}}}
 
-	batch, err := buildRemoteWriteBatch(req, 15*time.Second, 0)
+	batch, err := buildRemoteWriteBatch(req, 15*time.Second, 0, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}

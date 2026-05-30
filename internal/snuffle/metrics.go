@@ -567,7 +567,7 @@ func (s *Server) scrapeAndWriteSelfMetrics(parent context.Context) {
 	if seriesCount == 0 {
 		return
 	}
-	batch, err := buildRemoteWriteBatch(req, 0, s.cfg.SelfScrapeTeamID)
+	batch, err := buildRemoteWriteBatch(req, 0, s.cfg.SelfScrapeTeamID, s.cfg.SampleAttributes || s.cfg.postHogSchemaLayout())
 	if err != nil {
 		status = "error"
 		slog.Warn("self scrape encode failed", "error", err)

@@ -41,10 +41,13 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 	}
 	decodedBytes = len(decoded)
 
-	batch, ok, err := buildRemoteWriteBatchFromProto(decoded, s.cfg.RemoteWriteInterval, s.cfg.TeamID)
-	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
-		return
+	ok := false
+	if !s.cfg.SampleAttributes && !s.cfg.postHogSchemaLayout() {
+		batch, ok, err = buildRemoteWriteBatchFromProto(decoded, s.cfg.RemoteWriteInterval, s.cfg.TeamID)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+			return
+		}
 	}
 	if !ok {
 		var req prompb.WriteRequest
@@ -52,7 +55,7 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "bad_data", fmt.Errorf("decode remote write protobuf: %w", err))
 			return
 		}
-		batch, err = buildRemoteWriteBatch(&req, s.cfg.RemoteWriteInterval, s.cfg.TeamID)
+		batch, err = buildRemoteWriteBatch(&req, s.cfg.RemoteWriteInterval, s.cfg.TeamID, s.cfg.SampleAttributes || s.cfg.postHogSchemaLayout())
 	}
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
@@ -182,14 +185,18 @@ type remoteWriteSampleRow struct {
 	TimestampMS int64
 	ID          uint64
 	Value       float64
+	ServiceName string
+	Attributes  map[string]string
 }
 
 type remoteWriteSampleColumns struct {
-	TeamIDs     []uint64
-	MetricNames []string
-	Timestamps  []int64
-	IDs         []uint64
-	Values      []float64
+	TeamIDs      []uint64
+	MetricNames  []string
+	Timestamps   []int64
+	IDs          []uint64
+	Values       []float64
+	ServiceNames []string
+	Attributes   []map[string]string
 }
 
 func (c remoteWriteSampleColumns) count() int {
@@ -222,7 +229,7 @@ type remoteWriteMetadataRow struct {
 	UpdatedAtMS      int64
 }
 
-func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64) (remoteWriteBatch, error) {
+func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64, includeSampleAttributes bool) (remoteWriteBatch, error) {
 	timeseriesCount := len(req.GetTimeseries())
 	sampleIntervalMS := sampleInterval.Milliseconds()
 	batch := remoteWriteBatch{
@@ -258,6 +265,12 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		id, metricName, err := remoteWriteSeriesIdentityLabels(rowLabels)
 		if err != nil {
 			return remoteWriteBatch{}, err
+		}
+		var sampleAttributes map[string]string
+		var serviceName string
+		if includeSampleAttributes {
+			sampleAttributes = sampleAttributesFromRemoteWriteLabels(rowLabels)
+			serviceName = serviceNameFromRemoteWriteLabels(rowLabels)
 		}
 
 		var minMS int64
@@ -297,6 +310,8 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 				TimestampMS: bucketMS,
 				ID:          id,
 				Value:       sample.Value,
+				ServiceName: serviceName,
+				Attributes:  sampleAttributes,
 			})
 		}
 		for _, histogram := range ts.GetHistograms() {
@@ -532,6 +547,26 @@ func labelsJSONFromRemoteWriteLabels(input []remoteWriteLabel) (string, error) {
 	}
 	buf = append(buf, '}')
 	return string(buf), nil
+}
+
+func sampleAttributesFromRemoteWriteLabels(input []remoteWriteLabel) map[string]string {
+	attributes := make(map[string]string, len(input))
+	for _, label := range input {
+		if label.Name == labels.MetricName || label.Name == "" {
+			continue
+		}
+		attributes[label.Name+"__str"] = label.Value
+	}
+	return attributes
+}
+
+func serviceNameFromRemoteWriteLabels(input []remoteWriteLabel) string {
+	for _, label := range input {
+		if label.Name == "service.name" || label.Name == "service_name" {
+			return label.Value
+		}
+	}
+	return ""
 }
 
 func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
@@ -781,7 +816,16 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 	if batchRows.sampleCount == 0 {
 		return nil
 	}
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, id, value)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
+	insertAttributes := s.cfg.SampleAttributes
+	insertPostHogColumns := s.cfg.postHogSchemaLayout()
+	columnsSQL := "team_id, metric_name, timestamp, id, value"
+	if insertPostHogColumns {
+		columnsSQL += ", service_name"
+	}
+	if insertAttributes {
+		columnsSQL += ", attributes_map_str"
+	}
+	sql := fmt.Sprintf("INSERT INTO %s (%s)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable), columnsSQL)
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		columns := batchRows.sampleColumns
 		if columns.count() == 0 {
@@ -792,12 +836,24 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 				IDs:         make([]uint64, len(batchRows.sampleRows)),
 				Values:      make([]float64, len(batchRows.sampleRows)),
 			}
+			if insertPostHogColumns {
+				columns.ServiceNames = make([]string, len(batchRows.sampleRows))
+			}
+			if insertAttributes {
+				columns.Attributes = make([]map[string]string, len(batchRows.sampleRows))
+			}
 			for i, row := range batchRows.sampleRows {
 				columns.TeamIDs[i] = row.TeamID
 				columns.MetricNames[i] = row.MetricName
 				columns.Timestamps[i] = row.TimestampMS
 				columns.IDs[i] = row.ID
 				columns.Values[i] = row.Value
+				if insertPostHogColumns {
+					columns.ServiceNames[i] = row.ServiceName
+				}
+				if insertAttributes {
+					columns.Attributes[i] = row.Attributes
+				}
 			}
 		}
 		return appendRemoteSampleColumns(batch, columns)
@@ -819,6 +875,18 @@ func appendRemoteSampleColumns(batch clickHouseBatch, columns remoteWriteSampleC
 	}
 	if err := batch.Column(4).Append(columns.Values); err != nil {
 		return 0, err
+	}
+	nextColumn := 5
+	if len(columns.ServiceNames) > 0 {
+		if err := batch.Column(nextColumn).Append(columns.ServiceNames); err != nil {
+			return 0, err
+		}
+		nextColumn++
+	}
+	if len(columns.Attributes) > 0 {
+		if err := batch.Column(nextColumn).Append(columns.Attributes); err != nil {
+			return 0, err
+		}
 	}
 	return columns.count(), nil
 }

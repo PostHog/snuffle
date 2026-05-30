@@ -441,6 +441,45 @@ func TestLatestSamplesForSelectedSeriesSQLSkipsSelectedIDsForMetricOnlyMatcher(t
 	}
 }
 
+func TestPostHogLatestSamplesForSelectedSeriesSQLUsesPhysicalKeyPredicates(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SchemaLayout:        "posthog",
+		SamplesTable:        "samples",
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`http_requests_total{service_name="checkout", job="api"}`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	selector := expr.(*parser.VectorSelector)
+
+	sql := latestSamplesForSelectedSeriesSQL(cfg, selector.LabelMatchers, 1000, 2000)
+	for _, want := range []string{
+		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfDay(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"service_name = 'checkout'",
+		"resource_fingerprint IN (SELECT id FROM selected_series)",
+		"id IN (SELECT id FROM selected_series)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestPostHogSampleGroupSQLOnlyUsesPhysicalColumns(t *testing.T) {
+	_, _, _, ok := postHogSampleGroupSQL([]string{"service_name", "__name__"})
+	if !ok {
+		t.Fatal("expected physical posthog grouping labels to be supported")
+	}
+	_, _, _, ok = postHogSampleGroupSQL([]string{"region"})
+	if ok {
+		t.Fatal("expected ordinary labels to fall back to the label index aggregate path")
+	}
+}
+
 func TestNestedCountBitmapRangeSQLUsesPostingBitmaps(t *testing.T) {
 	cfg := Config{
 		CHDatabase:         "default",

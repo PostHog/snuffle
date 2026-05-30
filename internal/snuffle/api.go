@@ -46,7 +46,7 @@ func Run(cfg Config) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
+	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "schema_layout", cfg.SchemaLayout, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
 	return srv.ListenAndServe()
 }
 

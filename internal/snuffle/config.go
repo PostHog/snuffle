@@ -12,6 +12,7 @@ type Config struct {
 	CHUser              string
 	CHPassword          string
 	CHDatabase          string
+	SchemaLayout        string
 	SeriesTable         string
 	SamplesTable        string
 	LabelIndexTable     string
@@ -30,6 +31,7 @@ type Config struct {
 	IDChunkSize         int
 	AggregateThreads    int
 	RemoteWriteInterval time.Duration
+	SampleAttributes    bool
 	TeamID              uint64
 	DefaultTeamID       uint64
 	TeamHeader          string
@@ -45,11 +47,14 @@ type Config struct {
 func ConfigFromEnv() Config {
 	httpPort := getenv("SIDECAR_PORT", "9091")
 	defaultTeamID := envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0)
+	schemaLayout := storageSchemaLayout(getenv("CH_SCHEMA_LAYOUT", getenv("SNUFFLE_SCHEMA_LAYOUT", string(schemaLayoutCurrent))))
+	sampleAttributesDefault := schemaLayout == schemaLayoutPostHog
 	return Config{
 		CHAddr:              getenv("CH_ADDR", "localhost:9000"),
 		CHUser:              getenv("CH_USER", "default"),
 		CHPassword:          os.Getenv("CH_PASSWORD"),
 		CHDatabase:          getenv("CH_DATABASE", "default"),
+		SchemaLayout:        string(schemaLayout),
 		SeriesTable:         getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", "metrics_series")),
 		SamplesTable:        getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", "metrics_samples")),
 		LabelIndexTable:     getenv("CH_LABEL_INDEX_TABLE", "metrics_label_index"),
@@ -68,6 +73,7 @@ func ConfigFromEnv() Config {
 		IDChunkSize:         envInt("CH_ID_CHUNK_SIZE", 20000, 1),
 		AggregateThreads:    envInt("CH_AGGREGATE_MAX_THREADS", 4, 0),
 		RemoteWriteInterval: envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
+		SampleAttributes:    envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
 		TeamID:              defaultTeamID,
 		DefaultTeamID:       defaultTeamID,
 		TeamHeader:          getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
