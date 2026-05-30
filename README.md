@@ -105,13 +105,13 @@ opaque JSON string; ClickHouse does not run `JSONExtract` on labels in the
 query path.
 
 The posthog-style schema is in `scripts/create_metrics_posthog_schema.sql`.
-It keeps the same PromQL contract (`metrics_series`, `metrics_label_index`,
-and sample `id`s), but stores float samples in a wider OTel-oriented table
-ordered by `(team_id, time_bucket, service_name, metric_name,
-resource_fingerprint, timestamp)`. With `CH_SCHEMA_LAYOUT=posthog`, Snuffle
-adds sample predicates for `time_bucket`, `service_name`, and
-`resource_fingerprint` where safe, while still using the label index for exact
-PromQL matcher semantics.
+It uses the real PostHog-style table surface: `metrics`/`metrics1` for samples
+and `metric_attributes` for attribute discovery. With
+`CH_SCHEMA_LAYOUT=posthog`, Snuffle builds Prometheus labels from
+`metric_name`, `service_name`, `resource_attributes`, and `attributes_map_str`,
+and computes series identity in ClickHouse with
+`cityHash64(metric_name, service_name, mapSort(resource_attributes),
+mapSort(attributes_map_str))`.
 
 ## Query Shape
 
@@ -159,9 +159,13 @@ Environment variables:
 - `CH_DATABASE`: database, default `default`
 - `CH_SCHEMA_LAYOUT`: storage layout, `current` or `posthog`, default
   `current`
-- `CH_SERIES_TABLE`: series table, default `metrics_series`
-- `CH_SAMPLES_TABLE`: samples table, default `metrics_samples`
-- `CH_LABEL_INDEX_TABLE`: label index table, default `metrics_label_index`
+- `CH_SERIES_TABLE`: series table, default `metrics_series`; unused by the
+  posthog layout unless explicitly configured
+- `CH_SAMPLES_TABLE`: samples table, default `metrics_samples`, or `metrics`
+  for the posthog layout
+- `CH_LABEL_INDEX_TABLE`: label index table, default `metrics_label_index`;
+  unused by the posthog layout unless explicitly configured
+- `CH_ATTRIBUTE_TABLE`: posthog attribute table, default `metric_attributes`
 - `CH_HISTOGRAMS_TABLE`: native histogram table, default `metrics_histograms`
 - `CH_EXEMPLARS_TABLE`: exemplar table, default `metrics_exemplars`
 - `CH_METRICS_TABLE`: metric metadata table, default

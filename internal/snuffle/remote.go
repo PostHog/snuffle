@@ -614,7 +614,11 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 		return nil
 	}
 	batchSummary := remoteWriteBatchSummary(batch)
-	if batch.seriesCount > 0 {
+	if s.cfg.postHogSchemaLayout() {
+		batch.seriesRecords = nil
+		batch.seriesCount = 0
+		batchSummary = remoteWriteBatchSummary(batch)
+	} else if batch.seriesCount > 0 {
 		inserted, err := s.insertMissingRemoteSeriesRows(ctx, batch, batchSummary)
 		if err != nil {
 			return err
@@ -816,12 +820,11 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 	if batchRows.sampleCount == 0 {
 		return nil
 	}
-	insertAttributes := s.cfg.SampleAttributes
-	insertPostHogColumns := s.cfg.postHogSchemaLayout()
-	columnsSQL := "team_id, metric_name, timestamp, id, value"
-	if insertPostHogColumns {
-		columnsSQL += ", service_name"
+	if s.cfg.postHogSchemaLayout() {
+		return s.insertPostHogRemoteSampleRows(ctx, batchRows)
 	}
+	insertAttributes := s.cfg.SampleAttributes
+	columnsSQL := "team_id, metric_name, timestamp, id, value"
 	if insertAttributes {
 		columnsSQL += ", attributes_map_str"
 	}
@@ -836,9 +839,6 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 				IDs:         make([]uint64, len(batchRows.sampleRows)),
 				Values:      make([]float64, len(batchRows.sampleRows)),
 			}
-			if insertPostHogColumns {
-				columns.ServiceNames = make([]string, len(batchRows.sampleRows))
-			}
 			if insertAttributes {
 				columns.Attributes = make([]map[string]string, len(batchRows.sampleRows))
 			}
@@ -848,15 +848,62 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 				columns.Timestamps[i] = row.TimestampMS
 				columns.IDs[i] = row.ID
 				columns.Values[i] = row.Value
-				if insertPostHogColumns {
-					columns.ServiceNames[i] = row.ServiceName
-				}
 				if insertAttributes {
 					columns.Attributes[i] = row.Attributes
 				}
 			}
 		}
 		return appendRemoteSampleColumns(batch, columns)
+	})
+}
+
+func (s *Server) insertPostHogRemoteSampleRows(ctx context.Context, batchRows remoteWriteBatch) error {
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, observed_timestamp, value, service_name, resource_attributes, attributes_map_str)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
+	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+		teamIDs := make([]int32, len(batchRows.sampleRows))
+		metricNames := make([]string, len(batchRows.sampleRows))
+		timestamps := make([]int64, len(batchRows.sampleRows))
+		values := make([]float64, len(batchRows.sampleRows))
+		serviceNames := make([]string, len(batchRows.sampleRows))
+		resourceAttributes := make([]map[string]string, len(batchRows.sampleRows))
+		attributes := make([]map[string]string, len(batchRows.sampleRows))
+		for i, row := range batchRows.sampleRows {
+			teamIDs[i] = int32(row.TeamID)
+			metricNames[i] = row.MetricName
+			timestamps[i] = row.TimestampMS
+			values[i] = row.Value
+			serviceNames[i] = row.ServiceName
+			resourceAttributes[i] = map[string]string{}
+			attributes[i] = row.Attributes
+			if attributes[i] == nil {
+				attributes[i] = map[string]string{}
+			}
+		}
+		if err := batch.Column(0).Append(teamIDs); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(1).Append(metricNames); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(2).Append(timestamps); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(3).Append(timestamps); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(4).Append(values); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(5).Append(serviceNames); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(6).Append(resourceAttributes); err != nil {
+			return 0, err
+		}
+		if err := batch.Column(7).Append(attributes); err != nil {
+			return 0, err
+		}
+		return len(batchRows.sampleRows), nil
 	})
 }
 

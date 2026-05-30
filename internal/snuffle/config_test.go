@@ -49,6 +49,9 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	if !cfg.SampleAttributes {
 		t.Fatalf("SampleAttributes = false, want true for posthog layout")
 	}
+	if cfg.SamplesTable != "metrics" || cfg.SeriesTable != "" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes" {
+		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable)
+	}
 
 	t.Setenv("SNUFFLE_SAMPLE_ATTRIBUTES", "0")
 	cfg = ConfigFromEnv()

@@ -25,6 +25,7 @@ CH_NATIVE_PORT="${CH_NATIVE_PORT:-${CH_ADDR##*:}}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 CH_DATABASE="${CH_DATABASE:-snuffle_perf}"
+CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-}"
 
 SIDECAR_HOST="${SIDECAR_HOST:-127.0.0.1}"
 SIDECAR_PORT="${SIDECAR_PORT:-9091}"
@@ -49,16 +50,19 @@ case "$PERF_SCHEMA" in
   current)
     PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$ROOT/scripts/create_metrics_schema.sql}"
     CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-current}"
+    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics_samples}"
     SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-0}"
     ;;
   posthog|posthog_compat)
     PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$ROOT/scripts/create_metrics_posthog_schema.sql}"
     CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-posthog}"
+    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics1}"
     SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-1}"
     ;;
   *)
     PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$PERF_SCHEMA}"
     CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-current}"
+    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics_samples}"
     SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-0}"
     ;;
 esac
@@ -143,7 +147,7 @@ wait_for_http() {
 }
 
 sample_count() {
-  ch_client --query "SELECT count() FROM metrics_samples" | tr -d '[:space:]'
+  ch_client --query "SELECT count() FROM $CH_SAMPLES_TABLE" | tr -d '[:space:]'
 }
 
 wait_for_samples() {
@@ -160,7 +164,7 @@ wait_for_samples() {
     fi
     sleep 1
   done
-  echo "metrics_samples did not reach expected row count: got $(sample_count || echo unknown), expected $expected" >&2
+  echo "$CH_SAMPLES_TABLE did not reach expected row count: got $(sample_count || echo unknown), expected $expected" >&2
   return 1
 }
 
@@ -181,6 +185,7 @@ if [[ -z "${PERF_SNUFFLE_URL:-}" ]]; then
     CH_PASSWORD="$CH_PASSWORD" \
     CH_DATABASE="$CH_DATABASE" \
     CH_SCHEMA_LAYOUT="$CH_SCHEMA_LAYOUT" \
+    CH_SAMPLES_TABLE="$CH_SAMPLES_TABLE" \
     SIDECAR_HOST="$SIDECAR_HOST" \
     SIDECAR_PORT="$SIDECAR_PORT" \
     SNUFFLE_DEFAULT_TEAM_ID="$SNUFFLE_DEFAULT_TEAM_ID" \

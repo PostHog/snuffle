@@ -225,12 +225,11 @@ func TestSamplesSQLKeepsMetricConstraintForIDBatches(t *testing.T) {
 	}
 }
 
-func TestPostHogSamplesSQLAddsPhysicalKeyPredicates(t *testing.T) {
+func TestPostHogSeriesSamplesSQLUsesPostHogTablesAndAttributePredicates(t *testing.T) {
 	cfg := Config{
-		CHDatabase:      "default",
-		SchemaLayout:    "posthog",
-		SamplesTable:    "samples",
-		LabelIndexTable: "label_index",
+		CHDatabase:   "posthog",
+		SchemaLayout: "posthog",
+		SamplesTable: "metrics1",
 	}
 	matchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
@@ -238,43 +237,43 @@ func TestPostHogSamplesSQLAddsPhysicalKeyPredicates(t *testing.T) {
 		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
 	}
 
-	sql := samplesSQL(cfg, []uint64{1, 2}, 1000, 2000, false, matchers)
+	sql := postHogSeriesSamplesSQL(cfg, matchers, 1000, 2000, false)
 	for _, want := range []string{
+		"`posthog`.`metrics1`",
+		"xxHash64(metric_name, service_name, resource_fingerprint, mapSort(attributes_map_str)) AS series_id",
 		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfDay(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"service_name = 'checkout'",
-		"resource_fingerprint IN (1,2)",
-		"id IN (1,2)",
+		"metric_name = 'http_requests_total'",
+		"if(mapContains(attributes_map_str, 'status__str'), attributes_map_str['status__str'], resource_attributes['status']) = '200'",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
+	for _, notWant := range []string{"metrics_series", "metrics_label_index", "id IN"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("posthog SQL should not use %q:\n%s", notWant, sql)
+		}
+	}
 }
 
-func TestPostHogSamplesSQLFromMatchersDuplicatesIDFiltersOntoResourceFingerprint(t *testing.T) {
+func TestPostHogLoadSamplesSQLFiltersByComputedSeriesID(t *testing.T) {
 	cfg := Config{
-		CHDatabase:      "default",
-		SchemaLayout:    "posthog",
-		SeriesTable:     "series",
-		SamplesTable:    "samples",
-		LabelIndexTable: "label_index",
+		CHDatabase:   "posthog",
+		SchemaLayout: "posthog",
+		SamplesTable: "metrics1",
 	}
 	matchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
-		labels.MustNewMatcher(labels.MatchEqual, "job", "api"),
 	}
 
-	sql, ok := samplesSQLFromMatchers(cfg, matchers, 1000, 2000, false)
-	if !ok {
-		t.Fatal("samplesSQLFromMatchers returned ok=false")
-	}
+	sql := postHogLoadSamplesSQL(cfg, []uint64{1, 2}, matchers, 1000, 2000, true)
 	for _, want := range []string{
+		"`posthog`.`metrics1`",
 		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
-		"resource_fingerprint IN (SELECT id FROM `default`.`series`",
-		"resource_fingerprint IN (SELECT id FROM `default`.`label_index`",
-		"id IN (SELECT id FROM `default`.`series`",
-		"id IN (SELECT id FROM `default`.`label_index`",
+		"xxHash64(metric_name, service_name, resource_fingerprint, mapSort(attributes_map_str)) IN (1,2)",
+		"argMax(value, timestamp)",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)

@@ -16,6 +16,7 @@ type Config struct {
 	SeriesTable         string
 	SamplesTable        string
 	LabelIndexTable     string
+	AttributeTable      string
 	LabelPostingsTable  string
 	ActivityTable       string
 	MetricsTable        string
@@ -49,20 +50,37 @@ func ConfigFromEnv() Config {
 	defaultTeamID := envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0)
 	schemaLayout := storageSchemaLayout(getenv("CH_SCHEMA_LAYOUT", getenv("SNUFFLE_SCHEMA_LAYOUT", string(schemaLayoutCurrent))))
 	sampleAttributesDefault := schemaLayout == schemaLayoutPostHog
+	seriesTableDefault := "metrics_series"
+	samplesTableDefault := "metrics_samples"
+	labelIndexTableDefault := "metrics_label_index"
+	histogramsTableDefault := "metrics_histograms"
+	exemplarsTableDefault := "metrics_exemplars"
+	metadataTableDefault := "metrics_metadata"
+	aggregateThreadsDefault := 4
+	if schemaLayout == schemaLayoutPostHog {
+		seriesTableDefault = ""
+		samplesTableDefault = "metrics"
+		labelIndexTableDefault = ""
+		histogramsTableDefault = ""
+		exemplarsTableDefault = ""
+		metadataTableDefault = ""
+		aggregateThreadsDefault = 1
+	}
 	return Config{
 		CHAddr:              getenv("CH_ADDR", "localhost:9000"),
 		CHUser:              getenv("CH_USER", "default"),
 		CHPassword:          os.Getenv("CH_PASSWORD"),
 		CHDatabase:          getenv("CH_DATABASE", "default"),
 		SchemaLayout:        string(schemaLayout),
-		SeriesTable:         getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", "metrics_series")),
-		SamplesTable:        getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", "metrics_samples")),
-		LabelIndexTable:     getenv("CH_LABEL_INDEX_TABLE", "metrics_label_index"),
+		SeriesTable:         getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", seriesTableDefault)),
+		SamplesTable:        getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
+		LabelIndexTable:     getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
+		AttributeTable:      getenv("CH_ATTRIBUTE_TABLE", "metric_attributes"),
 		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:       getenv("CH_ACTIVITY_TABLE", ""),
-		MetricsTable:        getenv("CH_METRICS_TABLE", "metrics_metadata"),
-		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", "metrics_histograms"),
-		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", "metrics_exemplars"),
+		MetricsTable:        getenv("CH_METRICS_TABLE", metadataTableDefault),
+		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", histogramsTableDefault),
+		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
 		HTTPHost:            getenv("SIDECAR_HOST", "0.0.0.0"),
 		HTTPPort:            httpPort,
 		CHTimeout:           envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
@@ -71,7 +89,7 @@ func ConfigFromEnv() Config {
 		MaxSamples:          envInt("PROMQL_MAX_SAMPLES", 50_000_000, 1),
 		MaxSeries:           envInt("CH_MAX_SERIES", 1_000_000, 1),
 		IDChunkSize:         envInt("CH_ID_CHUNK_SIZE", 20000, 1),
-		AggregateThreads:    envInt("CH_AGGREGATE_MAX_THREADS", 4, 0),
+		AggregateThreads:    envInt("CH_AGGREGATE_MAX_THREADS", aggregateThreadsDefault, 0),
 		RemoteWriteInterval: envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
 		SampleAttributes:    envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
 		TeamID:              defaultTeamID,

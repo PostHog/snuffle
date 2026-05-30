@@ -58,14 +58,27 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg := ConfigFromEnv()
 	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
-	cfg.SeriesTable = "metrics_series"
-	cfg.SamplesTable = "metrics_samples"
-	cfg.LabelIndexTable = "metrics_label_index"
-	cfg.LabelPostingsTable = ""
-	cfg.ActivityTable = ""
-	cfg.MetricsTable = "metrics_metadata"
-	cfg.HistogramsTable = "metrics_histograms"
-	cfg.ExemplarsTable = "metrics_exemplars"
+	if cfg.postHogSchemaLayout() {
+		cfg.SeriesTable = ""
+		cfg.SamplesTable = "metrics1"
+		cfg.LabelIndexTable = ""
+		cfg.AttributeTable = "metric_attributes"
+		cfg.LabelPostingsTable = ""
+		cfg.ActivityTable = ""
+		cfg.MetricsTable = ""
+		cfg.HistogramsTable = ""
+		cfg.ExemplarsTable = ""
+		cfg.SampleAttributes = true
+	} else {
+		cfg.SeriesTable = "metrics_series"
+		cfg.SamplesTable = "metrics_samples"
+		cfg.LabelIndexTable = "metrics_label_index"
+		cfg.LabelPostingsTable = ""
+		cfg.ActivityTable = ""
+		cfg.MetricsTable = "metrics_metadata"
+		cfg.HistogramsTable = "metrics_histograms"
+		cfg.ExemplarsTable = "metrics_exemplars"
+	}
 	cfg.HTTPHost = "127.0.0.1"
 	cfg.CHTimeout = 10 * time.Second
 	cfg.QueryTimeout = 15 * time.Second
@@ -82,15 +95,21 @@ func TestEndToEndClickHouse(t *testing.T) {
 
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
-	assertMetricsQLRunningSumQuery(t, api.URL)
-	assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
+	if !cfg.postHogSchemaLayout() {
+		assertMetricsQLRunningSumQuery(t, api.URL)
+		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
+	}
 	assertLabels(t, api.URL)
 	assertLabelValues(t, api.URL)
 	assertSeries(t, api.URL)
-	assertMetadata(t, api.URL)
-	assertExemplars(t, api.URL)
-	assertRemoteReadSamples(t, api.URL)
-	assertRemoteReadHistograms(t, api.URL)
+	if !cfg.postHogSchemaLayout() {
+		assertMetadata(t, api.URL)
+		assertExemplars(t, api.URL)
+	}
+	assertRemoteReadSamples(t, api.URL, !cfg.postHogSchemaLayout())
+	if !cfg.postHogSchemaLayout() {
+		assertRemoteReadHistograms(t, api.URL)
+	}
 }
 
 func waitForClickHouse(t *testing.T, ctx context.Context, client *ClickHouseClient) {
@@ -370,7 +389,7 @@ func assertExemplars(t *testing.T, baseURL string) {
 	}
 }
 
-func assertRemoteReadSamples(t *testing.T, baseURL string) {
+func assertRemoteReadSamples(t *testing.T, baseURL string, expectExemplars bool) {
 	t.Helper()
 	resp := remoteRead(t, baseURL, e2eCounterMetric)
 	if len(resp.Results) != 1 || len(resp.Results[0].Timeseries) != 1 {
@@ -380,7 +399,7 @@ func assertRemoteReadSamples(t *testing.T, baseURL string) {
 	if len(ts.Samples) != 2 || ts.Samples[0].Timestamp != e2eStartMS || ts.Samples[0].Value != 12 || ts.Samples[1].Timestamp != e2eEndMS || ts.Samples[1].Value != 25 {
 		t.Fatalf("remote read samples = %#v", ts.Samples)
 	}
-	if len(ts.Exemplars) != 1 || ts.Exemplars[0].Labels[0].Value != "abc123" {
+	if expectExemplars && (len(ts.Exemplars) != 1 || ts.Exemplars[0].Labels[0].Value != "abc123") {
 		t.Fatalf("remote read exemplars = %#v", ts.Exemplars)
 	}
 }

@@ -41,6 +41,18 @@ func (q *CHQuerier) Close() error {
 }
 
 func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	if q.queryable.cfg.postHogSchemaLayout() {
+		latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
+		series, err := q.selectPostHogSeriesSamples(ctx, q.mint, q.maxt, latestOnly, matchers...)
+		if err != nil {
+			return storage.ErrSeriesSet(err)
+		}
+		if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
+			series = series[:hints.Limit]
+		}
+		return seriesSetFromMeta(series, sortSeries)
+	}
+
 	latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
 	if latestOnly {
 		series, ok, err := q.selectLatestSeriesSamples(ctx, q.mint, q.maxt, matchers...)
@@ -93,6 +105,10 @@ func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, m
 	if hints != nil {
 		limit = hints.Limit
 	}
+	if q.queryable.cfg.postHogSchemaLayout() {
+		names, err := q.postHogLabelNames(ctx, limit, matchers...)
+		return names, nil, err
+	}
 	if len(matchers) > 0 {
 		if names, ok, err := q.labelNamesFromIndex(ctx, limit, matchers...); ok || err != nil {
 			return names, nil, err
@@ -133,6 +149,10 @@ func (q *CHQuerier) LabelValues(ctx context.Context, name string, hints *storage
 	limit := 0
 	if hints != nil {
 		limit = hints.Limit
+	}
+	if q.queryable.cfg.postHogSchemaLayout() {
+		values, err := q.postHogLabelValues(ctx, name, limit, matchers...)
+		return values, nil, err
 	}
 	if len(matchers) > 0 {
 		if values, ok, err := q.labelValuesFromIndex(ctx, name, limit, matchers...); ok || err != nil {
@@ -215,10 +235,16 @@ type seriesJSONRow struct {
 }
 
 func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if q.queryable.cfg.postHogSchemaLayout() {
+		return q.selectPostHogSeries(ctx, mint, maxt, matchers...)
+	}
 	return q.selectSeriesMatching(ctx, mint, maxt, false, matchers...)
 }
 
 func (q *CHQuerier) selectActiveSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if q.queryable.cfg.postHogSchemaLayout() {
+		return q.selectPostHogSeries(ctx, mint, maxt, matchers...)
+	}
 	return q.selectSeriesMatching(ctx, mint, maxt, true, matchers...)
 }
 
@@ -271,6 +297,21 @@ func (q *CHQuerier) selectSeriesMatching(ctx context.Context, mint, maxt int64, 
 }
 
 func (q *CHQuerier) selectActiveSeriesJSON(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]seriesJSONRow, bool, error) {
+	if q.queryable.cfg.postHogSchemaLayout() {
+		series, err := q.selectPostHogSeries(ctx, mint, maxt, matchers...)
+		if err != nil {
+			return nil, true, err
+		}
+		rows := make([]seriesJSONRow, 0, len(series))
+		for _, s := range series {
+			raw, err := json.Marshal(s.labelMap)
+			if err != nil {
+				return nil, true, err
+			}
+			rows = append(rows, seriesJSONRow{id: s.id, labels: string(raw)})
+		}
+		return rows, true, nil
+	}
 	if !matchersPushdownSafe(matchers) {
 		return nil, false, nil
 	}
@@ -699,6 +740,9 @@ func metricLabelMap(metricName string, raw json.RawMessage, matchers []*labels.M
 }
 
 func (q *CHQuerier) loadSamples(ctx context.Context, series []*seriesMeta, mint, maxt int64, latestOnly bool, matchers []*labels.Matcher) error {
+	if q.queryable.cfg.postHogSchemaLayout() {
+		return q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers)
+	}
 	byID, ids := seriesIndex(series)
 
 	if len(series) > q.queryable.cfg.IDChunkSize {
