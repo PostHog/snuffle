@@ -146,9 +146,9 @@ func TestNestedCountTimestampSamplesRangeSQLUsesEvalTimestamps(t *testing.T) {
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
 		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
-		"GROUP BY ts, `__group_0`",
+		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
 		"modulo(toUnixTimestamp64Milli(timestamp) - 1778398980000, 60000) = 0",
-		"SELECT ts, toFloat64(count()) AS value",
+		"GROUP BY ts ORDER BY ts",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
@@ -368,8 +368,8 @@ func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
 		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
-		"GROUP BY `__group_0`",
-		"SELECT toInt64(1778398980000) AS ts, toFloat64(count()) AS value",
+		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
+		"SELECT toInt64(1778398980000) AS ts",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
@@ -536,10 +536,11 @@ func TestNestedCountSamplesRangeSQLUsesSamplesAndLabelIndex(t *testing.T) {
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
 		"active_ids AS",
-		"active_groups AS",
+		"group_labels AS",
 		"range(toUInt64(61))",
 		"GROUP BY step_idx, id",
 		"ANY LEFT JOIN",
+		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)

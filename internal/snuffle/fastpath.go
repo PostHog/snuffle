@@ -1066,7 +1066,7 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s), step_map AS (SELECT toInt64(%d) + toInt64(number) * %d AS ts, intDiv(toInt64(%d) + toInt64(number) * %d, %d) * %d AS bucket_ms FROM numbers(toUInt64(%d))) SELECT ts, toFloat64(count()) AS value FROM (SELECT step_map.ts AS ts, ifNull(%s, '') AS %s FROM step_map INNER JOIN (SELECT timestamp, id FROM %s WHERE %s) AS active_samples ON active_samples.timestamp = %s ANY LEFT JOIN group_labels USING id GROUP BY ts, %s) AS active_groups GROUP BY ts ORDER BY ts",
+		"WITH group_labels AS (%s), step_map AS (SELECT toInt64(%d) + toInt64(number) * %d AS ts, intDiv(toInt64(%d) + toInt64(number) * %d, %d) * %d AS bucket_ms FROM numbers(toUInt64(%d))) SELECT step_map.ts AS ts, %s AS value FROM step_map INNER JOIN (SELECT timestamp, id FROM %s WHERE %s) AS active_samples ON active_samples.timestamp = %s ANY LEFT JOIN group_labels USING id GROUP BY ts ORDER BY ts",
 		groupLabels,
 		outputStart.UnixMilli(),
 		stepMillis,
@@ -1075,12 +1075,10 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 		intervalMillis,
 		intervalMillis,
 		steps,
-		groupColumn,
-		groupColumn,
+		nestedCountDistinctGroupSQL(groupColumn),
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
 		chTimeMillisExpr("step_map.bucket_ms"),
-		groupColumn,
 	), true
 }
 
@@ -1094,17 +1092,15 @@ func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn,
 	sampleWhere = append(sampleWhere, idFilters...)
 
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s) SELECT ts, toFloat64(count()) AS value FROM (SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, ifNull(%s, '') AS %s FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY ts, %s) AS active_groups GROUP BY ts ORDER BY ts",
+		"WITH group_labels AS (%s) SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, %s AS value FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY ts ORDER BY ts",
 		groupLabels,
 		outputStartMillis,
 		evalStartMillis,
 		stepMillis,
 		stepMillis,
-		groupColumn,
-		groupColumn,
+		nestedCountDistinctGroupSQL(groupColumn),
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
-		groupColumn,
 	), true
 }
 
@@ -1132,18 +1128,16 @@ func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping
 	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, groupName)
 
 	return fmt.Sprintf(
-		"WITH active_ids AS (SELECT step_idx, id FROM (SELECT id, toUnixTimestamp64Milli(timestamp) AS ts FROM %s WHERE %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE ts >= %s AND ts <= %s GROUP BY step_idx, id), active_groups AS (SELECT step_idx, ifNull(%s, '') AS %s FROM active_ids ANY LEFT JOIN (%s) AS group_labels USING id GROUP BY step_idx, %s) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY step_idx ORDER BY step_idx",
+		"WITH active_ids AS (SELECT step_idx, id FROM (SELECT id, toUnixTimestamp64Milli(timestamp) AS ts FROM %s WHERE %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE ts >= %s AND ts <= %s GROUP BY step_idx, id), group_labels AS (%s) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, %s AS value FROM active_ids ANY LEFT JOIN group_labels USING id GROUP BY step_idx ORDER BY step_idx",
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
 		steps,
 		lookbackStartExpr,
 		evalMillisExpr,
-		groupColumn,
-		groupColumn,
 		groupLabels,
-		groupColumn,
 		outputStart.UnixMilli(),
 		stepMillis,
+		nestedCountDistinctGroupSQL(groupColumn),
 	), true
 }
 
@@ -1165,15 +1159,17 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 
 	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s) SELECT toInt64(%d) AS ts, toFloat64(count()) AS value FROM (SELECT ifNull(%s, '') AS %s FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY %s) AS active_groups",
+		"WITH group_labels AS (%s) SELECT toInt64(%d) AS ts, %s AS value FROM %s ANY LEFT JOIN group_labels USING id WHERE %s",
 		groupLabels,
 		evalMillis,
-		groupColumn,
-		groupColumn,
+		nestedCountDistinctGroupSQL(groupColumn),
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
-		groupColumn,
 	), true
+}
+
+func nestedCountDistinctGroupSQL(groupColumn string) string {
+	return "toFloat64(uniqExact(ifNull(" + groupColumn + ", '')))"
 }
 
 func nestedCountGroupLabelsSQL(cfg Config, metric, groupName string) (string, string) {
