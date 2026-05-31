@@ -90,3 +90,21 @@ func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
 		t.Fatalf("self scrape labels = job %q instance %q", cfg.SelfScrapeJob, cfg.SelfScrapeInstance)
 	}
 }
+
+func TestConfigFromEnvLogSettings(t *testing.T) {
+	t.Setenv("CH_LOGS_TABLE", "logs34")
+	t.Setenv("CH_LOG_ATTRIBUTES_TABLE", "log_attributes2")
+	t.Setenv("SNUFFLE_LOG_RETENTION", "48h")
+	t.Setenv("SNUFFLE_LOG_QUERY_MAX_ROWS", "1234")
+
+	cfg := ConfigFromEnv()
+	if cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes2" {
+		t.Fatalf("log tables = logs %q attrs %q", cfg.LogsTable, cfg.LogAttributesTable)
+	}
+	if cfg.LogRetention != 48*time.Hour {
+		t.Fatalf("LogRetention = %s, want 48h", cfg.LogRetention)
+	}
+	if cfg.LogQueryMaxRows != 1234 {
+		t.Fatalf("LogQueryMaxRows = %d, want 1234", cfg.LogQueryMaxRows)
+	}
+}

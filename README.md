@@ -18,6 +18,12 @@ paths for common high-cardinality query shapes. It does not call ClickHouse
 - `GET|POST /api/v1/query_exemplars`
 - `POST /api/v1/write`
 - `POST /api/v1/read`
+- `POST /loki/api/v1/push`
+- `GET|POST /loki/api/v1/query`
+- `GET|POST /loki/api/v1/query_range`
+- `GET|POST /loki/api/v1/labels`
+- `GET|POST /loki/api/v1/label/<name>/values`
+- `GET|POST /loki/api/v1/series`
 - `GET /metrics`
 - `GET /-/healthy`
 - `GET /-/ready`
@@ -113,6 +119,23 @@ and computes series identity in ClickHouse with
 `cityHash64(metric_name, service_name, mapSort(resource_attributes),
 mapSort(attributes_map_str))`.
 
+PostHog-style logs for Loki/LogQL are in `scripts/create_logs_posthog_schema.sql`.
+The Loki push API writes Loki stream labels and structured metadata into the
+OpenTelemetry-shaped `logs34` table:
+
+- `service_name` / `service.name` become the `service_name` column
+- `level`, `severity`, and `severity_text` become `severity_text`
+- `trace_id` and `span_id` are promoted to their native columns
+- structured metadata named `resource_*` or `resource.*` becomes
+  `resource_attributes`
+- other labels and metadata become `attributes_map_str` entries with the
+  PostHog `__str` suffix
+
+LogQL support covers stream selectors, line filters, label filters, `json`,
+`logfmt`, `regexp`, `pattern`, `line_format`, `label_format`, `drop`,
+`unwrap`, range aggregations such as `count_over_time` and `rate`, simple
+aggregations, and `topk`/`bottomk`.
+
 ## Query Shape
 
 - arbitrary positive label filters are pruned through `label_index`
@@ -170,6 +193,9 @@ Environment variables:
 - `CH_EXEMPLARS_TABLE`: exemplar table, default `metrics_exemplars`
 - `CH_METRICS_TABLE`: metric metadata table, default
   `metrics_metadata`
+- `CH_LOGS_TABLE`: OpenTelemetry/PostHog logs table, default `logs34`
+- `CH_LOG_ATTRIBUTES_TABLE`: logs attribute discovery table, default
+  `log_attributes2`; `CH_LOG_ATTRIBUTE_TABLE` is also accepted
 - `CH_TIMEOUT_SECONDS`: ClickHouse timeout, default `30`
 - `SIDECAR_HOST`: listen host, default `0.0.0.0`
 - `SIDECAR_PORT`: listen port, default `9091`
@@ -199,6 +225,10 @@ Environment variables:
   default `snuffle`
 - `SNUFFLE_SELF_SCRAPE_INSTANCE`: `instance` label for self-scraped bridge
   metrics, default `<hostname>:<SIDECAR_PORT>`
+- `SNUFFLE_LOG_RETENTION`: expiry applied when Loki push writes into `logs34`,
+  default `720h`
+- `SNUFFLE_LOG_QUERY_MAX_ROWS`: maximum raw log rows read per LogQL query,
+  default `100000`
 
 Tenant precedence is `/t/{team_id}/api/v1/...` or
 `/team/{team_id}/api/v1/...`, then the configured header, then the configured
@@ -237,6 +267,20 @@ Large benchmark seeds:
 ```bash
 docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/seed_metrics_large.sql
 ```
+
+LogQL comparison benchmark against real Loki:
+
+```bash
+REAL_LOKI_URL=http://localhost:3100 \
+SNUFFLE_URL=http://localhost:9091 \
+TENANT=42 \
+LINES=50000 \
+scripts/bench_logql_loki.sh
+```
+
+The benchmark harness clones Grafana Loki if needed, generates data with
+`pkg/logql/bench/cmd/stream`, pushes the same batches to both endpoints, then
+runs a query workload derived from Loki's `pkg/logql/bench/queries/fast`.
 
 The metrics seed creates 100k series, 400k label-index rows, and 10M samples.
 Use Go benchmarks as regression smoke tests, not as product capacity estimates:

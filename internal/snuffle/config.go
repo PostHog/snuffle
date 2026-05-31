@@ -20,6 +20,8 @@ type Config struct {
 	LabelPostingsTable  string
 	ActivityTable       string
 	MetricsTable        string
+	LogsTable           string
+	LogAttributesTable  string
 	HistogramsTable     string
 	ExemplarsTable      string
 	HTTPHost            string
@@ -43,6 +45,8 @@ type Config struct {
 	SelfScrapeTeamID    uint64
 	SelfScrapeJob       string
 	SelfScrapeInstance  string
+	LogRetention        time.Duration
+	LogQueryMaxRows     int
 }
 
 func ConfigFromEnv() Config {
@@ -78,6 +82,8 @@ func ConfigFromEnv() Config {
 		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:       getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:        getenv("CH_METRICS_TABLE", metadataTableDefault),
+		LogsTable:           getenv("CH_LOGS_TABLE", "logs34"),
+		LogAttributesTable:  getenv("CH_LOG_ATTRIBUTES_TABLE", getenv("CH_LOG_ATTRIBUTE_TABLE", "log_attributes2")),
 		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", histogramsTableDefault),
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
 		HTTPHost:            getenv("SIDECAR_HOST", "0.0.0.0"),
@@ -101,6 +107,8 @@ func ConfigFromEnv() Config {
 		SelfScrapeTeamID:    envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),
 		SelfScrapeJob:       getenv("SNUFFLE_SELF_SCRAPE_JOB", "snuffle"),
 		SelfScrapeInstance:  getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
+		LogRetention:        envDuration("SNUFFLE_LOG_RETENTION", 30*24*time.Hour),
+		LogQueryMaxRows:     envInt("SNUFFLE_LOG_QUERY_MAX_ROWS", 100000, 1),
 	}
 }
 

@@ -94,8 +94,10 @@ func (s *Server) routes(mux *http.ServeMux) {
 
 	api := s.apiRoutes()
 	mux.Handle("/api/v1/", api)
-	mux.HandleFunc("/t/", s.handleTeamPath(api))
-	mux.HandleFunc("/team/", s.handleTeamPath(api))
+	loki := s.lokiRoutes()
+	mux.Handle("/loki/api/v1/", loki)
+	mux.HandleFunc("/t/", s.handleTeamPath(mux))
+	mux.HandleFunc("/team/", s.handleTeamPath(mux))
 }
 
 func registerPprofRoutes(mux *http.ServeMux) {
@@ -193,7 +195,7 @@ func parseTeamPath(path string) (uint64, string, error) {
 		rest := strings.TrimPrefix(path, prefix)
 		parts := strings.SplitN(rest, "/", 2)
 		if len(parts) != 2 || parts[0] == "" {
-			return 0, "", fmt.Errorf("tenant path must be %s{team_id}/api/v1/...", prefix)
+			return 0, "", fmt.Errorf("tenant path must be %s{team_id}/...", prefix)
 		}
 		teamID, err := parseTeamID(parts[0])
 		if err != nil {
