@@ -232,10 +232,18 @@ type remoteWriteMetadataRow struct {
 func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64, includeSampleAttributes bool) (remoteWriteBatch, error) {
 	timeseriesCount := len(req.GetTimeseries())
 	sampleIntervalMS := sampleInterval.Milliseconds()
+	sampleCountHint := 0
+	histogramCountHint := 0
+	exemplarCountHint := 0
+	for _, ts := range req.GetTimeseries() {
+		sampleCountHint += len(ts.GetSamples())
+		histogramCountHint += len(ts.GetHistograms())
+		exemplarCountHint += len(ts.GetExemplars())
+	}
 	batch := remoteWriteBatch{
-		sampleRows:    make([]remoteWriteSampleRow, 0, timeseriesCount),
-		histogramRows: make([]remoteWriteHistogramRow, 0, timeseriesCount),
-		exemplarRows:  make([]remoteWriteExemplarRow, 0, timeseriesCount),
+		sampleRows:    make([]remoteWriteSampleRow, 0, sampleCountHint),
+		histogramRows: make([]remoteWriteHistogramRow, 0, histogramCountHint),
+		exemplarRows:  make([]remoteWriteExemplarRow, 0, exemplarCountHint),
 		metadataRows:  make([]remoteWriteMetadataRow, 0, len(req.GetMetadata())),
 		seriesRecords: make([]remoteWriteSeriesRow, 0, timeseriesCount),
 	}

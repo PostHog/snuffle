@@ -56,7 +56,7 @@ func ConfigFromEnv() Config {
 	histogramsTableDefault := "metrics_histograms"
 	exemplarsTableDefault := "metrics_exemplars"
 	metadataTableDefault := "metrics_metadata"
-	aggregateThreadsDefault := 4
+	aggregateThreadsDefault := 1
 	if schemaLayout == schemaLayoutPostHog {
 		seriesTableDefault = ""
 		samplesTableDefault = "metrics"
@@ -64,7 +64,6 @@ func ConfigFromEnv() Config {
 		histogramsTableDefault = ""
 		exemplarsTableDefault = ""
 		metadataTableDefault = ""
-		aggregateThreadsDefault = 1
 	}
 	return Config{
 		CHAddr:              getenv("CH_ADDR", "localhost:9000"),

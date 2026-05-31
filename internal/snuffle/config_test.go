@@ -40,6 +40,12 @@ func TestConfigFromEnvTeamSettings(t *testing.T) {
 }
 
 func TestConfigFromEnvSchemaLayout(t *testing.T) {
+	t.Setenv("CH_AGGREGATE_MAX_THREADS", "")
+	t.Setenv("CH_SCHEMA_LAYOUT", "")
+	if cfg := ConfigFromEnv(); cfg.AggregateThreads != 1 {
+		t.Fatalf("current AggregateThreads default = %d, want 1", cfg.AggregateThreads)
+	}
+
 	t.Setenv("CH_SCHEMA_LAYOUT", "posthog")
 
 	cfg := ConfigFromEnv()
@@ -51,6 +57,9 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	}
 	if cfg.SamplesTable != "metrics" || cfg.SeriesTable != "" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes" {
 		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable)
+	}
+	if cfg.AggregateThreads != 1 {
+		t.Fatalf("posthog AggregateThreads default = %d, want 1", cfg.AggregateThreads)
 	}
 
 	t.Setenv("SNUFFLE_SAMPLE_ATTRIBUTES", "0")

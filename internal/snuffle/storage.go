@@ -401,7 +401,7 @@ func activeSeriesIDsFromTimedTableSQL(cfg Config, table, metric string, mint, ma
 }
 
 func (q *CHQuerier) selectLatestSeriesSamples(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, bool, error) {
-	if !metricOnlyMatchers(matchers) || !matchersPushdownSafe(matchers) {
+	if !matchersPushdownSafe(matchers) {
 		return nil, false, nil
 	}
 	selectedSeries, ok := selectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt, []string{"id", "metric_name", "labels_json"})
@@ -942,17 +942,6 @@ func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, m
 			continue
 		}
 		if m.Name == labels.MetricName {
-			metricCondition, ok := metricMatcherCondition(m)
-			if !ok {
-				return nil, false
-			}
-			source := fmt.Sprintf(
-				"SELECT id FROM %s WHERE %s AND %s",
-				tableName(cfg.CHDatabase, cfg.SeriesTable),
-				teamFilter(cfg),
-				metricCondition,
-			)
-			filters = append(filters, sampleIDMembershipFilters(cfg, "IN", source)...)
 			continue
 		}
 		membership, condition, ok := labelIndexMembershipCondition(m)
@@ -996,11 +985,17 @@ func idBatches(ids []uint64, size int) [][]uint64 {
 }
 
 func joinUint64(ids []uint64) string {
-	parts := make([]string, len(ids))
-	for i, id := range ids {
-		parts[i] = strconv.FormatUint(id, 10)
+	if len(ids) == 0 {
+		return ""
 	}
-	return strings.Join(parts, ",")
+	var b strings.Builder
+	b.Grow(len(ids) * 21)
+	b.WriteString(strconv.FormatUint(ids[0], 10))
+	for _, id := range ids[1:] {
+		b.WriteByte(',')
+		b.WriteString(strconv.FormatUint(id, 10))
+	}
+	return b.String()
 }
 
 func seriesIDs(series []*seriesMeta) []uint64 {

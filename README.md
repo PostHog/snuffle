@@ -179,7 +179,7 @@ Environment variables:
 - `CH_MAX_SERIES`: maximum matching series per select, default `1000000`
 - `CH_ID_CHUNK_SIZE`: selected-ID batch size, default `20000`
 - `CH_AGGREGATE_MAX_THREADS`: per-query `max_threads` for aggregate pushdowns,
-  default `4`; set `0` to leave ClickHouse defaults unchanged
+  default `1`; set `0` to leave ClickHouse defaults unchanged
 - `REMOTE_WRITE_SAMPLE_INTERVAL`: remote-write sample/histogram bucket size,
   default `15s`; set `0` to store incoming timestamps unchanged
 - `SNUFFLE_SAMPLE_ATTRIBUTES`: write sample label maps into

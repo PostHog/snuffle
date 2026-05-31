@@ -369,6 +369,9 @@ func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExp
 	if data, ok, err := s.tryPostHogInstantAggregate(ctx, expr, selector, window, evalTime, aggSQL); ok || err != nil {
 		return data, ok, err
 	}
+	if data, ok, err := s.trySampleLabelIndexInstantAggregate(ctx, expr, selector, window, evalTime, aggSQL); ok || err != nil {
+		return data, ok, err
+	}
 	if data, ok, err := s.tryLabelIndexAggregate(ctx, expr, selector, window, evalTime, aggSQL); ok || err != nil {
 		return data, ok, err
 	}
@@ -817,6 +820,58 @@ func (s *Server) queryFastExactAggregateRange(ctx context.Context, expr *parser.
 		return queryData{}, true, err
 	}
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+func (s *Server) trySampleLabelIndexInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
+	if s.cfg.postHogSchemaLayout() || groupingHasMetricName(expr.Grouping) {
+		return queryData{}, false, nil
+	}
+	metric := exactMetricName(selector.LabelMatchers)
+	if metric == "" || s.cfg.SamplesTable == "" || s.cfg.LabelIndexTable == "" {
+		return queryData{}, false, nil
+	}
+	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(s.cfg, metric, selector.LabelMatchers)
+	if !ok {
+		return queryData{}, false, nil
+	}
+
+	where := sampleBaseFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
+	where = append(where, idFilters...)
+	latest := fmt.Sprintf(
+		"SELECT id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY id",
+		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
+		strings.Join(where, " AND "),
+	)
+
+	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(s.cfg, selector.LabelMatchers, expr.Grouping, false)
+	withParts := []string{"latest AS (" + latest + ")"}
+	if groupLabels != "" {
+		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
+	}
+
+	selectParts := make([]string, 0, len(groupSelect)+2)
+	selectParts = append(selectParts, groupSelect...)
+	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
+	selectParts = append(selectParts, aggSQL+" AS value")
+
+	sql := fmt.Sprintf(
+		"WITH %s SELECT %s FROM latest%s",
+		strings.Join(withParts, ", "),
+		strings.Join(selectParts, ", "),
+		groupJoin,
+	)
+	if len(groupBy) > 0 {
+		sql += " GROUP BY " + strings.Join(groupBy, ", ")
+		sql += " ORDER BY " + strings.Join(groupBy, ", ")
+	}
+	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+
+	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
 func (s *Server) queryAggregateRangeRows(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
