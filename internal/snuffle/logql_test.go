@@ -94,6 +94,51 @@ func TestApplyLogQLPipelineParsersAndFilters(t *testing.T) {
 	}
 }
 
+func TestApplyLogQLPipelineErrorsKeepDecolorizeAndPatternNot(t *testing.T) {
+	selector, err := parseLogQLSelector(`{service_name="api"} !> "<_> debug <_>" | decolorize | json | __error__="" | keep service_name, method`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	rows := []logRow{
+		{tsNS: 1000, line: "\x1b[31m{\"method\":\"GET\",\"status\":200}\x1b[0m", labels: map[string]string{"service_name": "api", "pod": "a"}, fields: map[string]string{}},
+		{tsNS: 2000, line: "x debug y", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+		{tsNS: 3000, line: "{bad json", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+	}
+	got := applyLogQLSelector(rows, *selector)
+	if len(got) != 1 {
+		t.Fatalf("rows after selector = %d, want 1: %#v", len(got), got)
+	}
+	if got[0].line != `{"method":"GET","status":200}` {
+		t.Fatalf("line = %q", got[0].line)
+	}
+	if got[0].labels["method"] != "GET" || got[0].labels["pod"] != "" {
+		t.Fatalf("labels = %#v", got[0].labels)
+	}
+}
+
+func TestLogQLLabelFiltersSupportDurationAndBytes(t *testing.T) {
+	selector, err := parseLogQLSelector(`{service_name="api"} | logfmt | duration >= 500ms and bytes < 2KiB`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	rows := []logRow{
+		{tsNS: 1000, line: `duration=750ms bytes=1024`, labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+		{tsNS: 2000, line: `duration=100ms bytes=1024`, labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+		{tsNS: 3000, line: `duration=750ms bytes=4096`, labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+	}
+	got := applyLogQLSelector(rows, *selector)
+	if len(got) != 1 || got[0].tsNS != 1000 {
+		t.Fatalf("rows after selector = %#v, want only first row", got)
+	}
+}
+
+func TestParseFlatJSONFieldsFlattensNestedObjects(t *testing.T) {
+	fields := parseFlatJSONFields(`{"http":{"method":"GET","status":200},"path":"/x"}`, "")
+	if fields["http_method"] != "GET" || fields["http_status"] != "200" || fields["path"] != "/x" {
+		t.Fatalf("fields = %#v", fields)
+	}
+}
+
 func TestEvaluateLogQLRangeMetric(t *testing.T) {
 	expr, err := parseLogQL(`sum by (service_name) (count_over_time({service_name=~"api|worker"}[1m]))`)
 	if err != nil {
@@ -108,6 +153,43 @@ func TestEvaluateLogQLRangeMetric(t *testing.T) {
 	if len(vector) != 2 {
 		t.Fatalf("vector length = %d, want 2: %#v", len(vector), vector)
 	}
+	values := map[string]string{}
+	for _, sample := range vector {
+		values[sample.Metric["service_name"]] = sample.Value[1].(string)
+	}
+	if values["api"] != "2" || values["worker"] != "1" {
+		t.Fatalf("values = %#v", values)
+	}
+}
+
+func TestEvaluateLogQLLabelReplaceAndJoin(t *testing.T) {
+	expr, err := parseLogQL(`label_join(label_replace(sum by (service_name) (count_over_time({service_name=~"api-.+"}[1m])), "cluster", "$1", "service_name", "api-(.+)"), "joined", "/", "cluster", "service_name")`)
+	if err != nil {
+		t.Fatalf("parseLogQL returned error: %v", err)
+	}
+	rows := []logRow{
+		{tsNS: int64(10 * time.Second), line: "a", labels: map[string]string{"service_name": "api-east"}, fields: map[string]string{}},
+	}
+	vector := evaluateLogQLInstantMetric(expr, rows, int64(time.Minute))
+	if len(vector) != 1 {
+		t.Fatalf("vector length = %d, want 1: %#v", len(vector), vector)
+	}
+	if vector[0].Metric["cluster"] != "east" || vector[0].Metric["joined"] != "east/api-east" {
+		t.Fatalf("metric labels = %#v", vector[0].Metric)
+	}
+}
+
+func TestEvaluateLogQLBinaryArithmeticAndMatching(t *testing.T) {
+	expr, err := parseLogQL(`sum by (service_name) (count_over_time({service_name=~"api|worker"}[1m])) / on (service_name) sum by (service_name) (count_over_time({service_name=~"api|worker"} |= "ok" [1m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL returned error: %v", err)
+	}
+	rows := []logRow{
+		{tsNS: int64(10 * time.Second), line: "ok", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+		{tsNS: int64(20 * time.Second), line: "bad", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
+		{tsNS: int64(30 * time.Second), line: "ok", labels: map[string]string{"service_name": "worker"}, fields: map[string]string{}},
+	}
+	vector := evaluateLogQLInstantMetric(expr, rows, int64(time.Minute))
 	values := map[string]string{}
 	for _, sample := range vector {
 		values[sample.Metric["service_name"]] = sample.Value[1].(string)

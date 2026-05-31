@@ -274,16 +274,26 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 }
 
 func (s *Server) queryLogQLMetricRows(ctx context.Context, expr *logQLExpr, startNS, endNS int64) ([]logRow, error) {
-	selector := firstLogQLSelector(expr)
-	if selector == nil {
-		return nil, errors.New("metric query does not contain a log selector")
+	selectors := collectLogQLSelectors(expr)
+	if len(selectors) == 0 {
+		return nil, nil
 	}
-	sql := logQLSelectSQL(s.cfg, *selector, startNS, endNS, s.cfg.LogQueryMaxRows, "forward")
-	rows, err := scanLogRows(ctx, s.client, sql)
-	if err != nil {
-		return nil, err
+	allRows := make([]logRow, 0)
+	seen := map[string]struct{}{}
+	for _, selector := range selectors {
+		key := logQLSelectorKey(selector)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		sql := logQLSelectSQL(s.cfg, selector, startNS, endNS, s.cfg.LogQueryMaxRows, "forward")
+		rows, err := scanLogRows(ctx, s.client, sql)
+		if err != nil {
+			return nil, err
+		}
+		allRows = append(allRows, rows...)
 	}
-	return rows, nil
+	return dedupLogRows(allRows), nil
 }
 
 func firstLogQLSelector(expr *logQLExpr) *logQLSelector {
@@ -299,9 +309,69 @@ func firstLogQLSelector(expr *logQLExpr) *logQLSelector {
 		return firstLogQLSelector(expr.aggregation.expr)
 	case expr.topK != nil:
 		return firstLogQLSelector(expr.topK.expr)
+	case expr.labelFunc != nil:
+		return firstLogQLSelector(expr.labelFunc.expr)
+	case expr.binaryOp != nil:
+		if selector := firstLogQLSelector(expr.binaryOp.lhs); selector != nil {
+			return selector
+		}
+		return firstLogQLSelector(expr.binaryOp.rhs)
 	default:
 		return nil
 	}
+}
+
+func collectLogQLSelectors(expr *logQLExpr) []logQLSelector {
+	if expr == nil {
+		return nil
+	}
+	switch {
+	case expr.logSelector != nil:
+		return []logQLSelector{*expr.logSelector}
+	case expr.rangeAgg != nil:
+		return []logQLSelector{expr.rangeAgg.selector}
+	case expr.aggregation != nil:
+		return collectLogQLSelectors(expr.aggregation.expr)
+	case expr.topK != nil:
+		return collectLogQLSelectors(expr.topK.expr)
+	case expr.labelFunc != nil:
+		return collectLogQLSelectors(expr.labelFunc.expr)
+	case expr.binaryOp != nil:
+		left := collectLogQLSelectors(expr.binaryOp.lhs)
+		return append(left, collectLogQLSelectors(expr.binaryOp.rhs)...)
+	default:
+		return nil
+	}
+}
+
+func logQLSelectorKey(selector logQLSelector) string {
+	var b strings.Builder
+	for _, matcher := range selector.matchers {
+		b.WriteString(matcher.name)
+		b.WriteByte('\x00')
+		b.WriteString(matcher.op)
+		b.WriteByte('\x00')
+		b.WriteString(matcher.value)
+		b.WriteByte('\x00')
+	}
+	b.WriteByte('\xff')
+	for _, stage := range selector.stages {
+		b.WriteString(stage.kind)
+		b.WriteByte('\x00')
+		if stage.lineFilter != nil {
+			b.WriteString(stage.lineFilter.op)
+			b.WriteByte('\x00')
+			b.WriteString(stage.lineFilter.value)
+		}
+		b.WriteByte('\x00')
+		b.WriteString(stage.parser)
+		b.WriteByte('\x00')
+		b.WriteString(stage.parserParam)
+		b.WriteByte('\x00')
+		b.WriteString(stage.lineFormat)
+		b.WriteByte('\xff')
+	}
+	return b.String()
 }
 
 func logQLCandidateLimit(selector logQLSelector, limit, maxRows int) int {
@@ -380,6 +450,10 @@ func maxLogQLWindow(expr *logQLExpr) time.Duration {
 		return maxLogQLWindow(expr.aggregation.expr)
 	case expr.topK != nil:
 		return maxLogQLWindow(expr.topK.expr)
+	case expr.labelFunc != nil:
+		return maxLogQLWindow(expr.labelFunc.expr)
+	case expr.binaryOp != nil:
+		return maxDuration(maxLogQLWindow(expr.binaryOp.lhs), maxLogQLWindow(expr.binaryOp.rhs))
 	default:
 		return 0
 	}
@@ -396,9 +470,20 @@ func maxLogQLOffset(expr *logQLExpr) time.Duration {
 		return maxLogQLOffset(expr.aggregation.expr)
 	case expr.topK != nil:
 		return maxLogQLOffset(expr.topK.expr)
+	case expr.labelFunc != nil:
+		return maxLogQLOffset(expr.labelFunc.expr)
+	case expr.binaryOp != nil:
+		return maxDuration(maxLogQLOffset(expr.binaryOp.lhs), maxLogQLOffset(expr.binaryOp.rhs))
 	default:
 		return 0
 	}
+}
+
+func maxDuration(a, b time.Duration) time.Duration {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func alignLogQLMetricRange(start, end time.Time, step time.Duration) (time.Time, time.Time) {

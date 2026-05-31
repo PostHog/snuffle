@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"text/template"
 	"time"
 	"unicode"
 )
@@ -19,6 +21,9 @@ type logQLExpr struct {
 	rangeAgg    *logQLRangeAggregation
 	aggregation *logQLAggregation
 	topK        *logQLTopK
+	labelFunc   *logQLLabelFunction
+	binaryOp    *logQLBinaryOp
+	scalar      *float64
 	comparison  *logQLComparison
 }
 
@@ -47,6 +52,32 @@ type logQLTopK struct {
 	k     int
 	expr  *logQLExpr
 	isTop bool
+}
+
+type logQLLabelFunction struct {
+	fn          string
+	expr        *logQLExpr
+	dstLabel    string
+	replacement string
+	srcLabel    string
+	regex       *regexp.Regexp
+	separator   string
+	srcLabels   []string
+}
+
+type logQLBinaryOp struct {
+	op           string
+	lhs          *logQLExpr
+	rhs          *logQLExpr
+	boolModifier bool
+	matching     *logQLVectorMatching
+}
+
+type logQLVectorMatching struct {
+	on      bool
+	labels  []string
+	group   string
+	include []string
 }
 
 type logQLGrouping struct {
@@ -78,6 +109,7 @@ type logQLLabelFilter struct {
 	value     string
 	numeric   bool
 	numValue  float64
+	valueType string
 	re        *regexp.Regexp
 	connector string
 }
@@ -91,6 +123,7 @@ type logQLStage struct {
 	lineFormat   string
 	labelFormats []logQLLabelFormat
 	dropLabels   []string
+	keepLabels   []string
 	unwrapLabel  string
 }
 
@@ -99,6 +132,7 @@ type logQLLabelFormat struct {
 	sourceName string
 	constValue string
 	isConst    bool
+	isTemplate bool
 }
 
 type logRow struct {
@@ -132,12 +166,41 @@ func parseLogQL(input string) (*logQLExpr, error) {
 	if input == "" {
 		return nil, errors.New("missing query")
 	}
+	return parseLogQLBinary(input, 1)
+}
+
+func parseLogQLBinary(input string, minPrec int) (*logQLExpr, error) {
+	input = trimLogQLOuterParens(strings.TrimSpace(input))
+	opStart, opEnd, op, prec, ok := findTopLevelLogQLBinaryOp(input, minPrec)
+	if ok {
+		matching, boolModifier, rhsText, err := parseLogQLBinaryModifiers(input[opEnd:], isLogQLComparisonOp(op))
+		if err != nil {
+			return nil, err
+		}
+		lhs, err := parseLogQLBinary(input[:opStart], prec+1)
+		if err != nil {
+			return nil, err
+		}
+		rhs, err := parseLogQLBinary(rhsText, prec+1)
+		if err != nil {
+			return nil, err
+		}
+		return &logQLExpr{binaryOp: &logQLBinaryOp{op: op, lhs: lhs, rhs: rhs, boolModifier: boolModifier, matching: matching}}, nil
+	}
+	return parseLogQLPrimary(input)
+}
+
+func parseLogQLPrimary(input string) (*logQLExpr, error) {
+	input = trimLogQLOuterParens(strings.TrimSpace(input))
 	if strings.HasPrefix(input, "{") {
 		selector, err := parseLogQLSelector(input)
 		if err != nil {
 			return nil, err
 		}
 		return &logQLExpr{logSelector: selector}, nil
+	}
+	if scalar, ok := parseLogQLScalar(input); ok {
+		return &logQLExpr{scalar: &scalar}, nil
 	}
 	name, rest := readIdentifier(input)
 	switch name {
@@ -154,6 +217,10 @@ func parseLogQL(input string) (*logQLExpr, error) {
 		return parseLogQLAggregation(name, rest)
 	case "topk", "bottomk":
 		return parseLogQLTopK(name, rest)
+	case "label_replace":
+		return parseLogQLLabelReplace(rest)
+	case "label_join":
+		return parseLogQLLabelJoin(rest)
 	case "quantile_over_time":
 		expr, tail, err := parseLogQLQuantileOverTime(rest)
 		if err != nil {
@@ -166,6 +233,93 @@ func parseLogQL(input string) (*logQLExpr, error) {
 	default:
 		return nil, fmt.Errorf("unsupported LogQL expression %q", input)
 	}
+}
+
+func parseLogQLLabelReplace(rest string) (*logQLExpr, error) {
+	inner, tail, err := parseParenthesized(strings.TrimSpace(rest))
+	if err != nil {
+		return nil, err
+	}
+	if tail != "" {
+		return nil, fmt.Errorf("unexpected label_replace tail %q", tail)
+	}
+	parts := splitTopLevel(inner, ',')
+	if len(parts) != 5 {
+		return nil, errors.New("label_replace expects an expression, destination label, replacement, source label, and regex")
+	}
+	child, err := parseLogQL(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	dstLabel, err := unquoteLogQLString(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return nil, err
+	}
+	replacement, err := unquoteLogQLString(strings.TrimSpace(parts[2]))
+	if err != nil {
+		return nil, err
+	}
+	srcLabel, err := unquoteLogQLString(strings.TrimSpace(parts[3]))
+	if err != nil {
+		return nil, err
+	}
+	pattern, err := unquoteLogQLString(strings.TrimSpace(parts[4]))
+	if err != nil {
+		return nil, err
+	}
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("invalid label_replace regex %q: %w", pattern, err)
+	}
+	return &logQLExpr{labelFunc: &logQLLabelFunction{
+		fn:          "label_replace",
+		expr:        child,
+		dstLabel:    dstLabel,
+		replacement: replacement,
+		srcLabel:    srcLabel,
+		regex:       re,
+	}}, nil
+}
+
+func parseLogQLLabelJoin(rest string) (*logQLExpr, error) {
+	inner, tail, err := parseParenthesized(strings.TrimSpace(rest))
+	if err != nil {
+		return nil, err
+	}
+	if tail != "" {
+		return nil, fmt.Errorf("unexpected label_join tail %q", tail)
+	}
+	parts := splitTopLevel(inner, ',')
+	if len(parts) < 4 {
+		return nil, errors.New("label_join expects an expression, destination label, separator, and source labels")
+	}
+	child, err := parseLogQL(parts[0])
+	if err != nil {
+		return nil, err
+	}
+	dstLabel, err := unquoteLogQLString(strings.TrimSpace(parts[1]))
+	if err != nil {
+		return nil, err
+	}
+	separator, err := unquoteLogQLString(strings.TrimSpace(parts[2]))
+	if err != nil {
+		return nil, err
+	}
+	srcLabels := make([]string, 0, len(parts)-3)
+	for _, part := range parts[3:] {
+		label, err := unquoteLogQLString(strings.TrimSpace(part))
+		if err != nil {
+			return nil, err
+		}
+		srcLabels = append(srcLabels, label)
+	}
+	return &logQLExpr{labelFunc: &logQLLabelFunction{
+		fn:        "label_join",
+		expr:      child,
+		dstLabel:  dstLabel,
+		separator: separator,
+		srcLabels: srcLabels,
+	}}, nil
 }
 
 func parseLogQLQuantileOverTime(rest string) (*logQLExpr, string, error) {
@@ -383,7 +537,7 @@ func parseLogQLPipeline(input string) ([]logQLStage, error) {
 	input = strings.TrimSpace(input)
 	for input != "" {
 		matchedLineFilter := false
-		for _, op := range []string{"|=", "|~", "!~", "!=", "|>"} {
+		for _, op := range []string{"|=", "|~", "!~", "!=", "|>", "!>"} {
 			if strings.HasPrefix(input, op) {
 				value, rest, err := consumeQuoted(strings.TrimSpace(input[len(op):]))
 				if err != nil {
@@ -430,7 +584,7 @@ func newLogQLLineFilter(op, value string) (*logQLLineFilter, error) {
 		}
 		filter.re = re
 	}
-	if op == "|>" {
+	if op == "|>" || op == "!>" {
 		re, err := compileLogQLPattern(value)
 		if err != nil {
 			return nil, err
@@ -446,6 +600,11 @@ func parseLogQLStage(segment string) (logQLStage, error) {
 	switch name {
 	case "json", "logfmt":
 		return logQLStage{kind: "parser", parser: name, parserParam: rest}, nil
+	case "decolorize":
+		if rest != "" {
+			return logQLStage{}, fmt.Errorf("unexpected decolorize tail %q", rest)
+		}
+		return logQLStage{kind: "decolorize"}, nil
 	case "regexp":
 		value, tail, err := consumeQuoted(rest)
 		if err != nil {
@@ -499,6 +658,20 @@ func parseLogQLStage(segment string) (logQLStage, error) {
 			labels = append(labels, part)
 		}
 		return logQLStage{kind: "drop", dropLabels: labels}, nil
+	case "keep":
+		parts := splitTopLevel(rest, ',')
+		labels := make([]string, 0, len(parts))
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			if idx := strings.Index(part, "="); idx >= 0 {
+				part = strings.TrimSpace(part[:idx])
+			}
+			labels = append(labels, part)
+		}
+		return logQLStage{kind: "keep", keepLabels: labels}, nil
 	case "unwrap", "unwrap_value":
 		if rest == "" {
 			return logQLStage{}, errors.New("unwrap requires a label name")
@@ -539,7 +712,11 @@ func parseLogQLLabelFormats(input string) ([]logQLLabelFormat, error) {
 			if err != nil {
 				return nil, err
 			}
-			formats = append(formats, logQLLabelFormat{name: name, constValue: unquoted, isConst: true})
+			if strings.Contains(unquoted, "{{") {
+				formats = append(formats, logQLLabelFormat{name: name, constValue: unquoted, isTemplate: true})
+			} else {
+				formats = append(formats, logQLLabelFormat{name: name, constValue: unquoted, isConst: true})
+			}
 			continue
 		}
 		formats = append(formats, logQLLabelFormat{name: name, sourceName: value})
@@ -565,9 +742,10 @@ func parseLogQLLabelFilterStage(input string) ([]logQLLabelFilter, error) {
 				return nil, err
 			}
 			f.value = value
-		} else if v, err := strconv.ParseFloat(raw, 64); err == nil {
+		} else if v, valueType, ok := parseLogQLNumericLiteral(raw); ok {
 			f.numeric = true
 			f.numValue = v
+			f.valueType = valueType
 			f.value = raw
 		} else {
 			f.value = raw
@@ -618,6 +796,8 @@ func (f logQLLineFilter) matches(line string) bool {
 		return f.re != nil && f.re.MatchString(line)
 	case "!~":
 		return f.re == nil || !f.re.MatchString(line)
+	case "!>":
+		return f.re == nil || !f.re.MatchString(line)
 	default:
 		return true
 	}
@@ -638,8 +818,8 @@ func (f logQLLabelFilter) matches(row *logRow) bool {
 	case "!~":
 		return f.re == nil || !f.re.MatchString(value)
 	case ">", ">=", "<", "<=":
-		left, err := strconv.ParseFloat(value, 64)
-		if err != nil {
+		left, ok := parseLogQLComparableValue(value, f.valueType)
+		if !ok {
 			return false
 		}
 		right := f.numValue
@@ -694,6 +874,10 @@ func (s logQLSelector) apply(row *logRow) bool {
 					row.labels[format.name] = format.constValue
 					continue
 				}
+				if format.isTemplate {
+					row.labels[format.name] = renderLogQLTemplate(format.constValue, row)
+					continue
+				}
 				row.labels[format.name] = row.value(format.sourceName)
 			}
 		case "drop":
@@ -701,11 +885,29 @@ func (s logQLSelector) apply(row *logRow) bool {
 				delete(row.labels, label)
 				delete(row.fields, label)
 			}
+		case "keep":
+			keep := map[string]struct{}{}
+			for _, label := range stage.keepLabels {
+				keep[label] = struct{}{}
+			}
+			for label := range row.labels {
+				if _, ok := keep[label]; !ok {
+					delete(row.labels, label)
+				}
+			}
+			for label := range row.fields {
+				if _, ok := keep[label]; !ok {
+					delete(row.fields, label)
+				}
+			}
+		case "decolorize":
+			row.line = decolorizeLogLine(row.line)
 		case "unwrap":
 			value := row.value(stage.unwrapLabel)
 			parsed, err := strconv.ParseFloat(value, 64)
 			if err != nil || math.IsNaN(parsed) {
-				return false
+				setLogQLParserError(row, "SampleExtractionErr")
+				continue
 			}
 			row.unwrap = parsed
 			row.haveUnwrap = true
@@ -717,7 +919,12 @@ func (s logQLSelector) apply(row *logRow) bool {
 func (s logQLStage) applyParser(row *logRow) {
 	switch s.parser {
 	case "json":
-		for key, value := range parseFlatJSONFields(row.line, s.parserParam) {
+		fields, err := parseFlatJSONFieldsErr(row.line, s.parserParam)
+		if err != nil {
+			setLogQLParserError(row, "JSONParserErr")
+			return
+		}
+		for key, value := range fields {
 			row.fields[key] = value
 			row.labels[key] = value
 		}
@@ -738,6 +945,21 @@ func (s logQLStage) applyParser(row *logRow) {
 			return
 		}
 		applyNamedCaptureParser(re, row)
+	}
+}
+
+func setLogQLParserError(row *logRow, value string) {
+	if row.labels == nil {
+		row.labels = map[string]string{}
+	}
+	if row.fields == nil {
+		row.fields = map[string]string{}
+	}
+	if row.labels["__error__"] == "" {
+		row.labels["__error__"] = value
+	}
+	if row.fields["__error__"] == "" {
+		row.fields["__error__"] = value
 	}
 }
 
@@ -768,9 +990,17 @@ func (r *logRow) value(name string) string {
 }
 
 func parseFlatJSONFields(line, params string) map[string]string {
+	fields, err := parseFlatJSONFieldsErr(line, params)
+	if err != nil {
+		return nil
+	}
+	return fields
+}
+
+func parseFlatJSONFieldsErr(line, params string) (map[string]string, error) {
 	var decoded map[string]any
 	if err := json.Unmarshal([]byte(line), &decoded); err != nil {
-		return nil
+		return nil, err
 	}
 	out := make(map[string]string, len(decoded))
 	paramMap := parseParserParams(params)
@@ -780,12 +1010,30 @@ func parseFlatJSONFields(line, params string) map[string]string {
 				out[label] = stringifyLogValue(value)
 			}
 		}
-		return out
+		return out, nil
 	}
 	for key, value := range decoded {
-		out[sanitizeLogLabelName(key)] = stringifyLogValue(value)
+		flattenJSONLogField(out, sanitizeLogLabelName(key), value)
 	}
-	return out
+	return out, nil
+}
+
+func flattenJSONLogField(out map[string]string, prefix string, value any) {
+	switch v := value.(type) {
+	case map[string]any:
+		if len(v) == 0 {
+			out[prefix] = "{}"
+			return
+		}
+		for key, child := range v {
+			childKey := prefix + "_" + sanitizeLogLabelName(key)
+			flattenJSONLogField(out, childKey, child)
+		}
+	case []any:
+		out[prefix] = stringifyLogValue(v)
+	default:
+		out[prefix] = stringifyLogValue(v)
+	}
 }
 
 func parseParserParams(params string) map[string]string {
@@ -936,6 +1184,24 @@ func compileLogQLPattern(pattern string) (*regexp.Regexp, error) {
 }
 
 func renderLogQLTemplate(tpl string, row *logRow) string {
+	data := map[string]string{}
+	for key, value := range row.fields {
+		data[key] = value
+	}
+	for key, value := range row.labels {
+		data[key] = value
+	}
+	data["_entry"] = row.line
+	data["__line__"] = row.line
+	data["line"] = row.line
+	data["timestamp"] = strconv.FormatFloat(float64(row.tsNS)/1e9, 'f', -1, 64)
+	parsed, err := template.New("logql").Option("missingkey=zero").Funcs(logQLTemplateFuncs(row)).Parse(tpl)
+	if err == nil {
+		var buf bytes.Buffer
+		if err := parsed.Execute(&buf, data); err == nil {
+			return buf.String()
+		}
+	}
 	re := regexp.MustCompile(`\{\{\s*\.?([A-Za-z_][A-Za-z0-9_\.]*)\s*\}\}`)
 	return re.ReplaceAllStringFunc(tpl, func(match string) string {
 		parts := re.FindStringSubmatch(match)
@@ -944,6 +1210,57 @@ func renderLogQLTemplate(tpl string, row *logRow) string {
 		}
 		return row.value(parts[1])
 	})
+}
+
+func logQLTemplateFuncs(row *logRow) template.FuncMap {
+	return template.FuncMap{
+		"lower":     strings.ToLower,
+		"upper":     strings.ToUpper,
+		"title":     strings.Title,
+		"trim":      strings.TrimSpace,
+		"contains":  strings.Contains,
+		"hasPrefix": strings.HasPrefix,
+		"hasSuffix": strings.HasSuffix,
+		"replace": func(old, newValue, input string) string {
+			return strings.ReplaceAll(input, old, newValue)
+		},
+		"default": func(defaultValue, input string) string {
+			if input == "" {
+				return defaultValue
+			}
+			return input
+		},
+		"trunc": func(length int, input string) string {
+			if length < 0 {
+				length = 0
+			}
+			runes := []rune(input)
+			if len(runes) <= length {
+				return input
+			}
+			return string(runes[:length])
+		},
+		"substr": func(start, end int, input string) string {
+			runes := []rune(input)
+			if start < 0 {
+				start = 0
+			}
+			if end < 0 || end > len(runes) {
+				end = len(runes)
+			}
+			if start > end || start >= len(runes) {
+				return ""
+			}
+			return string(runes[start:end])
+		},
+		"__line__": func() string { return row.line },
+	}
+}
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+func decolorizeLogLine(line string) string {
+	return ansiEscapeRE.ReplaceAllString(line, "")
 }
 
 func logQLSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
@@ -1112,9 +1429,17 @@ func logQLLineFilterCondition(f logQLLineFilter) string {
 	case "|~":
 		return "match(body, " + sqlString(f.value) + ")"
 	case "|>":
-		return "1"
+		if f.re == nil {
+			return "1"
+		}
+		return "match(body, " + sqlString(f.re.String()) + ")"
 	case "!~":
 		return "NOT match(body, " + sqlString(f.value) + ")"
+	case "!>":
+		if f.re == nil {
+			return "1"
+		}
+		return "NOT match(body, " + sqlString(f.re.String()) + ")"
 	default:
 		return "1"
 	}
@@ -1479,6 +1804,12 @@ func evaluateLogQLMetricAt(expr *logQLExpr, rows []logRow, tsNS int64) []logMetr
 		samples = evaluateLogQLAggregation(expr.aggregation, rows, tsNS)
 	case expr.topK != nil:
 		samples = evaluateLogQLTopK(expr.topK, rows, tsNS)
+	case expr.labelFunc != nil:
+		samples = evaluateLogQLLabelFunction(expr.labelFunc, rows, tsNS)
+	case expr.binaryOp != nil:
+		samples = evaluateLogQLBinaryOp(expr.binaryOp, rows, tsNS)
+	case expr.scalar != nil:
+		samples = []logMetricSample{{labels: map[string]string{}, value: *expr.scalar}}
 	}
 	if expr.comparison != nil {
 		samples = filterLogQLComparison(samples, expr.comparison)
@@ -1675,6 +2006,234 @@ func evaluateLogQLTopK(topK *logQLTopK, rows []logRow, tsNS int64) []logMetricSa
 		samples = samples[:topK.k]
 	}
 	return samples
+}
+
+func evaluateLogQLLabelFunction(fn *logQLLabelFunction, rows []logRow, tsNS int64) []logMetricSample {
+	samples := evaluateLogQLMetricAt(fn.expr, rows, tsNS)
+	out := make([]logMetricSample, 0, len(samples))
+	for _, sample := range samples {
+		labels := cloneStringMap(sample.labels)
+		switch fn.fn {
+		case "label_replace":
+			source := labels[fn.srcLabel]
+			if fn.regex != nil {
+				match := fn.regex.FindStringSubmatchIndex(source)
+				if match != nil {
+					var expanded []byte
+					expanded = fn.regex.ExpandString(expanded, fn.replacement, source, match)
+					labels[fn.dstLabel] = string(expanded)
+				}
+			}
+		case "label_join":
+			values := make([]string, 0, len(fn.srcLabels))
+			for _, label := range fn.srcLabels {
+				values = append(values, labels[label])
+			}
+			labels[fn.dstLabel] = strings.Join(values, fn.separator)
+		}
+		out = append(out, logMetricSample{labels: labels, value: sample.value})
+	}
+	return out
+}
+
+func evaluateLogQLBinaryOp(op *logQLBinaryOp, rows []logRow, tsNS int64) []logMetricSample {
+	lhs := evaluateLogQLMetricAt(op.lhs, rows, tsNS)
+	rhs := evaluateLogQLMetricAt(op.rhs, rows, tsNS)
+	lhsScalar, lhsValue := logQLScalarSample(op.lhs, lhs)
+	rhsScalar, rhsValue := logQLScalarSample(op.rhs, rhs)
+	switch {
+	case lhsScalar && rhsScalar:
+		value, keep := applyLogQLBinaryValue(op.op, lhsValue, rhsValue, op.boolModifier)
+		if !keep {
+			return nil
+		}
+		return []logMetricSample{{labels: map[string]string{}, value: value}}
+	case lhsScalar:
+		return evaluateLogQLScalarVectorBinary(op, lhsValue, rhs, true)
+	case rhsScalar:
+		return evaluateLogQLScalarVectorBinary(op, rhsValue, lhs, false)
+	case isLogQLSetOp(op.op):
+		return evaluateLogQLSetBinary(op, lhs, rhs)
+	default:
+		return evaluateLogQLVectorBinary(op, lhs, rhs)
+	}
+}
+
+func logQLScalarSample(expr *logQLExpr, samples []logMetricSample) (bool, float64) {
+	if expr == nil || expr.scalar == nil || len(samples) != 1 || len(samples[0].labels) != 0 {
+		return false, 0
+	}
+	return true, samples[0].value
+}
+
+func evaluateLogQLScalarVectorBinary(op *logQLBinaryOp, scalar float64, samples []logMetricSample, scalarOnLeft bool) []logMetricSample {
+	out := make([]logMetricSample, 0, len(samples))
+	for _, sample := range samples {
+		left, right := sample.value, scalar
+		if scalarOnLeft {
+			left, right = scalar, sample.value
+		}
+		value, keep := applyLogQLBinaryValue(op.op, left, right, op.boolModifier)
+		if !keep {
+			continue
+		}
+		out = append(out, logMetricSample{labels: cloneStringMap(sample.labels), value: value})
+	}
+	return out
+}
+
+func evaluateLogQLVectorBinary(op *logQLBinaryOp, lhs, rhs []logMetricSample) []logMetricSample {
+	rhsByKey := map[string][]logMetricSample{}
+	for _, sample := range rhs {
+		key := logQLBinaryMatchKey(sample.labels, op.matching)
+		rhsByKey[key] = append(rhsByKey[key], sample)
+	}
+	out := make([]logMetricSample, 0, len(lhs))
+	for _, left := range lhs {
+		key := logQLBinaryMatchKey(left.labels, op.matching)
+		for _, right := range rhsByKey[key] {
+			value, keep := applyLogQLBinaryValue(op.op, left.value, right.value, op.boolModifier)
+			if !keep {
+				continue
+			}
+			out = append(out, logMetricSample{labels: logQLBinaryOutputLabels(left.labels, right.labels, op.matching), value: value})
+			if op.matching == nil || op.matching.group == "" {
+				break
+			}
+		}
+	}
+	return out
+}
+
+func evaluateLogQLSetBinary(op *logQLBinaryOp, lhs, rhs []logMetricSample) []logMetricSample {
+	rhsByKey := map[string]logMetricSample{}
+	for _, sample := range rhs {
+		rhsByKey[logQLBinaryMatchKey(sample.labels, op.matching)] = sample
+	}
+	out := make([]logMetricSample, 0, len(lhs)+len(rhs))
+	seen := map[string]struct{}{}
+	for _, left := range lhs {
+		key := logQLBinaryMatchKey(left.labels, op.matching)
+		_, matched := rhsByKey[key]
+		switch op.op {
+		case "and":
+			if matched {
+				out = append(out, logMetricSample{labels: cloneStringMap(left.labels), value: left.value})
+			}
+		case "unless":
+			if !matched {
+				out = append(out, logMetricSample{labels: cloneStringMap(left.labels), value: left.value})
+			}
+		case "or":
+			out = append(out, logMetricSample{labels: cloneStringMap(left.labels), value: left.value})
+			seen[key] = struct{}{}
+		}
+	}
+	if op.op == "or" {
+		for _, right := range rhs {
+			key := logQLBinaryMatchKey(right.labels, op.matching)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			out = append(out, logMetricSample{labels: cloneStringMap(right.labels), value: right.value})
+		}
+	}
+	return out
+}
+
+func applyLogQLBinaryValue(op string, left, right float64, boolModifier bool) (float64, bool) {
+	switch op {
+	case "+":
+		return left + right, true
+	case "-":
+		return left - right, true
+	case "*":
+		return left * right, true
+	case "/":
+		return left / right, true
+	case "%":
+		return math.Mod(left, right), true
+	case "^":
+		return math.Pow(left, right), true
+	case "==", "!=", ">", ">=", "<", "<=":
+		ok := false
+		switch op {
+		case "==":
+			ok = left == right
+		case "!=":
+			ok = left != right
+		case ">":
+			ok = left > right
+		case ">=":
+			ok = left >= right
+		case "<":
+			ok = left < right
+		case "<=":
+			ok = left <= right
+		}
+		if boolModifier {
+			if ok {
+				return 1, true
+			}
+			return 0, true
+		}
+		if ok {
+			return left, true
+		}
+		return 0, false
+	default:
+		return math.NaN(), false
+	}
+}
+
+func logQLBinaryMatchKey(labels map[string]string, matching *logQLVectorMatching) string {
+	if matching == nil {
+		return labelsKey(labels)
+	}
+	set := make(map[string]struct{}, len(matching.labels))
+	for _, label := range matching.labels {
+		set[label] = struct{}{}
+	}
+	selected := map[string]string{}
+	if matching.on {
+		for _, label := range matching.labels {
+			if value, ok := labels[label]; ok {
+				selected[label] = value
+			}
+		}
+		return labelsKey(selected)
+	}
+	for key, value := range labels {
+		if _, drop := set[key]; drop {
+			continue
+		}
+		selected[key] = value
+	}
+	return labelsKey(selected)
+}
+
+func logQLBinaryOutputLabels(lhs, rhs map[string]string, matching *logQLVectorMatching) map[string]string {
+	if matching == nil {
+		return cloneStringMap(lhs)
+	}
+	if matching.group == "right" {
+		out := cloneStringMap(rhs)
+		for _, label := range matching.include {
+			if value, ok := lhs[label]; ok {
+				out[label] = value
+			}
+		}
+		return out
+	}
+	out := cloneStringMap(lhs)
+	if matching.group == "left" {
+		for _, label := range matching.include {
+			if value, ok := rhs[label]; ok {
+				out[label] = value
+			}
+		}
+	}
+	return out
 }
 
 func aggregateValues(fn string, values []float64) float64 {
@@ -1879,6 +2438,288 @@ func parseOptionalComparison(input string) (*logQLComparison, string, error) {
 		}
 	}
 	return nil, input, nil
+}
+
+func parseLogQLScalar(input string) (float64, bool) {
+	value, err := strconv.ParseFloat(strings.TrimSpace(input), 64)
+	return value, err == nil
+}
+
+func trimLogQLOuterParens(input string) string {
+	for {
+		input = strings.TrimSpace(input)
+		if !strings.HasPrefix(input, "(") {
+			return input
+		}
+		close := findMatching(input, 0, '(', ')')
+		if close != len(input)-1 {
+			return input
+		}
+		input = input[1:close]
+	}
+}
+
+func findTopLevelLogQLBinaryOp(input string, minPrec int) (int, int, string, int, bool) {
+	if strings.HasPrefix(strings.TrimSpace(input), "{") {
+		return 0, 0, "", 0, false
+	}
+	bestStart, bestEnd, bestPrec := -1, -1, 100
+	bestOp := ""
+	depth := 0
+	quote := byte(0)
+	escaped := false
+	for i := 0; i < len(input); i++ {
+		c := input[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if quote == '"' && c == '\\' {
+				escaped = true
+				continue
+			}
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '`':
+			quote = c
+			continue
+		case '(', '[', '{':
+			depth++
+			continue
+		case ')', ']', '}':
+			if depth > 0 {
+				depth--
+			}
+			continue
+		}
+		if depth != 0 {
+			continue
+		}
+		op, end, prec, ok := readLogQLBinaryOpAt(input, i)
+		if !ok || prec < minPrec {
+			continue
+		}
+		if isLogQLComparisonOp(op) && rhsIsPlainLogQLScalar(input[end:]) {
+			continue
+		}
+		if prec <= bestPrec {
+			bestStart, bestEnd, bestOp, bestPrec = i, end, op, prec
+		}
+	}
+	return bestStart, bestEnd, bestOp, bestPrec, bestStart >= 0
+}
+
+func readLogQLBinaryOpAt(input string, i int) (string, int, int, bool) {
+	for _, op := range []string{">=", "<=", "==", "!=", "+", "-", "*", "/", "%", "^", ">", "<"} {
+		if strings.HasPrefix(input[i:], op) {
+			if (op == "+" || op == "-") && isUnaryLogQLOperator(input, i) {
+				return "", i, 0, false
+			}
+			return op, i + len(op), logQLBinaryPrecedence(op), true
+		}
+	}
+	if !isLogQLWordBoundary(input, i-1) {
+		return "", i, 0, false
+	}
+	for _, op := range []string{"unless", "and", "or"} {
+		if len(input[i:]) >= len(op) && strings.EqualFold(input[i:i+len(op)], op) && isLogQLWordBoundary(input, i+len(op)) {
+			return strings.ToLower(op), i + len(op), logQLBinaryPrecedence(op), true
+		}
+	}
+	return "", i, 0, false
+}
+
+func logQLBinaryPrecedence(op string) int {
+	switch op {
+	case "or":
+		return 1
+	case "and", "unless":
+		return 2
+	case "==", "!=", ">", ">=", "<", "<=":
+		return 3
+	case "+", "-":
+		return 4
+	case "*", "/", "%":
+		return 5
+	case "^":
+		return 6
+	default:
+		return 0
+	}
+}
+
+func isLogQLComparisonOp(op string) bool {
+	switch op {
+	case "==", "!=", ">", ">=", "<", "<=":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLogQLSetOp(op string) bool {
+	return op == "and" || op == "or" || op == "unless"
+}
+
+func isUnaryLogQLOperator(input string, idx int) bool {
+	for i := idx - 1; i >= 0; i-- {
+		if unicode.IsSpace(rune(input[i])) {
+			continue
+		}
+		return strings.ContainsRune("(,+-*/%^<>=!", rune(input[i]))
+	}
+	return true
+}
+
+func isLogQLWordBoundary(input string, idx int) bool {
+	if idx < 0 || idx >= len(input) {
+		return true
+	}
+	r := rune(input[idx])
+	return !(unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' || r == '.')
+}
+
+func rhsIsPlainLogQLScalar(input string) bool {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return false
+	}
+	_, boolModifier, rhs, err := parseLogQLBinaryModifiers(input, true)
+	if err != nil {
+		return false
+	}
+	if boolModifier {
+		return false
+	}
+	_, ok := parseLogQLScalar(rhs)
+	return ok
+}
+
+func parseLogQLBinaryModifiers(input string, allowBool bool) (*logQLVectorMatching, bool, string, error) {
+	input = strings.TrimSpace(input)
+	var matching *logQLVectorMatching
+	boolModifier := false
+	for {
+		name, rest := readIdentifier(input)
+		switch name {
+		case "bool":
+			if !allowBool {
+				return nil, false, "", errors.New("bool modifier is only valid for comparison operators")
+			}
+			boolModifier = true
+			input = strings.TrimSpace(rest)
+		case "on", "ignoring":
+			inner, tail, err := parseParenthesized(strings.TrimSpace(rest))
+			if err != nil {
+				return nil, false, "", err
+			}
+			if matching == nil {
+				matching = &logQLVectorMatching{}
+			}
+			matching.on = name == "on"
+			matching.labels = splitCSVTrim(inner)
+			input = strings.TrimSpace(tail)
+		case "group_left", "group_right":
+			include := []string{}
+			tail := strings.TrimSpace(rest)
+			if strings.HasPrefix(tail, "(") {
+				inner, parsedTail, err := parseParenthesized(tail)
+				if err != nil {
+					return nil, false, "", err
+				}
+				include = splitCSVTrim(inner)
+				tail = parsedTail
+			}
+			if matching == nil {
+				matching = &logQLVectorMatching{}
+			}
+			matching.group = strings.TrimPrefix(name, "group_")
+			matching.include = include
+			input = strings.TrimSpace(tail)
+		default:
+			return matching, boolModifier, input, nil
+		}
+	}
+}
+
+func parseLogQLNumericLiteral(raw string) (float64, string, bool) {
+	if value, err := strconv.ParseFloat(raw, 64); err == nil {
+		return value, "", true
+	}
+	if value, ok := parseLogQLDurationValue(raw); ok {
+		return value, "duration", true
+	}
+	if value, ok := parseLogQLBytesValue(raw); ok {
+		return value, "bytes", true
+	}
+	return 0, "", false
+}
+
+func parseLogQLComparableValue(raw, valueType string) (float64, bool) {
+	switch valueType {
+	case "duration":
+		return parseLogQLDurationValue(raw)
+	case "bytes":
+		return parseLogQLBytesValue(raw)
+	default:
+		value, err := strconv.ParseFloat(raw, 64)
+		return value, err == nil
+	}
+}
+
+func parseLogQLDurationValue(raw string) (float64, bool) {
+	duration, err := parseLogQLDuration(raw)
+	if err != nil {
+		return 0, false
+	}
+	return float64(duration), true
+}
+
+func parseLogQLBytesValue(raw string) (float64, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, false
+	}
+	i := 0
+	for i < len(raw) && (raw[i] == '+' || raw[i] == '-' || raw[i] == '.' || (raw[i] >= '0' && raw[i] <= '9')) {
+		i++
+	}
+	if i == 0 {
+		return 0, false
+	}
+	value, err := strconv.ParseFloat(raw[:i], 64)
+	if err != nil {
+		return 0, false
+	}
+	unit := strings.ToLower(strings.TrimSpace(raw[i:]))
+	multiplier := float64(1)
+	switch unit {
+	case "", "b":
+	case "kb", "k":
+		multiplier = 1000
+	case "mb", "m":
+		multiplier = 1000 * 1000
+	case "gb", "g":
+		multiplier = 1000 * 1000 * 1000
+	case "tb", "t":
+		multiplier = 1000 * 1000 * 1000 * 1000
+	case "kib", "ki":
+		multiplier = 1024
+	case "mib", "mi":
+		multiplier = 1024 * 1024
+	case "gib", "gi":
+		multiplier = 1024 * 1024 * 1024
+	case "tib", "ti":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, false
+	}
+	return value * multiplier, true
 }
 
 func parseParenthesized(input string) (string, string, error) {
