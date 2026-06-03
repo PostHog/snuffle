@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -93,9 +94,9 @@ func (s *Server) routes(mux *http.ServeMux) {
 	}
 
 	api := s.apiRoutes()
-	mux.Handle("/api/v1/", api)
+	mux.Handle("/api/v1/", gzipJSONHandler(api))
 	loki := s.lokiRoutes()
-	mux.Handle("/loki/api/v1/", loki)
+	mux.Handle("/loki/api/v1/", gzipJSONHandler(loki))
 	mux.HandleFunc("/t/", s.handleTeamPath(mux))
 	mux.HandleFunc("/team/", s.handleTeamPath(mux))
 }
@@ -835,6 +836,91 @@ func writeJSON(w http.ResponseWriter, code int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func gzipJSONHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !acceptsGzip(r.Header.Get("Accept-Encoding")) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		wrapped := &gzipJSONResponseWriter{ResponseWriter: w}
+		defer wrapped.close()
+		next.ServeHTTP(wrapped, r)
+	})
+}
+
+type gzipJSONResponseWriter struct {
+	http.ResponseWriter
+	gzip  *gzip.Writer
+	wrote bool
+}
+
+func (w *gzipJSONResponseWriter) WriteHeader(code int) {
+	if w.wrote {
+		return
+	}
+	w.wrote = true
+	header := w.Header()
+	if shouldGzipJSON(header) {
+		gz, err := gzip.NewWriterLevel(w.ResponseWriter, gzip.BestSpeed)
+		if err == nil {
+			w.gzip = gz
+			header.Set("Content-Encoding", "gzip")
+			header.Set("Vary", appendVary(header.Get("Vary"), "Accept-Encoding"))
+			header.Del("Content-Length")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *gzipJSONResponseWriter) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	if w.gzip != nil {
+		if _, err := w.gzip.Write(p); err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *gzipJSONResponseWriter) close() {
+	if w.gzip != nil {
+		_ = w.gzip.Close()
+	}
+}
+
+func acceptsGzip(value string) bool {
+	for _, part := range strings.Split(value, ",") {
+		token := strings.TrimSpace(strings.ToLower(part))
+		if token == "gzip" || strings.HasPrefix(token, "gzip;") {
+			return true
+		}
+	}
+	return false
+}
+
+func shouldGzipJSON(header http.Header) bool {
+	if header.Get("Content-Encoding") != "" {
+		return false
+	}
+	contentType := strings.ToLower(header.Get("Content-Type"))
+	return contentType == "application/json" || strings.HasPrefix(contentType, "application/json;")
+}
+
+func appendVary(existing, value string) string {
+	if existing == "" {
+		return value
+	}
+	for _, part := range strings.Split(existing, ",") {
+		if strings.EqualFold(strings.TrimSpace(part), value) {
+			return existing
+		}
+	}
+	return existing + ", " + value
 }
 
 func formatSample(v float64) string {

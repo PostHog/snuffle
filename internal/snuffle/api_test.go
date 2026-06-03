@@ -1,6 +1,8 @@
 package snuffle
 
 import (
+	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -67,5 +69,53 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 	if !strings.Contains(body, "go_goroutines") {
 		t.Fatalf("/metrics body did not include Go runtime metrics")
+	}
+}
+
+func TestGzipJSONHandlerCompressesJSON(t *testing.T) {
+	handler := gzipJSONHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/query", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", got)
+	}
+	gz, err := gzip.NewReader(rec.Body)
+	if err != nil {
+		t.Fatalf("gzip reader: %v", err)
+	}
+	defer gz.Close()
+	body, err := io.ReadAll(gz)
+	if err != nil {
+		t.Fatalf("read gzip body: %v", err)
+	}
+	if !strings.Contains(string(body), `"status":"ok"`) {
+		t.Fatalf("decoded body = %q", string(body))
+	}
+}
+
+func TestGzipJSONHandlerSkipsNonJSON(t *testing.T) {
+	handler := gzipJSONHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-protobuf")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("payload"))
+	}))
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/read", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+
+	if got := rec.Header().Get("Content-Encoding"); got != "" {
+		t.Fatalf("Content-Encoding = %q, want empty", got)
+	}
+	if rec.Body.String() != "payload" {
+		t.Fatalf("body = %q, want payload", rec.Body.String())
 	}
 }

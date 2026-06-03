@@ -504,29 +504,23 @@ func (s *Server) queryLogQLMetricSQL(ctx context.Context, plan *logQLMetricSQLPl
 	sql = logQLMetricResultSQL(sql, plan)
 
 	seriesByKey := map[string]*logMetricMatrixResult{}
+	groupValues := make([]string, len(plan.groupLabels))
+	dest := make([]any, 0, 2+len(groupValues))
+	var evalNS int64
+	var value float64
+	dest = append(dest, &evalNS)
+	for i := range groupValues {
+		dest = append(dest, &groupValues[i])
+	}
+	dest = append(dest, &value)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var evalNS int64
-		groupValues := make([]string, len(plan.groupLabels))
-		var value float64
-		dest := make([]any, 0, 2+len(groupValues))
-		dest = append(dest, &evalNS)
-		for i := range groupValues {
-			dest = append(dest, &groupValues[i])
-		}
-		dest = append(dest, &value)
 		if err := row.Scan(dest...); err != nil {
 			return err
 		}
-		labels := make(map[string]string, len(plan.groupLabels))
-		for i, label := range plan.groupLabels {
-			if groupValues[i] != "" {
-				labels[label] = groupValues[i]
-			}
-		}
-		key := labelsKey(labels)
+		key := logQLGroupValuesKey(groupValues)
 		result := seriesByKey[key]
 		if result == nil {
-			result = &logMetricMatrixResult{Metric: stableLabelMap(labels)}
+			result = &logMetricMatrixResult{Metric: logQLLabelsFromGroupValues(plan.groupLabels, groupValues)}
 			seriesByKey[key] = result
 		}
 		result.Values = append(result.Values, []any{float64(evalNS) / 1e9, formatSample(value)})
@@ -940,29 +934,23 @@ func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLM
 
 func (s *Server) scanLogQLMetricSQLResults(ctx context.Context, sql string, groupLabels []string) ([]logMetricMatrixResult, error) {
 	seriesByKey := map[string]*logMetricMatrixResult{}
+	groupValues := make([]string, len(groupLabels))
+	dest := make([]any, 0, 2+len(groupValues))
+	var evalNS int64
+	var value float64
+	dest = append(dest, &evalNS)
+	for i := range groupValues {
+		dest = append(dest, &groupValues[i])
+	}
+	dest = append(dest, &value)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var evalNS int64
-		groupValues := make([]string, len(groupLabels))
-		var value float64
-		dest := make([]any, 0, 2+len(groupValues))
-		dest = append(dest, &evalNS)
-		for i := range groupValues {
-			dest = append(dest, &groupValues[i])
-		}
-		dest = append(dest, &value)
 		if err := row.Scan(dest...); err != nil {
 			return err
 		}
-		labels := make(map[string]string, len(groupLabels))
-		for i, label := range groupLabels {
-			if groupValues[i] != "" {
-				labels[label] = groupValues[i]
-			}
-		}
-		key := labelsKey(labels)
+		key := logQLGroupValuesKey(groupValues)
 		result := seriesByKey[key]
 		if result == nil {
-			result = &logMetricMatrixResult{Metric: stableLabelMap(labels)}
+			result = &logMetricMatrixResult{Metric: logQLLabelsFromGroupValues(groupLabels, groupValues)}
 			seriesByKey[key] = result
 		}
 		result.Values = append(result.Values, []any{float64(evalNS) / 1e9, formatSample(value)})
@@ -977,4 +965,26 @@ func (s *Server) scanLogQLMetricSQLResults(ctx context.Context, sql string, grou
 	}
 	sort.Slice(results, func(i, j int) bool { return labelsKey(results[i].Metric) < labelsKey(results[j].Metric) })
 	return results, nil
+}
+
+func logQLGroupValuesKey(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, value := range values {
+		b.WriteString(value)
+		b.WriteByte('\xff')
+	}
+	return b.String()
+}
+
+func logQLLabelsFromGroupValues(groupLabels, groupValues []string) map[string]string {
+	labels := make(map[string]string, len(groupLabels))
+	for i, label := range groupLabels {
+		if groupValues[i] != "" {
+			labels[label] = groupValues[i]
+		}
+	}
+	return stableLabelMap(labels)
 }
