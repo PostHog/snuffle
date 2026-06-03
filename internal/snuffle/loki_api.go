@@ -271,10 +271,11 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 		limit = maxRows
 	}
 	candidateLimit := logQLCandidateLimit(selector, limit, maxRows)
+	fullyPushed := logQLSelectorFullyPushed(selector)
 	for {
 		sql := logQLRawSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
 		scan := scanLogRows
-		if logQLSelectorFullyPushed(selector) {
+		if fullyPushed {
 			sql = logQLCompactSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
 			scan = scanCompactLogRows
 		}
@@ -283,7 +284,7 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 			return nil, err
 		}
 		rawCount := len(rows)
-		rows = applyLogQLSelector(dedupLogRows(rows), selector)
+		rows = finalizeLogQLRowsAfterSQLFilter(dedupLogRows(rows), selector, fullyPushed)
 		if len(rows) >= limit || rawCount < candidateLimit || candidateLimit >= maxRows {
 			if len(rows) > limit {
 				rows = rows[:limit]

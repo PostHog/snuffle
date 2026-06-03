@@ -1844,6 +1844,36 @@ func applyLogQLSelector(rows []logRow, selector logQLSelector) []logRow {
 	return out
 }
 
+func finalizeLogQLRowsAfterSQLFilter(rows []logRow, selector logQLSelector, fullyPushed bool) []logRow {
+	if !fullyPushed {
+		return applyLogQLSelector(rows, selector)
+	}
+	return annotateLogQLPushedEqualityMatchers(rows, selector)
+}
+
+func annotateLogQLPushedEqualityMatchers(rows []logRow, selector logQLSelector) []logRow {
+	for i := range rows {
+		for _, matcher := range selector.matchers {
+			if matcher.op != "=" {
+				continue
+			}
+			if rows[i].labels == nil {
+				rows[i].labels = map[string]string{}
+			}
+			if rows[i].fields == nil {
+				rows[i].fields = map[string]string{}
+			}
+			if _, ok := rows[i].labels[matcher.name]; !ok {
+				rows[i].labels[matcher.name] = matcher.value
+			}
+			if _, ok := rows[i].fields[matcher.name]; !ok {
+				rows[i].fields[matcher.name] = matcher.value
+			}
+		}
+	}
+	return rows
+}
+
 func logStreamResults(rows []logRow, limit int, direction string) []logStreamResult {
 	if strings.ToLower(direction) != "backward" {
 		sort.SliceStable(rows, func(i, j int) bool {

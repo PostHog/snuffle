@@ -763,6 +763,39 @@ func logMetricValuesByLabel(samples []logMetricVectorResult, label string) map[s
 	return out
 }
 
+func TestFinalizeLogQLRowsAfterSQLFilterKeepsCompactResourceMatcherRows(t *testing.T) {
+	selector, err := parseLogQLSelector(`{host.hostname="dev-us-iad-ch-1a"}`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	compactRows := []logRow{{
+		tsNS:         1000,
+		observedNS:   1001,
+		line:         "matched in SQL using resource_attributes['host.hostname']",
+		labels:       map[string]string{"service_name": "api"},
+		streamLabels: map[string]string{"service_name": "api"},
+		fields:       map[string]string{"service_name": "api"},
+	}}
+
+	filtered := finalizeLogQLRowsAfterSQLFilter(append([]logRow(nil), compactRows...), *selector, false)
+	if len(filtered) != 0 {
+		t.Fatalf("non-pushed selector filtering should still reject compact rows without host.hostname: %#v", filtered)
+	}
+
+	got := finalizeLogQLRowsAfterSQLFilter(append([]logRow(nil), compactRows...), *selector, true)
+	if len(got) != 1 {
+		t.Fatalf("fully pushed compact rows = %d, want 1: %#v", len(got), got)
+	}
+	if got[0].labels["host.hostname"] != "dev-us-iad-ch-1a" || got[0].fields["host.hostname"] != "dev-us-iad-ch-1a" {
+		t.Fatalf("labels=%#v fields=%#v, want exact matcher annotation", got[0].labels, got[0].fields)
+	}
+
+	streams := logStreamResults(got, 1000, "backward")
+	if len(streams) != 1 || streams[0].Stream["host.hostname"] != "dev-us-iad-ch-1a" || len(streams[0].Values) != 1 {
+		t.Fatalf("streams = %#v, want one stream containing host.hostname and one log line", streams)
+	}
+}
+
 type lokiTestResponse struct {
 	Status string `json:"status"`
 	Data   struct {
