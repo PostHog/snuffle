@@ -1,9 +1,11 @@
 package snuffle
 
 import (
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -94,6 +96,186 @@ func TestLokiQueryVectorFunction(t *testing.T) {
 	}
 }
 
+func TestLokiQueryGrafanaCompatibilityProbes(t *testing.T) {
+	tests := []struct {
+		name       string
+		rangeMode  bool
+		query      string
+		resultType string
+		want       string
+	}{
+		{"instant vector", false, `vector(1)`, "vector", `"1"`},
+		{"instant vector arithmetic", false, `vector(1)+vector(1)`, "vector", `"2"`},
+		{"instant vector aggregation", false, `sum(vector(0))`, "vector", `"0"`},
+		{"instant label replace vector", false, `label_replace(vector(0), "probe", "grafana", "", ".*")`, "vector", `"probe":"grafana"`},
+		{"instant vector bool comparison", false, `vector(1) == bool vector(0)`, "vector", `"0"`},
+		{"range vector", true, `vector(1)`, "matrix", `"1"`},
+		{"range vector arithmetic", true, `vector(1)+vector(1)`, "matrix", `"2"`},
+		{"range label join vector", true, `label_join(vector(1), "probe", "/", "missing")`, "matrix", `"probe":""`},
+	}
+	server := &Server{cfg: Config{QueryTimeout: time.Second}}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := url.Values{"query": {tt.query}}
+			handler := server.handleLokiQuery
+			path := "/loki/api/v1/query"
+			if tt.rangeMode {
+				handler = server.handleLokiQueryRange
+				path = "/loki/api/v1/query_range"
+				params.Set("start", "1970-01-01T00:00:00Z")
+				params.Set("end", "1970-01-01T00:00:02Z")
+				params.Set("step", "1s")
+			}
+			req := httptest.NewRequest(http.MethodGet, path+"?"+params.Encode(), nil)
+			rec := httptest.NewRecorder()
+
+			handler(rec, req)
+
+			resp := readLokiTestResponse(t, rec)
+			if resp.Status != "success" || resp.Data.ResultType != tt.resultType {
+				t.Fatalf("response = %#v, body %s", resp, rec.Body.String())
+			}
+			if !strings.Contains(string(resp.Data.Result), tt.want) {
+				t.Fatalf("result = %s, want fragment %s", string(resp.Data.Result), tt.want)
+			}
+		})
+	}
+}
+
+func TestParseLogQLCompatibilityCatalog(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"selector matcher operators", `{service_name="api", namespace!="", pod=~"api-[0-9]+", trace_id!~"deadbeef"}`},
+		{"raw string matcher and line filter", "{app=`api`} |= `error \"quoted\"`"},
+		{"chained line filters", `{app="api"} != "health" |~ "status=(4|5)[0-9]{2}" !~ "debug"`},
+		{"pattern line filters", `{app="api"} |> "<_> status=<status> <_>" !> "<_> debug <_>"`},
+		{"json aliases and filters", `{app="api"} | json method="request.method", status="response.status" | status >= 500`},
+		{"json default flattening and bool labels", `{app="api"} | json | response_status >= 500 or method="POST"`},
+		{"logfmt duration and bytes filters", `{app="api"} | logfmt | status >= 500 and duration < 1s and bytes <= 2MiB`},
+		{"regexp parser", `{app="api"} | regexp "method=(?P<method>[^ ]+) status=(?P<status>[0-9]+)" | method="GET"`},
+		{"pattern parser", `{app="api"} | pattern "<method> <path> <status>" | status!="200"`},
+		{"line and label formatting", `{app="api"} | json | line_format "{{.method}} {{.path}}" | label_format route=path, family="{{.status}}" | keep app, route, family`},
+		{"constant and copied label formats", `{app="api"} | label_format fixed="prod", copied=app, templated="{{.app}}-{{.service_name}}" | drop templated`},
+		{"millisecond range", `count_over_time({app="api"}[1ms])`},
+		{"day and week range offset", `count_over_time({app="api"}[1d] offset 1w)`},
+		{"rate with line filter offset", `rate({app="api"} |= "error" [30s] offset 1h)`},
+		{"bytes over time", `bytes_over_time({app="api"} != "health" [5m])`},
+		{"bytes rate", `bytes_rate({app="api"} |~ "GET|POST" [5m])`},
+		{"sum over time unwrap", `sum_over_time({app="api"} | logfmt | unwrap value [5m]) by (app)`},
+		{"avg over time unwrap value alias", `avg_over_time({app="api"} | logfmt | unwrap_value latency [5m]) without (instance)`},
+		{"quantile over time", `quantile_over_time(0.95, {app="api"} | logfmt | unwrap duration [5m]) by (app)`},
+		{"absent over time", `absent_over_time({app="api"}[5m])`},
+		{"aggregation suffix grouping", `sum(count_over_time({app="api"}[5m])) by (app)`},
+		{"aggregation prefix grouping", `sum by (app) (rate({app="api"}[5m]))`},
+		{"aggregation without", `avg without (instance) (count_over_time({app="api"}[5m]))`},
+		{"count aggregation", `count(count_over_time({app="api"}[5m]))`},
+		{"stddev aggregation", `stddev by (app) (count_over_time({app="api"}[5m]))`},
+		{"stdvar aggregation", `stdvar by (app) (count_over_time({app="api"}[5m]))`},
+		{"topk", `topk(3, sum by (app) (rate({app=~"api|web"}[5m])))`},
+		{"bottomk", `bottomk(3, sum by (app) (rate({app=~"api|web"}[5m])))`},
+		{"label replace", `label_replace(sum by (app) (count_over_time({app="api"}[5m])), "service", "$1", "app", "(.*)")`},
+		{"label join", `label_join(sum by (cluster, app) (count_over_time({app="api"}[5m])), "joined", "/", "cluster", "app")`},
+		{"vector precedence", `vector(1) + vector(2) * vector(3)`},
+		{"vector parentheses", `(vector(1) + vector(2)) * vector(3)`},
+		{"binary on matching", `sum by (app) (count_over_time({app="api"}[5m])) / on (app) sum by (app) (count_over_time({app="api"} |= "ok" [5m]))`},
+		{"binary ignoring group left", `sum by (app, instance) (count_over_time({app="api"}[5m])) / ignoring (instance) group_left (region) sum by (app, region) (count_over_time({app="api"}[5m]))`},
+		{"set and", `sum by (app) (count_over_time({app="api"}[5m])) and on (app) sum by (app) (count_over_time({app="api"} |= "ok" [5m]))`},
+		{"set or vector fallback", `sum by (app) (count_over_time({app="api"}[5m])) or vector(0)`},
+		{"set unless", `sum by (app) (count_over_time({app="api"}[5m])) unless on (app) sum by (app) (count_over_time({app="api"} |= "ok" [5m]))`},
+		{"bool comparison", `vector(1) > bool vector(0)`},
+		{"aggregation comparison", `sum(count_over_time({app="api"}[5m])) >= 1`},
+		{"modulo", `vector(5) % vector(2)`},
+		{"power", `vector(2) ^ vector(3)`},
+		{"raw regex line filter", "{app=\"api\"} |~ `(?i)error|warn`"},
+		{"post unwrap error filter", `rate({app="api"} | json | unwrap value | __error__!~".*" | value >5 [5m])`},
+		{"loki json array path", `{app="api"} | json first_server="servers[0]"`},
+		{"loki json bracket key path", `{app="api"} | json api_key="request.headers[\"X-API-KEY\"]"`},
+		{"loki comma label filters", `sum_over_time({app="api"} | json | foo>=5,bar<25ms | unwrap bytes(size) [5m])`},
+		{"unwrap duration conversion", `avg_over_time({app="api"} | logfmt | unwrap duration(duration) [5m]) by (app)`},
+		{"unwrap duration seconds conversion", `avg_over_time({app="api"} | logfmt | unwrap duration_seconds(duration) [5m]) by (app)`},
+		{"unwrap bytes conversion", `sum_over_time({app="api"} | logfmt | unwrap bytes(size) [5m]) by (app)`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseLogQL(tt.query); err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestParseLogQLKnownUnsupportedLokiCompatibilityGaps(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+	}{
+		{"sort", `sort(sum by (app) (rate({app="api"}[5m])))`},
+		{"sort desc", `sort_desc(sum by (app) (rate({app="api"}[5m])))`},
+		{"approx topk", `approx_topk(3, sum by (app) (rate({app="api"}[5m])))`},
+		{"rate counter", `rate_counter({app="api"} | unwrap value [5m])`},
+		{"unpack parser", `sum(count_over_time({app="api"} | unpack | json [5m]))`},
+		{"line filter ip matcher", `{app="api"} |= ip("127.0.0.1")`},
+		{"line filter or chain", `{app="api"} |= "500" or "200"`},
+		{"parenthesized label filters", `{app="api"} | logfmt | (status="500" or status="503")`},
+		{"parenthesized log range selector", `bytes_over_time(({app="api"} |= "error")[5m])`},
+		{"negative offset", `count_over_time({app="api"}[5m] offset -1m)`},
+		{"variants expression", `variants(count_over_time({app="api"}[5m])) of ({app="api"}[5m])`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := parseLogQL(tt.query); err == nil {
+				t.Fatalf("parseLogQL unexpectedly accepted unsupported Loki query %q", tt.query)
+			}
+		})
+	}
+}
+
+func TestEvaluateLogQLGrafanaProbeExpressions(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantLabels map[string]string
+		wantValue  float64
+		wantEmpty  bool
+	}{
+		{"vector", `vector(1)`, map[string]string{}, 1, false},
+		{"vector arithmetic", `vector(1)+vector(1)`, map[string]string{}, 2, false},
+		{"vector aggregation", `sum(vector(0))`, map[string]string{}, 0, false},
+		{"label replace vector", `label_replace(vector(0), "probe", "grafana", "", ".*")`, map[string]string{"probe": "grafana"}, 0, false},
+		{"label join vector", `label_join(label_replace(vector(2), "service", "api", "", ".*"), "joined", "/", "service", "missing")`, map[string]string{"service": "api", "joined": "api/"}, 2, false},
+		{"bool comparison true", `vector(1) > bool vector(0)`, map[string]string{}, 1, false},
+		{"bool comparison false", `vector(1) < bool vector(0)`, map[string]string{}, 0, false},
+		{"filter comparison true", `vector(1) > vector(0)`, map[string]string{}, 1, false},
+		{"filter comparison false", `vector(0) > vector(1)`, nil, 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+			samples := evaluateLogQLMetricAt(expr, nil, int64(time.Second))
+			if tt.wantEmpty {
+				if len(samples) != 0 {
+					t.Fatalf("samples = %#v, want none", samples)
+				}
+				return
+			}
+			if len(samples) != 1 {
+				t.Fatalf("samples = %d, want 1: %#v", len(samples), samples)
+			}
+			if labelsKey(samples[0].labels) != labelsKey(tt.wantLabels) {
+				t.Fatalf("labels = %#v, want %#v", samples[0].labels, tt.wantLabels)
+			}
+			if math.Abs(samples[0].value-tt.wantValue) > 1e-9 {
+				t.Fatalf("value = %v, want %v", samples[0].value, tt.wantValue)
+			}
+		})
+	}
+}
+
 func TestParseLogQLReferenceQueriesFromGigapipeAndLoki(t *testing.T) {
 	queries := []string{
 		`{ foo = "bar" } | decolorize`,
@@ -150,6 +332,81 @@ func TestApplyLogQLPipelineReferenceStages(t *testing.T) {
 	}
 	if got[0].labels["status_code"] != "" {
 		t.Fatalf("status_code label should have been dropped: %#v", got[0].labels)
+	}
+}
+
+func TestApplyLogQLJSONPathExtractionCompatibility(t *testing.T) {
+	selector, err := parseLogQLSelector(`{app="api"} | json first_server="servers[0]", api_key="request.headers[\"X-API-KEY\"]", param="top.params[0].param", bracket_param="top.params[0][\"param\"]" | api_key!=""`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	rows := []logRow{{
+		tsNS: 1000,
+		line: `{
+			"servers":["edge-a","edge-b"],
+			"request":{"headers":{"X-API-KEY":"secret"}},
+			"top":{"params":[{"param":"first"},{"param":"second"}]}
+		}`,
+		labels: map[string]string{"app": "api"},
+		fields: map[string]string{},
+	}}
+
+	got := applyLogQLSelector(rows, *selector)
+	if len(got) != 1 {
+		t.Fatalf("rows after selector = %d, want 1: %#v", len(got), got)
+	}
+	labels := got[0].labels
+	if labels["first_server"] != "edge-a" || labels["api_key"] != "secret" || labels["param"] != "first" || labels["bracket_param"] != "first" {
+		t.Fatalf("labels = %#v, want Loki JSON path extractions", labels)
+	}
+}
+
+func TestApplyLogQLCommaSeparatedLabelFiltersCompatibility(t *testing.T) {
+	selector, err := parseLogQLSelector(`{app="api"} | json | foo>=5,bar<25ms,size>=1KiB`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	rows := []logRow{
+		{tsNS: 1000, line: `{"foo":6,"bar":"10ms","size":"2KiB"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+		{tsNS: 2000, line: `{"foo":4,"bar":"10ms","size":"2KiB"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+		{tsNS: 3000, line: `{"foo":6,"bar":"30ms","size":"2KiB"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+		{tsNS: 4000, line: `{"foo":6,"bar":"10ms","size":"512B"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+	}
+
+	got := applyLogQLSelector(rows, *selector)
+	if len(got) != 1 || got[0].tsNS != 1000 {
+		t.Fatalf("rows after selector = %#v, want only first row", got)
+	}
+}
+
+func TestEvaluateLogQLUnwrapConversionFunctions(t *testing.T) {
+	rows := []logRow{
+		{tsNS: int64(10 * time.Second), line: `duration=250ms size=1.5KiB`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+		{tsNS: int64(20 * time.Second), line: `duration=750ms size=512B`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
+	}
+	tests := []struct {
+		name  string
+		query string
+		want  float64
+	}{
+		{"duration", `sum_over_time({app="api"} | logfmt | unwrap duration(duration) [1m]) by (app)`, 1},
+		{"duration seconds", `sum_over_time({app="api"} | logfmt | unwrap duration_seconds(duration) [1m]) by (app)`, 1},
+		{"bytes", `sum_over_time({app="api"} | logfmt | unwrap bytes(size) [1m]) by (app)`, 2048},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+			samples := evaluateLogQLMetricAt(expr, rows, int64(time.Minute))
+			if len(samples) != 1 {
+				t.Fatalf("samples = %d, want 1: %#v", len(samples), samples)
+			}
+			if math.Abs(samples[0].value-tt.want) > 1e-9 {
+				t.Fatalf("value = %v, want %v", samples[0].value, tt.want)
+			}
+		})
 	}
 }
 
@@ -344,6 +601,36 @@ func TestEvaluateLogQLBinaryArithmeticAndMatching(t *testing.T) {
 	}
 }
 
+func TestEvaluateLogQLBinaryMatchingAndVectorFallbacks(t *testing.T) {
+	rows := []logRow{
+		{tsNS: int64(10 * time.Second), line: "ok", labels: map[string]string{"env": "prod", "app": "api", "instance": "a", "region": "us"}, fields: map[string]string{}},
+		{tsNS: int64(20 * time.Second), line: "fail", labels: map[string]string{"env": "prod", "app": "api", "instance": "b", "region": "us"}, fields: map[string]string{}},
+	}
+
+	groupLeftExpr, err := parseLogQL(`sum by (app, instance) (count_over_time({env="prod"}[1m])) / on (app) group_left (region) sum by (app, region) (count_over_time({env="prod"} |= "ok" [1m]))`)
+	if err != nil {
+		t.Fatalf("parse group_left returned error: %v", err)
+	}
+	groupLeft := evaluateLogQLInstantMetric(groupLeftExpr, rows, int64(time.Minute))
+	if len(groupLeft) != 2 {
+		t.Fatalf("group_left samples = %d, want 2: %#v", len(groupLeft), groupLeft)
+	}
+	for _, sample := range groupLeft {
+		if sample.Metric["app"] != "api" || sample.Metric["region"] != "us" || sample.Value[1].(string) != "1" {
+			t.Fatalf("group_left sample = %#v", sample)
+		}
+	}
+
+	fallbackExpr, err := parseLogQL(`sum by (app) (count_over_time({app="missing"}[1m])) or vector(0)`)
+	if err != nil {
+		t.Fatalf("parse vector fallback returned error: %v", err)
+	}
+	fallback := evaluateLogQLInstantMetric(fallbackExpr, rows, int64(time.Minute))
+	if len(fallback) != 1 || len(fallback[0].Metric) != 0 || fallback[0].Value[1].(string) != "0" {
+		t.Fatalf("fallback = %#v, want unlabeled vector(0)", fallback)
+	}
+}
+
 func TestEvaluateLogQLQuantileOverTime(t *testing.T) {
 	expr, err := parseLogQL(`quantile_over_time(0.5, {service_name="api"} | json | unwrap duration [1m]) by (service_name)`)
 	if err != nil {
@@ -474,6 +761,31 @@ func logMetricValuesByLabel(samples []logMetricVectorResult, label string) map[s
 		out[sample.Metric[label]] = sample.Value[1].(string)
 	}
 	return out
+}
+
+type lokiTestResponse struct {
+	Status string `json:"status"`
+	Data   struct {
+		ResultType string          `json:"resultType"`
+		Result     json.RawMessage `json:"result"`
+	} `json:"data"`
+	ErrorType string `json:"errorType"`
+	Error     string `json:"error"`
+}
+
+func readLokiTestResponse(t *testing.T, rec *httptest.ResponseRecorder) lokiTestResponse {
+	t.Helper()
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var resp lokiTestResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid Loki JSON response %q: %v", rec.Body.String(), err)
+	}
+	if resp.ErrorType != "" || resp.Error != "" {
+		t.Fatalf("unexpected Loki error response: %#v", resp)
+	}
+	return resp
 }
 
 func TestLokiPushJSONRows(t *testing.T) {

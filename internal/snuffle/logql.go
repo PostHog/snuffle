@@ -126,6 +126,13 @@ type logQLStage struct {
 	dropLabels   []string
 	keepLabels   []string
 	unwrapLabel  string
+	unwrapFunc   string
+}
+
+type logQLJSONPathToken struct {
+	key     string
+	index   int
+	isIndex bool
 }
 
 type logQLLabelFormat struct {
@@ -171,7 +178,7 @@ func parseLogQL(input string) (*logQLExpr, error) {
 }
 
 func parseLogQLBinary(input string, minPrec int) (*logQLExpr, error) {
-	input = trimLogQLOuterParens(strings.TrimSpace(input))
+	input, minPrec = trimLogQLOuterParensForBinary(strings.TrimSpace(input), minPrec)
 	opStart, opEnd, op, prec, ok := findTopLevelLogQLBinaryOp(input, minPrec)
 	if ok {
 		matching, boolModifier, rhsText, err := parseLogQLBinaryModifiers(input[opEnd:], isLogQLComparisonOp(op))
@@ -694,6 +701,21 @@ func parseLogQLStage(segment string) (logQLStage, error) {
 		if rest == "" {
 			return logQLStage{}, errors.New("unwrap requires a label name")
 		}
+		unwrapFunc, funcRest := readIdentifier(rest)
+		if (unwrapFunc == "bytes" || unwrapFunc == "duration" || unwrapFunc == "duration_seconds") && strings.HasPrefix(strings.TrimSpace(funcRest), "(") {
+			inner, tail, err := parseParenthesized(funcRest)
+			if err != nil {
+				return logQLStage{}, err
+			}
+			if strings.TrimSpace(tail) != "" {
+				return logQLStage{}, fmt.Errorf("unexpected unwrap conversion tail %q", tail)
+			}
+			label := strings.TrimSpace(inner)
+			if label == "" {
+				return logQLStage{}, errors.New("unwrap conversion requires a label name")
+			}
+			return logQLStage{kind: "unwrap", unwrapLabel: label, unwrapFunc: unwrapFunc}, nil
+		}
 		label, _ := readIdentifier(rest)
 		if label == "" {
 			label = strings.TrimSpace(rest)
@@ -777,6 +799,9 @@ func parseLogQLLabelFilterStage(input string) ([]logQLLabelFilter, error) {
 		tokens = tokens[3:]
 		if len(tokens) > 0 {
 			connector := strings.ToLower(tokens[0])
+			if connector == "," {
+				connector = "and"
+			}
 			if connector != "and" && connector != "or" {
 				return nil, fmt.Errorf("invalid label filter connector %q", tokens[0])
 			}
@@ -922,8 +947,8 @@ func (s logQLSelector) apply(row *logRow) bool {
 			row.line = decolorizeLogLine(row.line)
 		case "unwrap":
 			value := row.value(stage.unwrapLabel)
-			parsed, err := strconv.ParseFloat(value, 64)
-			if err != nil || math.IsNaN(parsed) {
+			parsed, ok := parseLogQLUnwrapValue(value, stage.unwrapFunc)
+			if !ok || math.IsNaN(parsed) {
 				setLogQLParserError(row, "SampleExtractionErr")
 				continue
 			}
@@ -963,6 +988,30 @@ func (s logQLStage) applyParser(row *logRow) {
 			return
 		}
 		applyNamedCaptureParser(re, row)
+	}
+}
+
+func parseLogQLUnwrapValue(value, conversion string) (float64, bool) {
+	switch conversion {
+	case "":
+		parsed, err := strconv.ParseFloat(value, 64)
+		return parsed, err == nil
+	case "bytes":
+		return parseLogQLBytesValue(value)
+	case "duration":
+		duration, err := parseLogQLDuration(value)
+		if err != nil {
+			return 0, false
+		}
+		return duration.Seconds(), true
+	case "duration_seconds":
+		duration, err := parseLogQLDuration(value)
+		if err != nil {
+			return 0, false
+		}
+		return duration.Seconds(), true
+	default:
+		return 0, false
 	}
 }
 
@@ -1081,24 +1130,78 @@ func parseParserParams(params string) map[string]string {
 }
 
 func valueAtJSONPath(input map[string]any, path string) (any, bool) {
-	path = strings.TrimPrefix(path, ".")
-	parts := strings.Split(path, ".")
+	tokens, ok := parseLogQLJSONPath(path)
+	if !ok {
+		return nil, false
+	}
 	var current any = input
-	for _, part := range parts {
-		part = strings.Trim(part, "[]\"'")
-		if part == "" {
+	for _, token := range tokens {
+		if token.isIndex {
+			values, ok := current.([]any)
+			if !ok || token.index < 0 || token.index >= len(values) {
+				return nil, false
+			}
+			current = values[token.index]
 			continue
 		}
 		m, ok := current.(map[string]any)
 		if !ok {
 			return nil, false
 		}
-		current, ok = m[part]
+		current, ok = m[token.key]
 		if !ok {
 			return nil, false
 		}
 	}
 	return current, true
+}
+
+func parseLogQLJSONPath(path string) ([]logQLJSONPathToken, bool) {
+	path = strings.TrimSpace(strings.TrimPrefix(path, "."))
+	if path == "" {
+		return nil, false
+	}
+	tokens := []logQLJSONPathToken{}
+	for i := 0; i < len(path); {
+		switch path[i] {
+		case '.':
+			i++
+			continue
+		case '[':
+			close := findMatching(path, i, '[', ']')
+			if close < 0 {
+				return nil, false
+			}
+			inner := strings.TrimSpace(path[i+1 : close])
+			if inner == "" {
+				return nil, false
+			}
+			if inner[0] == '"' || inner[0] == '`' {
+				key, err := unquoteLogQLString(inner)
+				if err != nil {
+					return nil, false
+				}
+				tokens = append(tokens, logQLJSONPathToken{key: key})
+			} else {
+				index, err := strconv.Atoi(inner)
+				if err != nil {
+					return nil, false
+				}
+				tokens = append(tokens, logQLJSONPathToken{index: index, isIndex: true})
+			}
+			i = close + 1
+		default:
+			start := i
+			for i < len(path) && path[i] != '.' && path[i] != '[' {
+				i++
+			}
+			key := strings.TrimSpace(path[start:i])
+			if key != "" {
+				tokens = append(tokens, logQLJSONPathToken{key: key})
+			}
+		}
+	}
+	return tokens, len(tokens) > 0
 }
 
 func parseLogfmtFields(line string) map[string]string {
@@ -2479,6 +2582,21 @@ func trimLogQLOuterParens(input string) string {
 	}
 }
 
+func trimLogQLOuterParensForBinary(input string, minPrec int) (string, int) {
+	for {
+		input = strings.TrimSpace(input)
+		if !strings.HasPrefix(input, "(") {
+			return input, minPrec
+		}
+		close := findMatching(input, 0, '(', ')')
+		if close != len(input)-1 {
+			return input, minPrec
+		}
+		input = input[1:close]
+		minPrec = 1
+	}
+}
+
 func findTopLevelLogQLBinaryOp(input string, minPrec int) (int, int, string, int, bool) {
 	if strings.HasPrefix(strings.TrimSpace(input), "{") {
 		return 0, 0, "", 0, false
@@ -2969,6 +3087,11 @@ func lexLogQLFilter(input string) ([]string, error) {
 			i += consumed
 			continue
 		}
+		if input[i] == ',' {
+			tokens = append(tokens, ",")
+			i++
+			continue
+		}
 		for _, op := range []string{">=", "<=", "==", "!=", "=~", "!~", "=", ">", "<"} {
 			if strings.HasPrefix(input[i:], op) {
 				tokens = append(tokens, op)
@@ -2978,7 +3101,7 @@ func lexLogQLFilter(input string) ([]string, error) {
 		}
 		{
 			start := i
-			for i < len(input) && !unicode.IsSpace(rune(input[i])) && !strings.ContainsRune("=!<>", rune(input[i])) {
+			for i < len(input) && !unicode.IsSpace(rune(input[i])) && !strings.ContainsRune("=!<>,", rune(input[i])) {
 				i++
 			}
 			tokens = append(tokens, input[start:i])
