@@ -3,6 +3,7 @@ package snuffle
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -267,6 +268,24 @@ func buildLogQLUnwrapMetricSQL(rangeAgg *logQLRangeAggregation) (string, []strin
 					return "", nil, false
 				}
 				parserKind = "logfmt"
+			case "regexp":
+				params, ok := logQLSQLNamedCaptureParams(stage.parserParam)
+				if !ok {
+					return "", nil, false
+				}
+				parserKind = "regexp"
+				parserParams = params
+			case "pattern":
+				re, err := compileLogQLPattern(stage.parserParam)
+				if err != nil {
+					return "", nil, false
+				}
+				params, ok := logQLSQLNamedCaptureParams(re.String())
+				if !ok {
+					return "", nil, false
+				}
+				parserKind = "pattern"
+				parserParams = params
 			default:
 				return "", nil, false
 			}
@@ -374,11 +393,42 @@ func logQLSQLPipelineLabelValueExpr(label, parserKind string, parserParams map[s
 		}
 		fallback := logQLMetricLabelFilterValueExpr(label)
 		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
+	case "regexp", "pattern":
+		index := parserParams[label]
+		if index == "" {
+			if withFallback {
+				return logQLMetricLabelFilterValueExpr(label), true
+			}
+			return "", false
+		}
+		parsed := "arrayElement(extractGroups(body, " + sqlString(parserParams["__regex"]) + "), " + index + ")"
+		if !withFallback {
+			return parsed, true
+		}
+		fallback := logQLMetricLabelFilterValueExpr(label)
+		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
 	case "":
 		return logQLMetricLabelFilterValueExpr(label), true
 	default:
 		return "", false
 	}
+}
+
+func logQLSQLNamedCaptureParams(pattern string) (map[string]string, bool) {
+	re, err := regexp.Compile(pattern)
+	if err != nil {
+		return nil, false
+	}
+	params := map[string]string{"__regex": pattern}
+	haveNamedCapture := false
+	for i, name := range re.SubexpNames() {
+		if i == 0 || name == "" {
+			continue
+		}
+		params[sanitizeLogLabelName(name)] = strconv.Itoa(i)
+		haveNamedCapture = true
+	}
+	return params, haveNamedCapture
 }
 
 func logQLJSONSQLPath(path string) string {

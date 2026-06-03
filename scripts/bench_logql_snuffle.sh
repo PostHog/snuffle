@@ -122,6 +122,8 @@ queries = [
     ("comparison", "metric", 'sum by (service_name) (count_over_time({app="snuffle-bench"}[5m])) > 10'),
     ("logfmt-sum-duration", "metric", 'sum_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap duration(duration) [5m]) by (service_name)'),
     ("logfmt-avg-size", "metric", 'avg_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap bytes(size) [5m]) by (region)'),
+    ("regexp-sum-duration", "metric", 'sum_over_time({app="snuffle-bench",format="logfmt"} | regexp "duration=(?P<duration>[0-9]+ms)" | unwrap duration(duration) [5m]) by (service_name)'),
+    ("pattern-avg-size", "metric", 'avg_over_time({app="snuffle-bench",format="logfmt"} | pattern "<_> size=<size> <_>" | unwrap bytes(size) [5m]) by (region)'),
     ("json-avg-duration", "metric", 'avg_over_time({app="snuffle-bench",format="json"} | json | unwrap duration [5m]) by (service_name)'),
     ("json-filter-status", "metric", 'sum_over_time({app="snuffle-bench",format="json"} | json | status >= 500 | unwrap duration [5m]) by (service_name)'),
 ]

@@ -503,6 +503,16 @@ func TestLogQLMetricSQLPlanSupportsTopKComparisonBytesAndUnwrap(t *testing.T) {
 			query:      `sum_over_time({app="api",format="json"} | json | status >= 500 | unwrap duration [5m]) by (service_name)`,
 			wantUnwrap: true,
 		},
+		{
+			name:       "regexp duration unwrap",
+			query:      `sum_over_time({app="api"} | regexp "duration=(?P<duration>[0-9]+ms)" | unwrap duration(duration) [5m]) by (service_name)`,
+			wantUnwrap: true,
+		},
+		{
+			name:       "pattern bytes unwrap",
+			query:      `sum_over_time({app="api"} | pattern "<_> size=<size> <_>" | unwrap bytes(size) [5m]) by (service_name)`,
+			wantUnwrap: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -522,6 +532,43 @@ func TestLogQLMetricSQLPlanSupportsTopKComparisonBytesAndUnwrap(t *testing.T) {
 			}
 			if (plan.unwrapValueExpr != "") != tt.wantUnwrap {
 				t.Fatalf("unwrapValueExpr = %q, want present %v", plan.unwrapValueExpr, tt.wantUnwrap)
+			}
+		})
+	}
+}
+
+func TestLogQLMetricSQLPlanPushesRegexpAndPatternParsers(t *testing.T) {
+	tests := []struct {
+		name  string
+		query string
+		label string
+	}{
+		{
+			name:  "regexp",
+			query: `sum_over_time({app="api"} | regexp "duration=(?P<duration>[0-9]+ms)" | unwrap duration(duration) [5m]) by (service_name)`,
+			label: "duration",
+		},
+		{
+			name:  "pattern",
+			query: `sum_over_time({app="api"} | pattern "<_> size=<size> <_>" | unwrap bytes(size) [5m]) by (service_name)`,
+			label: "size",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+			plan, ok := buildLogQLMetricSQLPlan(expr)
+			if !ok {
+				t.Fatalf("buildLogQLMetricSQLPlan returned false")
+			}
+			if !strings.Contains(plan.unwrapValueExpr, "extractGroups(body") {
+				t.Fatalf("unwrapValueExpr = %q, want extractGroups pushdown", plan.unwrapValueExpr)
+			}
+			if !strings.Contains(plan.unwrapValueExpr, tt.label) {
+				t.Fatalf("unwrapValueExpr = %q, want parser expression for %s", plan.unwrapValueExpr, tt.label)
 			}
 		})
 	}
