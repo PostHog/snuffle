@@ -257,11 +257,18 @@ func (s *Server) handleHealthy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	recordQueryLogMetadata(w, queryLogMetadata{language: "promql", queryType: "instant"})
 	if err := r.ParseForm(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 	query := r.Form.Get("query")
+	recordQueryLogMetadata(w, queryLogMetadata{
+		language:  "promql",
+		queryType: "instant",
+		query:     query,
+		time:      r.Form.Get("time"),
+	})
 	if query == "" {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("missing query parameter"))
 		return
@@ -276,6 +283,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	queryStarted := time.Now()
+	recordQueryLogBackend(w, "fastpath")
 	if data, ok, err := s.tryFastInstantQuery(ctx, query, ts); ok {
 		status := "ok"
 		if err != nil {
@@ -291,6 +299,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queryStarted = time.Now()
+	recordQueryLogBackend(w, "prometheus")
 	q, err := s.engine.NewInstantQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, ts)
 	if err != nil {
 		s.metrics.observePromQLQuery("instant", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
@@ -311,11 +320,20 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
+	recordQueryLogMetadata(w, queryLogMetadata{language: "promql", queryType: "range"})
 	if err := r.ParseForm(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 	query := r.Form.Get("query")
+	recordQueryLogMetadata(w, queryLogMetadata{
+		language:  "promql",
+		queryType: "range",
+		query:     query,
+		start:     r.Form.Get("start"),
+		end:       r.Form.Get("end"),
+		step:      r.Form.Get("step"),
+	})
 	if query == "" {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("missing query parameter"))
 		return
@@ -344,6 +362,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	queryStarted := time.Now()
+	recordQueryLogBackend(w, "fastpath")
 	if data, ok, err := s.tryFastRangeQuery(ctx, query, start, end, step); ok {
 		status := "ok"
 		if err != nil {
@@ -359,6 +378,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queryStarted = time.Now()
+	recordQueryLogBackend(w, "prometheus")
 	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {
 		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
@@ -608,11 +628,20 @@ type exemplarAPIResult struct {
 }
 
 func (s *Server) handleQueryExemplars(w http.ResponseWriter, r *http.Request) {
+	recordQueryLogMetadata(w, queryLogMetadata{language: "promql", queryType: "exemplars", backend: "exemplars"})
 	if err := r.ParseForm(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 	query := r.Form.Get("query")
+	recordQueryLogMetadata(w, queryLogMetadata{
+		language:  "promql",
+		queryType: "exemplars",
+		query:     query,
+		backend:   "exemplars",
+		start:     r.Form.Get("start"),
+		end:       r.Form.Get("end"),
+	})
 	if query == "" {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("missing query parameter"))
 		return

@@ -110,11 +110,20 @@ func (s *Server) handleLokiPush(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
+	recordQueryLogMetadata(w, queryLogMetadata{language: "logql", queryType: "instant"})
 	if err := r.ParseForm(); err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 	query := r.Form.Get("query")
+	recordQueryLogMetadata(w, queryLogMetadata{
+		language:  "logql",
+		queryType: "instant",
+		query:     query,
+		time:      r.Form.Get("time"),
+		limit:     r.Form.Get("limit"),
+		direction: r.Form.Get("direction"),
+	})
 	if query == "" {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", errors.New("missing query parameter"))
 		return
@@ -130,6 +139,7 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	direction := lokiDirection(r.Form.Get("direction"))
+	recordQueryLogBackend(w, "logql-parser")
 	expr, err := parseLogQL(query)
 	if err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
@@ -138,6 +148,7 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 	if expr.logSelector != nil {
+		recordQueryLogBackend(w, "logql-logs")
 		startNS := ts.Add(-6 * time.Hour).UnixNano()
 		endNS := ts.UnixNano()
 		rows, err := s.queryLogQLRows(ctx, *expr.logSelector, startNS, endNS, limit, direction)
@@ -149,6 +160,7 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	startNS, endNS := logQLMetricFetchBounds(expr, ts.UnixNano(), ts.UnixNano())
+	recordQueryLogBackend(w, "logql-sql")
 	if data, ok, err := s.tryLogQLInstantMetricSQL(ctx, expr, ts); ok {
 		if err != nil {
 			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
@@ -157,6 +169,7 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 		writeLokiSuccess(w, data)
 		return
 	}
+	recordQueryLogBackend(w, "logql-eval")
 	rows, err := s.queryLogQLMetricRows(ctx, expr, startNS, endNS)
 	if err != nil {
 		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
@@ -166,11 +179,22 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
+	recordQueryLogMetadata(w, queryLogMetadata{language: "logql", queryType: "range"})
 	if err := r.ParseForm(); err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 	query := r.Form.Get("query")
+	recordQueryLogMetadata(w, queryLogMetadata{
+		language:  "logql",
+		queryType: "range",
+		query:     query,
+		start:     r.Form.Get("start"),
+		end:       r.Form.Get("end"),
+		step:      r.Form.Get("step"),
+		limit:     r.Form.Get("limit"),
+		direction: r.Form.Get("direction"),
+	})
 	if query == "" {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", errors.New("missing query parameter"))
 		return
@@ -200,6 +224,7 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	direction := lokiDirection(r.Form.Get("direction"))
+	recordQueryLogBackend(w, "logql-parser")
 	expr, err := parseLogQL(query)
 	if err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
@@ -208,6 +233,7 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 	if expr.logSelector != nil {
+		recordQueryLogBackend(w, "logql-logs")
 		rows, err := s.queryLogQLRows(ctx, *expr.logSelector, start.UnixNano(), end.UnixNano(), limit, direction)
 		if err != nil {
 			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
@@ -218,6 +244,7 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	metricStart, metricEnd := alignLogQLMetricRange(start, end, step)
 	startNS, endNS := logQLMetricFetchBounds(expr, metricStart.UnixNano(), metricEnd.UnixNano())
+	recordQueryLogBackend(w, "logql-sql")
 	if data, ok, err := s.tryLogQLRangeMetricSQL(ctx, expr, metricStart, metricEnd, step); ok {
 		if err != nil {
 			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
@@ -226,6 +253,7 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeLokiSuccess(w, data)
 		return
 	}
+	recordQueryLogBackend(w, "logql-eval")
 	rows, err := s.queryLogQLMetricRows(ctx, expr, startNS, endNS)
 	if err != nil {
 		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)

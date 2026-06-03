@@ -24,6 +24,7 @@ type logQLExpr struct {
 	labelFunc   *logQLLabelFunction
 	binaryOp    *logQLBinaryOp
 	scalar      *float64
+	vector      *float64
 	comparison  *logQLComparison
 }
 
@@ -217,6 +218,8 @@ func parseLogQLPrimary(input string) (*logQLExpr, error) {
 		return parseLogQLAggregation(name, rest)
 	case "topk", "bottomk":
 		return parseLogQLTopK(name, rest)
+	case "vector":
+		return parseLogQLVector(rest)
 	case "label_replace":
 		return parseLogQLLabelReplace(rest)
 	case "label_join":
@@ -233,6 +236,21 @@ func parseLogQLPrimary(input string) (*logQLExpr, error) {
 	default:
 		return nil, fmt.Errorf("unsupported LogQL expression %q", input)
 	}
+}
+
+func parseLogQLVector(rest string) (*logQLExpr, error) {
+	inner, tail, err := parseParenthesized(strings.TrimSpace(rest))
+	if err != nil {
+		return nil, err
+	}
+	if tail != "" {
+		return nil, fmt.Errorf("unexpected vector tail %q", tail)
+	}
+	value, ok := parseLogQLScalar(inner)
+	if !ok {
+		return nil, fmt.Errorf("vector expects a scalar argument, got %q", strings.TrimSpace(inner))
+	}
+	return &logQLExpr{vector: &value}, nil
 }
 
 func parseLogQLLabelReplace(rest string) (*logQLExpr, error) {
@@ -1810,6 +1828,8 @@ func evaluateLogQLMetricAt(expr *logQLExpr, rows []logRow, tsNS int64) []logMetr
 		samples = evaluateLogQLBinaryOp(expr.binaryOp, rows, tsNS)
 	case expr.scalar != nil:
 		samples = []logMetricSample{{labels: map[string]string{}, value: *expr.scalar}}
+	case expr.vector != nil:
+		samples = []logMetricSample{{labels: map[string]string{}, value: *expr.vector}}
 	}
 	if expr.comparison != nil {
 		samples = filterLogQLComparison(samples, expr.comparison)

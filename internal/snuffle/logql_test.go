@@ -1,6 +1,8 @@
 package snuffle
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +40,56 @@ func TestParseLogQLMetricAggregation(t *testing.T) {
 	}
 	if expr.aggregation.expr.rangeAgg == nil || expr.aggregation.expr.rangeAgg.window != 5*time.Minute {
 		t.Fatalf("range aggregation = %#v", expr.aggregation.expr.rangeAgg)
+	}
+}
+
+func TestEvaluateLogQLVectorFunction(t *testing.T) {
+	expr, err := parseLogQL(`vector(1)`)
+	if err != nil {
+		t.Fatalf("parseLogQL returned error: %v", err)
+	}
+	if expr.vector == nil || *expr.vector != 1 {
+		t.Fatalf("vector expression = %#v, want 1", expr.vector)
+	}
+
+	vector := evaluateLogQLInstantMetric(expr, nil, int64(time.Second))
+	if len(vector) != 1 {
+		t.Fatalf("vector length = %d, want 1: %#v", len(vector), vector)
+	}
+	if len(vector[0].Metric) != 0 || vector[0].Value[1].(string) != "1" {
+		t.Fatalf("vector result = %#v, want unlabeled value 1", vector[0])
+	}
+
+	matrix := evaluateLogQLRangeMetric(expr, nil, 0, int64(2*time.Second), time.Second)
+	if len(matrix) != 1 {
+		t.Fatalf("matrix length = %d, want 1: %#v", len(matrix), matrix)
+	}
+	if len(matrix[0].Metric) != 0 || len(matrix[0].Values) != 3 {
+		t.Fatalf("matrix result = %#v, want unlabeled 3-step series", matrix[0])
+	}
+	for _, value := range matrix[0].Values {
+		if value[1].(string) != "1" {
+			t.Fatalf("matrix value = %#v, want 1", value)
+		}
+	}
+}
+
+func TestLokiQueryVectorFunction(t *testing.T) {
+	server := &Server{cfg: Config{QueryTimeout: time.Second}}
+	req := httptest.NewRequest(http.MethodGet, "/loki/api/v1/query?query=vector(1)", nil)
+	rec := httptest.NewRecorder()
+
+	server.handleLokiQuery(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"status":"success"`) || !strings.Contains(body, `"resultType":"vector"`) {
+		t.Fatalf("unexpected body: %s", body)
+	}
+	if strings.Contains(body, "unsupported LogQL expression") {
+		t.Fatalf("body still reports unsupported vector expression: %s", body)
 	}
 }
 
