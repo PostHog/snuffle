@@ -473,6 +473,76 @@ func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 	}
 }
 
+func TestLogQLMetricSQLPlanSupportsTopKComparisonBytesAndUnwrap(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantTopK   bool
+		wantCmp    bool
+		wantUnwrap bool
+	}{
+		{
+			name:     "topk grouped rate",
+			query:    `topk(5, sum by (service_name) (rate({app="api"}[5m])))`,
+			wantTopK: true,
+		},
+		{
+			name:    "comparison grouped count",
+			query:   `sum by (service_name) (count_over_time({app="api"}[5m])) > 10`,
+			wantCmp: true,
+		},
+		{
+			name:  "bytes grouped",
+			query: `sum by (format) (bytes_over_time({app="api"}[5m]))`,
+		},
+		{
+			name:       "logfmt duration unwrap",
+			query:      `sum_over_time({app="api",format="logfmt"} | logfmt | unwrap duration(duration) [5m]) by (service_name)`,
+			wantUnwrap: true,
+		},
+		{
+			name:       "json filtered unwrap",
+			query:      `sum_over_time({app="api",format="json"} | json | status >= 500 | unwrap duration [5m]) by (service_name)`,
+			wantUnwrap: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+			plan, ok := buildLogQLMetricSQLPlan(expr)
+			if !ok || plan == nil {
+				t.Fatalf("buildLogQLMetricSQLPlan did not accept %q", tt.query)
+			}
+			if plan.hasTopK != tt.wantTopK {
+				t.Fatalf("hasTopK = %v, want %v", plan.hasTopK, tt.wantTopK)
+			}
+			if (plan.comparison != nil) != tt.wantCmp {
+				t.Fatalf("comparison = %#v, want present %v", plan.comparison, tt.wantCmp)
+			}
+			if (plan.unwrapValueExpr != "") != tt.wantUnwrap {
+				t.Fatalf("unwrapValueExpr = %q, want present %v", plan.unwrapValueExpr, tt.wantUnwrap)
+			}
+		})
+	}
+}
+
+func TestLogQLMetricBucketSQLSafeIncludesBytes(t *testing.T) {
+	expr, err := parseLogQL(`sum by (format) (bytes_over_time({app="api"}[5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL returned error: %v", err)
+	}
+	plan, ok := buildLogQLMetricSQLPlan(expr)
+	if !ok || plan == nil {
+		t.Fatal("bytes_over_time should build a SQL plan")
+	}
+	if !logQLMetricBucketSQLSafe(plan, time.Minute) {
+		t.Fatal("bytes_over_time with window divisible by step should use bucket SQL")
+	}
+}
+
 func TestApplyLogQLPipelineParsersAndFilters(t *testing.T) {
 	selector, err := parseLogQLSelector(`{service_name="api"} | json | status >= 500 | line_format "{{.method}} {{.path}}" | label_format route=path`)
 	if err != nil {
