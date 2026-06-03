@@ -486,7 +486,7 @@ func (s *Server) queryLogQLMetricSQL(ctx context.Context, plan *logQLMetricSQLPl
 	preAggSQL := fmt.Sprintf(
 		"(SELECT %s FROM %s GROUP BY %s)",
 		strings.Join(preAggSelects, ", "),
-		logQLDedupLogsSubquery(s.cfg, where),
+		logQLLogsSourceSQL(s.cfg, where),
 		strings.Join(preAggGroupBy, ", "),
 	)
 
@@ -678,7 +678,7 @@ func logQLUnwrapMetricSourceSQL(cfg Config, plan *logQLMetricSQLPlan, where []st
 	return fmt.Sprintf(
 		"(SELECT %s FROM %s WHERE isNotNull(unwrap_value))",
 		strings.Join(selects, ", "),
-		logQLDedupLogsSubquery(cfg, where),
+		logQLLogsSourceSQL(cfg, where),
 	)
 }
 
@@ -787,7 +787,7 @@ func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetri
 	fetchEndNS := endNS
 	where := logQLMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
 
-	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "uniqExact(uuid) AS log_count", "sum(length(body)) AS byte_count"}
+	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "count() AS log_count", "sum(length(body)) AS byte_count"}
 	bucketGroupBy := []string{"bucket_ns"}
 	outerSelects := []string{"eval_ns"}
 	orderBy := make([]string, 0, len(plan.groupLabels)+1)
@@ -891,7 +891,7 @@ func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLM
 	fetchEndNS := endNS
 	where := logQLMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
 
-	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "uniqExact(uuid) AS log_count", "sum(length(body)) AS byte_count"}
+	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "count() AS log_count", "sum(length(body)) AS byte_count"}
 	bucketGroupBy := []string{"bucket_ns"}
 	outerSelects := []string{"eval_ns"}
 	outerGroupBy := []string{"eval_ns"}

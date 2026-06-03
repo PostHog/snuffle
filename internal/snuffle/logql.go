@@ -1385,24 +1385,7 @@ func decolorizeLogLine(line string) string {
 }
 
 func logQLSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
-	where := logQLBaseFilters(cfg, selector, startNS, endNS)
-	order := "ASC"
-	if strings.ToLower(direction) == "backward" {
-		order = "DESC"
-	}
-	maxRows := cfg.LogQueryMaxRows
-	if maxRows <= 0 {
-		maxRows = 100000
-	}
-	if limit <= 0 || limit > maxRows {
-		limit = maxRows
-	}
-	return fmt.Sprintf(
-		"SELECT ts_ns, observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s ORDER BY ts_ns %s, stream_key ASC, observed_ns DESC LIMIT %d",
-		logQLDedupLogsSubquery(cfg, where),
-		order,
-		limit,
-	)
+	return logQLRawSelectSQL(cfg, selector, startNS, endNS, limit, direction)
 }
 
 func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
@@ -1419,34 +1402,7 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 		limit = maxRows
 	}
 	return fmt.Sprintf(
-		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, %s ASC, observed_ns DESC LIMIT %d",
-		tableName(cfg.CHDatabase, cfg.LogsTable),
-		strings.Join(where, " AND "),
-		order,
-		logQLRawStreamKeyExpr(),
-		limit,
-	)
-}
-
-func logQLCompactSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
-	where := logQLCompactBaseFilters(cfg, selector, startNS, endNS)
-	order := "ASC"
-	if strings.ToLower(direction) == "backward" {
-		order = "DESC"
-	}
-	maxRows := cfg.LogQueryMaxRows
-	if maxRows <= 0 {
-		maxRows = 100000
-	}
-	if limit <= 0 || limit > maxRows {
-		limit = maxRows
-	}
-	streamKey := sqlString(lokiStreamLabelsAttributeKey)
-	metadataKey := sqlString(lokiEntryMetadataAttributeKey)
-	return fmt.Sprintf(
-		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, attributes_map_str[%s] AS stream_labels, attributes_map_str[%s] AS entry_metadata FROM %s WHERE %s ORDER BY ts_ns %s, stream_labels ASC, observed_ns DESC LIMIT %d",
-		streamKey,
-		metadataKey,
+		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
 		tableName(cfg.CHDatabase, cfg.LogsTable),
 		strings.Join(where, " AND "),
 		order,
@@ -1454,22 +1410,12 @@ func logQLCompactSelectSQL(cfg Config, selector logQLSelector, startNS, endNS in
 	)
 }
 
-func logQLDedupLogsSubquery(cfg Config, where []string) string {
-	metadataKey := sqlString(lokiEntryMetadataAttributeKey)
-	dedupKey := logQLRawStreamKeyExpr()
-	weight := "length(attributes_map_str[" + metadataKey + "]) + length(trace_id) + length(span_id)"
+func logQLLogsSourceSQL(cfg Config, where []string) string {
 	return fmt.Sprintf(
-		"(SELECT ts_ns, body, dedup_key AS stream_key, argMax(toInt64(toUnixTimestamp64Nano(observed_timestamp)), dedup_weight) AS observed_ns, argMax(service_name, dedup_weight) AS service_name, argMax(severity_text, dedup_weight) AS severity_text, argMax(trace_id, dedup_weight) AS trace_id, argMax(span_id, dedup_weight) AS span_id, argMax(resource_attributes, dedup_weight) AS resource_attributes, argMax(attributes_map_str, dedup_weight) AS attributes_map_str FROM (SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, observed_timestamp, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str, %s AS dedup_key, %s AS dedup_weight FROM %s WHERE %s) GROUP BY ts_ns, body, dedup_key)",
-		dedupKey,
-		weight,
+		"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s)",
 		tableName(cfg.CHDatabase, cfg.LogsTable),
 		strings.Join(where, " AND "),
 	)
-}
-
-func logQLRawStreamKeyExpr() string {
-	streamKey := sqlString(lokiStreamLabelsAttributeKey)
-	return "if(mapContains(attributes_map_str, " + streamKey + "), attributes_map_str[" + streamKey + "], concat(toString(resource_attributes), toString(attributes_map_str)))"
 }
 
 func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
@@ -1493,48 +1439,6 @@ func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) 
 		}
 	}
 	return filters
-}
-
-func logQLCompactBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
-	filters := []string{
-		teamFilter(cfg),
-		"timestamp >= " + chTimeNanos(startNS),
-		"timestamp <= " + chTimeNanos(endNS),
-		"time_bucket >= toStartOfDay(" + chTimeNanos(startNS) + ")",
-		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
-	}
-	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLCompactMatcherCondition(matcher))
-	}
-	canPushLine := true
-	for _, stage := range selector.stages {
-		if stage.kind == "line_format" {
-			canPushLine = false
-		}
-		if canPushLine && stage.kind == "line_filter" {
-			filters = append(filters, logQLLineFilterCondition(*stage.lineFilter))
-		}
-	}
-	return filters
-}
-
-func logQLCompactMatcherCondition(m logQLLabelMatcher) string {
-	return logQLStringCondition(logQLCompactLabelValueExpr(m.name), m.op, m.value, true)
-}
-
-func logQLCompactLabelValueExpr(label string) string {
-	switch label {
-	case "service_name", "service.name":
-		return "service_name"
-	case "level", "severity", "severity_text", "detected_level":
-		return "severity_text"
-	case "trace_id":
-		return "trace_id"
-	case "span_id":
-		return "span_id"
-	default:
-		return logQLStreamLabelValueExpr(label)
-	}
 }
 
 func logQLMatcherCondition(m logQLLabelMatcher) string {
@@ -1588,57 +1492,29 @@ func logQLStringCondition(expr, op, value string, anchorRegex bool) string {
 }
 
 func logQLStreamLabelValueExpr(name string) string {
-	streamLabelExpr := func(fallback string) string {
-		key := sqlString(lokiStreamLabelsAttributeKey)
-		return "if(mapContains(attributes_map_str, " + key + "), JSONExtractString(attributes_map_str[" + key + "], " + sqlString(name) + "), " + fallback + ")"
-	}
 	switch name {
 	case "service_name":
-		return streamLabelExpr("service_name")
+		return "service_name"
 	case "service.name":
-		return streamLabelExpr("if(service_name != '', service_name, resource_attributes['service.name'])")
+		return "if(service_name != '', service_name, resource_attributes['service.name'])"
 	case "level", "severity", "severity_text", "detected_level":
-		fallback := "severity_text"
 		if name == "detected_level" {
-			fallback = "if(mapContains(attributes_map_str, 'detected_level__str'), attributes_map_str['detected_level__str'], severity_text)"
+			return "if(mapContains(attributes_map_str, 'detected_level__str'), attributes_map_str['detected_level__str'], severity_text)"
 		}
-		return streamLabelExpr(fallback)
+		return "severity_text"
 	case "trace_id":
-		return streamLabelExpr("trace_id")
+		return "trace_id"
 	case "span_id":
-		return streamLabelExpr("span_id")
+		return "span_id"
 	default:
 		attrKey := sqlString(name + "__str")
 		resourceKey := sqlString(name)
-		return streamLabelExpr("if(mapContains(attributes_map_str, " + attrKey + "), attributes_map_str[" + attrKey + "], resource_attributes[" + resourceKey + "])")
+		return "if(mapContains(attributes_map_str, " + attrKey + "), attributes_map_str[" + attrKey + "], resource_attributes[" + resourceKey + "])"
 	}
 }
 
 func logQLLabelValueExpr(name string) string {
-	stream := logQLStreamLabelValueExpr(name)
-	metadataKey := sqlString(lokiEntryMetadataAttributeKey)
-	metadata := "if(mapContains(attributes_map_str, " + metadataKey + "), JSONExtractString(attributes_map_str[" + metadataKey + "], " + sqlString(name) + "), '')"
-	fallback := "''"
-	switch name {
-	case "service_name":
-		fallback = "service_name"
-	case "service.name":
-		fallback = "if(service_name != '', service_name, resource_attributes['service.name'])"
-	case "level", "severity", "severity_text", "detected_level":
-		fallback = "severity_text"
-		if name == "detected_level" {
-			fallback = "if(mapContains(attributes_map_str, 'detected_level__str'), attributes_map_str['detected_level__str'], severity_text)"
-		}
-	case "trace_id":
-		fallback = "trace_id"
-	case "span_id":
-		fallback = "span_id"
-	default:
-		attrKey := sqlString(name + "__str")
-		resourceKey := sqlString(name)
-		fallback = "if(mapContains(attributes_map_str, " + attrKey + "), attributes_map_str[" + attrKey + "], resource_attributes[" + resourceKey + "])"
-	}
-	return "multiIf(" + stream + " != '', " + stream + ", " + metadata + " != '', " + metadata + ", " + fallback + ")"
+	return logQLStreamLabelValueExpr(name)
 }
 
 func chTimeNanos(ns int64) string {
@@ -1665,81 +1541,9 @@ func scanLogRows(ctx context.Context, client *ClickHouseClient, sql string) ([]l
 	return rows, err
 }
 
-func scanCompactLogRows(ctx context.Context, client *ClickHouseClient, sql string) ([]logRow, error) {
-	rows := make([]logRow, 0, 1024)
-	err := client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var out logRow
-		var serviceName string
-		var severityText string
-		var traceID string
-		var spanID string
-		var streamLabelsJSON string
-		var metadataJSON string
-		if err := row.Scan(&out.tsNS, &out.observedNS, &out.line, &serviceName, &severityText, &traceID, &spanID, &streamLabelsJSON, &metadataJSON); err != nil {
-			return err
-		}
-		out.labels, out.streamLabels, out.fields = labelsAndFieldsFromLokiMarkers(serviceName, severityText, traceID, spanID, streamLabelsJSON, metadataJSON)
-		rows = append(rows, out)
-		return nil
-	})
-	return rows, err
-}
-
 func labelsFromLogColumns(serviceName, severityText, traceID, spanID string, resourceAttrs, attrs map[string]string) map[string]string {
 	labels, _, _ := labelsAndFieldsFromLogColumns(serviceName, severityText, traceID, spanID, resourceAttrs, attrs)
 	return labels
-}
-
-func labelsAndFieldsFromLokiMarkers(serviceName, severityText, traceID, spanID, streamLabelsJSON, metadataJSON string) (map[string]string, map[string]string, map[string]string) {
-	streamLabels := parseStringMapJSON(streamLabelsJSON)
-	if streamLabels == nil {
-		streamLabels = map[string]string{}
-	}
-	metadata := parseStringMapJSON(metadataJSON)
-	fields := make(map[string]string, len(streamLabels)+len(metadata)+6)
-	for key, value := range streamLabels {
-		if key != "" {
-			fields[key] = value
-		}
-	}
-	for key, value := range metadata {
-		if key != "" {
-			fields[key] = value
-		}
-	}
-	if serviceName != "" {
-		fields["service_name"] = serviceName
-		fields["service.name"] = serviceName
-	}
-	if severityText != "" {
-		fields["level"] = severityText
-		fields["severity_text"] = severityText
-		fields["detected_level"] = severityText
-	}
-	if traceID != "" {
-		fields["trace_id"] = traceID
-	}
-	if spanID != "" {
-		fields["span_id"] = spanID
-	}
-	if len(streamLabels) == 0 {
-		labels := make(map[string]string, len(fields))
-		for key, value := range fields {
-			labels[key] = value
-			streamLabels[key] = value
-		}
-		return labels, streamLabels, fields
-	}
-	outputLabels := cloneStringMap(streamLabels)
-	for key, value := range metadata {
-		if key != "" {
-			outputLabels[key] = value
-		}
-	}
-	if severityText != "" {
-		outputLabels["detected_level"] = severityText
-	}
-	return outputLabels, streamLabels, fields
 }
 
 func labelsAndFieldsFromLogColumns(serviceName, severityText, traceID, spanID string, resourceAttrs, attrs map[string]string) (map[string]string, map[string]string, map[string]string) {
@@ -1765,8 +1569,9 @@ func labelsAndFieldsFromLogColumns(serviceName, severityText, traceID, spanID st
 	if spanID != "" {
 		fields["span_id"] = spanID
 	}
+	labels := logLabelsFromCoreColumns(serviceName, severityText, traceID, spanID)
 	for key, value := range attrs {
-		if key == lokiStreamLabelsAttributeKey || key == lokiEntryMetadataAttributeKey {
+		if key == legacyLokiStreamLabelsAttributeKey || key == legacyLokiEntryMetadataAttributeKey {
 			continue
 		}
 		key = strings.TrimSuffix(key, "__str")
@@ -1774,61 +1579,29 @@ func labelsAndFieldsFromLogColumns(serviceName, severityText, traceID, spanID st
 			continue
 		}
 		fields[key] = value
-	}
-	metadata := parseStringMapJSON(attrs[lokiEntryMetadataAttributeKey])
-	for key, value := range metadata {
-		if key != "" {
-			fields[key] = value
-		}
-	}
-	streamLabels := map[string]string{}
-	if raw := attrs[lokiStreamLabelsAttributeKey]; raw != "" {
-		if streamLabels := parseStringMapJSON(raw); len(streamLabels) > 0 {
-			outputLabels := cloneStringMap(streamLabels)
-			for key, value := range metadata {
-				if key != "" {
-					outputLabels[key] = value
-				}
-			}
-			if severityText != "" {
-				outputLabels["detected_level"] = severityText
-			}
-			return outputLabels, streamLabels, fields
-		}
-	}
-	labels := make(map[string]string, len(fields))
-	for key, value := range fields {
 		labels[key] = value
-		streamLabels[key] = value
 	}
-	return labels, streamLabels, fields
+	return labels, cloneStringMap(labels), fields
 }
 
-func stableJSONMap(input map[string]string) string {
-	if len(input) == 0 {
-		return "{}"
+func logLabelsFromCoreColumns(serviceName, severityText, traceID, spanID string) map[string]string {
+	labels := map[string]string{}
+	if serviceName != "" {
+		labels["service_name"] = serviceName
+		labels["service.name"] = serviceName
 	}
-	data, err := json.Marshal(stableLabelMap(input))
-	if err != nil {
-		return "{}"
+	if severityText != "" {
+		labels["level"] = severityText
+		labels["severity_text"] = severityText
+		labels["detected_level"] = severityText
 	}
-	return string(data)
-}
-
-func parseStringMapJSON(input string) map[string]string {
-	decoded := map[string]string{}
-	if err := json.Unmarshal([]byte(input), &decoded); err == nil {
-		return decoded
+	if traceID != "" {
+		labels["trace_id"] = traceID
 	}
-	raw := map[string]any{}
-	if err := json.Unmarshal([]byte(input), &raw); err != nil {
-		return nil
+	if spanID != "" {
+		labels["span_id"] = spanID
 	}
-	out := make(map[string]string, len(raw))
-	for key, value := range raw {
-		out[key] = stringifyLogValue(value)
-	}
-	return out
+	return labels
 }
 
 func applyLogQLSelector(rows []logRow, selector logQLSelector) []logRow {

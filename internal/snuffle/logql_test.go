@@ -459,13 +459,11 @@ func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 		"team_id = 0",
 		"timestamp >= fromUnixTimestamp64Nano(1000, 'UTC')",
 		"time_bucket >= toStartOfDay(fromUnixTimestamp64Nano(1000, 'UTC'))",
-		"JSONExtractString(attributes_map_str['_loki_stream_labels__str'], 'service_name')",
-		"= 'checkout'",
-		"match(if(mapContains(attributes_map_str, '_loki_stream_labels__str'), JSONExtractString(attributes_map_str['_loki_stream_labels__str'], 'level'), severity_text), '^(?:error|warn)$')",
-		"JSONExtractString(attributes_map_str['_loki_stream_labels__str'], 'trace_id')",
-		"!= 'abc'",
+		"service_name = 'checkout'",
+		"match(severity_text, '^(?:error|warn)$')",
+		"trace_id != 'abc'",
 		"position(body, 'failed') > 0",
-		"ORDER BY ts_ns DESC, stream_key ASC, observed_ns DESC LIMIT 50",
+		"ORDER BY ts_ns DESC, observed_ns DESC LIMIT 50",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
@@ -911,8 +909,11 @@ func TestLokiPushJSONRows(t *testing.T) {
 	if row.resourceAttributes["host.name"] != "host-1" {
 		t.Fatalf("resource attrs = %#v", row.resourceAttributes)
 	}
-	if row.attributes[lokiStreamLabelsAttributeKey] == "" {
-		t.Fatalf("missing stream label marker: %#v", row.attributes)
+	if row.attributes[legacyLokiStreamLabelsAttributeKey] != "" {
+		t.Fatalf("stream label marker should not be serialized: %#v", row.attributes)
+	}
+	if row.attributes["trace_id__str"] != "abc" || row.attributes["detected_level__str"] != "error" {
+		t.Fatalf("labels/metadata should be direct attributes: %#v", row.attributes)
 	}
 	labels, streamLabels, fields := labelsAndFieldsFromLogColumns(row.serviceName, row.severityText, row.traceID, row.spanID, row.resourceAttributes, row.attributes)
 	if labels["level"] != "error" || labels["service_name"] != "api" {
@@ -920,6 +921,9 @@ func TestLokiPushJSONRows(t *testing.T) {
 	}
 	if streamLabels["level"] != "error" || streamLabels["service_name"] != "api" {
 		t.Fatalf("stream labels = %#v", streamLabels)
+	}
+	if streamLabels["trace_id"] != "abc" {
+		t.Fatalf("metadata trace_id should be represented as a direct attribute label: %#v", streamLabels)
 	}
 	if _, ok := streamLabels["host.name"]; ok {
 		t.Fatalf("structured metadata leaked into selector labels: %#v", streamLabels)

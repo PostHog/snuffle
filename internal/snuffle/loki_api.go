@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	lokiStreamLabelsAttributeKey  = "_loki_stream_labels__str"
-	lokiEntryMetadataAttributeKey = "_loki_entry_metadata__str"
+	legacyLokiStreamLabelsAttributeKey  = "_loki_stream_labels__str"
+	legacyLokiEntryMetadataAttributeKey = "_loki_entry_metadata__str"
 )
 
 type lokiResponse struct {
@@ -274,17 +274,12 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 	fullyPushed := logQLSelectorFullyPushed(selector)
 	for {
 		sql := logQLRawSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
-		scan := scanLogRows
-		if fullyPushed {
-			sql = logQLCompactSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
-			scan = scanCompactLogRows
-		}
-		rows, err := scan(ctx, s.client, sql)
+		rows, err := scanLogRows(ctx, s.client, sql)
 		if err != nil {
 			return nil, err
 		}
 		rawCount := len(rows)
-		rows = finalizeLogQLRowsAfterSQLFilter(dedupLogRows(rows), selector, fullyPushed)
+		rows = finalizeLogQLRowsAfterSQLFilter(rows, selector, fullyPushed)
 		if len(rows) >= limit || rawCount < candidateLimit || candidateLimit >= maxRows {
 			if len(rows) > limit {
 				rows = rows[:limit]
@@ -322,7 +317,7 @@ func (s *Server) queryLogQLMetricRows(ctx context.Context, expr *logQLExpr, star
 		}
 		allRows = append(allRows, rows...)
 	}
-	return dedupLogRows(allRows), nil
+	return allRows, nil
 }
 
 func firstLogQLSelector(expr *logQLExpr) *logQLSelector {
@@ -430,38 +425,6 @@ func logQLSelectorFullyPushed(selector logQLSelector) bool {
 	return true
 }
 
-func dedupLogRows(rows []logRow) []logRow {
-	byKey := make(map[string]int, len(rows))
-	out := rows[:0]
-	for _, row := range rows {
-		key := logRowDedupKey(row)
-		if idx, ok := byKey[key]; ok {
-			if logRowDedupWeight(row) > logRowDedupWeight(out[idx]) {
-				out[idx] = row
-			}
-			continue
-		}
-		byKey[key] = len(out)
-		out = append(out, row)
-	}
-	return out
-}
-
-func logRowDedupKey(row logRow) string {
-	return strconv.FormatInt(row.tsNS, 10) + "\xff" + row.line + "\xff" + labelsKey(row.streamLabels)
-}
-
-func logRowDedupWeight(row logRow) int {
-	weight := len(row.labels) + len(row.fields)
-	if row.labels["trace_id"] != "" {
-		weight += 1000
-	}
-	if row.labels["span_id"] != "" {
-		weight += 1000
-	}
-	return weight
-}
-
 func logQLMetricFetchBounds(expr *logQLExpr, startNS, endNS int64) (int64, int64) {
 	window := maxLogQLWindow(expr)
 	offset := maxLogQLOffset(expr)
@@ -552,44 +515,16 @@ func (s *Server) handleLokiLabels(w http.ResponseWriter, r *http.Request) {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
-	names := map[string]struct{}{}
-	if s.cfg.LogsTable != "" {
-		sql := fmt.Sprintf(
-			"SELECT DISTINCT arrayJoin(JSONExtractKeys(attributes_map_str[%s])) AS label_name FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s AND mapContains(attributes_map_str, %s) ORDER BY label_name%s",
-			sqlString(lokiStreamLabelsAttributeKey),
-			tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
-			teamFilter(s.cfg),
-			chTimeNanos(start.UnixNano()),
-			chTimeNanos(end.UnixNano()),
-			sqlString(lokiStreamLabelsAttributeKey),
-			sqlLimit(limit),
-		)
-		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
-		defer cancel()
-		if err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-			var name string
-			if err := row.Scan(&name); err != nil {
-				return err
-			}
-			if name != "" {
-				names[name] = struct{}{}
-			}
-			return nil
-		}); err != nil {
-			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
-			return
-		}
+	names := map[string]struct{}{
+		"service_name":   {},
+		"service.name":   {},
+		"level":          {},
+		"severity_text":  {},
+		"trace_id":       {},
+		"span_id":        {},
+		"detected_level": {},
 	}
-	if len(names) == 0 && s.cfg.LogAttributesTable != "" {
-		names = map[string]struct{}{
-			"service_name":   {},
-			"service.name":   {},
-			"level":          {},
-			"severity_text":  {},
-			"trace_id":       {},
-			"span_id":        {},
-			"detected_level": {},
-		}
+	if s.cfg.LogAttributesTable != "" {
 		sql := fmt.Sprintf(
 			"SELECT DISTINCT attribute_key FROM %s WHERE %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_key%s",
 			tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
@@ -641,51 +576,11 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	values := make(map[string]struct{})
-	var sql string
-	sql = fmt.Sprintf(
-		"SELECT DISTINCT JSONExtractString(attributes_map_str[%s], %s) AS label_value FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s AND mapContains(attributes_map_str, %s) AND label_value != '' ORDER BY label_value%s",
-		sqlString(lokiStreamLabelsAttributeKey),
-		sqlString(name),
-		tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
-		teamFilter(s.cfg),
-		chTimeNanos(start.UnixNano()),
-		chTimeNanos(end.UnixNano()),
-		sqlString(lokiStreamLabelsAttributeKey),
-		sqlLimit(limit),
-	)
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
-	if err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var value string
-		if err := row.Scan(&value); err != nil {
-			return err
-		}
-		if value != "" {
-			values[value] = struct{}{}
-		}
-		return nil
-	}); err != nil {
-		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
-		return
-	}
-	if len(values) == 0 && s.cfg.LogAttributesTable != "" {
-		switch name {
-		case "service_name", "service.name":
-			sql = fmt.Sprintf("SELECT DISTINCT service_name FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY service_name%s", tableName(s.cfg.CHDatabase, s.cfg.LogsTable), teamFilter(s.cfg), chTimeNanos(start.UnixNano()), chTimeNanos(end.UnixNano()), sqlLimit(limit))
-		case "level", "severity", "severity_text":
-			sql = fmt.Sprintf("SELECT DISTINCT severity_text FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY severity_text%s", tableName(s.cfg.CHDatabase, s.cfg.LogsTable), teamFilter(s.cfg), chTimeNanos(start.UnixNano()), chTimeNanos(end.UnixNano()), sqlLimit(limit))
-		case "trace_id", "span_id":
-			sql = fmt.Sprintf("SELECT DISTINCT %s FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY %s%s", quoteIdent(name), tableName(s.cfg.CHDatabase, s.cfg.LogsTable), teamFilter(s.cfg), chTimeNanos(start.UnixNano()), chTimeNanos(end.UnixNano()), quoteIdent(name), sqlLimit(limit))
-		default:
-			sql = fmt.Sprintf(
-				"SELECT DISTINCT attribute_value FROM %s WHERE %s AND attribute_key = %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_value%s",
-				tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
-				teamFilter(s.cfg),
-				sqlString(name),
-				chTimeNanos(start.UnixNano()),
-				chTimeNanos(end.UnixNano()),
-				sqlLimit(limit),
-			)
+	queryValues := func(sql string) error {
+		if sql == "" {
+			return nil
 		}
 		if err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
 			var value string
@@ -697,6 +592,58 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 			}
 			return nil
 		}); err != nil {
+			return err
+		}
+		return nil
+	}
+	coreSQL := ""
+	if s.cfg.LogsTable != "" {
+		switch name {
+		case "service_name", "service.name":
+			coreSQL = fmt.Sprintf(
+				"SELECT DISTINCT service_name AS label_value FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY label_value%s",
+				tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
+				teamFilter(s.cfg),
+				chTimeNanos(start.UnixNano()),
+				chTimeNanos(end.UnixNano()),
+				sqlLimit(limit),
+			)
+		case "level", "severity", "severity_text", "detected_level":
+			coreSQL = fmt.Sprintf(
+				"SELECT DISTINCT severity_text AS label_value FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY label_value%s",
+				tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
+				teamFilter(s.cfg),
+				chTimeNanos(start.UnixNano()),
+				chTimeNanos(end.UnixNano()),
+				sqlLimit(limit),
+			)
+		case "trace_id", "span_id":
+			coreSQL = fmt.Sprintf(
+				"SELECT DISTINCT %s AS label_value FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY label_value%s",
+				quoteIdent(name),
+				tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
+				teamFilter(s.cfg),
+				chTimeNanos(start.UnixNano()),
+				chTimeNanos(end.UnixNano()),
+				sqlLimit(limit),
+			)
+		}
+	}
+	if err := queryValues(coreSQL); err != nil {
+		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
+	if coreSQL == "" && s.cfg.LogAttributesTable != "" {
+		sql := fmt.Sprintf(
+			"SELECT DISTINCT attribute_value FROM %s WHERE %s AND attribute_key = %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_value%s",
+			tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
+			teamFilter(s.cfg),
+			sqlString(name),
+			chTimeNanos(start.UnixNano()),
+			chTimeNanos(end.UnixNano()),
+			sqlLimit(limit),
+		)
+		if err := queryValues(sql); err != nil {
 			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
 			return
 		}
@@ -1088,12 +1035,6 @@ func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp tim
 	for key, value := range labels {
 		addLabel(key, value)
 	}
-	if len(labels) > 0 {
-		attributes[lokiStreamLabelsAttributeKey] = stableJSONMap(labels)
-	}
-	if len(metadata) > 0 {
-		attributes[lokiEntryMetadataAttributeKey] = stableJSONMap(metadata)
-	}
 	for key, value := range metadata {
 		if strings.HasPrefix(key, "resource_") {
 			resourceAttributes[strings.TrimPrefix(key, "resource_")] = value
@@ -1404,7 +1345,7 @@ func newLogUUID() string {
 
 func lokiLogUUID(labels map[string]string, timestamp time.Time, line string) string {
 	h := sha256.New()
-	h.Write([]byte(stableJSONMap(labels)))
+	h.Write([]byte(labelsKey(stableLabelMap(labels))))
 	h.Write([]byte{0})
 	h.Write([]byte(strconv.FormatInt(timestamp.UTC().UnixNano(), 10)))
 	h.Write([]byte{0})
