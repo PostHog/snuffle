@@ -251,13 +251,7 @@ func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser
 	}
 	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
 	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
-	gridExpr := fmt.Sprintf(
-		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
-		chTimeMillis(shiftedStart.UnixMilli()),
-		chTimeMillis(shiftedEnd.UnixMilli()),
-		formatDurationSeconds(step),
-		formatDurationSeconds(s.cfg.LookbackDelta),
-	)
+	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		gridExpr,
@@ -296,7 +290,7 @@ func (s *Server) queryRangeGridResults(ctx context.Context, sql string, matchers
 		}
 		values := make([][]any, 0, len(vals))
 		for i, value := range vals {
-			if value == nil {
+			if value == nil || isStaleSampleValue(*value) {
 				continue
 			}
 			ts := start.UnixMilli() + int64(i)*stepMillis
@@ -404,6 +398,7 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
 	)
+	perID = fmt.Sprintf("SELECT * FROM (%s) WHERE %s", perID, nonStaleSampleSQL("value"))
 
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
@@ -442,6 +437,7 @@ func (s *Server) tryPostHogExactInstantAggregate(ctx context.Context, expr *pars
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
 	)
+	sql += " AND " + nonStaleSampleSQL("value")
 	if len(groupBy) > 0 {
 		sql += " GROUP BY " + strings.Join(groupBy, ", ")
 		sql += " ORDER BY " + strings.Join(groupBy, ", ")
@@ -473,6 +469,7 @@ func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *pa
 	}
 
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
+	where = append(where, nonStaleSampleSQL("value"))
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
 	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
@@ -545,7 +542,7 @@ func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector 
 		}
 		values := make([][]any, 0, len(vals))
 		for i, value := range vals {
-			if value == nil {
+			if value == nil || isStaleSampleValue(*value) {
 				continue
 			}
 			ts := start.UnixMilli() + int64(i)*stepMillis
@@ -590,6 +587,9 @@ func (s *Server) tryPostHogExactSelectorRangeRows(ctx context.Context, selector 
 		var value float64
 		if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs, &ts, &value); err != nil {
 			return err
+		}
+		if isStaleSampleValue(value) {
+			return nil
 		}
 		idx, ok := seen[id]
 		if !ok {
@@ -759,10 +759,11 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 
 	rangeSource := aggregateSourceSQL("per_series", expr.Grouping, groupJoin)
 	sql := fmt.Sprintf(
-		"WITH %s SELECT %s FROM %s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE isNotNull(sample_value) GROUP BY %s ORDER BY %s",
+		"WITH %s SELECT %s FROM %s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
 		strings.Join(withParts, ", "),
 		strings.Join(selectParts, ", "),
 		rangeSource,
+		nonStaleNullableSampleSQL("sample_value"),
 		strings.Join(groupByParts, ", "),
 		strings.Join(orderByParts, ", "),
 	)
@@ -778,6 +779,7 @@ func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.Aggre
 func (s *Server) queryFastExactAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, start, end time.Time, aggSQL string) (queryData, bool, error) {
 	where := sampleBaseFilters(s.cfg, groupMatchers, start.UnixMilli(), end.UnixMilli())
 	where = append(where, sampleSelectedSeriesFilters(s.cfg)...)
+	where = append(where, nonStaleSampleSQL("value"))
 	samples := fmt.Sprintf(
 		"SELECT id, timestamp, value AS sample_value FROM %s WHERE %s",
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
@@ -842,6 +844,7 @@ func (s *Server) trySampleLabelIndexInstantAggregate(ctx context.Context, expr *
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
 	)
+	latest = fmt.Sprintf("SELECT * FROM (%s) WHERE %s", latest, nonStaleSampleSQL("value"))
 
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
 	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(s.cfg, selector.LabelMatchers, expr.Grouping, false)
@@ -931,7 +934,11 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 		}
 		return data, true, nil
 	}
-	if sql, ok := nestedCountBitmapRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
+	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
+	if !ok {
+		return queryData{}, false, nil
+	}
+	if sql, ok := nestedCountSelectedSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, selectedSeries, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
 		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 		data, err := s.queryNestedCountRangeValues(ctx, sql)
 		if err != nil {
@@ -939,18 +946,7 @@ func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.
 		}
 		return data, true, nil
 	}
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
-	if !ok {
-		return queryData{}, false, nil
-	}
-	sql, ok := nestedCountRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, selectedSeries, source.start, start, stepMillis, steps, s.cfg.LookbackDelta)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-
-	data, err := s.queryNestedCountRangeValues(ctx, sql)
-	return data, true, err
+	return queryData{}, false, nil
 }
 
 func (s *Server) tryFastNestedCountInstantQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
@@ -981,6 +977,7 @@ func (s *Server) tryPostHogNestedCountRangeQuery(ctx context.Context, expr *pars
 		return queryData{}, false, nil
 	}
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
+	where = append(where, nonStaleSampleSQL("value"))
 	sql := fmt.Sprintf(
 		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniqExact(%s)) AS value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
 		postHogUniqGroupExpr(groupExprs),
@@ -1006,12 +1003,28 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 		return queryData{}, false, nil
 	}
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
-	sql := fmt.Sprintf(
-		"SELECT toInt64(%d) AS ts, toFloat64(uniqExact(%s)) AS value FROM %s WHERE %s",
-		evalTime.UnixMilli(),
-		postHogUniqGroupExpr(groupExprs),
+	perSeriesSelects := []string{
+		postHogSeriesIDExpr() + " AS series_id",
+		"argMax(value, timestamp) AS value",
+	}
+	uniqExprs := make([]string, 0, len(groupExprs))
+	for i, expr := range groupExprs {
+		alias := quoteIdent(groupAlias(i))
+		perSeriesSelects = append(perSeriesSelects, "argMax("+expr+", timestamp) AS "+alias)
+		uniqExprs = append(uniqExprs, alias)
+	}
+	perSeries := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
+		strings.Join(perSeriesSelects, ", "),
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
+	)
+	sql := fmt.Sprintf(
+		"SELECT toInt64(%d) AS ts, toFloat64(uniqExact(%s)) AS value FROM (%s) WHERE %s",
+		evalTime.UnixMilli(),
+		postHogUniqGroupExpr(uniqExprs),
+		perSeries,
+		nonStaleSampleSQL("value"),
 	)
 	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 	data, err := s.queryNestedCountInstantValue(ctx, sql)
@@ -1064,6 +1077,7 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 	bucketEndMillis := bucketTimestampMS(evalEndMillis, cfg.RemoteWriteInterval)
 	sampleWhere := sampleBaseFilters(cfg, matchers, bucketStartMillis, bucketEndMillis)
 	sampleWhere = append(sampleWhere, idFilters...)
+	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
 
 	return fmt.Sprintf(
 		"WITH group_labels AS (%s), step_map AS (SELECT toInt64(%d) + toInt64(number) * %d AS ts, intDiv(toInt64(%d) + toInt64(number) * %d, %d) * %d AS bucket_ms FROM numbers(toUInt64(%d))) SELECT step_map.ts AS ts, %s AS value FROM step_map INNER JOIN (SELECT timestamp, id FROM %s WHERE %s) AS active_samples ON active_samples.timestamp = %s ANY LEFT JOIN group_labels USING id GROUP BY ts ORDER BY ts",
@@ -1090,6 +1104,7 @@ func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn,
 		sampleWhere = append(sampleWhere, fmt.Sprintf("modulo(toUnixTimestamp64Milli(timestamp) - %d, %d) = 0", evalStartMillis, stepMillis))
 	}
 	sampleWhere = append(sampleWhere, idFilters...)
+	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
 
 	return fmt.Sprintf(
 		"WITH group_labels AS (%s) SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, %s AS value FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY ts ORDER BY ts",
@@ -1105,39 +1120,84 @@ func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn,
 }
 
 func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
-	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName {
+	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) == 0 || groupingHasMetricName(grouping) || steps <= 0 {
 		return "", false
 	}
 	metric := exactMetricName(matchers)
 	if metric == "" {
 		return "", false
 	}
-	idFilters, ok := sampleIDFiltersFromMatchers(cfg, matchers, evalStart.UnixMilli(), outputStart.UnixMilli()+((steps-1)*stepMillis))
+	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers)
 	if !ok {
 		return "", false
 	}
 
-	evalMillisExpr := fmt.Sprintf("(%d + toInt64(step_idx) * %d)", evalStart.UnixMilli(), stepMillis)
-	lookbackStartExpr := fmt.Sprintf("(%s - %d)", evalMillisExpr, lookback.Milliseconds())
 	sampleStart := evalStart.Add(-lookback)
 	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
 	sampleWhere := sampleBaseFilters(cfg, matchers, sampleStart.UnixMilli(), sampleEnd.UnixMilli())
 	sampleWhere = append(sampleWhere, idFilters...)
 
-	groupName := grouping[0]
-	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, groupName)
-
-	return fmt.Sprintf(
-		"WITH active_ids AS (SELECT step_idx, id FROM (SELECT id, toUnixTimestamp64Milli(timestamp) AS ts FROM %s WHERE %s) ARRAY JOIN range(toUInt64(%d)) AS step_idx WHERE ts >= %s AND ts <= %s GROUP BY step_idx, id), group_labels AS (%s) SELECT toInt64(%d) + toInt64(step_idx) * %d AS ts, %s AS value FROM active_ids ANY LEFT JOIN group_labels USING id GROUP BY step_idx ORDER BY step_idx",
+	groupSelect, groupBy := labelIndexGroupSQL(grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, false)
+	if groupLabels == "" || len(groupBy) == 0 {
+		return "", false
+	}
+	gridEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
+	gridExpr := lastGridExpr(evalStart, gridEnd, time.Duration(stepMillis)*time.Millisecond, lookback)
+	perSeries := fmt.Sprintf(
+		"SELECT id, %s AS vals FROM (SELECT id, timestamp, value FROM %s WHERE %s) GROUP BY id",
+		gridExpr,
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
-		steps,
-		lookbackStartExpr,
-		evalMillisExpr,
+	)
+
+	return fmt.Sprintf(
+		"WITH group_labels AS (%s), per_series AS (%s), active_groups AS (SELECT idx, %s FROM per_series%s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY idx, %s) SELECT toInt64(%d) + (toInt64(idx) - 1) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY idx ORDER BY idx",
 		groupLabels,
+		perSeries,
+		strings.Join(groupSelect, ", "),
+		groupJoin,
+		nonStaleNullableSampleSQL("sample_value"),
+		strings.Join(groupBy, ", "),
 		outputStart.UnixMilli(),
 		stepMillis,
-		nestedCountDistinctGroupSQL(groupColumn),
+	), true
+}
+
+func nestedCountSelectedSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, selectedSeries string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
+	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || steps <= 0 {
+		return "", false
+	}
+	groupSelect, groupBy := labelIndexGroupSQL(grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, true)
+	if groupLabels == "" || len(groupBy) == 0 {
+		return "", false
+	}
+
+	sampleStart := evalStart.Add(-lookback)
+	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
+	sampleWhere := sampleBaseFilters(cfg, matchers, sampleStart.UnixMilli(), sampleEnd.UnixMilli())
+	sampleWhere = append(sampleWhere, sampleSelectedSeriesFilters(cfg)...)
+	gridEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
+	gridExpr := lastGridExpr(evalStart, gridEnd, time.Duration(stepMillis)*time.Millisecond, lookback)
+	perSeries := fmt.Sprintf(
+		"SELECT id, %s AS vals FROM (SELECT id, timestamp, value FROM %s WHERE %s) GROUP BY id",
+		gridExpr,
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
+	)
+
+	return fmt.Sprintf(
+		"WITH selected_series AS (%s), group_labels AS (%s), per_series AS (%s), active_groups AS (SELECT idx, %s FROM per_series%s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY idx, %s) SELECT toInt64(%d) + (toInt64(idx) - 1) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY idx ORDER BY idx",
+		selectedSeries,
+		groupLabels,
+		perSeries,
+		strings.Join(groupSelect, ", "),
+		groupJoin,
+		nonStaleNullableSampleSQL("sample_value"),
+		strings.Join(groupBy, ", "),
+		outputStart.UnixMilli(),
+		stepMillis,
 	), true
 }
 
@@ -1159,12 +1219,13 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 
 	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s) SELECT toInt64(%d) AS ts, %s AS value FROM %s ANY LEFT JOIN group_labels USING id WHERE %s",
+		"WITH group_labels AS (%s), active_ids AS (SELECT id FROM (SELECT id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY id) WHERE %s) SELECT toInt64(%d) AS ts, %s AS value FROM active_ids ANY LEFT JOIN group_labels USING id",
 		groupLabels,
-		evalMillis,
-		nestedCountDistinctGroupSQL(groupColumn),
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
+		nonStaleSampleSQL("value"),
+		evalMillis,
+		nestedCountDistinctGroupSQL(groupColumn),
 	), true
 }
 
@@ -1398,12 +1459,13 @@ type selectorGridSource struct {
 }
 
 type aggregateRangeSource struct {
-	gridExpr       string
-	gridStart      time.Time
-	gridEnd        time.Time
-	gridStep       time.Duration
-	runningSumWrap bool
-	sumOverTime    *rangeSourceSumOverTime
+	gridExpr           string
+	gridStart          time.Time
+	gridEnd            time.Time
+	gridStep           time.Duration
+	filterStaleSamples bool
+	runningSumWrap     bool
+	sumOverTime        *rangeSourceSumOverTime
 }
 
 type rangeSourceSumOverTime struct {
@@ -1469,7 +1531,7 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	if fn.increase {
 		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", rangeSeconds, gridExpr)
 	}
-	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step}, selector, mint, maxt, true
+	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step, filterStaleSamples: true}, selector, mint, maxt, true
 }
 
 func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
@@ -1499,6 +1561,9 @@ func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.
 }
 
 func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) string {
+	if source.filterStaleSamples {
+		sampleSource = "SELECT * FROM (" + sampleSource + ") WHERE " + nonStaleSampleSQL("value")
+	}
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
 		source.gridExpr,
@@ -1629,13 +1694,14 @@ func postHogExactInstantSampleMillis(cfg Config, selector *parser.VectorSelector
 }
 
 func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
-	return fmt.Sprintf(
+	grid := fmt.Sprintf(
 		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
 		chTimeMillis(start.UnixMilli()),
 		chTimeMillis(end.UnixMilli()),
 		formatDurationSeconds(step),
 		formatDurationSeconds(lookback),
 	)
+	return staleAwareNullableGridSQL(grid)
 }
 
 func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
@@ -1786,12 +1852,17 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 		return s.tryPostHogExactTopK(ctx, selector, sampleMillis, evalTime, limit, direction)
 	}
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
-	sql := fmt.Sprintf(
-		"SELECT out_metric_name, out_service_name, out_resource_attributes, out_attributes_map_str, toInt64(%d) AS ts, value FROM (SELECT %s AS series_id, argMax(metric_name, timestamp) AS out_metric_name, argMax(service_name, timestamp) AS out_service_name, argMax(resource_attributes, timestamp) AS out_resource_attributes, argMax(attributes_map_str, timestamp) AS out_attributes_map_str, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id) ORDER BY value %s LIMIT %d",
-		evalTime.UnixMilli(),
+	latest := fmt.Sprintf(
+		"SELECT %s AS series_id, argMax(metric_name, timestamp) AS out_metric_name, argMax(service_name, timestamp) AS out_service_name, argMax(resource_attributes, timestamp) AS out_resource_attributes, argMax(attributes_map_str, timestamp) AS out_attributes_map_str, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
 		postHogSeriesIDExpr(),
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
+	)
+	sql := fmt.Sprintf(
+		"SELECT out_metric_name, out_service_name, out_resource_attributes, out_attributes_map_str, toInt64(%d) AS ts, value FROM (%s) WHERE %s ORDER BY value %s LIMIT %d",
+		evalTime.UnixMilli(),
+		latest,
+		nonStaleSampleSQL("value"),
 		direction,
 		limit,
 	)
@@ -1826,6 +1897,7 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 
 func (s *Server) tryPostHogExactTopK(ctx context.Context, selector *parser.VectorSelector, sampleMillis int64, evalTime time.Time, limit int, direction string) (queryData, bool, error) {
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, sampleMillis, sampleMillis)
+	where = append(where, nonStaleSampleSQL("value"))
 	sql := fmt.Sprintf(
 		"SELECT metric_name, service_name, resource_attributes, attributes_map_str, toInt64(%d) AS ts, value FROM %s WHERE %s ORDER BY value %s LIMIT %d",
 		evalTime.UnixMilli(),
@@ -2179,10 +2251,11 @@ func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, m
 		where = append(where, sampleSelectedSeriesFilters(cfg)...)
 	}
 	source := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
-	return fmt.Sprintf(
+	latest := fmt.Sprintf(
 		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
 		source,
 	)
+	return fmt.Sprintf("SELECT id, value, ts_col FROM (%s) WHERE %s", latest, nonStaleSampleSQL("value"))
 }
 
 func metricGroupProjection(grouping []string) []string {

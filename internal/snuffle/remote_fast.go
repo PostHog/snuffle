@@ -324,7 +324,7 @@ func parseFastTimeSeries(data []byte, batch *remoteWriteBatch, seriesIndexByID *
 				return true, err
 			}
 			sawSample = true
-			if !math.IsNaN(sample.Value) {
+			if !isRemoteWriteSampleDroppable(sample.Value) {
 				samples = append(samples, sample)
 			}
 		case 3, 4:

@@ -148,6 +148,7 @@ func TestNestedCountTimestampSamplesRangeSQLUsesEvalTimestamps(t *testing.T) {
 		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
 		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
 		"modulo(toUnixTimestamp64Milli(timestamp) - 1778398980000, 60000) = 0",
+		nonStaleSampleSQL("value"),
 		"GROUP BY ts ORDER BY ts",
 	} {
 		if !strings.Contains(sql, want) {
@@ -192,6 +193,7 @@ func TestNestedCountTimestampSamplesRangeSQLBucketsUnalignedEvalTimes(t *testing
 		"active_samples ON active_samples.timestamp = fromUnixTimestamp64Milli(step_map.bucket_ms, 'UTC')",
 		"SELECT toInt64(1778398999000) + toInt64(number) * 60000 AS ts",
 		"label_name = 'ready'",
+		nonStaleSampleSQL("value"),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
@@ -228,6 +230,23 @@ func TestExactBucketRangeSelectorRequiresAlignedRemoteWriteRange(t *testing.T) {
 	selector.OriginalOffset = time.Minute
 	if exactBucketRangeSelector(cfg, selector, start, end, 15*time.Second) {
 		t.Fatal("offset selector should not use exact bucket path")
+	}
+}
+
+func TestLastGridExprTurnsStaleSamplesIntoNulls(t *testing.T) {
+	start := time.Unix(100, 0).UTC()
+	end := time.Unix(160, 0).UTC()
+
+	sql := lastGridExpr(start, end, 15*time.Second, 5*time.Minute)
+	for _, want := range []string{
+		"timeSeriesLastToGrid",
+		"arrayMap(x -> if(isNull(x) OR",
+		"reinterpretAsUInt64(assumeNotNull(x))",
+		"NULL, x)",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
 	}
 }
 
@@ -367,7 +386,10 @@ func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 		"timestamp >= fromUnixTimestamp64Milli(1778398680000, 'UTC') AND timestamp <= fromUnixTimestamp64Milli(1778398980000, 'UTC')",
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
-		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
+		"active_ids AS",
+		"argMax(value, timestamp)",
+		nonStaleSampleSQL("value"),
+		"active_ids ANY LEFT JOIN group_labels USING id",
 		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
 		"SELECT toInt64(1778398980000) AS ts",
 	} {
@@ -402,6 +424,7 @@ func TestLatestSamplesForSelectedSeriesSQLUsesLookbackWindow(t *testing.T) {
 		"timestamp <= fromUnixTimestamp64Milli(2000, 'UTC')",
 		"metric_name = 'http_requests_total'",
 		"id IN (SELECT id FROM selected_series)",
+		nonStaleSampleSQL("value"),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
@@ -504,7 +527,7 @@ func TestNestedCountBitmapRangeSQLUsesPostingBitmaps(t *testing.T) {
 	}
 }
 
-func TestNestedCountSamplesRangeSQLUsesSamplesAndLabelIndex(t *testing.T) {
+func TestNestedCountSamplesRangeSQLUsesLastGridAndLabelIndex(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",
 		SamplesTable:    "samples",
@@ -535,18 +558,90 @@ func TestNestedCountSamplesRangeSQLUsesSamplesAndLabelIndex(t *testing.T) {
 		"metric_name = 'node_cpu_seconds_total'",
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
-		"active_ids AS",
 		"group_labels AS",
-		"range(toUInt64(61))",
-		"GROUP BY step_idx, id",
+		"per_series AS",
+		"timeSeriesLastToGrid",
+		"arrayMap(x -> if(isNull(x) OR",
+		"active_groups AS",
+		"arrayEnumerate(vals) AS idx",
+		nonStaleNullableSampleSQL("sample_value"),
 		"ANY LEFT JOIN",
-		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
+		"GROUP BY idx, `__group_0`",
+		"toFloat64(count()) AS value",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
 	}
-	for _, notWant := range []string{"series_activity", "label_postings", "groupBitmap"} {
+	for _, notWant := range []string{"series_activity", "label_postings", "groupBitmap", "active_ids AS", "argMax(value, ts)", "range(toUInt64"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
+func TestNestedCountSelectedSamplesRangeSQLUsesLastGridFallback(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SamplesTable:    "samples",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		LookbackDelta:   5 * time.Minute,
+		TeamID:          42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count({__name__=~"node_.*", ready=~"true"}) by (cpu, mode))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	start := time.Unix(1778398980, 0).UTC()
+	end := time.Unix(1778402580, 0).UTC()
+	step := time.Minute
+	stepMillis := step.Milliseconds()
+	source, mint, maxt, ok := selectorRangeGridSource(cfg, selector, start, end, step)
+	if !ok {
+		t.Fatal("selectorRangeGridSource returned ok=false")
+	}
+	selectedSeries, ok := selectedSeriesSQL(cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
+	if !ok {
+		t.Fatal("selectedSeriesSQL returned ok=false")
+	}
+	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
+	sql, ok := nestedCountSelectedSamplesRangeSQL(cfg, selector.LabelMatchers, inner.Grouping, selectedSeries, source.start, start, stepMillis, steps, cfg.LookbackDelta)
+	if !ok {
+		t.Fatal("nestedCountSelectedSamplesRangeSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"selected_series AS",
+		"`default`.`series`",
+		"`default`.`samples`",
+		"`default`.`label_index`",
+		"metric_name",
+		"min(min_time) AS min_time",
+		"max(max_time) AS max_time",
+		"max_time >= fromUnixTimestamp64Milli(",
+		"min_time <= fromUnixTimestamp64Milli(",
+		"id IN (SELECT id FROM selected_series)",
+		"label_name IN ('cpu', 'mode')",
+		"group_labels AS",
+		"per_series AS",
+		"timeSeriesLastToGrid",
+		"active_groups AS",
+		"arrayEnumerate(vals) AS idx",
+		nonStaleNullableSampleSQL("sample_value"),
+		"GROUP BY idx, `__group_0`, `__group_1`",
+		"toFloat64(count()) AS value",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"series_activity", "label_postings", "groupBitmap", "active_ids AS", "argMax(value, ts)", "range(toUInt64"} {
 		if strings.Contains(sql, notWant) {
 			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
 		}

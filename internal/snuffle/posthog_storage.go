@@ -126,9 +126,14 @@ func postHogLoadSamplesSQL(cfg Config, ids []uint64, matchers []*labels.Matcher,
 		strings.Join(where, " AND "),
 	)
 	if latestOnly {
-		return fmt.Sprintf(
-			"SELECT series_id, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id ORDER BY series_id",
+		latest := fmt.Sprintf(
+			"SELECT series_id, max(timestamp) AS ts_col, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id",
 			source,
+		)
+		return fmt.Sprintf(
+			"SELECT series_id, toUnixTimestamp64Milli(ts_col) AS ts, value FROM (%s) WHERE %s ORDER BY series_id",
+			latest,
+			nonStaleSampleSQL("value"),
 		)
 	}
 	return fmt.Sprintf(
@@ -149,19 +154,11 @@ func postHogSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt
 func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
 	if latestOnly && postHogExactSampleTimestamp(cfg, maxt) {
 		source := postHogSeriesSourceSQL(cfg, matchers, maxt, maxt, true)
-		return fmt.Sprintf(
-			"SELECT series_id, any(metric_name) AS metric_name, any(service_name) AS service_name, any(resource_attributes) AS resource_attributes, any(attributes_map_str) AS attributes_map_str, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id ORDER BY series_id LIMIT %d",
-			source,
-			cfg.MaxSeries,
-		)
+		return postHogLatestSeriesSamplesSQL(source, cfg.MaxSeries)
 	}
 	source := postHogSeriesSourceSQL(cfg, matchers, mint, maxt, true)
 	if latestOnly {
-		return fmt.Sprintf(
-			"SELECT series_id, any(metric_name) AS metric_name, any(service_name) AS service_name, any(resource_attributes) AS resource_attributes, any(attributes_map_str) AS attributes_map_str, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id ORDER BY series_id LIMIT %d",
-			source,
-			cfg.MaxSeries,
-		)
+		return postHogLatestSeriesSamplesSQL(source, cfg.MaxSeries)
 	}
 	selectedSeries := fmt.Sprintf(
 		"SELECT xxHash64(metric_name, service_name, resource_fingerprint, sorted_attributes_map_str) AS series_id, metric_name, service_name, any(resource_attributes) AS resource_attributes, sorted_attributes_map_str AS attributes_map_str FROM (%s) GROUP BY metric_name, service_name, resource_fingerprint, sorted_attributes_map_str LIMIT %d",
@@ -173,6 +170,19 @@ func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt 
 		"WITH selected_series AS (%s) SELECT selected_series.series_id, selected_series.metric_name, selected_series.service_name, selected_series.resource_attributes, selected_series.attributes_map_str, toUnixTimestamp64Milli(samples.timestamp) AS ts, samples.value AS value FROM (%s) AS samples INNER JOIN selected_series USING series_id ORDER BY selected_series.series_id, samples.timestamp",
 		selectedSeries,
 		samples,
+	)
+}
+
+func postHogLatestSeriesSamplesSQL(source string, limit int) string {
+	latest := fmt.Sprintf(
+		"SELECT series_id, any(metric_name) AS metric_name, any(service_name) AS service_name, any(resource_attributes) AS resource_attributes, any(attributes_map_str) AS attributes_map_str, max(timestamp) AS ts_col, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id",
+		source,
+	)
+	return fmt.Sprintf(
+		"SELECT series_id, metric_name, service_name, resource_attributes, attributes_map_str, toUnixTimestamp64Milli(ts_col) AS ts, value FROM (%s) WHERE %s ORDER BY series_id LIMIT %d",
+		latest,
+		nonStaleSampleSQL("value"),
+		limit,
 	)
 }
 

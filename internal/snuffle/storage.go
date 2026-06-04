@@ -910,9 +910,14 @@ func samplesSQLFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt i
 func sampleRowsSQL(cfg Config, where string, latestOnly bool) string {
 	source := rawSamplesSourceSQL(cfg, where)
 	if latestOnly {
-		return fmt.Sprintf(
-			"SELECT id, toUnixTimestamp64Milli(max(timestamp)) AS ts, argMax(value, timestamp) AS value FROM (%s) GROUP BY id ORDER BY id",
+		latest := fmt.Sprintf(
+			"SELECT id, max(timestamp) AS ts_col, argMax(value, timestamp) AS value FROM (%s) GROUP BY id",
 			source,
+		)
+		return fmt.Sprintf(
+			"SELECT id, toUnixTimestamp64Milli(ts_col) AS ts, value FROM (%s) WHERE %s ORDER BY id",
+			latest,
+			nonStaleSampleSQL("value"),
 		)
 	}
 	return fmt.Sprintf(

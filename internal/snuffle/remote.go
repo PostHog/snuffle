@@ -300,7 +300,7 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 		}
 
 		for _, sample := range ts.GetSamples() {
-			if math.IsNaN(sample.Value) {
+			if isRemoteWriteSampleDroppable(sample.Value) {
 				continue
 			}
 			bucketMS := bucketTimestampForStepMS(sample.Timestamp, sampleIntervalMS)

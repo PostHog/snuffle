@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
+	promvalue "github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -61,19 +62,27 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	}
 }
 
-func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
+func TestBuildRemoteWriteBatchPreservesStaleNaNSamples(t *testing.T) {
+	stale := math.Float64frombits(promvalue.StaleNaN)
 	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
 		{
 			Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "api"}},
 			Samples: []prompb.Sample{
 				{Timestamp: 1_000, Value: math.NaN()},
 				{Timestamp: 2_000, Value: 2},
+				{Timestamp: 3_000, Value: stale},
 			},
 		},
 		{
 			Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "gone"}},
 			Samples: []prompb.Sample{
-				{Timestamp: 3_000, Value: math.NaN()},
+				{Timestamp: 4_000, Value: stale},
+			},
+		},
+		{
+			Labels: []prompb.Label{{Name: labels.MetricName, Value: "up"}, {Name: "job", Value: "noise"}},
+			Samples: []prompb.Sample{
+				{Timestamp: 5_000, Value: math.NaN()},
 			},
 		},
 	}}
@@ -82,16 +91,22 @@ func TestBuildRemoteWriteBatchDropsNaNSamples(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
-	if batch.seriesCount != 1 || batch.sampleCount != 1 {
+	if batch.seriesCount != 2 || batch.sampleCount != 3 {
 		t.Fatalf("counts = series %d samples %d", batch.seriesCount, batch.sampleCount)
 	}
-	if len(batch.sampleRows) != 1 || math.IsNaN(batch.sampleRows[0].Value) || batch.sampleRows[0].Value != 2 || batch.sampleRows[0].TimestampMS != 2000 {
+	if len(batch.sampleRows) != 3 || math.IsNaN(batch.sampleRows[0].Value) || batch.sampleRows[0].Value != 2 || batch.sampleRows[0].TimestampMS != 2000 {
 		t.Fatalf("unexpected sample rows: %#v", batch.sampleRows)
 	}
-	if batch.sampleRows[0].MetricName != "up" {
+	if !isStaleSampleValue(batch.sampleRows[1].Value) || batch.sampleRows[1].TimestampMS != 3000 {
+		t.Fatalf("second sample should be stale at 3000ms: %#v", batch.sampleRows)
+	}
+	if !isStaleSampleValue(batch.sampleRows[2].Value) || batch.sampleRows[2].TimestampMS != 4000 {
+		t.Fatalf("third sample should be stale at 4000ms: %#v", batch.sampleRows)
+	}
+	if batch.sampleRows[0].MetricName != "up" || batch.sampleRows[1].MetricName != "up" || batch.sampleRows[2].MetricName != "up" {
 		t.Fatalf("sample rows should carry metric name for inserts: %#v", batch.sampleRows)
 	}
-	if len(batch.seriesRecords) != 1 || batch.seriesRecords[0].MinMS != 2000 || batch.seriesRecords[0].MaxMS != 2000 {
+	if len(batch.seriesRecords) != 2 || batch.seriesRecords[0].MinMS != 2000 || batch.seriesRecords[0].MaxMS != 3000 || batch.seriesRecords[1].MinMS != 4000 || batch.seriesRecords[1].MaxMS != 4000 {
 		t.Fatalf("unexpected series records: %#v", batch.seriesRecords)
 	}
 }
@@ -168,6 +183,7 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 }
 
 func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
+	stale := math.Float64frombits(promvalue.StaleNaN)
 	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
 		Labels: []prompb.Label{
 			{Name: labels.MetricName, Value: "up"},
@@ -179,6 +195,7 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 			{Timestamp: 14_000, Value: 3},
 			{Timestamp: 16_000, Value: 2},
 			{Timestamp: 17_000, Value: math.NaN()},
+			{Timestamp: 31_000, Value: stale},
 		},
 	}}}
 	payload, err := req.Marshal()
@@ -193,7 +210,7 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 	if !ok {
 		t.Fatal("buildRemoteWriteBatchFromProto did not use fast path")
 	}
-	if batch.seriesCount != 1 || batch.sampleCount != 2 || batch.histogramCount != 0 || batch.exemplarCount != 0 || batch.metadataCount != 0 {
+	if batch.seriesCount != 1 || batch.sampleCount != 3 || batch.histogramCount != 0 || batch.exemplarCount != 0 || batch.metadataCount != 0 {
 		t.Fatalf("counts = series %d samples %d histograms %d exemplars %d metadata %d", batch.seriesCount, batch.sampleCount, batch.histogramCount, batch.exemplarCount, batch.metadataCount)
 	}
 	if got := batch.sampleColumns; got.TeamIDs[0] != 7 || got.MetricNames[0] != "up" || got.Timestamps[0] != 0 || got.Values[0] != 3 {
@@ -202,7 +219,10 @@ func TestBuildRemoteWriteBatchFromProtoFastPath(t *testing.T) {
 	if got := batch.sampleColumns; got.Timestamps[1] != 15000 || got.Values[1] != 2 {
 		t.Fatalf("unexpected second sample columns: %#v", got)
 	}
-	if got := batch.seriesRecords[0]; got.TeamID != 7 || got.MetricName != "up" || got.MinMS != 0 || got.MaxMS != 15000 || len(got.Labels) != 0 || got.LabelsJSON != "" {
+	if got := batch.sampleColumns; got.Timestamps[2] != 30000 || !isStaleSampleValue(got.Values[2]) {
+		t.Fatalf("unexpected third sample columns: %#v", got)
+	}
+	if got := batch.seriesRecords[0]; got.TeamID != 7 || got.MetricName != "up" || got.MinMS != 0 || got.MaxMS != 30000 || len(got.Labels) != 0 || got.LabelsJSON != "" {
 		t.Fatalf("unexpected series row: %#v", got)
 	}
 	if err := populateSeriesLabelsJSONFromProto(batch.fastProto, batch.seriesRecords); err != nil {

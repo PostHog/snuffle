@@ -82,6 +82,7 @@ func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 		"metric_name = 'http_requests_total'",
 		"label_name = 'job'",
 		"label_value = 'api'",
+		nonStaleSampleSQL("value"),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
@@ -272,6 +273,7 @@ func TestPostHogLoadSamplesSQLFiltersByComputedSeriesID(t *testing.T) {
 		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"xxHash64(metric_name, service_name, resource_fingerprint, mapSort(attributes_map_str)) IN (1,2)",
 		"argMax(value, timestamp)",
+		nonStaleSampleSQL("value"),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
