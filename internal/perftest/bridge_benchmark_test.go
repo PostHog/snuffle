@@ -19,27 +19,7 @@ type bridgeScenario struct {
 	params map[string]string
 }
 
-var bridgeDemoScenarios = []bridgeScenario{
-	{name: "instant_selector", path: "/api/v1/query", params: map[string]string{"query": `up{job="api"}`, "time": "1700000060"}},
-	{name: "aggregation", path: "/api/v1/query", params: map[string]string{"query": "sum by (job) (up)", "time": "1700000060"}},
-	{name: "range_rate", path: "/api/v1/query_range", params: map[string]string{"query": `rate(http_requests_total{status="200"}[30s])`, "start": "1700000030", "end": "1700000060", "step": "15s"}},
-	{name: "range_selector", path: "/api/v1/query_range", params: map[string]string{"query": `cpu_usage{core="0"}`, "start": "1700000000", "end": "1700000060", "step": "15s"}},
-	{name: "labels", path: "/api/v1/labels", params: map[string]string{"start": "1700000000", "end": "1700000060"}},
-	{name: "series", path: "/api/v1/series", params: map[string]string{"match[]": `http_requests_total{status="500"}`, "start": "1700000000", "end": "1700000060"}},
-}
-
-var bridgeLargeScenarios = []bridgeScenario{
-	{name: "large_one_series", path: "/api/v1/query", params: map[string]string{"query": `load_requests_total{instance="host-4242"}`, "time": "1700100135"}},
-	{name: "large_job_rate", path: "/api/v1/query", params: map[string]string{"query": `rate(load_requests_total{job="svc-42",status="200"}[30s])`, "time": "1700100135"}},
-	{name: "large_sum_rate", path: "/api/v1/query", params: map[string]string{"query": `sum by (status) (rate(load_requests_total{job="svc-42"}[30s]))`, "time": "1700100135"}},
-	{name: "large_broad_sum", path: "/api/v1/query", params: map[string]string{"query": "sum by (job) (load_requests_total)", "time": "1700100135"}},
-	{name: "large_topk", path: "/api/v1/query", params: map[string]string{"query": `topk(5, load_requests_total{status="200"})`, "time": "1700100135"}},
-	{name: "large_range_rate", path: "/api/v1/query_range", params: map[string]string{"query": `rate(load_requests_total{job="svc-42",status="200"}[30s])`, "start": "1700100090", "end": "1700100135", "step": "15s"}},
-	{name: "large_long_range_rate", path: "/api/v1/query_range", params: map[string]string{"query": `rate(load_requests_total{job="svc-42",status="200"}[30s])`, "start": "1700100000", "end": "1700100300", "step": "15s"}},
-	{name: "large_series_20k", path: "/api/v1/series", params: map[string]string{"match[]": `load_requests_total{status="500"}`, "start": "1700100000", "end": "1700100135"}},
-}
-
-func bridgeTSBSScenarios() []bridgeScenario {
+func bridgePostHogMetricScenarios() []bridgeScenario {
 	metric := envString("BRIDGE_BENCH_TSBS_METRIC", "usage_user")
 	host := envString("BRIDGE_BENCH_TSBS_HOSTNAME", "host_42")
 	eval := envString("BRIDGE_BENCH_TSBS_QUERY_TIME", "1451608185")
@@ -71,6 +51,52 @@ func bridgeTSBSScenarios() []bridgeScenario {
 	}
 }
 
+func bridgePostHogLogScenarios() []bridgeScenario {
+	start := envString("BRIDGE_BENCH_LOG_START_NS", "1780272000000000000")
+	end := envString("BRIDGE_BENCH_LOG_END_NS", "1780358399000000000")
+	step := envString("BRIDGE_BENCH_LOG_STEP", "60s")
+	limit := envString("BRIDGE_BENCH_LOG_LIMIT", "5000")
+	commonRangeParams := func(query string) map[string]string {
+		return map[string]string{
+			"query":     query,
+			"start":     start,
+			"end":       end,
+			"step":      step,
+			"limit":     limit,
+			"direction": "backward",
+		}
+	}
+	commonMetadataParams := func() map[string]string {
+		return map[string]string{
+			"start": start,
+			"end":   end,
+			"limit": limit,
+		}
+	}
+
+	return []bridgeScenario{
+		{name: "log_basic", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench"}`)},
+		{name: "log_line_error", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench"} |= "error"`)},
+		{name: "log_regex_checkout", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench"} |~ "checkout|failed"`)},
+		{name: "log_host", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench",host="host-42"}`)},
+		{name: "log_sum_count", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum(count_over_time({app="snuffle-bench"}[5m]))`)},
+		{name: "log_count_by_service", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (service_name) (count_over_time({app="snuffle-bench"}[5m]))`)},
+		{name: "log_rate_by_region", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (region) (rate({app="snuffle-bench"} |= "message" [5m]))`)},
+		{name: "log_bytes_by_format", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (format) (bytes_over_time({app="snuffle-bench"}[5m]))`)},
+		{name: "log_topk_rate", path: "/loki/api/v1/query_range", params: commonRangeParams(`topk(5, sum by (service_name) (rate({app="snuffle-bench"}[5m])))`)},
+		{name: "log_comparison", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (service_name) (count_over_time({app="snuffle-bench"}[5m])) > 10`)},
+		{name: "log_logfmt_sum_duration", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap duration(duration) [5m]) by (service_name)`)},
+		{name: "log_logfmt_avg_size", path: "/loki/api/v1/query_range", params: commonRangeParams(`avg_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap bytes(size) [5m]) by (region)`)},
+		{name: "log_regexp_sum_duration", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum_over_time({app="snuffle-bench",format="logfmt"} | regexp "duration=(?P<duration>[0-9]+ms)" | unwrap duration(duration) [5m]) by (service_name)`)},
+		{name: "log_pattern_avg_size", path: "/loki/api/v1/query_range", params: commonRangeParams(`avg_over_time({app="snuffle-bench",format="logfmt"} | pattern "<_> size=<size> <_>" | unwrap bytes(size) [5m]) by (region)`)},
+		{name: "log_json_avg_duration", path: "/loki/api/v1/query_range", params: commonRangeParams(`avg_over_time({app="snuffle-bench",format="json"} | json | unwrap duration [5m]) by (service_name)`)},
+		{name: "log_json_filter_status", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum_over_time({app="snuffle-bench",format="json"} | json | status >= 500 | unwrap duration [5m]) by (service_name)`)},
+		{name: "log_labels", path: "/loki/api/v1/labels", params: commonMetadataParams()},
+		{name: "log_label_values_service", path: "/loki/api/v1/label/service_name/values", params: commonMetadataParams()},
+		{name: "log_series_host", path: "/loki/api/v1/series", params: map[string]string{"match[]": `{app="snuffle-bench",host="host-42"}`, "start": start, "end": end}},
+	}
+}
+
 type bridgeFetchResult struct {
 	elapsed time.Duration
 	bytes   int
@@ -87,9 +113,9 @@ func BenchmarkBridgeHTTP(b *testing.B) {
 		b.Fatalf("bridge is not healthy: %v", err)
 	}
 
-	scenarios, ok := bridgeScenarios(envString("BRIDGE_BENCH_PROFILE", "large"))
+	scenarios, ok := bridgeScenarios(envString("BRIDGE_BENCH_PROFILE", "posthog_metrics"))
 	if !ok {
-		b.Fatalf("unknown BRIDGE_BENCH_PROFILE %q", envString("BRIDGE_BENCH_PROFILE", "large"))
+		b.Fatalf("unknown BRIDGE_BENCH_PROFILE %q", envString("BRIDGE_BENCH_PROFILE", "posthog_metrics"))
 	}
 	scenarios = filterBridgeScenarios(scenarios, envCSV("BRIDGE_BENCH_SCENARIO"))
 	warmup := envInt("BRIDGE_BENCH_WARMUP", 10, 0)
@@ -162,12 +188,10 @@ func benchmarkBridgeScenario(b *testing.B, client *http.Client, baseURL string, 
 
 func bridgeScenarios(profile string) ([]bridgeScenario, bool) {
 	switch profile {
-	case "demo":
-		return bridgeDemoScenarios, true
-	case "large":
-		return bridgeLargeScenarios, true
-	case "tsbs":
-		return bridgeTSBSScenarios(), true
+	case "posthog_metrics":
+		return bridgePostHogMetricScenarios(), true
+	case "posthog_logs":
+		return bridgePostHogLogScenarios(), true
 	default:
 		return nil, false
 	}

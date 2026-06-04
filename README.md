@@ -242,10 +242,11 @@ Start ClickHouse:
 docker compose up -d clickhouse
 ```
 
-Create the metrics schema:
+Create the PostHog metrics and logs schemas:
 
 ```bash
-docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_metrics_schema.sql
+docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_metrics_posthog_schema.sql
+docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_logs_posthog_schema.sql
 ```
 
 Run the sidecar:
@@ -253,72 +254,33 @@ Run the sidecar:
 ```bash
 CH_ADDR=localhost:9000 \
 CH_DATABASE=default \
-CH_SERIES_TABLE=metrics_series \
-CH_SAMPLES_TABLE=metrics_samples \
-CH_LABEL_INDEX_TABLE=metrics_label_index \
-CH_HISTOGRAMS_TABLE=metrics_histograms \
-CH_EXEMPLARS_TABLE=metrics_exemplars \
-CH_METRICS_TABLE=metrics_metadata \
+CH_SCHEMA_LAYOUT=posthog \
+CH_SAMPLES_TABLE=metrics1 \
+CH_LOGS_TABLE=logs34 \
+CH_LOG_ATTRIBUTES_TABLE=log_attributes2 \
 go run ./cmd/snuffle
 ```
 
-Large benchmark seeds:
-
-```bash
-docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/seed_metrics_large.sql
-```
-
-LogQL comparison benchmark against real Loki:
-
-```bash
-REAL_LOKI_URL=http://localhost:3100 \
-SNUFFLE_URL=http://localhost:9091 \
-TENANT=42 \
-LINES=50000 \
-scripts/bench_logql_loki.sh
-```
-
-The benchmark harness clones Grafana Loki if needed, generates data with
-`pkg/logql/bench/cmd/stream`, pushes the same batches to both endpoints, then
-runs a query workload derived from Loki's `pkg/logql/bench/queries/fast`.
-
-The metrics seed creates 100k series, 400k label-index rows, and 10M samples.
-Use Go benchmarks as regression smoke tests, not as product capacity estimates:
-
-```bash
-BRIDGE_BENCH_URL=http://localhost:9091 \
-BRIDGE_BENCH_PROFILE=large \
-BRIDGE_BENCH_CONCURRENCY=10 \
-BRIDGE_BENCH_WARMUP=10 \
-go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime=100x -timeout=10m
-```
-
-Run the local Prometheus TSDB baseline with the same scenario names:
-
-```bash
-PROM_TSDB_BENCH=1 \
-PROM_TSDB_BENCH_CONCURRENCY=10 \
-PROM_TSDB_BENCH_WARMUP=10 \
-go test -run '^$' -bench '^BenchmarkPrometheusTSDB$' ./internal/perftest -benchtime=100x -timeout=30m
-```
-
-Run the TSBS devops regression benchmark:
+Run the PostHog metrics and logs regression benchmark suite:
 
 ```bash
 make perf-test
 ```
 
-This generates TSBS Prometheus remote-write data, replays the generated
-protobuf messages through `/api/v1/write`, runs the TSBS HTTP query profile,
-and compares the run against `perf-results.json`. Faster runs replace
-`perf-results.json`; slower runs keep the existing file and print the
-regression size. By default the target starts the local ClickHouse service from
-`docker-compose.yml` and uses a `snuffle_perf` database. The default TSBS shape
-is about 24.2M rows (`TSBS_SCALE=1000`, 1 hour, 15s interval), and the
-target refuses to record a run below `PERF_MIN_ROWS=1000000`. The TSBS module is
-pinned by default for repeatability; override `TSBS_VERSION` when intentionally
-changing datasets. Set `PERF_START_CLICKHOUSE=0`, `CH_ADDR`, and `CH_DATABASE`
-to use an existing ClickHouse/database.
+By default this runs `PERF_RUNS=posthog_metrics,posthog_logs` three times
+(`PERF_REPEAT=3`) and compares the slowest candidate for each named run. The
+metrics run generates TSBS Prometheus remote-write data, replays it through
+`/api/v1/write`, and queries the PostHog-style `metrics1` schema. The logs run
+seeds synthetic PostHog-shaped rows into `logs34` and queries them through
+LogQL. Attempt artifacts are stored under `.perf/<run>/attempt-<n>/`, selected
+run results are copied to `.perf/<run>/perf-results.current.json`, and accepted
+suite baselines are kept in `perf-results.json`. Use
+`PERF_RUNS=posthog_metrics` or `PERF_RUNS=posthog_logs` for a targeted run,
+`BRIDGE_BENCH_SCENARIO=<scenario>` for a targeted query scenario, and
+`PERF_REPEAT=1` for a local smoke pass. In CI the same suite runs with
+`PERF_FAIL_ON_SLOWER=true`, so a slower selected candidate fails the workflow.
+Set `PERF_START_CLICKHOUSE=0`, `CH_ADDR`, and `CH_DATABASE` to use an existing
+ClickHouse/database.
 
 Run the Docker-backed integration suite:
 

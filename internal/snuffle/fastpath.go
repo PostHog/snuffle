@@ -429,7 +429,7 @@ func (s *Server) tryPostHogExactInstantAggregate(ctx context.Context, expr *pars
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
 	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
-	selectParts = append(selectParts, aggSQL+" AS value")
+	selectParts = append(selectParts, aggSQL+" AS agg_value")
 
 	sql := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE %s",
@@ -473,7 +473,7 @@ func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *pa
 	selectParts := make([]string, 0, len(groupSelect)+2)
 	selectParts = append(selectParts, groupSelect...)
 	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
-	selectParts = append(selectParts, aggSQL+" AS value")
+	selectParts = append(selectParts, aggSQL+" AS agg_value")
 
 	groupByParts := append([]string{}, groupBy...)
 	groupByParts = append(groupByParts, "ts")
@@ -979,7 +979,7 @@ func (s *Server) tryPostHogNestedCountRangeQuery(ctx context.Context, expr *pars
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
 	where = append(where, nonStaleSampleSQL("value"))
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniqExact(%s)) AS value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
+		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniqExact(%s)) AS count_value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
 		postHogUniqGroupExpr(groupExprs),
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
@@ -1020,7 +1020,7 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 		strings.Join(where, " AND "),
 	)
 	sql := fmt.Sprintf(
-		"SELECT toInt64(%d) AS ts, toFloat64(uniqExact(%s)) AS value FROM (%s) WHERE %s",
+		"SELECT toInt64(%d) AS ts, toFloat64(uniqExact(%s)) AS count_value FROM (%s) WHERE %s",
 		evalTime.UnixMilli(),
 		postHogUniqGroupExpr(uniqExprs),
 		perSeries,

@@ -8,6 +8,14 @@ WORKDIR="${PERF_WORKDIR:-$ROOT/.perf}"
 RESULTS_FILE="${PERF_RESULTS_FILE:-$ROOT/perf-results.json}"
 mkdir -p "$WORKDIR"
 
+PERF_RUNS="${PERF_RUNS:-posthog_metrics,posthog_logs}"
+PERF_START_CLICKHOUSE="${PERF_START_CLICKHOUSE:-1}"
+PERF_COMPARE_TOLERANCE="${PERF_COMPARE_TOLERANCE:-0}"
+PERF_FAIL_ON_SLOWER="${PERF_FAIL_ON_SLOWER:-false}"
+PERF_REPEAT="${PERF_REPEAT:-3}"
+PERF_MIN_ROWS="${PERF_MIN_ROWS:-1000000}"
+PERF_MIN_LOG_ROWS="${PERF_MIN_LOG_ROWS:-100000}"
+
 TSBS_VERSION="${TSBS_VERSION:-v0.0.0-20260527045238-8323e59c7402}"
 TSBS_USE_CASE="${TSBS_USE_CASE:-devops}"
 TSBS_SCALE="${TSBS_SCALE:-1000}"
@@ -19,69 +27,45 @@ TSBS_WORKERS="${TSBS_WORKERS:-16}"
 TSBS_BATCH_SIZE="${TSBS_BATCH_SIZE:-250000}"
 TSBS_REPORTING_PERIOD="${TSBS_REPORTING_PERIOD:-5s}"
 
+POSTHOG_LOG_ROWS="${POSTHOG_LOG_ROWS:-500000}"
+POSTHOG_LOG_START="${POSTHOG_LOG_START:-2026-06-01 00:00:00}"
+POSTHOG_LOG_RANGE_SECONDS="${POSTHOG_LOG_RANGE_SECONDS:-86400}"
+POSTHOG_LOG_STEP="${POSTHOG_LOG_STEP:-60s}"
+POSTHOG_LOG_LIMIT="${POSTHOG_LOG_LIMIT:-5000}"
+
 CH_ADDR="${CH_ADDR:-localhost:9000}"
 CH_HOST="${CH_HOST:-${CH_ADDR%%:*}}"
 CH_NATIVE_PORT="${CH_NATIVE_PORT:-${CH_ADDR##*:}}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 CH_DATABASE="${CH_DATABASE:-snuffle_perf}"
-CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-}"
+CH_LOGS_TABLE="${CH_LOGS_TABLE:-logs34}"
+CH_LOG_ATTRIBUTES_TABLE="${CH_LOG_ATTRIBUTES_TABLE:-log_attributes2}"
 
 SIDECAR_HOST="${SIDECAR_HOST:-127.0.0.1}"
 SIDECAR_PORT="${SIDECAR_PORT:-9091}"
 SNUFFLE_URL="${PERF_SNUFFLE_URL:-http://$SIDECAR_HOST:$SIDECAR_PORT}"
-SNUFFLE_DEFAULT_TEAM_ID="${SNUFFLE_DEFAULT_TEAM_ID:-0}"
+SNUFFLE_DEFAULT_TEAM_ID="${SNUFFLE_DEFAULT_TEAM_ID:-${TENANT:-0}}"
+SNUFFLE_SELF_SCRAPE_ENABLED="${SNUFFLE_SELF_SCRAPE_ENABLED:-false}"
 REMOTE_WRITE_SAMPLE_INTERVAL="${REMOTE_WRITE_SAMPLE_INTERVAL:-$TSBS_INTERVAL}"
 CH_TIMEOUT_SECONDS="${CH_TIMEOUT_SECONDS:-120}"
 PROMQL_QUERY_TIMEOUT_SECONDS="${PROMQL_QUERY_TIMEOUT_SECONDS:-120}"
+SNUFFLE_LOG_QUERY_MAX_ROWS="${SNUFFLE_LOG_QUERY_MAX_ROWS:-$POSTHOG_LOG_ROWS}"
 
 BRIDGE_BENCH_CONCURRENCY="${BRIDGE_BENCH_CONCURRENCY:-10}"
 BRIDGE_BENCH_WARMUP="${BRIDGE_BENCH_WARMUP:-10}"
 BRIDGE_BENCHTIME="${BRIDGE_BENCHTIME:-50x}"
 BRIDGE_BENCH_TIMEOUT="${BRIDGE_BENCH_TIMEOUT:-120s}"
-PERF_COMPARE_TOLERANCE="${PERF_COMPARE_TOLERANCE:-0}"
-PERF_FAIL_ON_SLOWER="${PERF_FAIL_ON_SLOWER:-false}"
-PERF_START_CLICKHOUSE="${PERF_START_CLICKHOUSE:-1}"
-PERF_MIN_ROWS="${PERF_MIN_ROWS:-1000000}"
-PERF_SCHEMA="${PERF_SCHEMA:-current}"
-SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-}"
-
-case "$PERF_SCHEMA" in
-  current)
-    PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$ROOT/scripts/create_metrics_schema.sql}"
-    CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-current}"
-    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics_samples}"
-    SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-0}"
-    ;;
-  posthog|posthog_compat)
-    PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$ROOT/scripts/create_metrics_posthog_schema.sql}"
-    CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-posthog}"
-    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics1}"
-    SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-1}"
-    ;;
-  *)
-    PERF_SCHEMA_FILE="${PERF_SCHEMA_FILE:-$PERF_SCHEMA}"
-    CH_SCHEMA_LAYOUT="${CH_SCHEMA_LAYOUT:-current}"
-    CH_SAMPLES_TABLE="${CH_SAMPLES_TABLE:-metrics_samples}"
-    SNUFFLE_SAMPLE_ATTRIBUTES="${SNUFFLE_SAMPLE_ATTRIBUTES:-0}"
-    ;;
-esac
+BRIDGE_BENCH_GO_TEST_TIMEOUT="${BRIDGE_BENCH_GO_TEST_TIMEOUT:-60m}"
 
 DATA_KEY="$(printf '%s' "$TSBS_USE_CASE-scale-$TSBS_SCALE-$TSBS_START-$TSBS_END-$TSBS_INTERVAL-$TSBS_SEED" | tr -c 'A-Za-z0-9_.-' '_')"
 DATA_FILE="${PERF_DATA_FILE:-$WORKDIR/tsbs-$DATA_KEY.prom}"
-LOAD_RESULTS="$WORKDIR/tsbs-load-results.json"
-LOAD_OUTPUT="$WORKDIR/tsbs-load.out"
-BENCH_OUTPUT="$WORKDIR/go-bench.out"
-CURRENT_RESULTS="$WORKDIR/perf-results.current.json"
 SNUFFLE_BIN="$WORKDIR/snuffle"
-SNUFFLE_LOG="$WORKDIR/snuffle.log"
 SNUFFLE_PID=""
+SNUFFLE_LOG=""
 
 cleanup() {
-  if [[ -n "$SNUFFLE_PID" ]]; then
-    kill "$SNUFFLE_PID" >/dev/null 2>&1 || true
-    wait "$SNUFFLE_PID" >/dev/null 2>&1 || true
-  fi
+  stop_snuffle
 }
 trap cleanup EXIT
 
@@ -97,6 +81,46 @@ validate_identifier() {
     echo "invalid ClickHouse identifier: $1" >&2
     return 1
   fi
+}
+
+validate_uint() {
+  local name="$1"
+  local value="$2"
+  if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+    echo "$name must be an unsigned integer, got $value" >&2
+    return 1
+  fi
+}
+
+validate_positive_uint() {
+  local name="$1"
+  local value="$2"
+  validate_uint "$name" "$value"
+  if [[ "$value" -lt 1 ]]; then
+    echo "$name must be greater than zero, got $value" >&2
+    return 1
+  fi
+}
+
+trim_run_name() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+now_millis() {
+  date +%s%3N
+}
+
+datetime_to_ns() {
+  local value="$1"
+  local seconds
+  if ! seconds="$(date -u -d "$value UTC" +%s 2>/dev/null)"; then
+    echo "could not parse UTC datetime: $value" >&2
+    return 1
+  fi
+  printf '%s000000000' "$seconds"
 }
 
 ch_base_client() {
@@ -140,122 +164,349 @@ wait_for_http() {
     sleep 1
   done
   echo "$url did not become ready" >&2
-  if [[ -f "$SNUFFLE_LOG" ]]; then
+  if [[ -n "$SNUFFLE_LOG" && -f "$SNUFFLE_LOG" ]]; then
     tail -n 80 "$SNUFFLE_LOG" >&2 || true
   fi
   return 1
 }
 
-sample_count() {
-  ch_client --query "SELECT count() FROM $CH_SAMPLES_TABLE" | tr -d '[:space:]'
+table_count() {
+  local table="$1"
+  ch_client --query "SELECT count() FROM $table" | tr -d '[:space:]'
 }
 
-wait_for_samples() {
-  local expected="$1"
+wait_for_table_rows() {
+  local table="$1"
+  local expected="$2"
   if [[ -z "$expected" || "$expected" == "0" ]]; then
     return 0
   fi
   ch_client --query "SYSTEM FLUSH ASYNC INSERT QUEUE" >/dev/null 2>&1 || true
   for _ in $(seq 1 120); do
     local got
-    got="$(sample_count || true)"
+    got="$(table_count "$table" || true)"
     if [[ "$got" =~ ^[0-9]+$ && "$got" -ge "$expected" ]]; then
       return 0
     fi
     sleep 1
   done
-  echo "$CH_SAMPLES_TABLE did not reach expected row count: got $(sample_count || echo unknown), expected $expected" >&2
+  echo "$table did not reach expected row count: got $(table_count "$table" || echo unknown), expected $expected" >&2
   return 1
 }
 
-if is_true "$PERF_START_CLICKHOUSE"; then
-  docker compose up -d clickhouse
-fi
+stop_snuffle() {
+  if [[ -n "${SNUFFLE_PID:-}" ]]; then
+    kill "$SNUFFLE_PID" >/dev/null 2>&1 || true
+    wait "$SNUFFLE_PID" >/dev/null 2>&1 || true
+    SNUFFLE_PID=""
+  fi
+}
 
-wait_for_clickhouse
-validate_identifier "$CH_DATABASE"
-ch_base_client --query "CREATE DATABASE IF NOT EXISTS $CH_DATABASE"
-ch_client --multiquery < "$PERF_SCHEMA_FILE"
-
-if [[ -z "${PERF_SNUFFLE_URL:-}" ]]; then
-  go build -o "$SNUFFLE_BIN" ./cmd/snuffle
+start_snuffle() {
+  local run_dir="$1"
+  local schema_layout="$2"
+  local samples_table="$3"
+  local sample_attributes="$4"
+  if [[ -n "${PERF_SNUFFLE_URL:-}" ]]; then
+    return 0
+  fi
+  stop_snuffle
+  SNUFFLE_LOG="$run_dir/snuffle.log"
   env \
     CH_ADDR="$CH_ADDR" \
     CH_USER="$CH_USER" \
     CH_PASSWORD="$CH_PASSWORD" \
     CH_DATABASE="$CH_DATABASE" \
-    CH_SCHEMA_LAYOUT="$CH_SCHEMA_LAYOUT" \
-    CH_SAMPLES_TABLE="$CH_SAMPLES_TABLE" \
+    CH_SCHEMA_LAYOUT="$schema_layout" \
+    CH_SAMPLES_TABLE="$samples_table" \
+    CH_LOGS_TABLE="$CH_LOGS_TABLE" \
+    CH_LOG_ATTRIBUTES_TABLE="$CH_LOG_ATTRIBUTES_TABLE" \
     SIDECAR_HOST="$SIDECAR_HOST" \
     SIDECAR_PORT="$SIDECAR_PORT" \
     SNUFFLE_DEFAULT_TEAM_ID="$SNUFFLE_DEFAULT_TEAM_ID" \
     REMOTE_WRITE_SAMPLE_INTERVAL="$REMOTE_WRITE_SAMPLE_INTERVAL" \
-    SNUFFLE_SAMPLE_ATTRIBUTES="$SNUFFLE_SAMPLE_ATTRIBUTES" \
+    SNUFFLE_SAMPLE_ATTRIBUTES="$sample_attributes" \
+    SNUFFLE_SELF_SCRAPE_ENABLED="$SNUFFLE_SELF_SCRAPE_ENABLED" \
+    SNUFFLE_LOG_QUERY_MAX_ROWS="$SNUFFLE_LOG_QUERY_MAX_ROWS" \
     CH_TIMEOUT_SECONDS="$CH_TIMEOUT_SECONDS" \
     PROMQL_QUERY_TIMEOUT_SECONDS="$PROMQL_QUERY_TIMEOUT_SECONDS" \
     "$SNUFFLE_BIN" >"$SNUFFLE_LOG" 2>&1 &
   SNUFFLE_PID="$!"
+}
+
+ensure_tsbs_data() {
+  if [[ ! -s "$DATA_FILE" || "${PERF_REGENERATE_DATA:-0}" != "0" ]]; then
+    go run "github.com/timescale/tsbs/cmd/tsbs_generate_data@$TSBS_VERSION" \
+      --format prometheus \
+      --use-case "$TSBS_USE_CASE" \
+      --scale "$TSBS_SCALE" \
+      --timestamp-start "$TSBS_START" \
+      --timestamp-end "$TSBS_END" \
+      --log-interval "$TSBS_INTERVAL" \
+      --seed "$TSBS_SEED" \
+      --file "$DATA_FILE"
+  fi
+}
+
+write_load_result() {
+  local path="$1"
+  local rows="$2"
+  local duration_ms="$3"
+  local rate
+  rate="$(awk -v rows="$rows" -v ms="$duration_ms" 'BEGIN { if (ms > 0) printf "%.6f", rows / (ms / 1000.0); else printf "0.000000" }')"
+  printf '{\n "DurationMillis": %s,\n "Totals": {\n  "metricRate": %.6f,\n  "rowRate": %.6f\n }\n}\n' "$duration_ms" "$rate" "$rate" >"$path"
+}
+
+run_bridge_bench() {
+  local run_dir="$1"
+  local profile="$2"
+  local bench_output="$run_dir/go-bench.out"
+  env \
+    BRIDGE_BENCH_URL="$SNUFFLE_URL" \
+    BRIDGE_BENCH_PROFILE="$profile" \
+    BRIDGE_BENCH_CONCURRENCY="$BRIDGE_BENCH_CONCURRENCY" \
+    BRIDGE_BENCH_WARMUP="$BRIDGE_BENCH_WARMUP" \
+    BRIDGE_BENCH_TIMEOUT="$BRIDGE_BENCH_TIMEOUT" \
+    BRIDGE_BENCH_LOG_START_NS="$POSTHOG_LOG_START_NS" \
+    BRIDGE_BENCH_LOG_END_NS="$POSTHOG_LOG_END_NS" \
+    BRIDGE_BENCH_LOG_STEP="$POSTHOG_LOG_STEP" \
+    BRIDGE_BENCH_LOG_LIMIT="$POSTHOG_LOG_LIMIT" \
+    go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime="$BRIDGE_BENCHTIME" -timeout="$BRIDGE_BENCH_GO_TEST_TIMEOUT" | tee "$bench_output"
+}
+
+report_run_attempt() {
+  local run_name="$1"
+  local run_dir="$2"
+  local load_results="$3"
+  local bench_output="$4"
+  local rows="$5"
+  local source_name="$6"
+  local source_version="$7"
+  local source_use_case="$8"
+  local source_scale="$9"
+  local source_start="${10}"
+  local source_end="${11}"
+  local source_interval="${12}"
+  local source_seed="${13}"
+  local source_workers="${14}"
+  local source_batch_size="${15}"
+  local attempt="${16}"
+  go run ./cmd/snuffle-perf-report \
+    --build-only \
+    --current-output "$run_dir/perf-results.current.json" \
+    --run-name "$run_name" \
+    --attempt "$attempt" \
+    --repeat-count "$PERF_REPEAT" \
+    --load "$load_results" \
+    --bench "$bench_output" \
+    --rows "$rows" \
+    --source-name "$source_name" \
+    --source-version "$source_version" \
+    --source-use-case "$source_use_case" \
+    --source-scale "$source_scale" \
+    --source-start "$source_start" \
+    --source-end "$source_end" \
+    --source-interval "$source_interval" \
+    --source-seed "$source_seed" \
+    --source-workers "$source_workers" \
+    --source-batch-size "$source_batch_size" \
+    --query-concurrency "$BRIDGE_BENCH_CONCURRENCY" \
+    --query-benchtime "$BRIDGE_BENCHTIME"
+}
+
+select_run_baseline() {
+  local run_name="$1"
+  local candidates="${RUN_CANDIDATES[$run_name]:-}"
+  if [[ -z "$candidates" ]]; then
+    echo "no candidates recorded for $run_name" >&2
+    exit 1
+  fi
+  mkdir -p "$WORKDIR/$run_name"
+  go run ./cmd/snuffle-perf-report \
+    --results "$RESULTS_FILE" \
+    --current-output "$WORKDIR/$run_name/perf-results.current.json" \
+    --run-name "$run_name" \
+    --repeat-count "$PERF_REPEAT" \
+    --candidates "$candidates" \
+    --tolerance "$PERF_COMPARE_TOLERANCE" \
+    --fail-on-slower="$PERF_FAIL_ON_SLOWER"
+}
+
+record_candidate() {
+  local run_name="$1"
+  local candidate_path="$2"
+  if [[ -n "${RUN_CANDIDATES[$run_name]:-}" ]]; then
+    RUN_CANDIDATES[$run_name]+=",$candidate_path"
+  else
+    RUN_CANDIDATES[$run_name]="$candidate_path"
+  fi
+}
+
+run_posthog_metrics() {
+  local attempt="$1"
+  local run_name="posthog_metrics"
+  local schema_file="$ROOT/scripts/create_metrics_posthog_schema.sql"
+  local schema_layout="posthog"
+  local samples_table="metrics1"
+  local sample_attributes="1"
+  local source_name="tsbs-posthog-metrics"
+  local run_dir="$WORKDIR/$run_name/attempt-$attempt"
+  local load_results="$run_dir/tsbs-load-results.json"
+  local load_output="$run_dir/tsbs-load.out"
+  local bench_output="$run_dir/go-bench.out"
+  mkdir -p "$run_dir"
+
+  echo "==> $run_name attempt $attempt/$PERF_REPEAT: recreate metrics schema from $schema_file"
+  validate_identifier "$samples_table"
+  ch_client --multiquery < "$schema_file"
+  start_snuffle "$run_dir" "$schema_layout" "$samples_table" "$sample_attributes"
+  wait_for_http "$SNUFFLE_URL/-/healthy"
+
+  ensure_tsbs_data
+  go run ./cmd/snuffle-tsbs-replay \
+    --file "$DATA_FILE" \
+    --url "$SNUFFLE_URL/api/v1/write" \
+    --workers "$TSBS_WORKERS" \
+    --batch-size "$TSBS_BATCH_SIZE" \
+    --reporting-period "$TSBS_REPORTING_PERIOD" \
+    --results-file "$load_results" | tee "$load_output"
+
+  local expected_rows
+  expected_rows="$(awk '/^loaded [0-9]+ rows/{print $2}' "$load_output" | tail -n 1)"
+  if [[ ! "$expected_rows" =~ ^[0-9]+$ ]]; then
+    echo "could not parse TSBS loaded row count from $load_output" >&2
+    exit 1
+  fi
+  if [[ "$expected_rows" -lt "$PERF_MIN_ROWS" ]]; then
+    echo "TSBS dataset is too small: loaded $expected_rows rows, minimum is $PERF_MIN_ROWS" >&2
+    echo "Increase TSBS_SCALE or TSBS_END, or lower PERF_MIN_ROWS for a local smoke run." >&2
+    exit 1
+  fi
+  wait_for_table_rows "$samples_table" "$expected_rows"
+
+  run_bridge_bench "$run_dir" "posthog_metrics"
+  report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$expected_rows" "$source_name" "$TSBS_VERSION" "$TSBS_USE_CASE" "$TSBS_SCALE" "$TSBS_START" "$TSBS_END" "$TSBS_INTERVAL" "$TSBS_SEED" "$TSBS_WORKERS" "$TSBS_BATCH_SIZE" "$attempt"
+  record_candidate "$run_name" "$run_dir/perf-results.current.json"
+  stop_snuffle
+}
+
+run_posthog_logs() {
+  local attempt="$1"
+  local run_name="posthog_logs"
+  local run_dir="$WORKDIR/$run_name/attempt-$attempt"
+  local load_results="$run_dir/log-load-results.json"
+  local bench_output="$run_dir/go-bench.out"
+  mkdir -p "$run_dir"
+
+  echo "==> $run_name attempt $attempt/$PERF_REPEAT: recreate PostHog logs schema"
+  validate_identifier "$CH_LOGS_TABLE"
+  ch_client --multiquery < "$ROOT/scripts/create_logs_posthog_schema.sql"
+
+  echo "==> $run_name: seed $POSTHOG_LOG_ROWS log rows"
+  local started_ms
+  local duration_ms
+  started_ms="$(now_millis)"
+  ch_client \
+    --param_rows="$POSTHOG_LOG_ROWS" \
+    --param_tenant="$SNUFFLE_DEFAULT_TEAM_ID" \
+    --param_bench_start="$POSTHOG_LOG_START" \
+    --multiquery < "$ROOT/scripts/seed_logs_posthog.sql"
+  duration_ms="$(( $(now_millis) - started_ms ))"
+  wait_for_table_rows "$CH_LOGS_TABLE" "$POSTHOG_LOG_ROWS"
+  if [[ "$POSTHOG_LOG_ROWS" -lt "$PERF_MIN_LOG_ROWS" ]]; then
+    echo "log dataset is too small: loaded $POSTHOG_LOG_ROWS rows, minimum is $PERF_MIN_LOG_ROWS" >&2
+    echo "Increase POSTHOG_LOG_ROWS, or lower PERF_MIN_LOG_ROWS for a local smoke run." >&2
+    exit 1
+  fi
+  write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
+
+  start_snuffle "$run_dir" "posthog" "metrics1" "1"
+  wait_for_http "$SNUFFLE_URL/-/healthy"
+  run_bridge_bench "$run_dir" "posthog_logs"
+  report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "posthog-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
+  record_candidate "$run_name" "$run_dir/perf-results.current.json"
+  stop_snuffle
+}
+
+run_named() {
+  local run_name="$1"
+  local attempt="$2"
+  case "$run_name" in
+    posthog_metrics)
+      run_posthog_metrics "$attempt"
+      ;;
+    posthog_logs)
+      run_posthog_logs "$attempt"
+      ;;
+    *)
+      echo "unknown PERF_RUNS entry: $run_name" >&2
+      echo "known runs: posthog_metrics, posthog_logs" >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_run_name() {
+  local run_name="$1"
+  case "$run_name" in
+    posthog_metrics|posthog_logs)
+      ;;
+    *)
+      echo "unknown PERF_RUNS entry: $run_name" >&2
+      echo "known runs: posthog_metrics, posthog_logs" >&2
+      exit 1
+      ;;
+  esac
+}
+
+validate_identifier "$CH_DATABASE"
+validate_positive_uint "PERF_REPEAT" "$PERF_REPEAT"
+validate_uint "POSTHOG_LOG_ROWS" "$POSTHOG_LOG_ROWS"
+validate_uint "POSTHOG_LOG_RANGE_SECONDS" "$POSTHOG_LOG_RANGE_SECONDS"
+validate_uint "SNUFFLE_DEFAULT_TEAM_ID" "$SNUFFLE_DEFAULT_TEAM_ID"
+POSTHOG_LOG_START_NS="${POSTHOG_LOG_START_NS:-$(datetime_to_ns "$POSTHOG_LOG_START")}"
+POSTHOG_LOG_END_NS="${POSTHOG_LOG_END_NS:-$((POSTHOG_LOG_START_NS + (POSTHOG_LOG_RANGE_SECONDS - 1) * 1000000000))}"
+
+if is_true "$PERF_START_CLICKHOUSE"; then
+  if ch_base_client --query "SELECT 1" >/dev/null 2>&1; then
+    echo "ClickHouse already reachable at $CH_HOST:$CH_NATIVE_PORT; skipping docker compose up"
+  else
+    docker compose up -d clickhouse
+  fi
 fi
 
-wait_for_http "$SNUFFLE_URL/-/healthy"
+wait_for_clickhouse
+ch_base_client --query "CREATE DATABASE IF NOT EXISTS $CH_DATABASE"
 
-if [[ ! -s "$DATA_FILE" || "${PERF_REGENERATE_DATA:-0}" != "0" ]]; then
-  go run "github.com/timescale/tsbs/cmd/tsbs_generate_data@$TSBS_VERSION" \
-    --format prometheus \
-    --use-case "$TSBS_USE_CASE" \
-    --scale "$TSBS_SCALE" \
-    --timestamp-start "$TSBS_START" \
-    --timestamp-end "$TSBS_END" \
-    --log-interval "$TSBS_INTERVAL" \
-    --seed "$TSBS_SEED" \
-    --file "$DATA_FILE"
+if [[ -z "${PERF_SNUFFLE_URL:-}" ]]; then
+  go build -o "$SNUFFLE_BIN" ./cmd/snuffle
 fi
 
-go run ./cmd/snuffle-tsbs-replay \
-  --file "$DATA_FILE" \
-  --url "$SNUFFLE_URL/api/v1/write" \
-  --workers "$TSBS_WORKERS" \
-  --batch-size "$TSBS_BATCH_SIZE" \
-  --reporting-period "$TSBS_REPORTING_PERIOD" \
-  --results-file "$LOAD_RESULTS" | tee "$LOAD_OUTPUT"
+declare -A RUN_CANDIDATES=()
+IFS=',' read -r -a raw_runs <<< "$PERF_RUNS"
+runs=()
+for raw_run in "${raw_runs[@]}"; do
+  run="$(trim_run_name "$raw_run")"
+  if [[ -z "$run" ]]; then
+    continue
+  fi
+  validate_run_name "$run"
+  runs+=("$run")
+done
 
-EXPECTED_ROWS="$(awk '/^loaded [0-9]+ rows/{print $2}' "$LOAD_OUTPUT" | tail -n 1)"
-if [[ ! "$EXPECTED_ROWS" =~ ^[0-9]+$ ]]; then
-  echo "could not parse TSBS loaded row count from $LOAD_OUTPUT" >&2
+if [[ "${#runs[@]}" -eq 0 ]]; then
+  echo "PERF_RUNS did not contain any run names" >&2
   exit 1
 fi
-if [[ "$EXPECTED_ROWS" -lt "$PERF_MIN_ROWS" ]]; then
-  echo "TSBS dataset is too small: loaded $EXPECTED_ROWS rows, minimum is $PERF_MIN_ROWS" >&2
-  echo "Increase TSBS_SCALE or TSBS_END, or lower PERF_MIN_ROWS for a local smoke run." >&2
-  exit 1
-fi
-wait_for_samples "$EXPECTED_ROWS"
 
-env \
-  BRIDGE_BENCH_URL="$SNUFFLE_URL" \
-  BRIDGE_BENCH_PROFILE=tsbs \
-  BRIDGE_BENCH_CONCURRENCY="$BRIDGE_BENCH_CONCURRENCY" \
-  BRIDGE_BENCH_WARMUP="$BRIDGE_BENCH_WARMUP" \
-  BRIDGE_BENCH_TIMEOUT="$BRIDGE_BENCH_TIMEOUT" \
-  go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime="$BRIDGE_BENCHTIME" -timeout=30m | tee "$BENCH_OUTPUT"
+for attempt in $(seq 1 "$PERF_REPEAT"); do
+  echo "==> suite attempt $attempt/$PERF_REPEAT"
+  for run in "${runs[@]}"; do
+    run_named "$run" "$attempt"
+  done
+done
 
-go run ./cmd/snuffle-perf-report \
-  --results "$RESULTS_FILE" \
-  --current-output "$CURRENT_RESULTS" \
-  --load "$LOAD_RESULTS" \
-  --bench "$BENCH_OUTPUT" \
-  --rows "$EXPECTED_ROWS" \
-  --tolerance "$PERF_COMPARE_TOLERANCE" \
-  --fail-on-slower="$PERF_FAIL_ON_SLOWER" \
-  --source-name tsbs \
-  --source-version "$TSBS_VERSION" \
-  --source-use-case "$TSBS_USE_CASE" \
-  --source-scale "$TSBS_SCALE" \
-  --source-start "$TSBS_START" \
-  --source-end "$TSBS_END" \
-  --source-interval "$TSBS_INTERVAL" \
-  --source-seed "$TSBS_SEED" \
-  --source-workers "$TSBS_WORKERS" \
-  --source-batch-size "$TSBS_BATCH_SIZE" \
-  --query-concurrency "$BRIDGE_BENCH_CONCURRENCY" \
-  --query-benchtime "$BRIDGE_BENCHTIME"
+for run in "${runs[@]}"; do
+  echo "==> $run: selecting slowest candidate from $PERF_REPEAT attempt(s)"
+  select_run_baseline "$run"
+done
