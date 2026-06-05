@@ -291,6 +291,12 @@ For unknown incoming labels, the default should not assume hot label names.
   `team_id UInt64`, `metric_name LowCardinality(String)`
 - engine: `MergeTree`
 - primary order: `(team_id, metric_name, id, timestamp)`
+- index granularity: `1024` rows. Larger granules measured slightly smaller
+  on disk, but narrow one-series reads scanned 8-16x more rows, so the schema
+  keeps the tighter granularity.
+- keep `metric_name` in the sample key. A no-metric/no-ZSTD sample table
+  measured worse at 2.7327 bytes/sample and also removed the metric key prefix
+  that exact-metric queries use.
 - all columns are non-null
 
 `metrics_series`
@@ -305,12 +311,17 @@ For unknown incoming labels, the default should not assume hot label names.
 
 `metrics_label_index`
 
-- columns: `team_id`, `metric_name`, `label_name`, `label_value`, `id`
+- columns: `team_id`, `metric_name`, `label_name`,
+  `label_value LowCardinality(String)`, `id`
 - primary order: `(team_id, metric_name, label_name, label_value, id)`
 - projection: `(team_id, label_name, label_value, id, metric_name)` for
   arbitrary label lookup
 - projection: `(team_id, id, label_name, metric_name, label_value)` for
   fetching group labels
+- `label_value LowCardinality(String)` keeps the existing order and
+  projections while reducing local label-index storage from 0.9337 to 0.7651
+  bytes/sample. Tested label lookups kept the same read row counts and read
+  fewer bytes.
 - used for arbitrary label filtering and label metadata
 - all columns are non-null
 

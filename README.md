@@ -97,7 +97,7 @@ The default Prometheus-native schema is in `scripts/create_metrics_schema.sql`:
   `(team_id, metric_name, id, timestamp)`
 - `metrics_label_index`: inverted label index
   `(team_id, metric_name, label_name, label_value, id)` for arbitrary label
-  pruning
+  pruning, with `label_value` stored as `LowCardinality(String)`
 - `metrics_histograms`: native histogram samples stored as remote-write
   protobuf payloads with `metric_name` and `version`, keyed by
   `(team_id, id, timestamp)`

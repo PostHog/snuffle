@@ -37,7 +37,7 @@ CREATE TABLE metrics_label_index
     team_id UInt64,
     metric_name LowCardinality(String),
     label_name LowCardinality(String),
-    label_value String,
+    label_value LowCardinality(String),
     id UInt64
 )
 ENGINE = ReplacingMergeTree
