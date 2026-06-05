@@ -23,6 +23,7 @@ type perfResult struct {
 	Source          perfSource        `json:"source"`
 	Ingest          ingestResult      `json:"ingest"`
 	Query           querySummary      `json:"query"`
+	Memory          *memorySummary    `json:"memory,omitempty"`
 	Benchmarks      []benchmarkResult `json:"benchmarks"`
 	CompareBasis    string            `json:"compare_basis"`
 }
@@ -62,6 +63,16 @@ type querySummary struct {
 	TotalAvgMS    float64 `json:"total_avg_ms"`
 }
 
+type memorySummary struct {
+	SnufflePeakRSSBytes            uint64  `json:"snuffle_peak_rss_bytes,omitempty"`
+	SnufflePeakHWMBytes            uint64  `json:"snuffle_peak_hwm_bytes,omitempty"`
+	SnuffleMemorySamples           uint64  `json:"snuffle_memory_samples,omitempty"`
+	ClickHouseQueryCount           uint64  `json:"clickhouse_query_count,omitempty"`
+	ClickHousePeakMemoryBytes      uint64  `json:"clickhouse_peak_memory_bytes,omitempty"`
+	ClickHouseAvgPeakMemoryBytes   float64 `json:"clickhouse_avg_peak_memory_bytes,omitempty"`
+	ClickHouseTotalPeakMemoryBytes uint64  `json:"clickhouse_total_peak_memory_bytes,omitempty"`
+}
+
 type benchmarkResult struct {
 	Name       string             `json:"name"`
 	Iterations int                `json:"iterations"`
@@ -93,6 +104,7 @@ func main() {
 	currentPath := flag.String("current-output", "", "path for the current run json")
 	loadPath := flag.String("load", "", "load results json")
 	benchPath := flag.String("bench", "", "go test benchmark output")
+	memoryPath := flag.String("memory", "", "memory results json")
 	runName := flag.String("run-name", "", "named suite run to update inside the results file")
 	rows := flag.Uint64("rows", 0, "loaded row count")
 	attempt := flag.Int("attempt", 0, "1-based suite attempt number for candidate results")
@@ -154,7 +166,7 @@ func main() {
 		fatalf("usage: snuffle-perf-report --load <load-results.json> --bench <go-bench.out>")
 	}
 
-	result, err := buildResult(*loadPath, *benchPath, *rows, source)
+	result, err := buildResult(*loadPath, *benchPath, *memoryPath, *rows, source)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -187,7 +199,7 @@ func (s *stringList) Set(value string) error {
 	return nil
 }
 
-func buildResult(loadPath, benchPath string, rows uint64, source perfSource) (perfResult, error) {
+func buildResult(loadPath, benchPath, memoryPath string, rows uint64, source perfSource) (perfResult, error) {
 	ingest, err := parseLoadResult(loadPath)
 	if err != nil {
 		return perfResult{}, err
@@ -200,12 +212,17 @@ func buildResult(loadPath, benchPath string, rows uint64, source perfSource) (pe
 	if len(benchmarks) == 0 {
 		return perfResult{}, fmt.Errorf("no benchmark rows found in %s", benchPath)
 	}
+	memory, err := parseMemorySummary(memoryPath)
+	if err != nil {
+		return perfResult{}, err
+	}
 	return perfResult{
 		Version:      1,
 		GeneratedAt:  time.Now().UTC().Format(time.RFC3339),
 		Source:       source,
 		Ingest:       ingest,
 		Query:        summarizeQueries(benchmarks),
+		Memory:       memory,
 		Benchmarks:   benchmarks,
 		CompareBasis: compareBasis,
 	}, nil
@@ -225,6 +242,27 @@ func parseLoadResult(path string) (ingestResult, error) {
 		MetricRate:     loaded.Totals.MetricRate,
 		RowRate:        loaded.Totals.RowRate,
 	}, nil
+}
+
+func parseMemorySummary(path string) (*memorySummary, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read memory result: %w", err)
+	}
+	var result memorySummary
+	if err := json.Unmarshal(data, &result); err != nil {
+		return nil, fmt.Errorf("parse memory result: %w", err)
+	}
+	if result == (memorySummary{}) {
+		return nil, nil
+	}
+	return &result, nil
 }
 
 func parseBenchmarks(path string) ([]benchmarkResult, error) {

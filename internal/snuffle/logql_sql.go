@@ -405,7 +405,7 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 			return parsed, true
 		}
 		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
-		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
+		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
 	case "json":
 		path := parserParams[label]
 		if path == "" {
@@ -416,7 +416,7 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 			return parsed, true
 		}
 		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
-		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
+		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
 	case "regexp", "pattern":
 		index := parserParams[label]
 		if index == "" {
@@ -430,7 +430,7 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 			return parsed, true
 		}
 		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
-		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
+		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
 	case "":
 		return logQLMetricLabelFilterValueExpr(cfg, label), true
 	default:
@@ -662,7 +662,7 @@ func logQLUnwrapMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration
 		return false
 	}
 	switch plan.rangeAgg.fn {
-	case "sum_over_time", "avg_over_time", "min_over_time", "max_over_time", "stdvar_over_time", "stddev_over_time":
+	case "sum_over_time":
 	default:
 		return false
 	}
@@ -670,13 +670,6 @@ func logQLUnwrapMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration
 }
 
 func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
-	points := int64(1)
-	if endNS > startNS {
-		points = ((endNS - startNS) / step.Nanoseconds()) + 1
-	}
-	if points < 1 {
-		points = 1
-	}
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
 	fetchEndNS := endNS
 	where := logQLUnwrapMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS, plan.selectorFilters)
@@ -711,14 +704,26 @@ func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQ
 		sourceSQL,
 		strings.Join(bucketGroupBy, ", "),
 	)
+	windowSteps := plan.rangeAgg.window / step
+	if windowSteps < 1 {
+		windowSteps = 1
+	}
+	fanoutSelects := append([]string{}, outerGroupBy...)
+	fanoutSelects = append(fanoutSelects, "value_count", "value_sum", "value_sum_squares", "value_min", "value_max")
+	fanoutSQL := fmt.Sprintf(
+		"(SELECT %s FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM %s ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
+		strings.Join(fanoutSelects, ", "),
+		bucketSQL,
+		int64(windowSteps),
+	)
 	sql := fmt.Sprintf(
-		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s AS buckets CROSS JOIN (SELECT start_ns + (toInt64(number) * step_ns) AS eval_ns FROM numbers(%d)) AS grid WHERE buckets.bucket_ns > eval_ns - window_ns AND buckets.bucket_ns <= eval_ns GROUP BY %s ORDER BY %s",
+		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s GROUP BY %s ORDER BY %s",
 		startNS,
+		endNS,
 		step.Nanoseconds(),
 		plan.rangeAgg.window.Nanoseconds(),
 		strings.Join(outerSelects, ", "),
-		bucketSQL,
-		points,
+		fanoutSQL,
 		strings.Join(outerGroupBy, ", "),
 		strings.Join(orderBy, ", "),
 	)
@@ -875,6 +880,88 @@ func logQLSnuffleStatsLabelSafe(label string) bool {
 	}
 }
 
+func logQLSnuffleStatsLabelIndexJoinCount(cfg Config, plan *logQLMetricSQLPlan) int {
+	if cfg.postHogLogSchemaLayout() || cfg.LogStreamLabelsTable == "" || plan == nil || plan.rangeAgg == nil {
+		return 0
+	}
+	if len(plan.groupLabels) == 0 && len(plan.rangeAgg.selector.matchers) == 0 {
+		return 0
+	}
+	indexJoinCount := 0
+	for _, label := range plan.groupLabels {
+		if !logQLSnuffleStatsLabelSafe(label) {
+			return 0
+		}
+		if logQLSnuffleStatsCoreLabel(label) {
+			return 0
+		}
+		indexJoinCount++
+	}
+	for _, matcher := range plan.rangeAgg.selector.matchers {
+		if !logQLSnuffleStatsLabelIndexMatcherSafe(matcher) {
+			return 0
+		}
+		indexJoinCount++
+	}
+	return indexJoinCount
+}
+
+func logQLSnuffleStatsLabelIndexMatcherSafe(matcher logQLLabelMatcher) bool {
+	if !logQLSnuffleStatsLabelSafe(matcher.name) {
+		return false
+	}
+	switch matcher.op {
+	case "=":
+		return true
+	case "=~":
+		re, err := regexp.Compile(promRegexToCH(matcher.value))
+		return err == nil && !re.MatchString("")
+	default:
+		return false
+	}
+}
+
+func logQLSnuffleStatsIndexedTableSQL(cfg Config, plan *logQLMetricSQLPlan) string {
+	joins := make([]string, 0, len(plan.groupLabels)+len(plan.rangeAgg.selector.matchers))
+	for i, label := range plan.groupLabels {
+		alias := fmt.Sprintf("label_%d", i)
+		joins = append(joins, fmt.Sprintf(
+			"ANY LEFT JOIN (SELECT team_id, stream_id, label_value AS %s FROM %s WHERE %s AND label_name = %s) AS group_label_%d USING (team_id, stream_id)",
+			alias,
+			tableName(cfg.CHDatabase, cfg.LogStreamLabelsTable),
+			teamFilter(cfg),
+			sqlString(label),
+			i,
+		))
+	}
+	for i, matcher := range plan.rangeAgg.selector.matchers {
+		joins = append(joins, fmt.Sprintf(
+			"ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND label_name = %s AND %s) AS filter_label_%d USING (team_id, stream_id)",
+			tableName(cfg.CHDatabase, cfg.LogStreamLabelsTable),
+			teamFilter(cfg),
+			sqlString(matcher.name),
+			logQLSnuffleStatsLabelIndexMatcherCondition(matcher),
+			i,
+		))
+	}
+	return fmt.Sprintf(
+		"%s AS stats %s",
+		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
+		strings.Join(joins, " "),
+	)
+}
+
+func logQLSnuffleStatsLabelIndexMatcherCondition(matcher logQLLabelMatcher) string {
+	switch matcher.op {
+	case "=":
+		return "label_value = " + sqlString(matcher.value)
+	case "=~":
+		return "match(label_value, " + sqlString(promRegexToCH(matcher.value)) + ")"
+	default:
+		return "1"
+	}
+}
+
 func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
 	points := int64(1)
 	if endNS > startNS {
@@ -885,7 +972,20 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 	}
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
 	fetchEndNS := endNS
+	labelIndexJoinCount := logQLSnuffleStatsLabelIndexJoinCount(s.cfg, plan)
+	useLabelIndex := labelIndexJoinCount > 0
 	where := logQLSnuffleStatsBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
+	sourceSQL := logQLSnuffleStatsTableSQL(s.cfg)
+	bucketSettings := ""
+	if useLabelIndex {
+		where = logQLSnuffleStatsTimeFilters(s.cfg, fetchStartNS, fetchEndNS)
+		sourceSQL = logQLSnuffleStatsIndexedTableSQL(s.cfg, plan)
+		if labelIndexJoinCount == 1 {
+			bucketSettings = logQLSnuffleFullSortingMergeJoinSettings(s.cfg)
+		} else {
+			bucketSettings = " SETTINGS join_algorithm = 'hash'"
+		}
+	}
 
 	minuteEndNS := "(toInt64(toUnixTimestamp(bucket)) * 1000000000 + 60000000000)"
 	bucketSelects := []string{
@@ -898,7 +998,11 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 	orderBy := make([]string, 0, len(plan.groupLabels)+1)
 	for i, label := range plan.groupLabels {
 		alias := fmt.Sprintf("label_%d", i)
-		bucketSelects = append(bucketSelects, logQLSnuffleStreamOnlyLabelValueExpr(label)+" AS "+alias)
+		labelExpr := logQLSnuffleStatsLabelValueExpr(label)
+		if useLabelIndex {
+			labelExpr = alias
+		}
+		bucketSelects = append(bucketSelects, labelExpr+" AS "+alias)
 		bucketGroupBy = append(bucketGroupBy, alias)
 		outerSelects = append(outerSelects, alias)
 		orderBy = append(orderBy, alias)
@@ -906,16 +1010,47 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 	orderBy = append(orderBy, "eval_ns")
 
 	bucketSQL := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY %s",
+		"SELECT %s FROM %s WHERE %s GROUP BY %s%s",
 		strings.Join(bucketSelects, ", "),
-		logQLSnuffleStatsTableSQL(s.cfg),
+		sourceSQL,
 		strings.Join(where, " AND "),
 		strings.Join(bucketGroupBy, ", "),
+		bucketSettings,
 	)
 	windowSteps := plan.rangeAgg.window / step
 	if windowSteps < 1 {
 		windowSteps = 1
 	}
+	if plan.rangeAgg.fn == "count_over_time" && len(plan.groupLabels) > 0 && !plan.hasTopK {
+		fanoutSelects := []string{"eval_ns"}
+		outerGroupBy := []string{"eval_ns"}
+		for i := range plan.groupLabels {
+			alias := fmt.Sprintf("label_%d", i)
+			fanoutSelects = append(fanoutSelects, alias)
+			outerGroupBy = append(outerGroupBy, alias)
+		}
+		fanoutSelects = append(fanoutSelects, "log_count", "byte_count")
+		fanoutSQL := fmt.Sprintf(
+			"(SELECT %s FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM (%s) ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
+			strings.Join(fanoutSelects, ", "),
+			bucketSQL,
+			int64(windowSteps),
+		)
+		sql := fmt.Sprintf(
+			"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s, toFloat64(sum(log_count)) AS value FROM %s GROUP BY %s ORDER BY %s",
+			startNS,
+			endNS,
+			step.Nanoseconds(),
+			plan.rangeAgg.window.Nanoseconds(),
+			strings.Join(outerSelects, ", "),
+			fanoutSQL,
+			strings.Join(outerGroupBy, ", "),
+			strings.Join(orderBy, ", "),
+		)
+		sql = logQLMetricResultSQL(sql, plan)
+		return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+	}
+
 	windowFrame := int64(windowSteps) - 1
 	groupSelects := []string{"1 AS group_key"}
 	gridSelects := []string{"start_ns + (toInt64(n.number) * step_ns) AS eval_ns"}
@@ -968,21 +1103,48 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 
 func logQLSnuffleStatsTableSQL(cfg Config) string {
 	return fmt.Sprintf(
-		"(SELECT stats.team_id AS team_id, stats.bucket AS bucket, stats.stream_id AS stream_id, stats.log_count AS log_count, stats.byte_count AS byte_count, streams.labels AS labels, streams.resource_attributes AS resource_attributes FROM %s AS stats ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		"(SELECT stats.team_id AS team_id, stats.bucket AS bucket, stats.stream_id AS stream_id, stats.log_count AS log_count, stats.byte_count AS byte_count, streams.labels AS labels, streams.resource_attributes AS resource_attributes, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS stats ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
 		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
 		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
 		logQLSnuffleFullSortingMergeJoinSettings(cfg),
 	)
 }
 
-func logQLSnuffleStatsBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
-	filters := []string{
+func logQLSnuffleStatsLabelValueExpr(label string) string {
+	if logQLSnuffleStatsCoreLabel(label) {
+		switch label {
+		case "service_name", "service.name":
+			return "stream_service_name"
+		default:
+			return "stream_severity_text"
+		}
+	}
+	return logQLSnuffleStreamOnlyLabelValueExpr(label)
+}
+
+func logQLSnuffleStatsCoreLabel(label string) bool {
+	switch label {
+	case "service_name", "service.name":
+		return true
+	case "level", "severity", "severity_text", "detected_level":
+		return true
+	default:
+		return false
+	}
+}
+
+func logQLSnuffleStatsTimeFilters(cfg Config, startNS, endNS int64) []string {
+	return []string{
 		teamFilter(cfg),
 		"bucket >= toStartOfMinute(" + chTimeNanos(startNS) + ")",
 		"bucket <= toStartOfMinute(" + chTimeNanos(endNS) + ")",
 	}
+}
+
+func logQLSnuffleStatsBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
+	filters := logQLSnuffleStatsTimeFilters(cfg, startNS, endNS)
 	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLStringCondition(logQLSnuffleStreamOnlyLabelValueExpr(matcher.name), matcher.op, matcher.value, true))
+		filters = append(filters, logQLStringCondition(logQLSnuffleStatsLabelValueExpr(matcher.name), matcher.op, matcher.value, true))
 	}
 	return filters
 }

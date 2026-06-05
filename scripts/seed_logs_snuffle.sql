@@ -18,6 +18,21 @@ SELECT DISTINCT
     now64(6)
 FROM numbers({rows:UInt64});
 
+INSERT INTO log_stream_labels (team_id, label_name, label_value, stream_id)
+SELECT
+    team_id,
+    label.1,
+    label.2,
+    stream_id
+FROM log_streams
+ARRAY JOIN mapConcat(labels, mapFilter((k, v) -> NOT mapContains(labels, k), resource_attributes)) AS label
+WHERE label.1 != '' AND label.2 != ''
+ORDER BY
+    team_id,
+    stream_id,
+    label.1,
+    label.2;
+
 INSERT INTO log_stream_stats (team_id, bucket, stream_id, log_count, byte_count)
 WITH
     number AS n,

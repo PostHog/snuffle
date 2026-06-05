@@ -42,6 +42,7 @@ CH_DATABASE="${CH_DATABASE:-snuffle_perf}"
 CH_LOG_SCHEMA_LAYOUT="${CH_LOG_SCHEMA_LAYOUT:-}"
 CH_LOGS_TABLE="${CH_LOGS_TABLE:-}"
 CH_LOG_STREAMS_TABLE="${CH_LOG_STREAMS_TABLE:-}"
+CH_LOG_STREAM_LABELS_TABLE="${CH_LOG_STREAM_LABELS_TABLE:-}"
 CH_LOG_ATTRIBUTES_TABLE="${CH_LOG_ATTRIBUTES_TABLE:-}"
 CH_LOG_STREAM_STATS_TABLE="${CH_LOG_STREAM_STATS_TABLE:-}"
 
@@ -60,14 +61,17 @@ BRIDGE_BENCH_WARMUP="${BRIDGE_BENCH_WARMUP:-0}"
 BRIDGE_BENCHTIME="${BRIDGE_BENCHTIME:-1x}"
 BRIDGE_BENCH_TIMEOUT="${BRIDGE_BENCH_TIMEOUT:-120s}"
 BRIDGE_BENCH_GO_TEST_TIMEOUT="${BRIDGE_BENCH_GO_TEST_TIMEOUT:-60m}"
+PERF_MEMORY_SAMPLE_INTERVAL_MS="${PERF_MEMORY_SAMPLE_INTERVAL_MS:-100}"
 
 DATA_KEY="$(printf '%s' "$TSBS_USE_CASE-scale-$TSBS_SCALE-$TSBS_START-$TSBS_END-$TSBS_INTERVAL-$TSBS_SEED" | tr -c 'A-Za-z0-9_.-' '_')"
 DATA_FILE="${PERF_DATA_FILE:-$WORKDIR/tsbs-$DATA_KEY.prom}"
 SNUFFLE_BIN="$WORKDIR/snuffle"
 SNUFFLE_PID=""
 SNUFFLE_LOG=""
+MEMORY_SAMPLER_PID=""
 
 cleanup() {
+  stop_memory_sampler
   stop_snuffle
 }
 trap cleanup EXIT
@@ -114,6 +118,115 @@ trim_run_name() {
 
 now_millis() {
   date +%s%3N
+}
+
+process_status_kb() {
+  local pid="$1"
+  local field="$2"
+  awk -v field="$field:" '$1 == field { print $2; found = 1; exit } END { if (!found) print 0 }' "/proc/$pid/status" 2>/dev/null || printf '0\n'
+}
+
+start_memory_sampler() {
+  local pid="$1"
+  local state_file="$2"
+  if [[ -z "$pid" || ! -r "/proc/$pid/status" ]]; then
+    printf '0 0 0\n' > "$state_file"
+    MEMORY_SAMPLER_PID=""
+    return 0
+  fi
+
+  local interval_seconds
+  interval_seconds="$(awk -v ms="$PERF_MEMORY_SAMPLE_INTERVAL_MS" 'BEGIN { if (ms <= 0) ms = 100; printf "%.3f", ms / 1000.0 }')"
+  (
+    local peak_rss_kb=0
+    local peak_hwm_kb=0
+    local samples=0
+    while [[ -r "/proc/$pid/status" ]]; do
+      local rss_kb
+      local hwm_kb
+      rss_kb="$(process_status_kb "$pid" "VmRSS")"
+      hwm_kb="$(process_status_kb "$pid" "VmHWM")"
+      if [[ "$rss_kb" =~ ^[0-9]+$ && "$rss_kb" -gt "$peak_rss_kb" ]]; then
+        peak_rss_kb="$rss_kb"
+      fi
+      if [[ "$hwm_kb" =~ ^[0-9]+$ && "$hwm_kb" -gt "$peak_hwm_kb" ]]; then
+        peak_hwm_kb="$hwm_kb"
+      fi
+      samples="$((samples + 1))"
+      printf '%s %s %s\n' "$((peak_rss_kb * 1024))" "$((peak_hwm_kb * 1024))" "$samples" > "$state_file"
+      sleep "$interval_seconds"
+    done
+  ) &
+  MEMORY_SAMPLER_PID="$!"
+}
+
+stop_memory_sampler() {
+  if [[ -n "${MEMORY_SAMPLER_PID:-}" ]]; then
+    kill "$MEMORY_SAMPLER_PID" >/dev/null 2>&1 || true
+    wait "$MEMORY_SAMPLER_PID" >/dev/null 2>&1 || true
+    MEMORY_SAMPLER_PID=""
+  fi
+}
+
+clickhouse_now64() {
+  ch_client --query "SELECT now64(6) FORMAT TSVRaw"
+}
+
+collect_clickhouse_memory() {
+  local window_start="$1"
+  local window_end="$2"
+  local output_file="$3"
+  if ! ch_client \
+    --param_database="$CH_DATABASE" \
+    --param_window_start="$window_start" \
+    --param_window_end="$window_end" \
+    --query "
+      SELECT
+        count() AS query_count,
+        toUInt64(max(memory_usage)) AS peak_memory_bytes,
+        toFloat64(ifNull(avgOrNull(memory_usage), 0)) AS avg_peak_memory_bytes,
+        toUInt64(sum(memory_usage)) AS total_peak_memory_bytes
+      FROM system.query_log
+      WHERE current_database = {database:String}
+        AND type = 'QueryFinish'
+        AND is_initial_query = 1
+        AND query_kind = 'Select'
+        AND notEmpty(tables)
+        AND event_time_microseconds >= parseDateTime64BestEffort({window_start:String}, 6)
+        AND event_time_microseconds < parseDateTime64BestEffort({window_end:String}, 6)
+      FORMAT TSVRaw" > "$output_file"; then
+    printf '0\t0\t0\t0\n' > "$output_file"
+  fi
+}
+
+write_memory_result() {
+  local output_file="$1"
+  local process_state="$2"
+  local clickhouse_state="$3"
+  local snuffle_peak_rss_bytes=0
+  local snuffle_peak_hwm_bytes=0
+  local snuffle_memory_samples=0
+  local clickhouse_query_count=0
+  local clickhouse_peak_memory_bytes=0
+  local clickhouse_avg_peak_memory_bytes=0
+  local clickhouse_total_peak_memory_bytes=0
+
+  if [[ -s "$process_state" ]]; then
+    read -r snuffle_peak_rss_bytes snuffle_peak_hwm_bytes snuffle_memory_samples < "$process_state" || true
+  fi
+  if [[ -s "$clickhouse_state" ]]; then
+    IFS=$'\t' read -r clickhouse_query_count clickhouse_peak_memory_bytes clickhouse_avg_peak_memory_bytes clickhouse_total_peak_memory_bytes < "$clickhouse_state" || true
+  fi
+
+  printf '{\n' > "$output_file"
+  printf '  "snuffle_peak_rss_bytes": %s,\n' "${snuffle_peak_rss_bytes:-0}" >> "$output_file"
+  printf '  "snuffle_peak_hwm_bytes": %s,\n' "${snuffle_peak_hwm_bytes:-0}" >> "$output_file"
+  printf '  "snuffle_memory_samples": %s,\n' "${snuffle_memory_samples:-0}" >> "$output_file"
+  printf '  "clickhouse_query_count": %s,\n' "${clickhouse_query_count:-0}" >> "$output_file"
+  printf '  "clickhouse_peak_memory_bytes": %s,\n' "${clickhouse_peak_memory_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_avg_peak_memory_bytes": %s,\n' "${clickhouse_avg_peak_memory_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_total_peak_memory_bytes": %s\n' "${clickhouse_total_peak_memory_bytes:-0}" >> "$output_file"
+  printf '}\n' >> "$output_file"
 }
 
 datetime_to_ns() {
@@ -213,8 +326,9 @@ start_snuffle() {
   local log_schema_layout="${5:-$CH_LOG_SCHEMA_LAYOUT}"
   local logs_table="${6:-$CH_LOGS_TABLE}"
   local log_streams_table="${7:-$CH_LOG_STREAMS_TABLE}"
-  local log_attributes_table="${8:-$CH_LOG_ATTRIBUTES_TABLE}"
-  local log_stream_stats_table="${9:-$CH_LOG_STREAM_STATS_TABLE}"
+  local log_stream_labels_table="${8:-$CH_LOG_STREAM_LABELS_TABLE}"
+  local log_attributes_table="${9:-$CH_LOG_ATTRIBUTES_TABLE}"
+  local log_stream_stats_table="${10:-$CH_LOG_STREAM_STATS_TABLE}"
   if [[ -n "${PERF_SNUFFLE_URL:-}" ]]; then
     return 0
   fi
@@ -230,6 +344,7 @@ start_snuffle() {
     CH_LOG_SCHEMA_LAYOUT="$log_schema_layout" \
     CH_LOGS_TABLE="$logs_table" \
     CH_LOG_STREAMS_TABLE="$log_streams_table" \
+    CH_LOG_STREAM_LABELS_TABLE="$log_stream_labels_table" \
     CH_LOG_ATTRIBUTES_TABLE="$log_attributes_table" \
     CH_LOG_STREAM_STATS_TABLE="$log_stream_stats_table" \
     SIDECAR_HOST="$SIDECAR_HOST" \
@@ -272,6 +387,16 @@ run_bridge_bench() {
   local run_dir="$1"
   local profile="$2"
   local bench_output="$run_dir/go-bench.out"
+  local process_memory_state="$run_dir/process-memory.state"
+  local clickhouse_memory_state="$run_dir/clickhouse-memory.tsv"
+  local memory_output="$run_dir/memory-results.json"
+  local query_window_start
+  local query_window_end
+  local bench_status
+  ch_client --query "SYSTEM FLUSH LOGS" >/dev/null 2>&1 || true
+  query_window_start="$(clickhouse_now64)"
+  start_memory_sampler "$SNUFFLE_PID" "$process_memory_state"
+  set +e
   env \
     BRIDGE_BENCH_URL="$SNUFFLE_URL" \
     BRIDGE_BENCH_PROFILE="$profile" \
@@ -283,6 +408,16 @@ run_bridge_bench() {
     BRIDGE_BENCH_LOG_STEP="$POSTHOG_LOG_STEP" \
     BRIDGE_BENCH_LOG_LIMIT="$POSTHOG_LOG_LIMIT" \
     go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime="$BRIDGE_BENCHTIME" -timeout="$BRIDGE_BENCH_GO_TEST_TIMEOUT" | tee "$bench_output"
+  bench_status="${PIPESTATUS[0]}"
+  set -e
+  stop_memory_sampler
+  query_window_end="$(clickhouse_now64)"
+  ch_client --query "SYSTEM FLUSH LOGS" >/dev/null 2>&1 || true
+  collect_clickhouse_memory "$query_window_start" "$query_window_end" "$clickhouse_memory_state"
+  write_memory_result "$memory_output" "$process_memory_state" "$clickhouse_memory_state"
+  if [[ "$bench_status" -ne 0 ]]; then
+    return "$bench_status"
+  fi
 }
 
 report_run_attempt() {
@@ -302,6 +437,7 @@ report_run_attempt() {
   local source_workers="${14}"
   local source_batch_size="${15}"
   local attempt="${16}"
+  local memory_results="$run_dir/memory-results.json"
   go run ./cmd/snuffle-perf-report \
     --build-only \
     --current-output "$run_dir/perf-results.current.json" \
@@ -310,6 +446,7 @@ report_run_attempt() {
     --repeat-count "$PERF_REPEAT" \
     --load "$load_results" \
     --bench "$bench_output" \
+    --memory "$memory_results" \
     --rows "$rows" \
     --source-name "$source_name" \
     --source-version "$source_version" \
@@ -433,7 +570,7 @@ run_posthog_logs() {
   fi
   write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
 
-  start_snuffle "$run_dir" "posthog" "metrics1" "1" "posthog" "$logs_table" "" "$attributes_table" ""
+  start_snuffle "$run_dir" "posthog" "metrics1" "1" "posthog" "$logs_table" "" "" "$attributes_table" ""
   wait_for_http "$SNUFFLE_URL/-/healthy"
   run_bridge_bench "$run_dir" "posthog_logs"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "posthog-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
@@ -449,6 +586,7 @@ run_snuffle_logs() {
   local bench_output="$run_dir/go-bench.out"
   local logs_table="logs"
   local streams_table="log_streams"
+  local labels_table="log_stream_labels"
   local attributes_table=""
   local stats_table="log_stream_stats"
   mkdir -p "$run_dir"
@@ -456,6 +594,7 @@ run_snuffle_logs() {
   echo "==> $run_name attempt $attempt/$PERF_REPEAT: recreate Snuffle logs schema"
   validate_identifier "$logs_table"
   validate_identifier "$streams_table"
+  validate_identifier "$labels_table"
   validate_identifier "$stats_table"
   ch_client --multiquery < "$ROOT/scripts/create_logs_snuffle_schema.sql"
 
@@ -477,7 +616,7 @@ run_snuffle_logs() {
   fi
   write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
 
-  start_snuffle "$run_dir" "posthog" "metrics1" "1" "snuffle" "$logs_table" "$streams_table" "$attributes_table" "$stats_table"
+  start_snuffle "$run_dir" "posthog" "metrics1" "1" "snuffle" "$logs_table" "$streams_table" "$labels_table" "$attributes_table" "$stats_table"
   wait_for_http "$SNUFFLE_URL/-/healthy"
   run_bridge_bench "$run_dir" "snuffle_logs"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "snuffle-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"

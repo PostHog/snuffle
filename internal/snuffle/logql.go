@@ -1433,7 +1433,7 @@ func logQLLogsSourceSQL(cfg Config, where []string) string {
 		)
 	}
 	return fmt.Sprintf(
-		"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, labels, fields, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s)",
+		"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, labels, fields, stream_service_name, stream_severity_text, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s)",
 		logQLSnuffleLabelValueExpr("service_name"),
 		logQLSnuffleLabelValueExpr("severity_text"),
 		logQLSnuffleLabelValueExpr("trace_id"),
@@ -1449,7 +1449,7 @@ func logQLLogsTableSQL(cfg Config) string {
 		return tableName(cfg.CHDatabase, cfg.LogsTable)
 	}
 	return fmt.Sprintf(
-		"(SELECT logs.team_id AS team_id, logs.timestamp AS timestamp, logs.time_bucket AS time_bucket, logs.observed_ns AS observed_ns, logs.body AS body, logs.stream_id AS stream_id, logs.fields AS fields, streams.resource_attributes AS resource_attributes, streams.labels AS labels FROM %s AS logs ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		"(SELECT logs.team_id AS team_id, logs.timestamp AS timestamp, logs.time_bucket AS time_bucket, logs.observed_ns AS observed_ns, logs.body AS body, logs.stream_id AS stream_id, logs.fields AS fields, streams.resource_attributes AS resource_attributes, streams.labels AS labels, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS logs ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
 		tableName(cfg.CHDatabase, cfg.LogsTable),
 		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
 		logQLSnuffleFullSortingMergeJoinSettings(cfg),
@@ -1460,7 +1460,7 @@ func logQLSnuffleFullSortingMergeJoinSettings(cfg Config) string {
 	if cfg.postHogLogSchemaLayout() {
 		return ""
 	}
-	return " SETTINGS join_algorithm = 'full_sorting_merge'"
+	return " SETTINGS join_algorithm = 'full_sorting_merge', max_rows_in_set_to_optimize_join = 0"
 }
 
 func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
@@ -1568,11 +1568,11 @@ func logQLLabelValueExpr(cfg Config, name string) string {
 func logQLSnuffleLabelValueExpr(name string) string {
 	switch name {
 	case "service_name":
-		return "if(mapContains(labels, 'service_name'), labels['service_name'], if(mapContains(fields, 'service_name'), fields['service_name'], if(mapContains(labels, 'service.name'), labels['service.name'], fields['service.name'])))"
+		return "if(stream_service_name != '', stream_service_name, if(mapContains(fields, 'service_name'), fields['service_name'], fields['service.name']))"
 	case "service.name":
-		return "if(mapContains(labels, 'service.name'), labels['service.name'], if(mapContains(fields, 'service.name'), fields['service.name'], if(mapContains(labels, 'service_name'), labels['service_name'], fields['service_name'])))"
+		return "if(stream_service_name != '', stream_service_name, if(mapContains(fields, 'service.name'), fields['service.name'], fields['service_name']))"
 	case "level", "severity", "severity_text", "detected_level":
-		return "multiIf(mapContains(labels, 'level'), labels['level'], mapContains(fields, 'level'), fields['level'], mapContains(labels, 'severity_text'), labels['severity_text'], mapContains(fields, 'severity_text'), fields['severity_text'], mapContains(labels, 'detected_level'), labels['detected_level'], fields['detected_level'])"
+		return "if(stream_severity_text != '', stream_severity_text, multiIf(mapContains(fields, 'level'), fields['level'], mapContains(fields, 'severity_text'), fields['severity_text'], fields['detected_level']))"
 	case "trace_id":
 		return "if(mapContains(labels, 'trace_id'), labels['trace_id'], fields['trace_id'])"
 	case "span_id":

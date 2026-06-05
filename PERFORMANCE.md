@@ -77,6 +77,8 @@ The target writes:
 - `.perf/<run>/attempt-<n>/tsbs-load-results.json`: metrics write/load summary
 - `.perf/<run>/attempt-<n>/log-load-results.json`: logs seed summary
 - `.perf/<run>/attempt-<n>/go-bench.out`: raw Go HTTP benchmark output
+- `.perf/<run>/attempt-<n>/memory-results.json`: Snuffle process RSS samples
+  and ClickHouse query-memory summary for the benchmark window
 - `.perf/<run>/attempt-<n>/perf-results.current.json`: candidate result for
   that attempt
 - `.perf/<run>/perf-results.current.json`: selected slowest candidate, even
@@ -97,7 +99,8 @@ candidates to make the command exit non-zero.
 2. Waits for ClickHouse and creates `CH_DATABASE`, default `snuffle_perf`.
 3. Recreates the benchmark schema for the current run:
    `scripts/create_metrics_posthog_schema.sql`,
-   `scripts/create_logs_posthog_schema.sql`.
+   `scripts/create_logs_posthog_schema.sql`, or
+   `scripts/create_logs_snuffle_schema.sql`.
 4. Builds `cmd/snuffle` into `.perf/snuffle`.
 5. Starts snuffle on `SIDECAR_HOST:SIDECAR_PORT`, default
    `127.0.0.1:9091`, unless `PERF_SNUFFLE_URL` points at an already-running
@@ -108,8 +111,8 @@ candidates to make the command exit non-zero.
    `scripts/seed_logs_posthog.sql`.
 8. Flushes ClickHouse async inserts and waits until the target table reaches
    the expected row count.
-9. Runs `BenchmarkBridgeHTTP` with `BRIDGE_BENCH_PROFILE=posthog_metrics` or
-   `posthog_logs`.
+9. Runs `BenchmarkBridgeHTTP` with the selected profile while sampling managed
+   Snuffle RSS and collecting matching ClickHouse `system.query_log` memory.
 10. Builds a candidate result for each attempt.
 11. Selects the slowest candidate for each named run and compares it to that
    run's entry in `perf-results.json`.
@@ -123,6 +126,8 @@ entry records:
 - per-scenario HTTP query latency summaries
 - query geomean average latency
 - total average latency across all scenarios
+- Snuffle peak RSS and ClickHouse per-query peak memory summary for the
+  benchmark window
 
 The reporter compares the previous accepted result to the current run with a
 geomean of these ratios:
@@ -261,6 +266,8 @@ accepting a change.
 - `BRIDGE_BENCH_GO_TEST_TIMEOUT`: timeout for each Go benchmark profile.
   Default `60m`.
 - `BRIDGE_BENCH_SCENARIO`: comma-separated scenario filter for focused runs.
+- `PERF_MEMORY_SAMPLE_INTERVAL_MS`: Snuffle RSS sampling interval during the
+  HTTP benchmark. Default `100`.
 - `PERF_RESULTS_FILE`: alternate baseline path. Useful when testing a risky
   branch without touching `perf-results.json`.
 - `PERF_COMPARE_TOLERANCE`: allowed slower ratio before the reporter treats the

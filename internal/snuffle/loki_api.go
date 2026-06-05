@@ -647,6 +647,30 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 			)
 		}
 	}
+	if coreSQL == "" && !s.cfg.postHogLogSchemaLayout() && s.cfg.LogStreamsTable != "" {
+		if s.cfg.LogStreamLabelsTable != "" && s.cfg.LogStreamStatsTable != "" {
+			coreSQL = logQLSnuffleLabelValuesFromIndexSQL(s.cfg, name, start.UnixNano(), end.UnixNano(), limit)
+		}
+	}
+	if coreSQL == "" && !s.cfg.postHogLogSchemaLayout() && s.cfg.LogStreamsTable != "" {
+		streamsTable := logQLSnuffleStreamsTableSQL(s.cfg, start.UnixNano(), end.UnixNano())
+		switch name {
+		case "service_name", "service.name":
+			coreSQL = fmt.Sprintf(
+				"SELECT DISTINCT service_name AS label_value FROM %s WHERE %s AND service_name != '' ORDER BY label_value%s",
+				streamsTable,
+				teamFilter(s.cfg),
+				sqlLimit(limit),
+			)
+		case "level", "severity", "severity_text", "detected_level":
+			coreSQL = fmt.Sprintf(
+				"SELECT DISTINCT severity_text AS label_value FROM %s WHERE %s AND severity_text != '' ORDER BY label_value%s",
+				streamsTable,
+				teamFilter(s.cfg),
+				sqlLimit(limit),
+			)
+		}
+	}
 	if err := queryValues(coreSQL); err != nil {
 		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
 		return
@@ -684,18 +708,39 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 	writeLokiSuccess(w, sortedLimited(values, limit))
 }
 
+func logQLSnuffleLabelValuesFromIndexSQL(cfg Config, name string, startNS, endNS int64, limit int) string {
+	return fmt.Sprintf(
+		"SELECT DISTINCT labels.label_value AS label_value FROM %s AS stats ANY INNER JOIN (SELECT team_id, stream_id, label_value FROM %s WHERE %s AND %s) AS labels USING (team_id, stream_id) WHERE %s AND bucket >= toStartOfMinute(%s) AND bucket <= toStartOfMinute(%s) AND labels.label_value != '' ORDER BY label_value%s%s",
+		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
+		tableName(cfg.CHDatabase, cfg.LogStreamLabelsTable),
+		teamFilter(cfg),
+		logQLSnuffleStreamLabelKeyCondition("label_name", name),
+		teamFilter(cfg),
+		chTimeNanos(startNS),
+		chTimeNanos(endNS),
+		sqlLimit(limit),
+		logQLSnuffleFullSortingMergeJoinSettings(cfg),
+	)
+}
+
+func logQLSnuffleActiveStreamsSQL(cfg Config, startNS, endNS int64) string {
+	return fmt.Sprintf(
+		"(SELECT team_id, stream_id FROM %s WHERE %s AND bucket >= toStartOfMinute(%s) AND bucket <= toStartOfMinute(%s) GROUP BY team_id, stream_id ORDER BY team_id, stream_id)",
+		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
+		teamFilter(cfg),
+		chTimeNanos(startNS),
+		chTimeNanos(endNS),
+	)
+}
+
 func logQLSnuffleStreamsTableSQL(cfg Config, startNS, endNS int64) string {
 	if cfg.postHogLogSchemaLayout() || cfg.LogStreamStatsTable == "" {
 		return tableName(cfg.CHDatabase, cfg.LogStreamsTable)
 	}
 	return fmt.Sprintf(
-		"(SELECT streams.team_id AS team_id, streams.stream_id AS stream_id, streams.labels AS labels, streams.resource_attributes AS resource_attributes FROM %s AS streams ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND bucket >= toStartOfMinute(%s) AND bucket <= toStartOfMinute(%s) GROUP BY team_id, stream_id ORDER BY team_id, stream_id) AS active USING (team_id, stream_id)%s)",
+		"(SELECT streams.team_id AS team_id, streams.stream_id AS stream_id, streams.labels AS labels, streams.resource_attributes AS resource_attributes, streams.service_name AS service_name, streams.severity_text AS severity_text FROM %s AS streams ANY INNER JOIN %s AS active USING (team_id, stream_id))",
 		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
-		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
-		teamFilter(cfg),
-		chTimeNanos(startNS),
-		chTimeNanos(endNS),
-		logQLSnuffleFullSortingMergeJoinSettings(cfg),
+		logQLSnuffleActiveStreamsSQL(cfg, startNS, endNS),
 	)
 }
 
@@ -1314,6 +1359,9 @@ func (s *Server) insertSnuffleLokiLogRows(ctx context.Context, rows []lokiLogIns
 	if err := s.insertSnuffleLogStreams(ctx, rows); err != nil {
 		return err
 	}
+	if err := s.insertSnuffleLogStreamLabels(ctx, rows); err != nil {
+		return err
+	}
 	if err := s.insertSnuffleLogEvents(ctx, rows); err != nil {
 		return err
 	}
@@ -1359,6 +1407,77 @@ func (s *Server) insertSnuffleLogStreams(ctx context.Context, rows []lokiLogInse
 			}
 		}
 		return len(unique), nil
+	})
+}
+
+func (s *Server) insertSnuffleLogStreamLabels(ctx context.Context, rows []lokiLogInsertRow) error {
+	if s.cfg.LogStreamLabelsTable == "" || len(rows) == 0 {
+		return nil
+	}
+	type labelRow struct {
+		teamID int32
+		name   string
+		value  string
+		stream uint64
+	}
+	seen := map[string]struct{}{}
+	labels := make([]labelRow, 0, len(rows)*8)
+	add := func(row lokiLogInsertRow, name, value string) {
+		if name == "" || value == "" {
+			return
+		}
+		key := strconv.FormatInt(int64(row.teamID), 10) + "\x00" + name + "\x00" + value + "\x00" + strconv.FormatUint(row.streamID, 10)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		labels = append(labels, labelRow{teamID: row.teamID, name: name, value: value, stream: row.streamID})
+	}
+	for _, row := range rows {
+		for name, value := range row.streamLabels {
+			add(row, name, value)
+		}
+		for name, value := range row.resourceAttributes {
+			if _, ok := row.streamLabels[name]; ok {
+				continue
+			}
+			add(row, name, value)
+		}
+	}
+	if len(labels) == 0 {
+		return nil
+	}
+	sort.Slice(labels, func(i, j int) bool {
+		if labels[i].teamID != labels[j].teamID {
+			return labels[i].teamID < labels[j].teamID
+		}
+		if labels[i].stream != labels[j].stream {
+			return labels[i].stream < labels[j].stream
+		}
+		if labels[i].name != labels[j].name {
+			return labels[i].name < labels[j].name
+		}
+		return labels[i].value < labels[j].value
+	})
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, label_name, label_value, stream_id)", tableName(s.cfg.CHDatabase, s.cfg.LogStreamLabelsTable))
+	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+		teamIDs := make([]int32, len(labels))
+		names := make([]string, len(labels))
+		values := make([]string, len(labels))
+		streams := make([]uint64, len(labels))
+		for i, row := range labels {
+			teamIDs[i] = row.teamID
+			names[i] = row.name
+			values[i] = row.value
+			streams[i] = row.stream
+		}
+		columns := []any{teamIDs, names, values, streams}
+		for i, column := range columns {
+			if err := batch.Column(i).Append(column); err != nil {
+				return 0, err
+			}
+		}
+		return len(labels), nil
 	})
 }
 

@@ -1,6 +1,6 @@
 DROP TABLE IF EXISTS logs34_to_resource_attributes SYNC;
 DROP TABLE IF EXISTS logs34_to_log_attributes SYNC;
-DROP VIEW IF EXISTS logs SYNC;
+DROP TABLE IF EXISTS logs SYNC;
 DROP TABLE IF EXISTS logs34 SYNC;
 DROP TABLE IF EXISTS log_attributes2 SYNC;
 

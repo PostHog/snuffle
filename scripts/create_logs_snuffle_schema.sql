@@ -4,6 +4,7 @@ DROP TABLE IF EXISTS logs SYNC;
 DROP TABLE IF EXISTS log_stream_days SYNC;
 DROP TABLE IF EXISTS log_stream_stats SYNC;
 DROP TABLE IF EXISTS log_label_index SYNC;
+DROP TABLE IF EXISTS log_stream_labels SYNC;
 DROP TABLE IF EXISTS log_streams SYNC;
 
 CREATE TABLE log_streams
@@ -46,6 +47,19 @@ ORDER BY (team_id, stream_id, bucket)
 TTL bucket + toIntervalDay(31)
 SETTINGS
     ttl_only_drop_parts = 1,
+    index_granularity_bytes = 104857600,
+    index_granularity = 8192;
+
+CREATE TABLE log_stream_labels
+(
+    team_id Int32 CODEC(T64, Default),
+    label_name LowCardinality(String),
+    label_value String,
+    stream_id UInt64 CODEC(Delta, Default)
+)
+ENGINE = ReplacingMergeTree
+ORDER BY (team_id, stream_id, label_name, label_value)
+SETTINGS
     index_granularity_bytes = 104857600,
     index_granularity = 8192;
 

@@ -102,8 +102,8 @@ func TestConfigFromEnvLogSettings(t *testing.T) {
 	if cfg.LogSchemaLayout != "snuffle" {
 		t.Fatalf("LogSchemaLayout = %q, want snuffle", cfg.LogSchemaLayout)
 	}
-	if cfg.LogsTable != "logs" || cfg.LogStreamsTable != "log_streams" || cfg.LogAttributesTable != "" || cfg.LogStreamStatsTable != "log_stream_stats" {
-		t.Fatalf("snuffle log tables = logs %q streams %q attrs %q stats %q", cfg.LogsTable, cfg.LogStreamsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
+	if cfg.LogsTable != "logs" || cfg.LogStreamsTable != "log_streams" || cfg.LogStreamLabelsTable != "log_stream_labels" || cfg.LogAttributesTable != "" || cfg.LogStreamStatsTable != "log_stream_stats" {
+		t.Fatalf("snuffle log tables = logs %q streams %q stream labels %q attrs %q stats %q", cfg.LogsTable, cfg.LogStreamsTable, cfg.LogStreamLabelsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
 	}
 	if cfg.LogRetention != 48*time.Hour {
 		t.Fatalf("LogRetention = %s, want 48h", cfg.LogRetention)
@@ -114,16 +114,17 @@ func TestConfigFromEnvLogSettings(t *testing.T) {
 
 	t.Setenv("CH_LOG_SCHEMA_LAYOUT", "posthog")
 	cfg = ConfigFromEnv()
-	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes2" || cfg.LogStreamsTable != "" || cfg.LogStreamStatsTable != "" {
-		t.Fatalf("posthog log layout = layout %q logs %q streams %q attrs %q stats %q", cfg.LogSchemaLayout, cfg.LogsTable, cfg.LogStreamsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
+	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes2" || cfg.LogStreamsTable != "" || cfg.LogStreamLabelsTable != "" || cfg.LogStreamStatsTable != "" {
+		t.Fatalf("posthog log layout = layout %q logs %q streams %q stream labels %q attrs %q stats %q", cfg.LogSchemaLayout, cfg.LogsTable, cfg.LogStreamsTable, cfg.LogStreamLabelsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
 	}
 
 	t.Setenv("CH_LOGS_TABLE", "custom_logs")
 	t.Setenv("CH_LOG_STREAMS_TABLE", "custom_streams")
+	t.Setenv("CH_LOG_STREAM_LABELS_TABLE", "custom_stream_labels")
 	t.Setenv("CH_LOG_ATTRIBUTES_TABLE", "custom_attrs")
 	t.Setenv("CH_LOG_STREAM_STATS_TABLE", "custom_stats")
 	cfg = ConfigFromEnv()
-	if cfg.LogsTable != "custom_logs" || cfg.LogStreamsTable != "custom_streams" || cfg.LogAttributesTable != "custom_attrs" || cfg.LogStreamStatsTable != "custom_stats" {
-		t.Fatalf("custom log tables = logs %q streams %q attrs %q stats %q", cfg.LogsTable, cfg.LogStreamsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
+	if cfg.LogsTable != "custom_logs" || cfg.LogStreamsTable != "custom_streams" || cfg.LogStreamLabelsTable != "custom_stream_labels" || cfg.LogAttributesTable != "custom_attrs" || cfg.LogStreamStatsTable != "custom_stats" {
+		t.Fatalf("custom log tables = logs %q streams %q stream labels %q attrs %q stats %q", cfg.LogsTable, cfg.LogStreamsTable, cfg.LogStreamLabelsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
 	}
 }

@@ -307,7 +307,9 @@ Snuffle-native `logs` schema and queries it through LogQL. Attempt
 artifacts are stored under
 `.perf/<run>/attempt-<n>/`, selected run results are copied to
 `.perf/<run>/perf-results.current.json`, and accepted suite baselines are kept
-in `perf-results.json`. Use `PERF_RUNS=posthog_metrics`,
+in `perf-results.json`. Each run result also records managed Snuffle RSS and
+ClickHouse query-memory totals from the benchmark window. Use
+`PERF_RUNS=posthog_metrics`,
 `PERF_RUNS=posthog_logs`, or `PERF_RUNS=snuffle_logs` for a targeted run,
 `BRIDGE_BENCH_SCENARIO=<scenario>` for a targeted query scenario, and env vars
 like `TSBS_SCALE`, `POSTHOG_LOG_ROWS`, or `BRIDGE_BENCHTIME` for larger local
