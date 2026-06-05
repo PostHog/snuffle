@@ -26,7 +26,7 @@ type logQLMetricSQLPlan struct {
 }
 
 func (s *Server) tryLogQLRangeMetricSQL(ctx context.Context, expr *logQLExpr, start, end time.Time, step time.Duration) (lokiQueryData, bool, error) {
-	plan, ok := buildLogQLMetricSQLPlan(expr)
+	plan, ok := buildLogQLMetricSQLPlan(s.cfg, expr)
 	if !ok {
 		return lokiQueryData{}, false, nil
 	}
@@ -38,7 +38,7 @@ func (s *Server) tryLogQLRangeMetricSQL(ctx context.Context, expr *logQLExpr, st
 }
 
 func (s *Server) tryLogQLInstantMetricSQL(ctx context.Context, expr *logQLExpr, ts time.Time) (lokiQueryData, bool, error) {
-	plan, ok := buildLogQLMetricSQLPlan(expr)
+	plan, ok := buildLogQLMetricSQLPlan(s.cfg, expr)
 	if !ok {
 		return lokiQueryData{}, false, nil
 	}
@@ -59,22 +59,22 @@ func (s *Server) tryLogQLInstantMetricSQL(ctx context.Context, expr *logQLExpr, 
 	return lokiQueryData{ResultType: "vector", Result: vector, Stats: lokiEmptyStats()}, true, nil
 }
 
-func buildLogQLMetricSQLPlan(expr *logQLExpr) (*logQLMetricSQLPlan, bool) {
+func buildLogQLMetricSQLPlan(cfg Config, expr *logQLExpr) (*logQLMetricSQLPlan, bool) {
 	if expr == nil {
 		return nil, false
 	}
 	var plan *logQLMetricSQLPlan
 	if expr.rangeAgg != nil {
-		plan = buildLogQLRangeAggSQLPlan(expr.rangeAgg, nil, "")
+		plan = buildLogQLRangeAggSQLPlan(cfg, expr.rangeAgg, nil, "")
 	} else if expr.aggregation != nil && expr.aggregation.expr != nil && expr.aggregation.expr.rangeAgg != nil && expr.aggregation.expr.comparison == nil {
 		switch expr.aggregation.fn {
 		case "sum":
 		default:
 			return nil, false
 		}
-		plan = buildLogQLRangeAggSQLPlan(expr.aggregation.expr.rangeAgg, expr.aggregation.grouping, expr.aggregation.fn)
+		plan = buildLogQLRangeAggSQLPlan(cfg, expr.aggregation.expr.rangeAgg, expr.aggregation.grouping, expr.aggregation.fn)
 	} else if expr.topK != nil && expr.topK.expr != nil && expr.topK.expr.comparison == nil {
-		child, ok := buildLogQLMetricSQLPlan(expr.topK.expr)
+		child, ok := buildLogQLMetricSQLPlan(cfg, expr.topK.expr)
 		if !ok || child == nil || child.hasTopK {
 			return nil, false
 		}
@@ -92,7 +92,7 @@ func buildLogQLMetricSQLPlan(expr *logQLExpr) (*logQLMetricSQLPlan, bool) {
 	return plan, plan != nil
 }
 
-func buildLogQLRangeAggSQLPlan(rangeAgg *logQLRangeAggregation, grouping *logQLGrouping, outerAgg string) *logQLMetricSQLPlan {
+func buildLogQLRangeAggSQLPlan(cfg Config, rangeAgg *logQLRangeAggregation, grouping *logQLGrouping, outerAgg string) *logQLMetricSQLPlan {
 	if rangeAgg == nil {
 		return nil
 	}
@@ -128,11 +128,11 @@ func buildLogQLRangeAggSQLPlan(rangeAgg *logQLRangeAggregation, grouping *logQLG
 		}
 		valueExpr = fmt.Sprintf("toFloat64(sum(byte_count)) / %s", formatDurationSeconds(rangeAgg.window))
 	default:
-		unwrapValueExpr, selectorFilters, ok := buildLogQLUnwrapMetricSQL(rangeAgg)
+		unwrapValueExpr, selectorFilters, ok := buildLogQLUnwrapMetricSQL(cfg, rangeAgg)
 		if !ok {
 			return nil
 		}
-		groupLabels, groupExprs := logQLSQLGroupingExprs(grouping)
+		groupLabels, groupExprs := logQLSQLGroupingExprs(cfg, grouping)
 		return &logQLMetricSQLPlan{
 			rangeAgg:        rangeAgg,
 			grouping:        grouping,
@@ -143,7 +143,7 @@ func buildLogQLRangeAggSQLPlan(rangeAgg *logQLRangeAggregation, grouping *logQLG
 			selectorFilters: selectorFilters,
 		}
 	}
-	groupLabels, groupExprs := logQLSQLGroupingExprs(grouping)
+	groupLabels, groupExprs := logQLSQLGroupingExprs(cfg, grouping)
 	return &logQLMetricSQLPlan{
 		rangeAgg:    rangeAgg,
 		grouping:    grouping,
@@ -165,7 +165,7 @@ func logQLMetricSelectorSQLSafe(selector logQLSelector) bool {
 	return true
 }
 
-func logQLSQLGroupingExprs(grouping *logQLGrouping) ([]string, []string) {
+func logQLSQLGroupingExprs(cfg Config, grouping *logQLGrouping) ([]string, []string) {
 	if grouping == nil || grouping.without {
 		return nil, nil
 	}
@@ -176,23 +176,35 @@ func logQLSQLGroupingExprs(grouping *logQLGrouping) ([]string, []string) {
 			continue
 		}
 		labels = append(labels, label)
-		exprs = append(exprs, logQLMetricGroupLabelValueExpr(label))
+		exprs = append(exprs, logQLMetricGroupLabelValueExpr(cfg, label))
 	}
 	return labels, exprs
 }
 
-func logQLMetricGroupLabelValueExpr(label string) string {
+func logQLMetricGroupLabelValueExpr(cfg Config, label string) string {
 	switch label {
 	case "service_name":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "service_name"
 	case "level", "severity", "severity_text", "detected_level":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "severity_text"
 	case "trace_id":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "trace_id"
 	case "span_id":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "span_id"
 	default:
-		return logQLLabelValueExpr(label)
+		return logQLLabelValueExpr(cfg, label)
 	}
 }
 
@@ -205,7 +217,7 @@ func logQLMetricBaseFilters(cfg Config, selector logQLSelector, startNS, endNS i
 		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
 	}
 	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLMetricMatcherCondition(matcher))
+		filters = append(filters, logQLMetricMatcherCondition(cfg, matcher))
 	}
 	canPushLine := true
 	for _, stage := range selector.stages {
@@ -219,26 +231,38 @@ func logQLMetricBaseFilters(cfg Config, selector logQLSelector, startNS, endNS i
 	return filters
 }
 
-func logQLMetricMatcherCondition(m logQLLabelMatcher) string {
-	return logQLStringCondition(logQLMetricLabelFilterValueExpr(m.name), m.op, m.value, true)
+func logQLMetricMatcherCondition(cfg Config, m logQLLabelMatcher) string {
+	return logQLStringCondition(logQLMetricLabelFilterValueExpr(cfg, m.name), m.op, m.value, true)
 }
 
-func logQLMetricLabelFilterValueExpr(label string) string {
+func logQLMetricLabelFilterValueExpr(cfg Config, label string) string {
 	switch label {
 	case "service_name", "service.name":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "service_name"
 	case "level", "severity", "severity_text", "detected_level":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "severity_text"
 	case "trace_id":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "trace_id"
 	case "span_id":
+		if !cfg.postHogLogSchemaLayout() {
+			return logQLSnuffleLabelValueExpr(label)
+		}
 		return "span_id"
 	default:
-		return logQLStreamLabelValueExpr(label)
+		return logQLStreamLabelValueExpr(cfg, label)
 	}
 }
 
-func buildLogQLUnwrapMetricSQL(rangeAgg *logQLRangeAggregation) (string, []string, bool) {
+func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (string, []string, bool) {
 	if rangeAgg == nil {
 		return "", nil, false
 	}
@@ -290,7 +314,7 @@ func buildLogQLUnwrapMetricSQL(rangeAgg *logQLRangeAggregation) (string, []strin
 				return "", nil, false
 			}
 		case "label_filter":
-			condition, ok := logQLSQLLabelFiltersCondition(stage.labelFilters, parserKind, parserParams)
+			condition, ok := logQLSQLLabelFiltersCondition(cfg, stage.labelFilters, parserKind, parserParams)
 			if !ok {
 				return "", nil, false
 			}
@@ -298,7 +322,7 @@ func buildLogQLUnwrapMetricSQL(rangeAgg *logQLRangeAggregation) (string, []strin
 				filters = append(filters, condition)
 			}
 		case "unwrap":
-			valueExpr, ok := logQLSQLPipelineLabelValueExpr(stage.unwrapLabel, parserKind, parserParams, false)
+			valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, stage.unwrapLabel, parserKind, parserParams, false)
 			if !ok {
 				return "", nil, false
 			}
@@ -316,17 +340,17 @@ func buildLogQLUnwrapMetricSQL(rangeAgg *logQLRangeAggregation) (string, []strin
 	return unwrapValueExpr, filters, true
 }
 
-func logQLSQLLabelFiltersCondition(filters []logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
+func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
 	if len(filters) == 0 {
 		return "", true
 	}
-	first, ok := logQLSQLLabelFilterCondition(filters[0], parserKind, parserParams)
+	first, ok := logQLSQLLabelFilterCondition(cfg, filters[0], parserKind, parserParams)
 	if !ok {
 		return "", false
 	}
 	condition := first
 	for i := 1; i < len(filters); i++ {
-		next, ok := logQLSQLLabelFilterCondition(filters[i], parserKind, parserParams)
+		next, ok := logQLSQLLabelFilterCondition(cfg, filters[i], parserKind, parserParams)
 		if !ok {
 			return "", false
 		}
@@ -339,7 +363,7 @@ func logQLSQLLabelFiltersCondition(filters []logQLLabelFilter, parserKind string
 	return condition, true
 }
 
-func logQLSQLLabelFilterCondition(filter logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
+func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
 	if filter.name == "__error__" {
 		switch filter.op {
 		case "=", "==":
@@ -350,7 +374,7 @@ func logQLSQLLabelFilterCondition(filter logQLLabelFilter, parserKind string, pa
 			return "", false
 		}
 	}
-	valueExpr, ok := logQLSQLPipelineLabelValueExpr(filter.name, parserKind, parserParams, true)
+	valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, filter.name, parserKind, parserParams, true)
 	if !ok {
 		return "", false
 	}
@@ -373,14 +397,14 @@ func logQLSQLLabelFilterCondition(filter logQLLabelFilter, parserKind string, pa
 	}
 }
 
-func logQLSQLPipelineLabelValueExpr(label, parserKind string, parserParams map[string]string, withFallback bool) (string, bool) {
+func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parserParams map[string]string, withFallback bool) (string, bool) {
 	switch parserKind {
 	case "logfmt":
 		parsed := "extractKeyValuePairs(body, '=', ' ')[" + sqlString(label) + "]"
 		if !withFallback {
 			return parsed, true
 		}
-		fallback := logQLMetricLabelFilterValueExpr(label)
+		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
 		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
 	case "json":
 		path := parserParams[label]
@@ -391,13 +415,13 @@ func logQLSQLPipelineLabelValueExpr(label, parserKind string, parserParams map[s
 		if !withFallback {
 			return parsed, true
 		}
-		fallback := logQLMetricLabelFilterValueExpr(label)
+		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
 		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
 	case "regexp", "pattern":
 		index := parserParams[label]
 		if index == "" {
 			if withFallback {
-				return logQLMetricLabelFilterValueExpr(label), true
+				return logQLMetricLabelFilterValueExpr(cfg, label), true
 			}
 			return "", false
 		}
@@ -405,10 +429,10 @@ func logQLSQLPipelineLabelValueExpr(label, parserKind string, parserParams map[s
 		if !withFallback {
 			return parsed, true
 		}
-		fallback := logQLMetricLabelFilterValueExpr(label)
+		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
 		return "if(" + parsed + " != '', " + parsed + ", " + fallback + ")", true
 	case "":
-		return logQLMetricLabelFilterValueExpr(label), true
+		return logQLMetricLabelFilterValueExpr(cfg, label), true
 	default:
 		return "", false
 	}
@@ -499,6 +523,9 @@ func (s *Server) queryLogQLMetricSQL(ctx context.Context, plan *logQLMetricSQLPl
 	}
 	if plan.unwrapValueExpr != "" {
 		return s.queryLogQLUnwrapMetricSQL(ctx, plan, startNS, endNS, step)
+	}
+	if logQLMetricSnuffleStatsSQLSafe(s.cfg, plan, step) {
+		return s.queryLogQLMetricSnuffleStatsSQL(ctx, plan, startNS, endNS, step)
 	}
 	if logQLMetricBucketSQLSafe(plan, step) {
 		return s.queryLogQLMetricBucketSQL(ctx, plan, startNS, endNS, step)
@@ -708,7 +735,7 @@ func logQLUnwrapMetricBaseFilters(cfg Config, selector logQLSelector, startNS, e
 		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
 	}
 	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLMetricMatcherCondition(matcher))
+		filters = append(filters, logQLMetricMatcherCondition(cfg, matcher))
 	}
 	filters = append(filters, selectorFilters...)
 	return filters
@@ -816,6 +843,150 @@ func logQLMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration) bool
 	return plan.rangeAgg.window%step == 0 && plan.rangeAgg.offset == 0
 }
 
+func logQLMetricSnuffleStatsSQLSafe(cfg Config, plan *logQLMetricSQLPlan, step time.Duration) bool {
+	if cfg.postHogLogSchemaLayout() || cfg.LogStreamStatsTable == "" || cfg.LogStreamsTable == "" {
+		return false
+	}
+	if !logQLMetricBucketSQLSafe(plan, step) || step < time.Minute || step%time.Minute != 0 {
+		return false
+	}
+	if len(plan.rangeAgg.selector.stages) != 0 {
+		return false
+	}
+	for _, matcher := range plan.rangeAgg.selector.matchers {
+		if !logQLSnuffleStatsLabelSafe(matcher.name) {
+			return false
+		}
+	}
+	for _, label := range plan.groupLabels {
+		if !logQLSnuffleStatsLabelSafe(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func logQLSnuffleStatsLabelSafe(label string) bool {
+	switch label {
+	case "trace_id", "span_id":
+		return false
+	default:
+		return true
+	}
+}
+
+func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
+	points := int64(1)
+	if endNS > startNS {
+		points = ((endNS - startNS) / step.Nanoseconds()) + 1
+	}
+	if points < 1 {
+		points = 1
+	}
+	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
+	fetchEndNS := endNS
+	where := logQLSnuffleStatsBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
+
+	minuteEndNS := "(toInt64(toUnixTimestamp(bucket)) * 1000000000 + 60000000000)"
+	bucketSelects := []string{
+		"intDiv(" + minuteEndNS + " + step_ns - 1, step_ns) * step_ns AS bucket_ns",
+		"sum(log_count) AS log_count",
+		"sum(byte_count) AS byte_count",
+	}
+	bucketGroupBy := []string{"bucket_ns"}
+	outerSelects := []string{"eval_ns"}
+	orderBy := make([]string, 0, len(plan.groupLabels)+1)
+	for i, label := range plan.groupLabels {
+		alias := fmt.Sprintf("label_%d", i)
+		bucketSelects = append(bucketSelects, logQLSnuffleStreamOnlyLabelValueExpr(label)+" AS "+alias)
+		bucketGroupBy = append(bucketGroupBy, alias)
+		outerSelects = append(outerSelects, alias)
+		orderBy = append(orderBy, alias)
+	}
+	orderBy = append(orderBy, "eval_ns")
+
+	bucketSQL := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s GROUP BY %s",
+		strings.Join(bucketSelects, ", "),
+		logQLSnuffleStatsTableSQL(s.cfg),
+		strings.Join(where, " AND "),
+		strings.Join(bucketGroupBy, ", "),
+	)
+	windowSteps := plan.rangeAgg.window / step
+	if windowSteps < 1 {
+		windowSteps = 1
+	}
+	windowFrame := int64(windowSteps) - 1
+	groupSelects := []string{"1 AS group_key"}
+	gridSelects := []string{"start_ns + (toInt64(n.number) * step_ns) AS eval_ns"}
+	joinConditions := []string{"buckets.bucket_ns = grid.eval_ns"}
+	partitionBy := ""
+	if len(plan.groupLabels) > 0 {
+		groupSelects = groupSelects[:0]
+		for i := range plan.groupLabels {
+			alias := fmt.Sprintf("label_%d", i)
+			groupSelects = append(groupSelects, alias)
+			gridSelects = append(gridSelects, alias)
+			joinConditions = append(joinConditions, "buckets."+alias+" = grid."+alias)
+		}
+		partitionBy = "PARTITION BY " + strings.Join(groupSelects, ", ") + " "
+	}
+	groupsSQL := "SELECT 1 AS group_key"
+	if len(plan.groupLabels) > 0 {
+		groupsSQL = "SELECT DISTINCT " + strings.Join(groupSelects, ", ") + " FROM buckets"
+	}
+	valueExpr := "toFloat64(window_log_count)"
+	switch plan.rangeAgg.fn {
+	case "rate":
+		valueExpr = fmt.Sprintf("toFloat64(window_log_count) / %s", formatDurationSeconds(plan.rangeAgg.window))
+	case "bytes_over_time":
+		valueExpr = "toFloat64(window_byte_count)"
+	case "bytes_rate":
+		valueExpr = fmt.Sprintf("toFloat64(window_byte_count) / %s", formatDurationSeconds(plan.rangeAgg.window))
+	}
+	sql := fmt.Sprintf(
+		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, buckets AS (%s), groups AS (%s) SELECT %s, %s AS value FROM (SELECT %s, sum(ifNull(log_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_log_count, sum(ifNull(byte_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_byte_count FROM (SELECT %s FROM groups CROSS JOIN numbers(%d) AS n) AS grid LEFT JOIN buckets ON %s) WHERE window_log_count > 0 ORDER BY %s",
+		startNS,
+		step.Nanoseconds(),
+		bucketSQL,
+		groupsSQL,
+		strings.Join(outerSelects, ", "),
+		valueExpr,
+		strings.Join(outerSelects, ", "),
+		partitionBy,
+		windowFrame,
+		partitionBy,
+		windowFrame,
+		strings.Join(gridSelects, ", "),
+		points,
+		strings.Join(joinConditions, " AND "),
+		strings.Join(orderBy, ", "),
+	)
+	sql = logQLMetricResultSQL(sql, plan)
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+}
+
+func logQLSnuffleStatsTableSQL(cfg Config) string {
+	return fmt.Sprintf(
+		"(SELECT stats.team_id AS team_id, stats.bucket AS bucket, stats.stream_id AS stream_id, stats.log_count AS log_count, stats.byte_count AS byte_count, streams.labels AS labels, streams.resource_attributes AS resource_attributes FROM %s AS stats ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
+		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
+		logQLSnuffleFullSortingMergeJoinSettings(cfg),
+	)
+}
+
+func logQLSnuffleStatsBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
+	filters := []string{
+		teamFilter(cfg),
+		"bucket >= toStartOfMinute(" + chTimeNanos(startNS) + ")",
+		"bucket <= toStartOfMinute(" + chTimeNanos(endNS) + ")",
+	}
+	for _, matcher := range selector.matchers {
+		filters = append(filters, logQLStringCondition(logQLSnuffleStreamOnlyLabelValueExpr(matcher.name), matcher.op, matcher.value, true))
+	}
+	return filters
+}
+
 func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
 	if !logQLMetricPreferWindowBucketSQL(plan) {
 		return s.queryLogQLMetricBucketJoinSQL(ctx, plan, startNS, endNS, step)
@@ -847,7 +1018,7 @@ func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetri
 	bucketSQL := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE %s GROUP BY %s",
 		strings.Join(bucketSelects, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
+		logQLLogsTableSQL(s.cfg),
 		strings.Join(where, " AND "),
 		strings.Join(bucketGroupBy, ", "),
 	)
@@ -963,7 +1134,7 @@ func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLM
 	bucketSQL := fmt.Sprintf(
 		"(SELECT %s FROM %s WHERE %s GROUP BY %s)",
 		strings.Join(bucketSelects, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.LogsTable),
+		logQLLogsTableSQL(s.cfg),
 		strings.Join(where, " AND "),
 		strings.Join(bucketGroupBy, ", "),
 	)

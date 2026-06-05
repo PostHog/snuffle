@@ -446,6 +446,7 @@ func TestApplyLogQLRegexpAndPatternReferenceStages(t *testing.T) {
 func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "posthog",
+		LogSchemaLayout: "posthog",
 		LogsTable:       "logs34",
 		LogQueryMaxRows: 1000,
 	}
@@ -468,6 +469,38 @@ func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
+	}
+}
+
+func TestLogQLSelectSQLUsesSnuffleLogsSchema(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "snuffle",
+		LogSchemaLayout: "snuffle",
+		LogsTable:       "logs",
+		LogStreamsTable: "log_streams",
+		LogQueryMaxRows: 1000,
+	}
+	selector, err := parseLogQLSelector(`{service_name="checkout", level=~"error|warn", trace_id!="abc"} |= "failed"`)
+	if err != nil {
+		t.Fatalf("parseLogQLSelector returned error: %v", err)
+	}
+	sql := logQLSelectSQL(cfg, *selector, 1000, 2000, 50, "backward")
+	for _, want := range []string{
+		"`snuffle`.`logs` AS logs ANY INNER JOIN `snuffle`.`log_streams` AS streams USING (team_id, stream_id) SETTINGS join_algorithm = 'full_sorting_merge'",
+		"team_id = 0",
+		"timestamp >= fromUnixTimestamp64Nano(1000, 'UTC')",
+		"mapContains(labels, 'service_name')",
+		"mapContains(fields, 'level')",
+		"mapContains(labels, 'trace_id')",
+		"position(body, 'failed') > 0",
+		"ORDER BY ts_ns DESC, observed_ns DESC LIMIT 50",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "stream_id IN") {
+		t.Fatalf("SQL %q should use sorted stream join instead of stream_id IN pruning", sql)
 	}
 }
 
@@ -520,7 +553,7 @@ func TestLogQLMetricSQLPlanSupportsTopKComparisonBytesAndUnwrap(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseLogQL returned error: %v", err)
 			}
-			plan, ok := buildLogQLMetricSQLPlan(expr)
+			plan, ok := buildLogQLMetricSQLPlan(Config{}, expr)
 			if !ok || plan == nil {
 				t.Fatalf("buildLogQLMetricSQLPlan did not accept %q", tt.query)
 			}
@@ -560,7 +593,7 @@ func TestLogQLMetricSQLPlanPushesRegexpAndPatternParsers(t *testing.T) {
 			if err != nil {
 				t.Fatalf("parseLogQL returned error: %v", err)
 			}
-			plan, ok := buildLogQLMetricSQLPlan(expr)
+			plan, ok := buildLogQLMetricSQLPlan(Config{}, expr)
 			if !ok {
 				t.Fatalf("buildLogQLMetricSQLPlan returned false")
 			}
@@ -579,12 +612,70 @@ func TestLogQLMetricBucketSQLSafeIncludesBytes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parseLogQL returned error: %v", err)
 	}
-	plan, ok := buildLogQLMetricSQLPlan(expr)
+	plan, ok := buildLogQLMetricSQLPlan(Config{}, expr)
 	if !ok || plan == nil {
 		t.Fatal("bytes_over_time should build a SQL plan")
 	}
 	if !logQLMetricBucketSQLSafe(plan, time.Minute) {
 		t.Fatal("bytes_over_time with window divisible by step should use bucket SQL")
+	}
+}
+
+func TestLogQLMetricSnuffleStatsSQLSafe(t *testing.T) {
+	cfg := Config{
+		LogSchemaLayout:     "snuffle",
+		LogStreamsTable:     "log_streams",
+		LogStreamStatsTable: "log_stream_stats",
+	}
+	expr, err := parseLogQL(`sum by (service_name) (count_over_time({app="api"}[5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL returned error: %v", err)
+	}
+	plan, ok := buildLogQLMetricSQLPlan(cfg, expr)
+	if !ok || plan == nil {
+		t.Fatalf("buildLogQLMetricSQLPlan did not accept stats-safe query")
+	}
+	if !logQLMetricSnuffleStatsSQLSafe(cfg, plan, time.Minute) {
+		t.Fatalf("expected stream stats path for pure stream selector")
+	}
+
+	lineExpr, err := parseLogQL(`sum by (service_name) (count_over_time({app="api"} |= "error" [5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL line filter returned error: %v", err)
+	}
+	linePlan, ok := buildLogQLMetricSQLPlan(cfg, lineExpr)
+	if !ok || linePlan == nil {
+		t.Fatalf("buildLogQLMetricSQLPlan did not accept line-filter query")
+	}
+	if logQLMetricSnuffleStatsSQLSafe(cfg, linePlan, time.Minute) {
+		t.Fatalf("line-filter query must read raw log bodies, not stream stats")
+	}
+
+	traceExpr, err := parseLogQL(`sum by (trace_id) (count_over_time({app="api"}[5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL trace query returned error: %v", err)
+	}
+	tracePlan, ok := buildLogQLMetricSQLPlan(cfg, traceExpr)
+	if !ok || tracePlan == nil {
+		t.Fatalf("buildLogQLMetricSQLPlan did not accept trace grouping query")
+	}
+	if logQLMetricSnuffleStatsSQLSafe(cfg, tracePlan, time.Minute) {
+		t.Fatalf("trace/span labels can be per-entry fields and must not use stream stats")
+	}
+
+	statsSQL := logQLSnuffleStatsTableSQL(Config{
+		CHDatabase:          "snuffle",
+		LogSchemaLayout:     "snuffle",
+		LogStreamsTable:     "log_streams",
+		LogStreamStatsTable: "log_stream_stats",
+	})
+	for _, want := range []string{
+		"`snuffle`.`log_stream_stats` AS stats ANY INNER JOIN `snuffle`.`log_streams` AS streams USING (team_id, stream_id)",
+		"SETTINGS join_algorithm = 'full_sorting_merge'",
+	} {
+		if !strings.Contains(statsSQL, want) {
+			t.Fatalf("stats SQL %q does not contain %q", statsSQL, want)
+		}
 	}
 }
 

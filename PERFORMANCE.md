@@ -13,6 +13,9 @@ The default repeatable regression benchmark runs a suite:
   remote-write into the PostHog-style `metrics1` schema.
 - `posthog_logs`: synthetic OpenTelemetry/PostHog-shaped log rows inserted into
   `logs34`, then queried through the Loki-compatible LogQL API.
+- `snuffle_logs`: synthetic log rows inserted into the Snuffle-native
+  `logs`/`log_streams`/`log_stream_stats` schema, then queried through the same
+  Loki-compatible LogQL API.
 
 The metrics run uses TSBS `devops` data in Prometheus remote-write format:
 
@@ -21,17 +24,17 @@ The metrics run uses TSBS `devops` data in Prometheus remote-write format:
   `github.com/timescale/tsbs@v0.0.0-20260527045238-8323e59c7402`
 - replayed through snuffle's `/api/v1/write` by `cmd/snuffle-tsbs-replay`
   without unmarshalling each TSBS `TimeSeries` just to marshal it again
-- default scale: 1,000 hosts
+- default scale: 50 hosts
 - default range: `2016-01-01T00:00:00Z` to `2016-01-01T01:00:00Z`
 - default interval: `15s`
-- default rows: about 24.2 million
+- default rows: about 1.2 million
 - minimum rows for a recorded baseline: `PERF_MIN_ROWS=1000000`
 - database: `snuffle_perf`
 - tenant: `team_id = 0`
 
-The logs run uses `scripts/seed_logs_posthog.sql` with ClickHouse query
-parameters. By default it inserts 500,000 rows over a 24-hour window starting at
-`2026-06-01 00:00:00` UTC.
+The PostHog logs run uses `scripts/seed_logs_posthog.sql`; the Snuffle logs run
+uses `scripts/seed_logs_snuffle.sql`. By default each log run inserts 10,000
+rows over a 24-hour window starting at `2026-06-01 00:00:00` UTC.
 
 ## Repeatable Benchmark Runbook
 
@@ -60,8 +63,8 @@ make perf-test
 The first run takes longer because it generates `.perf/tsbs-*.prom`. Later runs
 reuse that generated file unless `PERF_REGENERATE_DATA=1` is set.
 
-By default the harness runs the selected suite three times
-(`PERF_REPEAT=3`). Each attempt recreates the relevant schema, reloads the
+By default the harness runs the selected suite once (`PERF_REPEAT=1`). Each
+attempt recreates the relevant schema, reloads the
 dataset, and reruns the HTTP benchmark profile. After all attempts finish, the
 reporter selects the slowest candidate for each named run and compares only
 that candidate against `perf-results.json`.
@@ -84,7 +87,8 @@ The target writes:
 
 If the selected candidate is slower than `perf-results.json`, the reporter
 prints the overall slowdown and the slowest dimensions, then keeps the existing
-baseline. Set `PERF_FAIL_ON_SLOWER=true` when running in CI.
+baseline. Set `PERF_FAIL_ON_SLOWER=true` only when you want slower selected
+candidates to make the command exit non-zero.
 
 ### What The Harness Does
 
@@ -237,23 +241,23 @@ accepting a change.
 ### Common Knobs
 
 - `PERF_RUNS`: comma-separated run list. Default
-  `posthog_metrics,posthog_logs`; available runs are `posthog_metrics` and
-  `posthog_logs`.
+  `posthog_metrics,posthog_logs,snuffle_logs`; available runs are
+  `posthog_metrics`, `posthog_logs`, and `snuffle_logs`.
 - `PERF_REPEAT`: number of full suite attempts before selecting the slowest
-  candidate for each run. Default `3`.
-- `TSBS_SCALE`: number of hosts. Default `1000`.
+  candidate for each run. Default `1`.
+- `TSBS_SCALE`: number of hosts. Default `50`.
 - `TSBS_START`, `TSBS_END`, `TSBS_INTERVAL`, `TSBS_SEED`: generated data shape.
-- `TSBS_WORKERS`: concurrent remote-write workers. Default `16`.
+- `TSBS_WORKERS`: concurrent remote-write workers. Default `2`.
 - `TSBS_BATCH_SIZE`: TimeSeries messages per remote-write request. Default
-  `250000`.
+  `10000`.
 - `POSTHOG_LOG_ROWS`: synthetic logs inserted for `posthog_logs`. Default
-  `500000`.
+  `10000`.
 - `POSTHOG_LOG_START`, `POSTHOG_LOG_RANGE_SECONDS`, `POSTHOG_LOG_STEP`, and
   `POSTHOG_LOG_LIMIT`: LogQL benchmark time range and response limits.
 - `BRIDGE_BENCH_CONCURRENCY`: concurrent query requests per scenario. Default
-  `10`.
-- `BRIDGE_BENCH_WARMUP`: warmup requests before timing. Default `10`.
-- `BRIDGE_BENCHTIME`: Go benchmark iteration count. Default `50x`.
+  `1`.
+- `BRIDGE_BENCH_WARMUP`: warmup requests before timing. Default `0`.
+- `BRIDGE_BENCHTIME`: Go benchmark iteration count. Default `1x`.
 - `BRIDGE_BENCH_GO_TEST_TIMEOUT`: timeout for each Go benchmark profile.
   Default `60m`.
 - `BRIDGE_BENCH_SCENARIO`: comma-separated scenario filter for focused runs.

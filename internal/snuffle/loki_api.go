@@ -15,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 const (
@@ -70,6 +72,9 @@ type lokiLogInsertRow struct {
 	instrumentationScope    string
 	eventName               string
 	attributes              map[string]string
+	streamID                uint64
+	streamLabels            map[string]string
+	fields                  map[string]string
 }
 
 func (s *Server) lokiRoutes() *http.ServeMux {
@@ -524,15 +529,28 @@ func (s *Server) handleLokiLabels(w http.ResponseWriter, r *http.Request) {
 		"span_id":        {},
 		"detected_level": {},
 	}
-	if s.cfg.LogAttributesTable != "" {
-		sql := fmt.Sprintf(
-			"SELECT DISTINCT attribute_key FROM %s WHERE %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_key%s",
-			tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
-			teamFilter(s.cfg),
-			chTimeNanos(start.UnixNano()),
-			chTimeNanos(end.UnixNano()),
-			sqlLimit(limit),
-		)
+	if s.cfg.LogAttributesTable != "" || (!s.cfg.postHogLogSchemaLayout() && s.cfg.LogStreamsTable != "") {
+		sql := ""
+		if s.cfg.postHogLogSchemaLayout() {
+			sql = fmt.Sprintf(
+				"SELECT DISTINCT attribute_key FROM %s WHERE %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_key%s",
+				tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
+				teamFilter(s.cfg),
+				chTimeNanos(start.UnixNano()),
+				chTimeNanos(end.UnixNano()),
+				sqlLimit(limit),
+			)
+		} else {
+			streamsTable := logQLSnuffleStreamsTableSQL(s.cfg, start.UnixNano(), end.UnixNano())
+			sql = fmt.Sprintf(
+				"SELECT DISTINCT label_name FROM (SELECT label.1 AS label_name FROM %s ARRAY JOIN labels AS label WHERE %s UNION ALL SELECT attribute.1 AS label_name FROM %s ARRAY JOIN resource_attributes AS attribute WHERE %s) ORDER BY label_name%s",
+				streamsTable,
+				teamFilter(s.cfg),
+				streamsTable,
+				teamFilter(s.cfg),
+				sqlLimit(limit),
+			)
+		}
 		ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 		defer cancel()
 		if err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -597,7 +615,7 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 		return nil
 	}
 	coreSQL := ""
-	if s.cfg.LogsTable != "" {
+	if s.cfg.LogsTable != "" && s.cfg.postHogLogSchemaLayout() {
 		switch name {
 		case "service_name", "service.name":
 			coreSQL = fmt.Sprintf(
@@ -633,22 +651,52 @@ func (s *Server) handleLokiLabelValues(w http.ResponseWriter, r *http.Request) {
 		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
 		return
 	}
-	if coreSQL == "" && s.cfg.LogAttributesTable != "" {
-		sql := fmt.Sprintf(
-			"SELECT DISTINCT attribute_value FROM %s WHERE %s AND attribute_key = %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_value%s",
-			tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
-			teamFilter(s.cfg),
-			sqlString(name),
-			chTimeNanos(start.UnixNano()),
-			chTimeNanos(end.UnixNano()),
-			sqlLimit(limit),
-		)
+	if coreSQL == "" && (s.cfg.LogAttributesTable != "" || (!s.cfg.postHogLogSchemaLayout() && s.cfg.LogStreamsTable != "")) {
+		sql := ""
+		if s.cfg.postHogLogSchemaLayout() {
+			sql = fmt.Sprintf(
+				"SELECT DISTINCT attribute_value FROM %s WHERE %s AND attribute_key = %s AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) AND attribute_type IN ('log', 'resource') ORDER BY attribute_value%s",
+				tableName(s.cfg.CHDatabase, s.cfg.LogAttributesTable),
+				teamFilter(s.cfg),
+				sqlString(name),
+				chTimeNanos(start.UnixNano()),
+				chTimeNanos(end.UnixNano()),
+				sqlLimit(limit),
+			)
+		} else {
+			streamsTable := logQLSnuffleStreamsTableSQL(s.cfg, start.UnixNano(), end.UnixNano())
+			sql = fmt.Sprintf(
+				"SELECT DISTINCT label_value FROM (SELECT label.2 AS label_value FROM %s ARRAY JOIN labels AS label WHERE %s AND %s UNION ALL SELECT attribute.2 AS label_value FROM %s ARRAY JOIN resource_attributes AS attribute WHERE %s AND %s) WHERE label_value != '' ORDER BY label_value%s",
+				streamsTable,
+				teamFilter(s.cfg),
+				logQLSnuffleStreamLabelKeyCondition("label.1", name),
+				streamsTable,
+				teamFilter(s.cfg),
+				logQLSnuffleStreamLabelKeyCondition("attribute.1", name),
+				sqlLimit(limit),
+			)
+		}
 		if err := queryValues(sql); err != nil {
 			writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
 			return
 		}
 	}
 	writeLokiSuccess(w, sortedLimited(values, limit))
+}
+
+func logQLSnuffleStreamsTableSQL(cfg Config, startNS, endNS int64) string {
+	if cfg.postHogLogSchemaLayout() || cfg.LogStreamStatsTable == "" {
+		return tableName(cfg.CHDatabase, cfg.LogStreamsTable)
+	}
+	return fmt.Sprintf(
+		"(SELECT streams.team_id AS team_id, streams.stream_id AS stream_id, streams.labels AS labels, streams.resource_attributes AS resource_attributes FROM %s AS streams ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND bucket >= toStartOfMinute(%s) AND bucket <= toStartOfMinute(%s) GROUP BY team_id, stream_id ORDER BY team_id, stream_id) AS active USING (team_id, stream_id)%s)",
+		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
+		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
+		teamFilter(cfg),
+		chTimeNanos(startNS),
+		chTimeNanos(endNS),
+		logQLSnuffleFullSortingMergeJoinSettings(cfg),
+	)
 }
 
 func (s *Server) handleLokiSeries(w http.ResponseWriter, r *http.Request) {
@@ -677,6 +725,24 @@ func (s *Server) handleLokiSeries(w http.ResponseWriter, r *http.Request) {
 			writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 			return
 		}
+		if !s.cfg.postHogLogSchemaLayout() && s.cfg.LogStreamsTable != "" && len(selector.stages) == 0 {
+			series, err := s.querySnuffleLogSeries(ctx, *selector, start.UnixNano(), end.UnixNano(), s.cfg.MaxSeries)
+			if err != nil {
+				writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
+				return
+			}
+			for _, labels := range series {
+				if !selector.matchesLabels(labels) {
+					continue
+				}
+				labels = stableLabelMap(labels)
+				seen[labelsKey(labels)] = labels
+				if len(seen) >= s.cfg.MaxSeries {
+					break
+				}
+			}
+			continue
+		}
 		sql := logQLSelectSQL(s.cfg, *selector, start.UnixNano(), end.UnixNano(), s.cfg.MaxSeries, "forward")
 		rows, err := scanLogRows(ctx, s.client, sql)
 		if err != nil {
@@ -700,6 +766,68 @@ func (s *Server) handleLokiSeries(w http.ResponseWriter, r *http.Request) {
 	}
 	sort.Slice(result, func(i, j int) bool { return labelsKey(result[i]) < labelsKey(result[j]) })
 	writeLokiSuccess(w, result)
+}
+
+func (s *Server) querySnuffleLogSeries(ctx context.Context, selector logQLSelector, startNS, endNS int64, limit int) ([]map[string]string, error) {
+	where := []string{teamFilter(s.cfg)}
+	for _, matcher := range selector.matchers {
+		where = append(where, logQLStringCondition(logQLSnuffleStreamOnlyLabelValueExpr(matcher.name), matcher.op, matcher.value, true))
+	}
+	sql := fmt.Sprintf(
+		"SELECT labels, resource_attributes FROM %s WHERE %s ORDER BY stream_id%s",
+		logQLSnuffleStreamsTableSQL(s.cfg, startNS, endNS),
+		strings.Join(where, " AND "),
+		sqlLimit(limit),
+	)
+	series := make([]map[string]string, 0, 1024)
+	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var labels map[string]string
+		var resourceAttrs map[string]string
+		if err := row.Scan(&labels, &resourceAttrs); err != nil {
+			return err
+		}
+		series = append(series, snuffleStreamLabels(labels, resourceAttrs))
+		return nil
+	})
+	return series, err
+}
+
+func snuffleStreamLabels(labels, resourceAttrs map[string]string) map[string]string {
+	out := make(map[string]string, len(labels)+len(resourceAttrs)+4)
+	for key, value := range resourceAttrs {
+		if value != "" {
+			out[key] = value
+		}
+	}
+	for key, value := range labels {
+		if value != "" {
+			out[key] = value
+		}
+	}
+	serviceName := out["service_name"]
+	if serviceName == "" {
+		serviceName = out["service.name"]
+	}
+	if serviceName == "" {
+		serviceName = resourceAttrs["service.name"]
+	}
+	if serviceName != "" {
+		out["service_name"] = serviceName
+		out["service.name"] = serviceName
+	}
+	severityText := out["level"]
+	if severityText == "" {
+		severityText = out["severity_text"]
+	}
+	if severityText == "" {
+		severityText = out["detected_level"]
+	}
+	if severityText != "" {
+		out["level"] = severityText
+		out["severity_text"] = severityText
+		out["detected_level"] = severityText
+	}
+	return stableLabelMap(out)
 }
 
 func (s *Server) handleLokiIndexStats(w http.ResponseWriter, r *http.Request) {
@@ -1008,6 +1136,8 @@ func parseLokiProtoLabelPair(data []byte) (string, string, error) {
 func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp time.Time, line string) lokiLogInsertRow {
 	resourceAttributes := map[string]string{}
 	attributes := map[string]string{}
+	streamLabels := map[string]string{}
+	fields := map[string]string{}
 	serviceName := ""
 	severityText := ""
 	traceID := ""
@@ -1034,6 +1164,7 @@ func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp tim
 	}
 	for key, value := range labels {
 		addLabel(key, value)
+		addSnuffleLogLabel(streamLabels, key, value)
 	}
 	for key, value := range metadata {
 		if strings.HasPrefix(key, "resource_") {
@@ -1045,6 +1176,7 @@ func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp tim
 			continue
 		}
 		addLabel(key, value)
+		addSnuffleLogLabel(fields, key, value)
 	}
 	if serviceName == "" {
 		if value := resourceAttributes["service.name"]; value != "" {
@@ -1054,6 +1186,19 @@ func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp tim
 	if severityText == "" {
 		severityText = inferLogSeverity(line)
 	}
+	if serviceName != "" {
+		addSnuffleLogLabel(streamLabels, "service_name", serviceName)
+	}
+	if severityText != "" {
+		addSnuffleLogLabel(streamLabels, "level", severityText)
+	}
+	if traceID != "" && streamLabels["trace_id"] == "" {
+		fields["trace_id"] = traceID
+	}
+	if spanID != "" && streamLabels["span_id"] == "" {
+		fields["span_id"] = spanID
+	}
+	streamLabels = stableLabelMap(streamLabels)
 	return lokiLogInsertRow{
 		teamID:                  int32(s.cfg.TeamID),
 		originalExpiryTimestamp: timestamp.Add(s.cfg.LogRetention),
@@ -1068,6 +1213,34 @@ func (s *Server) lokiInsertRow(labels, metadata map[string]string, timestamp tim
 		serviceName:             serviceName,
 		resourceAttributes:      resourceAttributes,
 		attributes:              attributes,
+		streamID:                snuffleLogStreamID(streamLabels, resourceAttributes),
+		streamLabels:            streamLabels,
+		fields:                  stableLabelMap(fields),
+	}
+}
+
+func snuffleLogStreamID(labels, resourceAttributes map[string]string) uint64 {
+	return xxhash.Sum64String(labelsKey(labels) + "\x00" + labelsKey(resourceAttributes))
+}
+
+func addSnuffleLogLabel(dst map[string]string, key, value string) {
+	if key == "" {
+		return
+	}
+	switch key {
+	case "service_name", "service.name":
+		dst["service_name"] = value
+		dst["service.name"] = value
+	case "level", "severity", "severity_text", "detected_level":
+		dst["level"] = value
+		dst["severity_text"] = value
+		dst["detected_level"] = value
+	case "trace_id":
+		dst["trace_id"] = value
+	case "span_id":
+		dst["span_id"] = value
+	default:
+		dst[key] = value
 	}
 }
 
@@ -1075,6 +1248,13 @@ func (s *Server) insertLokiLogRows(ctx context.Context, rows []lokiLogInsertRow)
 	if len(rows) == 0 {
 		return nil
 	}
+	if s.cfg.postHogLogSchemaLayout() {
+		return s.insertPostHogLokiLogRows(ctx, rows)
+	}
+	return s.insertSnuffleLokiLogRows(ctx, rows)
+}
+
+func (s *Server) insertPostHogLokiLogRows(ctx context.Context, rows []lokiLogInsertRow) error {
 	sql := fmt.Sprintf("INSERT INTO %s (team_id, original_expiry_timestamp, uuid, trace_id, span_id, trace_flags, timestamp, observed_timestamp, body, severity_text, severity_number, service_name, resource_attributes, instrumentation_scope, event_name, attributes_map_str)", tableName(s.cfg.CHDatabase, s.cfg.LogsTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
 		teamIDs := make([]int32, len(rows))
@@ -1124,6 +1304,159 @@ func (s *Server) insertLokiLogRows(ctx context.Context, rows []lokiLogInsertRow)
 			}
 		}
 		return len(rows), nil
+	})
+}
+
+func (s *Server) insertSnuffleLokiLogRows(ctx context.Context, rows []lokiLogInsertRow) error {
+	if s.cfg.LogStreamsTable == "" {
+		return errors.New("snuffle log schema requires CH_LOG_STREAMS_TABLE")
+	}
+	if err := s.insertSnuffleLogStreams(ctx, rows); err != nil {
+		return err
+	}
+	if err := s.insertSnuffleLogEvents(ctx, rows); err != nil {
+		return err
+	}
+	return s.insertSnuffleLogStreamStats(ctx, rows)
+}
+
+func (s *Server) insertSnuffleLogStreams(ctx context.Context, rows []lokiLogInsertRow) error {
+	unique := make([]lokiLogInsertRow, 0, len(rows))
+	seen := map[string]struct{}{}
+	for _, row := range rows {
+		key := strconv.FormatInt(int64(row.teamID), 10) + ":" + strconv.FormatUint(row.streamID, 10)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		unique = append(unique, row)
+	}
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, stream_id, labels, resource_attributes, updated_at)", tableName(s.cfg.CHDatabase, s.cfg.LogStreamsTable))
+	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+		teamIDs := make([]int32, len(unique))
+		streamIDs := make([]uint64, len(unique))
+		labels := make([]map[string]string, len(unique))
+		resourceAttrs := make([]map[string]string, len(unique))
+		updatedAt := make([]time.Time, len(unique))
+		now := time.Now().UTC()
+		for i, row := range unique {
+			teamIDs[i] = row.teamID
+			streamIDs[i] = row.streamID
+			labels[i] = row.streamLabels
+			if labels[i] == nil {
+				labels[i] = map[string]string{}
+			}
+			resourceAttrs[i] = row.resourceAttributes
+			if resourceAttrs[i] == nil {
+				resourceAttrs[i] = map[string]string{}
+			}
+			updatedAt[i] = now
+		}
+		columns := []any{teamIDs, streamIDs, labels, resourceAttrs, updatedAt}
+		for i, column := range columns {
+			if err := batch.Column(i).Append(column); err != nil {
+				return 0, err
+			}
+		}
+		return len(unique), nil
+	})
+}
+
+func (s *Server) insertSnuffleLogEvents(ctx context.Context, rows []lokiLogInsertRow) error {
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, timestamp, expires_at, stream_id, observed_ns, body, fields)", tableName(s.cfg.CHDatabase, s.cfg.LogsTable))
+	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+		teamIDs := make([]int32, len(rows))
+		timestamps := make([]time.Time, len(rows))
+		expiresAt := make([]time.Time, len(rows))
+		streamIDs := make([]uint64, len(rows))
+		observedNS := make([]int64, len(rows))
+		bodies := make([]string, len(rows))
+		fields := make([]map[string]string, len(rows))
+		for i, row := range rows {
+			teamIDs[i] = row.teamID
+			timestamps[i] = row.timestamp
+			expiresAt[i] = row.originalExpiryTimestamp
+			streamIDs[i] = row.streamID
+			observedNS[i] = row.observedTimestamp.UnixNano()
+			bodies[i] = row.body
+			fields[i] = row.fields
+			if fields[i] == nil {
+				fields[i] = map[string]string{}
+			}
+		}
+		columns := []any{teamIDs, timestamps, expiresAt, streamIDs, observedNS, bodies, fields}
+		for i, column := range columns {
+			if err := batch.Column(i).Append(column); err != nil {
+				return 0, err
+			}
+		}
+		return len(rows), nil
+	})
+}
+
+func (s *Server) insertSnuffleLogStreamStats(ctx context.Context, rows []lokiLogInsertRow) error {
+	if s.cfg.LogStreamStatsTable == "" || len(rows) == 0 {
+		return nil
+	}
+	type statsKey struct {
+		teamID   int32
+		bucket   time.Time
+		streamID uint64
+	}
+	type statsRow struct {
+		key       statsKey
+		logCount  uint64
+		byteCount uint64
+	}
+	byKey := make(map[statsKey]*statsRow, len(rows))
+	for _, row := range rows {
+		key := statsKey{
+			teamID:   row.teamID,
+			bucket:   row.timestamp.UTC().Truncate(time.Minute),
+			streamID: row.streamID,
+		}
+		stat := byKey[key]
+		if stat == nil {
+			stat = &statsRow{key: key}
+			byKey[key] = stat
+		}
+		stat.logCount++
+		stat.byteCount += uint64(len(row.body))
+	}
+	stats := make([]*statsRow, 0, len(byKey))
+	for _, stat := range byKey {
+		stats = append(stats, stat)
+	}
+	sort.Slice(stats, func(i, j int) bool {
+		if stats[i].key.teamID != stats[j].key.teamID {
+			return stats[i].key.teamID < stats[j].key.teamID
+		}
+		if !stats[i].key.bucket.Equal(stats[j].key.bucket) {
+			return stats[i].key.bucket.Before(stats[j].key.bucket)
+		}
+		return stats[i].key.streamID < stats[j].key.streamID
+	})
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, bucket, stream_id, log_count, byte_count)", tableName(s.cfg.CHDatabase, s.cfg.LogStreamStatsTable))
+	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
+		teamIDs := make([]int32, len(stats))
+		buckets := make([]time.Time, len(stats))
+		streamIDs := make([]uint64, len(stats))
+		logCounts := make([]uint64, len(stats))
+		byteCounts := make([]uint64, len(stats))
+		for i, row := range stats {
+			teamIDs[i] = row.key.teamID
+			buckets[i] = row.key.bucket
+			streamIDs[i] = row.key.streamID
+			logCounts[i] = row.logCount
+			byteCounts[i] = row.byteCount
+		}
+		columns := []any{teamIDs, buckets, streamIDs, logCounts, byteCounts}
+		for i, column := range columns {
+			if err := batch.Column(i).Append(column); err != nil {
+				return 0, err
+			}
+		}
+		return len(stats), nil
 	})
 }
 

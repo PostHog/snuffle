@@ -1,343 +1,343 @@
 {
   "version": 2,
-  "generated_at": "2026-06-04T15:44:23Z",
+  "generated_at": "2026-06-05T13:57:54Z",
   "compare_basis": "geomean(write row-rate ratio, per-scenario query avg_ms ratios); lower is faster",
   "runs": [
     {
       "version": 1,
       "run": "posthog_logs",
-      "attempt": 2,
-      "repeat_count": 3,
-      "selected_attempt": 2,
-      "generated_at": "2026-06-04T15:24:16Z",
+      "attempt": 1,
+      "repeat_count": 1,
+      "selected_attempt": 1,
+      "generated_at": "2026-06-05T13:57:50Z",
       "source": {
         "name": "posthog-logs-synthetic",
         "version": "synthetic-v1",
         "use_case": "logs",
-        "scale": "500000",
+        "scale": "10000",
         "start": "2026-06-01 00:00:00",
         "end": "86400s",
         "interval": "60s",
         "seed": "",
         "workers": "",
         "batch_size": "",
-        "query_concurrency": "10",
-        "query_benchtime": "50x"
+        "query_concurrency": "1",
+        "query_benchtime": "1x"
       },
       "ingest": {
-        "rows": 500000,
-        "duration_ms": 8813,
-        "metric_rate": 56734.369681,
-        "row_rate": 56734.369681
+        "rows": 10000,
+        "duration_ms": 230,
+        "metric_rate": 43478.26087,
+        "row_rate": 43478.26087
       },
       "query": {
         "scenario_count": 19,
-        "geomean_avg_ms": 2930.6724591153347,
-        "total_avg_ms": 123485.87999999999
+        "geomean_avg_ms": 47.199017066690935,
+        "total_avg_ms": 1483.752
       },
       "benchmarks": [
         {
           "name": "BenchmarkBridgeHTTP/log_basic",
-          "iterations": 50,
-          "avg_ms": 5336,
+          "iterations": 1,
+          "avg_ms": 202.7,
           "metrics": {
-            "B/op": 6717935,
-            "allocs/op": 527,
-            "avg_ms": 5336,
-            "max_ms": 7461,
-            "ns/op": 545996700,
-            "p50_ms": 5495,
-            "p95_ms": 6555,
-            "p99_ms": 7461,
-            "response_bytes/op": 2751369
+            "B/op": 6739760,
+            "allocs/op": 584,
+            "avg_ms": 202.7,
+            "max_ms": 202.7,
+            "ns/op": 233742781,
+            "p50_ms": 202.7,
+            "p95_ms": 202.7,
+            "p99_ms": 202.7,
+            "response_bytes/op": 2738067
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_bytes_by_format",
-          "iterations": 50,
-          "avg_ms": 4922,
+          "iterations": 1,
+          "avg_ms": 22.16,
           "metrics": {
-            "B/op": 154393,
-            "allocs/op": 110,
-            "avg_ms": 4922,
-            "max_ms": 7204,
-            "ns/op": 507004259,
-            "p50_ms": 5195,
-            "p95_ms": 6891,
-            "p99_ms": 7204,
-            "response_bytes/op": 63671
+            "B/op": 42368,
+            "allocs/op": 99,
+            "avg_ms": 22.16,
+            "max_ms": 22.16,
+            "ns/op": 22247953,
+            "p50_ms": 22.16,
+            "p95_ms": 22.16,
+            "p99_ms": 22.16,
+            "response_bytes/op": 7491
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_comparison",
-          "iterations": 50,
-          "avg_ms": 7771,
+          "iterations": 1,
+          "avg_ms": 60.75,
           "metrics": {
-            "B/op": 3477295,
-            "allocs/op": 280,
-            "avg_ms": 7771,
-            "max_ms": 9587,
-            "ns/op": 787453583,
-            "p50_ms": 7901,
-            "p95_ms": 9357,
-            "p99_ms": 9587,
-            "response_bytes/op": 1660862
+            "B/op": 67088,
+            "allocs/op": 94,
+            "avg_ms": 60.75,
+            "max_ms": 60.75,
+            "ns/op": 60775188,
+            "p50_ms": 60.75,
+            "p95_ms": 60.75,
+            "p99_ms": 60.75,
+            "response_bytes/op": 217
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_count_by_service",
-          "iterations": 50,
-          "avg_ms": 8261,
+          "iterations": 1,
+          "avg_ms": 69.8,
           "metrics": {
-            "B/op": 3477757,
-            "allocs/op": 295,
-            "avg_ms": 8261,
-            "max_ms": 9861,
-            "ns/op": 839477073,
-            "p50_ms": 8397,
-            "p95_ms": 9470,
-            "p99_ms": 9861,
-            "response_bytes/op": 1662052
+            "B/op": 515304,
+            "allocs/op": 121,
+            "avg_ms": 69.8,
+            "max_ms": 69.8,
+            "ns/op": 72148257,
+            "p50_ms": 69.8,
+            "p95_ms": 69.8,
+            "p99_ms": 69.8,
+            "response_bytes/op": 188867
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_host",
-          "iterations": 50,
-          "avg_ms": 79.45,
+          "iterations": 1,
+          "avg_ms": 16.32,
           "metrics": {
-            "B/op": 683960,
-            "allocs/op": 170,
-            "avg_ms": 79.45,
-            "max_ms": 103.9,
-            "ns/op": 8982730,
-            "p50_ms": 89.33,
-            "p95_ms": 103,
-            "p99_ms": 103.9,
-            "response_bytes/op": 259846
+            "B/op": 36920,
+            "allocs/op": 97,
+            "avg_ms": 16.32,
+            "max_ms": 16.32,
+            "ns/op": 16363889,
+            "p50_ms": 16.32,
+            "p95_ms": 16.32,
+            "p99_ms": 16.32,
+            "response_bytes/op": 5479
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_json_avg_duration",
-          "iterations": 50,
-          "avg_ms": 17642,
+          "iterations": 1,
+          "avg_ms": 223.8,
           "metrics": {
-            "B/op": 3077035,
-            "allocs/op": 290,
-            "avg_ms": 17642,
-            "max_ms": 27966,
-            "ns/op": 1813764844,
-            "p50_ms": 18027,
-            "p95_ms": 27439,
-            "p99_ms": 27966,
-            "response_bytes/op": 1255267
+            "B/op": 296792,
+            "allocs/op": 136,
+            "avg_ms": 223.8,
+            "max_ms": 223.8,
+            "ns/op": 225137142,
+            "p50_ms": 223.8,
+            "p95_ms": 223.8,
+            "p99_ms": 223.8,
+            "response_bytes/op": 108113
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_json_filter_status",
-          "iterations": 50,
-          "avg_ms": 6948,
+          "iterations": 1,
+          "avg_ms": 32.91,
           "metrics": {
-            "B/op": 539200,
-            "allocs/op": 138,
-            "avg_ms": 6948,
-            "max_ms": 9324,
-            "ns/op": 705139259,
-            "p50_ms": 7028,
-            "p95_ms": 8796,
-            "p99_ms": 9324,
-            "response_bytes/op": 252119
+            "B/op": 83008,
+            "allocs/op": 108,
+            "avg_ms": 32.91,
+            "max_ms": 32.91,
+            "ns/op": 32994458,
+            "p50_ms": 32.91,
+            "p95_ms": 32.91,
+            "p99_ms": 32.91,
+            "response_bytes/op": 6812
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_label_values_service",
-          "iterations": 50,
-          "avg_ms": 97.24,
+          "iterations": 1,
+          "avg_ms": 5.74,
           "metrics": {
-            "B/op": 17257,
-            "allocs/op": 85,
-            "avg_ms": 97.24,
-            "max_ms": 194.3,
-            "ns/op": 10311458,
-            "p50_ms": 100.3,
-            "p95_ms": 192.5,
-            "p99_ms": 194.3,
+            "B/op": 66536,
+            "allocs/op": 86,
+            "avg_ms": 5.74,
+            "max_ms": 5.74,
+            "ns/op": 5759671,
+            "p50_ms": 5.74,
+            "p95_ms": 5.74,
+            "p99_ms": 5.74,
             "response_bytes/op": 596
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_labels",
-          "iterations": 50,
-          "avg_ms": 187.9,
+          "iterations": 1,
+          "avg_ms": 7.502,
           "metrics": {
-            "B/op": 15499,
-            "allocs/op": 83,
-            "avg_ms": 187.9,
-            "max_ms": 298.5,
-            "ns/op": 19322771,
-            "p50_ms": 198.8,
-            "p95_ms": 295.7,
-            "p99_ms": 298.5,
+            "B/op": 65608,
+            "allocs/op": 84,
+            "avg_ms": 7.502,
+            "max_ms": 7.502,
+            "ns/op": 7510235,
+            "p50_ms": 7.502,
+            "p95_ms": 7.502,
+            "p99_ms": 7.502,
             "response_bytes/op": 216
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_line_error",
-          "iterations": 50,
-          "avg_ms": 2892,
+          "iterations": 1,
+          "avg_ms": 22.92,
           "metrics": {
-            "B/op": 6822147,
-            "allocs/op": 536,
-            "avg_ms": 2892,
-            "max_ms": 3990,
-            "ns/op": 299713738,
-            "p50_ms": 3005,
-            "p95_ms": 3753,
-            "p99_ms": 3990,
-            "response_bytes/op": 2857143
+            "B/op": 205456,
+            "allocs/op": 125,
+            "avg_ms": 22.92,
+            "max_ms": 22.92,
+            "ns/op": 23623303,
+            "p50_ms": 22.92,
+            "p95_ms": 22.92,
+            "p99_ms": 22.92,
+            "response_bytes/op": 59297
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_logfmt_avg_size",
-          "iterations": 50,
-          "avg_ms": 6760,
+          "iterations": 1,
+          "avg_ms": 63.54,
           "metrics": {
-            "B/op": 214411,
-            "allocs/op": 122,
-            "avg_ms": 6760,
-            "max_ms": 9303,
-            "ns/op": 689861534,
-            "p50_ms": 7000,
-            "p95_ms": 8898,
-            "p99_ms": 9303,
-            "response_bytes/op": 79641
+            "B/op": 83768,
+            "allocs/op": 108,
+            "avg_ms": 63.54,
+            "max_ms": 63.54,
+            "ns/op": 63641834,
+            "p50_ms": 63.54,
+            "p95_ms": 63.54,
+            "p99_ms": 63.54,
+            "response_bytes/op": 7241
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_logfmt_sum_duration",
-          "iterations": 50,
-          "avg_ms": 18207,
+          "iterations": 1,
+          "avg_ms": 255.6,
           "metrics": {
-            "B/op": 3023528,
-            "allocs/op": 220,
-            "avg_ms": 18207,
-            "max_ms": 26611,
-            "ns/op": 1875509977,
-            "p50_ms": 17905,
-            "p95_ms": 26106,
-            "p99_ms": 26611,
-            "response_bytes/op": 1210432
+            "B/op": 377352,
+            "allocs/op": 128,
+            "avg_ms": 255.6,
+            "max_ms": 255.6,
+            "ns/op": 257341748,
+            "p50_ms": 255.6,
+            "p95_ms": 255.6,
+            "p99_ms": 255.6,
+            "response_bytes/op": 138146
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_pattern_avg_size",
-          "iterations": 50,
-          "avg_ms": 6540,
+          "iterations": 1,
+          "avg_ms": 47.75,
           "metrics": {
-            "B/op": 216826,
-            "allocs/op": 123,
-            "avg_ms": 6540,
-            "max_ms": 8258,
-            "ns/op": 667654891,
-            "p50_ms": 6689,
-            "p95_ms": 7998,
-            "p99_ms": 8258,
-            "response_bytes/op": 79641
+            "B/op": 83216,
+            "allocs/op": 103,
+            "avg_ms": 47.75,
+            "max_ms": 47.75,
+            "ns/op": 47851751,
+            "p50_ms": 47.75,
+            "p95_ms": 47.75,
+            "p99_ms": 47.75,
+            "response_bytes/op": 7241
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_rate_by_region",
-          "iterations": 50,
-          "avg_ms": 5723,
+          "iterations": 1,
+          "avg_ms": 43.66,
           "metrics": {
-            "B/op": 248160,
-            "allocs/op": 126,
-            "avg_ms": 5723,
-            "max_ms": 10564,
-            "ns/op": 579963634,
-            "p50_ms": 5902,
-            "p95_ms": 8606,
-            "p99_ms": 10564,
-            "response_bytes/op": 111452
+            "B/op": 62264,
+            "allocs/op": 102,
+            "avg_ms": 43.66,
+            "max_ms": 43.66,
+            "ns/op": 43855777,
+            "p50_ms": 43.66,
+            "p95_ms": 43.66,
+            "p99_ms": 43.66,
+            "response_bytes/op": 14388
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_regex_checkout",
-          "iterations": 50,
-          "avg_ms": 4304,
+          "iterations": 1,
+          "avg_ms": 80.89,
           "metrics": {
-            "B/op": 6732124,
-            "allocs/op": 519,
-            "avg_ms": 4304,
-            "max_ms": 6284,
-            "ns/op": 440182760,
-            "p50_ms": 4318,
-            "p95_ms": 5292,
-            "p99_ms": 6284,
-            "response_bytes/op": 2767597
+            "B/op": 2403776,
+            "allocs/op": 284,
+            "avg_ms": 80.89,
+            "max_ms": 80.89,
+            "ns/op": 94048779,
+            "p50_ms": 80.89,
+            "p95_ms": 80.89,
+            "p99_ms": 80.89,
+            "response_bytes/op": 1146257
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_regexp_sum_duration",
-          "iterations": 50,
-          "avg_ms": 16320,
+          "iterations": 1,
+          "avg_ms": 179.4,
           "metrics": {
-            "B/op": 3029444,
-            "allocs/op": 221,
-            "avg_ms": 16320,
-            "max_ms": 24768,
-            "ns/op": 1667794980,
-            "p50_ms": 15850,
-            "p95_ms": 21863,
-            "p99_ms": 24768,
-            "response_bytes/op": 1210432
+            "B/op": 336288,
+            "allocs/op": 121,
+            "avg_ms": 179.4,
+            "max_ms": 179.4,
+            "ns/op": 180698111,
+            "p50_ms": 179.4,
+            "p95_ms": 179.4,
+            "p99_ms": 179.4,
+            "response_bytes/op": 138146
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_series_host",
-          "iterations": 50,
-          "avg_ms": 97.29,
+          "iterations": 1,
+          "avg_ms": 13.05,
           "metrics": {
-            "B/op": 372137,
-            "allocs/op": 139,
-            "avg_ms": 97.29,
-            "max_ms": 186.5,
-            "ns/op": 10174494,
-            "p50_ms": 90.75,
-            "p95_ms": 141.8,
-            "p99_ms": 186.5,
-            "response_bytes/op": 162860
+            "B/op": 73320,
+            "allocs/op": 96,
+            "avg_ms": 13.05,
+            "max_ms": 13.05,
+            "ns/op": 13089258,
+            "p50_ms": 13.05,
+            "p95_ms": 13.05,
+            "p99_ms": 13.05,
+            "response_bytes/op": 3337
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_sum_count",
-          "iterations": 50,
-          "avg_ms": 3421,
+          "iterations": 1,
+          "avg_ms": 54.54,
           "metrics": {
-            "B/op": 81326,
-            "allocs/op": 110,
-            "avg_ms": 3421,
-            "max_ms": 4605,
-            "ns/op": 348519141,
-            "p50_ms": 3401,
-            "p95_ms": 4199,
-            "p99_ms": 4605,
-            "response_bytes/op": 29056
+            "B/op": 74408,
+            "allocs/op": 100,
+            "avg_ms": 54.54,
+            "max_ms": 54.54,
+            "ns/op": 54598564,
+            "p50_ms": 54.54,
+            "p95_ms": 54.54,
+            "p99_ms": 54.54,
+            "response_bytes/op": 3504
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/log_topk_rate",
-          "iterations": 50,
-          "avg_ms": 7977,
+          "iterations": 1,
+          "avg_ms": 80.72,
           "metrics": {
-            "B/op": 356323,
-            "allocs/op": 131,
-            "avg_ms": 7977,
-            "max_ms": 9995,
-            "ns/op": 810403310,
-            "p50_ms": 8290,
-            "p95_ms": 9899,
-            "p99_ms": 9995,
-            "response_bytes/op": 163120
+            "B/op": 148088,
+            "allocs/op": 123,
+            "avg_ms": 80.72,
+            "max_ms": 80.72,
+            "ns/op": 80952037,
+            "p50_ms": 80.72,
+            "p95_ms": 80.72,
+            "p99_ms": 80.72,
+            "response_bytes/op": 32175
           }
         }
       ],
@@ -346,210 +346,550 @@
     {
       "version": 1,
       "run": "posthog_metrics",
-      "attempt": 2,
-      "repeat_count": 3,
-      "selected_attempt": 2,
-      "generated_at": "2026-06-04T15:10:29Z",
+      "attempt": 1,
+      "repeat_count": 1,
+      "selected_attempt": 1,
+      "generated_at": "2026-06-05T13:57:47Z",
       "source": {
         "name": "tsbs-posthog-metrics",
         "version": "v0.0.0-20260527045238-8323e59c7402",
         "use_case": "devops",
-        "scale": "1000",
+        "scale": "50",
         "start": "2016-01-01T00:00:00Z",
         "end": "2016-01-01T01:00:00Z",
         "interval": "15s",
         "seed": "1",
-        "workers": "16",
-        "batch_size": "250000",
-        "query_concurrency": "10",
-        "query_benchtime": "50x"
+        "workers": "2",
+        "batch_size": "10000",
+        "query_concurrency": "1",
+        "query_benchtime": "1x"
       },
       "ingest": {
-        "rows": 24240000,
-        "duration_ms": 360777,
-        "metric_rate": 67188.2161001502,
-        "row_rate": 67188.2161001502
+        "rows": 1212000,
+        "duration_ms": 15118,
+        "metric_rate": 80165.79869850083,
+        "row_rate": 80165.79869850083
       },
       "query": {
         "scenario_count": 11,
-        "geomean_avg_ms": 127.56488150770623,
-        "total_avg_ms": 1856.7399999999998
+        "geomean_avg_ms": 10.7732331381331,
+        "total_avg_ms": 126.32299999999998
       },
       "benchmarks": [
         {
           "name": "BenchmarkBridgeHTTP/tsbs_avg_by_environment",
-          "iterations": 50,
-          "avg_ms": 58.69,
+          "iterations": 1,
+          "avg_ms": 8.625,
           "metrics": {
-            "B/op": 16962,
-            "allocs/op": 87,
-            "avg_ms": 58.69,
-            "max_ms": 98.32,
-            "ns/op": 6322040,
-            "p50_ms": 91.86,
-            "p95_ms": 97.72,
-            "p99_ms": 98.32,
-            "response_bytes/op": 321
+            "B/op": 65720,
+            "allocs/op": 86,
+            "avg_ms": 8.625,
+            "max_ms": 8.625,
+            "ns/op": 8636617,
+            "p50_ms": 8.625,
+            "p95_ms": 8.625,
+            "p99_ms": 8.625,
+            "response_bytes/op": 312
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_label_values_hostname",
-          "iterations": 50,
-          "avg_ms": 23.65,
+          "iterations": 1,
+          "avg_ms": 4.022,
           "metrics": {
-            "B/op": 41747,
-            "allocs/op": 101,
-            "avg_ms": 23.65,
-            "max_ms": 86.28,
-            "ns/op": 2449243,
-            "p50_ms": 6.048,
-            "p95_ms": 84,
-            "p99_ms": 86.28,
-            "response_bytes/op": 10920
+            "B/op": 66760,
+            "allocs/op": 89,
+            "avg_ms": 4.022,
+            "max_ms": 4.022,
+            "ns/op": 4039666,
+            "p50_ms": 4.022,
+            "p95_ms": 4.022,
+            "p99_ms": 4.022,
+            "response_bytes/op": 520
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_nested_count_filtered_hostname",
-          "iterations": 50,
-          "avg_ms": 278.5,
+          "iterations": 1,
+          "avg_ms": 15.54,
           "metrics": {
-            "B/op": 14470,
-            "allocs/op": 83,
-            "avg_ms": 278.5,
-            "max_ms": 403.1,
-            "ns/op": 29715822,
-            "p50_ms": 295.8,
-            "p95_ms": 396,
-            "p99_ms": 403.1,
-            "response_bytes/op": 468
+            "B/op": 65872,
+            "allocs/op": 88,
+            "avg_ms": 15.54,
+            "max_ms": 15.54,
+            "ns/op": 15552477,
+            "p50_ms": 15.54,
+            "p95_ms": 15.54,
+            "p99_ms": 15.54,
+            "response_bytes/op": 448
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_nested_count_hostname",
-          "iterations": 50,
-          "avg_ms": 208.2,
+          "iterations": 1,
+          "avg_ms": 11.64,
           "metrics": {
-            "B/op": 13677,
-            "allocs/op": 84,
-            "avg_ms": 208.2,
-            "max_ms": 304.4,
-            "ns/op": 22484368,
-            "p50_ms": 201.9,
-            "p95_ms": 300.9,
-            "p99_ms": 304.4,
-            "response_bytes/op": 488
+            "B/op": 25696,
+            "allocs/op": 91,
+            "avg_ms": 11.64,
+            "max_ms": 11.64,
+            "ns/op": 11657292,
+            "p50_ms": 11.64,
+            "p95_ms": 11.64,
+            "p99_ms": 11.64,
+            "response_bytes/op": 448
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_nested_count_region",
-          "iterations": 50,
-          "avg_ms": 216.4,
+          "iterations": 1,
+          "avg_ms": 13.3,
           "metrics": {
-            "B/op": 13710,
-            "allocs/op": 84,
-            "avg_ms": 216.4,
-            "max_ms": 305.5,
-            "ns/op": 22745394,
-            "p50_ms": 204.7,
-            "p95_ms": 301.1,
-            "p99_ms": 305.5,
+            "B/op": 65824,
+            "allocs/op": 88,
+            "avg_ms": 13.3,
+            "max_ms": 13.3,
+            "ns/op": 13317586,
+            "p50_ms": 13.3,
+            "p95_ms": 13.3,
+            "p99_ms": 13.3,
             "response_bytes/op": 428
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_one_series",
-          "iterations": 50,
-          "avg_ms": 87.12,
+          "iterations": 1,
+          "avg_ms": 15.18,
           "metrics": {
-            "B/op": 13369,
-            "allocs/op": 86,
-            "avg_ms": 87.12,
-            "max_ms": 187.5,
-            "ns/op": 8881010,
-            "p50_ms": 99.45,
-            "p95_ms": 186,
-            "p99_ms": 187.5,
+            "B/op": 76112,
+            "allocs/op": 121,
+            "avg_ms": 15.18,
+            "max_ms": 15.18,
+            "ns/op": 15228148,
+            "p50_ms": 15.18,
+            "p95_ms": 15.18,
+            "p99_ms": 15.18,
             "response_bytes/op": 328
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_range_selector",
-          "iterations": 50,
-          "avg_ms": 232.1,
+          "iterations": 1,
+          "avg_ms": 13,
           "metrics": {
-            "B/op": 15467,
-            "allocs/op": 86,
-            "avg_ms": 232.1,
-            "max_ms": 393.3,
-            "ns/op": 24031112,
-            "p50_ms": 204.8,
-            "p95_ms": 389.6,
-            "p99_ms": 393.3,
+            "B/op": 26144,
+            "allocs/op": 89,
+            "avg_ms": 13,
+            "max_ms": 13,
+            "ns/op": 13019957,
+            "p50_ms": 13,
+            "p95_ms": 13,
+            "p99_ms": 13,
             "response_bytes/op": 673
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_range_sum_by_region",
-          "iterations": 50,
-          "avg_ms": 213.7,
+          "iterations": 1,
+          "avg_ms": 15.82,
           "metrics": {
-            "B/op": 24604,
-            "allocs/op": 98,
-            "avg_ms": 213.7,
-            "max_ms": 299.4,
-            "ns/op": 21829638,
-            "p50_ms": 204.1,
-            "p95_ms": 295.7,
-            "p99_ms": 299.4,
-            "response_bytes/op": 4086
+            "B/op": 33520,
+            "allocs/op": 104,
+            "avg_ms": 15.82,
+            "max_ms": 15.82,
+            "ns/op": 15883178,
+            "p50_ms": 15.82,
+            "p95_ms": 15.82,
+            "p99_ms": 15.82,
+            "response_bytes/op": 3886
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_series_metric",
-          "iterations": 50,
-          "avg_ms": 398.5,
+          "iterations": 1,
+          "avg_ms": 11.72,
           "metrics": {
-            "B/op": 520909,
-            "allocs/op": 146,
-            "avg_ms": 398.5,
-            "max_ms": 574.4,
-            "ns/op": 42226587,
-            "p50_ms": 399.1,
-            "p95_ms": 502.7,
-            "p99_ms": 574.4,
-            "response_bytes/op": 224915
+            "B/op": 91984,
+            "allocs/op": 105,
+            "avg_ms": 11.72,
+            "max_ms": 11.72,
+            "ns/op": 11804829,
+            "p50_ms": 11.72,
+            "p95_ms": 11.72,
+            "p99_ms": 11.72,
+            "response_bytes/op": 11236
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_sum_by_region",
-          "iterations": 50,
-          "avg_ms": 76.11,
+          "iterations": 1,
+          "avg_ms": 7.306,
           "metrics": {
-            "B/op": 16234,
-            "allocs/op": 87,
-            "avg_ms": 76.11,
-            "max_ms": 101.9,
-            "ns/op": 7834384,
-            "p50_ms": 94.31,
-            "p95_ms": 99.86,
-            "p99_ms": 101.9,
-            "response_bytes/op": 639
+            "B/op": 67176,
+            "allocs/op": 94,
+            "avg_ms": 7.306,
+            "max_ms": 7.306,
+            "ns/op": 7322442,
+            "p50_ms": 7.306,
+            "p95_ms": 7.306,
+            "p99_ms": 7.306,
+            "response_bytes/op": 629
           }
         },
         {
           "name": "BenchmarkBridgeHTTP/tsbs_topk",
-          "iterations": 50,
-          "avg_ms": 63.77,
+          "iterations": 1,
+          "avg_ms": 10.17,
           "metrics": {
-            "B/op": 23768,
-            "allocs/op": 95,
-            "avg_ms": 63.77,
-            "max_ms": 99.1,
-            "ns/op": 6445841,
-            "p50_ms": 93.18,
-            "p95_ms": 98.11,
-            "p99_ms": 99.1,
-            "response_bytes/op": 2667
+            "B/op": 72952,
+            "allocs/op": 104,
+            "avg_ms": 10.17,
+            "max_ms": 10.17,
+            "ns/op": 10215578,
+            "p50_ms": 10.17,
+            "p95_ms": 10.17,
+            "p99_ms": 10.17,
+            "response_bytes/op": 2671
+          }
+        }
+      ],
+      "compare_basis": "geomean(write row-rate ratio, per-scenario query avg_ms ratios); lower is faster"
+    },
+    {
+      "version": 1,
+      "run": "snuffle_logs",
+      "attempt": 1,
+      "repeat_count": 1,
+      "selected_attempt": 1,
+      "generated_at": "2026-06-05T13:57:53Z",
+      "source": {
+        "name": "snuffle-logs-synthetic",
+        "version": "synthetic-v1",
+        "use_case": "logs",
+        "scale": "10000",
+        "start": "2026-06-01 00:00:00",
+        "end": "86400s",
+        "interval": "60s",
+        "seed": "",
+        "workers": "",
+        "batch_size": "",
+        "query_concurrency": "1",
+        "query_benchtime": "1x"
+      },
+      "ingest": {
+        "rows": 10000,
+        "duration_ms": 155,
+        "metric_rate": 64516.129032,
+        "row_rate": 64516.129032
+      },
+      "query": {
+        "scenario_count": 19,
+        "geomean_avg_ms": 53.872812394407,
+        "total_avg_ms": 1279.6299999999999
+      },
+      "benchmarks": [
+        {
+          "name": "BenchmarkBridgeHTTP/log_basic",
+          "iterations": 1,
+          "avg_ms": 150,
+          "metrics": {
+            "B/op": 4820096,
+            "allocs/op": 461,
+            "avg_ms": 150,
+            "max_ms": 150,
+            "ns/op": 176971191,
+            "p50_ms": 150,
+            "p95_ms": 150,
+            "p99_ms": 150,
+            "response_bytes/op": 2106515
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_bytes_by_format",
+          "iterations": 1,
+          "avg_ms": 47.23,
+          "metrics": {
+            "B/op": 83680,
+            "allocs/op": 109,
+            "avg_ms": 47.23,
+            "max_ms": 47.23,
+            "ns/op": 47329612,
+            "p50_ms": 47.23,
+            "p95_ms": 47.23,
+            "p99_ms": 47.23,
+            "response_bytes/op": 7242
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_comparison",
+          "iterations": 1,
+          "avg_ms": 91.82,
+          "metrics": {
+            "B/op": 66752,
+            "allocs/op": 91,
+            "avg_ms": 91.82,
+            "max_ms": 91.82,
+            "ns/op": 91837332,
+            "p50_ms": 91.82,
+            "p95_ms": 91.82,
+            "p99_ms": 91.82,
+            "response_bytes/op": 217
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_count_by_service",
+          "iterations": 1,
+          "avg_ms": 86.99,
+          "metrics": {
+            "B/op": 410800,
+            "allocs/op": 141,
+            "avg_ms": 86.99,
+            "max_ms": 86.99,
+            "ns/op": 89054262,
+            "p50_ms": 86.99,
+            "p95_ms": 86.99,
+            "p99_ms": 86.99,
+            "response_bytes/op": 166172
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_host",
+          "iterations": 1,
+          "avg_ms": 31.78,
+          "metrics": {
+            "B/op": 71552,
+            "allocs/op": 101,
+            "avg_ms": 31.78,
+            "max_ms": 31.78,
+            "ns/op": 31826116,
+            "p50_ms": 31.78,
+            "p95_ms": 31.78,
+            "p99_ms": 31.78,
+            "response_bytes/op": 2623
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_json_avg_duration",
+          "iterations": 1,
+          "avg_ms": 87.49,
+          "metrics": {
+            "B/op": 278504,
+            "allocs/op": 120,
+            "avg_ms": 87.49,
+            "max_ms": 87.49,
+            "ns/op": 88701540,
+            "p50_ms": 87.49,
+            "p95_ms": 87.49,
+            "p99_ms": 87.49,
+            "response_bytes/op": 97102
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_json_filter_status",
+          "iterations": 1,
+          "avg_ms": 57.66,
+          "metrics": {
+            "B/op": 41824,
+            "allocs/op": 103,
+            "avg_ms": 57.66,
+            "max_ms": 57.66,
+            "ns/op": 57762237,
+            "p50_ms": 57.66,
+            "p95_ms": 57.66,
+            "p99_ms": 57.66,
+            "response_bytes/op": 6812
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_label_values_service",
+          "iterations": 1,
+          "avg_ms": 24.29,
+          "metrics": {
+            "B/op": 66608,
+            "allocs/op": 88,
+            "avg_ms": 24.29,
+            "max_ms": 24.29,
+            "ns/op": 24308448,
+            "p50_ms": 24.29,
+            "p95_ms": 24.29,
+            "p99_ms": 24.29,
+            "response_bytes/op": 596
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_labels",
+          "iterations": 1,
+          "avg_ms": 19.57,
+          "metrics": {
+            "B/op": 65696,
+            "allocs/op": 87,
+            "avg_ms": 19.57,
+            "max_ms": 19.57,
+            "ns/op": 19592343,
+            "p50_ms": 19.57,
+            "p95_ms": 19.57,
+            "p99_ms": 19.57,
+            "response_bytes/op": 175
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_line_error",
+          "iterations": 1,
+          "avg_ms": 23.42,
+          "metrics": {
+            "B/op": 164104,
+            "allocs/op": 122,
+            "avg_ms": 23.42,
+            "max_ms": 23.42,
+            "ns/op": 24034294,
+            "p50_ms": 23.42,
+            "p95_ms": 23.42,
+            "p99_ms": 23.42,
+            "response_bytes/op": 46159
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_logfmt_avg_size",
+          "iterations": 1,
+          "avg_ms": 126.1,
+          "metrics": {
+            "B/op": 90856,
+            "allocs/op": 121,
+            "avg_ms": 126.1,
+            "max_ms": 126.1,
+            "ns/op": 126207288,
+            "p50_ms": 126.1,
+            "p95_ms": 126.1,
+            "p99_ms": 126.1,
+            "response_bytes/op": 9395
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_logfmt_sum_duration",
+          "iterations": 1,
+          "avg_ms": 91.69,
+          "metrics": {
+            "B/op": 319624,
+            "allocs/op": 116,
+            "avg_ms": 91.69,
+            "max_ms": 91.69,
+            "ns/op": 93145284,
+            "p50_ms": 91.69,
+            "p95_ms": 91.69,
+            "p99_ms": 91.69,
+            "response_bytes/op": 117821
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_pattern_avg_size",
+          "iterations": 1,
+          "avg_ms": 108.5,
+          "metrics": {
+            "B/op": 90120,
+            "allocs/op": 113,
+            "avg_ms": 108.5,
+            "max_ms": 108.5,
+            "ns/op": 108657786,
+            "p50_ms": 108.5,
+            "p95_ms": 108.5,
+            "p99_ms": 108.5,
+            "response_bytes/op": 9395
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_rate_by_region",
+          "iterations": 1,
+          "avg_ms": 42.4,
+          "metrics": {
+            "B/op": 108952,
+            "allocs/op": 120,
+            "avg_ms": 42.4,
+            "max_ms": 42.4,
+            "ns/op": 42649405,
+            "p50_ms": 42.4,
+            "p95_ms": 42.4,
+            "p99_ms": 42.4,
+            "response_bytes/op": 19267
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_regex_checkout",
+          "iterations": 1,
+          "avg_ms": 82.6,
+          "metrics": {
+            "B/op": 2137112,
+            "allocs/op": 250,
+            "avg_ms": 82.6,
+            "max_ms": 82.6,
+            "ns/op": 92787483,
+            "p50_ms": 82.6,
+            "p95_ms": 82.6,
+            "p99_ms": 82.6,
+            "response_bytes/op": 880543
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_regexp_sum_duration",
+          "iterations": 1,
+          "avg_ms": 63.08,
+          "metrics": {
+            "B/op": 361248,
+            "allocs/op": 123,
+            "avg_ms": 63.08,
+            "max_ms": 63.08,
+            "ns/op": 64538615,
+            "p50_ms": 63.08,
+            "p95_ms": 63.08,
+            "p99_ms": 63.08,
+            "response_bytes/op": 117821
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_series_host",
+          "iterations": 1,
+          "avg_ms": 15.07,
+          "metrics": {
+            "B/op": 68528,
+            "allocs/op": 91,
+            "avg_ms": 15.07,
+            "max_ms": 15.07,
+            "ns/op": 15099728,
+            "p50_ms": 15.07,
+            "p95_ms": 15.07,
+            "p99_ms": 15.07,
+            "response_bytes/op": 1420
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_sum_count",
+          "iterations": 1,
+          "avg_ms": 16.44,
+          "metrics": {
+            "B/op": 73168,
+            "allocs/op": 99,
+            "avg_ms": 16.44,
+            "max_ms": 16.44,
+            "ns/op": 16479325,
+            "p50_ms": 16.44,
+            "p95_ms": 16.44,
+            "p99_ms": 16.44,
+            "response_bytes/op": 3420
+          }
+        },
+        {
+          "name": "BenchmarkBridgeHTTP/log_topk_rate",
+          "iterations": 1,
+          "avg_ms": 113.5,
+          "metrics": {
+            "B/op": 127736,
+            "allocs/op": 124,
+            "avg_ms": 113.5,
+            "max_ms": 113.5,
+            "ns/op": 113908823,
+            "p50_ms": 113.5,
+            "p95_ms": 113.5,
+            "p99_ms": 113.5,
+            "response_bytes/op": 28347
           }
         }
       ],

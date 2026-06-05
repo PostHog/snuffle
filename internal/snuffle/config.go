@@ -20,8 +20,11 @@ type Config struct {
 	LabelPostingsTable  string
 	ActivityTable       string
 	MetricsTable        string
+	LogSchemaLayout     string
 	LogsTable           string
+	LogStreamsTable     string
 	LogAttributesTable  string
+	LogStreamStatsTable string
 	HistogramsTable     string
 	ExemplarsTable      string
 	HTTPHost            string
@@ -53,6 +56,11 @@ func ConfigFromEnv() Config {
 	httpPort := getenv("SIDECAR_PORT", "9091")
 	defaultTeamID := envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0)
 	schemaLayout := storageSchemaLayout(getenv("CH_SCHEMA_LAYOUT", getenv("SNUFFLE_SCHEMA_LAYOUT", string(schemaLayoutCurrent))))
+	logSchemaLayoutDefault := string(logSchemaLayoutSnuffle)
+	if schemaLayout == schemaLayoutPostHog {
+		logSchemaLayoutDefault = string(logSchemaLayoutPostHog)
+	}
+	logSchemaLayout := storageLogSchemaLayout(getenv("CH_LOG_SCHEMA_LAYOUT", getenv("SNUFFLE_LOG_SCHEMA_LAYOUT", logSchemaLayoutDefault)))
 	sampleAttributesDefault := schemaLayout == schemaLayoutPostHog
 	seriesTableDefault := "metrics_series"
 	samplesTableDefault := "metrics_samples"
@@ -60,6 +68,10 @@ func ConfigFromEnv() Config {
 	histogramsTableDefault := "metrics_histograms"
 	exemplarsTableDefault := "metrics_exemplars"
 	metadataTableDefault := "metrics_metadata"
+	logsTableDefault := "logs"
+	logStreamsTableDefault := "log_streams"
+	logAttributesTableDefault := ""
+	logStreamStatsTableDefault := "log_stream_stats"
 	aggregateThreadsDefault := 1
 	if schemaLayout == schemaLayoutPostHog {
 		seriesTableDefault = ""
@@ -68,6 +80,12 @@ func ConfigFromEnv() Config {
 		histogramsTableDefault = ""
 		exemplarsTableDefault = ""
 		metadataTableDefault = ""
+	}
+	if logSchemaLayout == logSchemaLayoutPostHog {
+		logsTableDefault = "logs34"
+		logStreamsTableDefault = ""
+		logAttributesTableDefault = "log_attributes2"
+		logStreamStatsTableDefault = ""
 	}
 	return Config{
 		CHAddr:              getenv("CH_ADDR", "localhost:9000"),
@@ -82,8 +100,11 @@ func ConfigFromEnv() Config {
 		LabelPostingsTable:  getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:       getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:        getenv("CH_METRICS_TABLE", metadataTableDefault),
-		LogsTable:           getenv("CH_LOGS_TABLE", "logs34"),
-		LogAttributesTable:  getenv("CH_LOG_ATTRIBUTES_TABLE", getenv("CH_LOG_ATTRIBUTE_TABLE", "log_attributes2")),
+		LogSchemaLayout:     string(logSchemaLayout),
+		LogsTable:           getenv("CH_LOGS_TABLE", logsTableDefault),
+		LogStreamsTable:     getenv("CH_LOG_STREAMS_TABLE", logStreamsTableDefault),
+		LogAttributesTable:  getenv("CH_LOG_ATTRIBUTES_TABLE", getenv("CH_LOG_ATTRIBUTE_TABLE", logAttributesTableDefault)),
+		LogStreamStatsTable: getenv("CH_LOG_STREAM_STATS_TABLE", logStreamStatsTableDefault),
 		HistogramsTable:     getenv("CH_HISTOGRAMS_TABLE", histogramsTableDefault),
 		ExemplarsTable:      getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
 		HTTPHost:            getenv("SIDECAR_HOST", "0.0.0.0"),

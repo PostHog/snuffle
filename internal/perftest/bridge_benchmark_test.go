@@ -192,6 +192,8 @@ func bridgeScenarios(profile string) ([]bridgeScenario, bool) {
 		return bridgePostHogMetricScenarios(), true
 	case "posthog_logs":
 		return bridgePostHogLogScenarios(), true
+	case "snuffle_logs":
+		return bridgePostHogLogScenarios(), true
 	default:
 		return nil, false
 	}

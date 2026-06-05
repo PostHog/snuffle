@@ -119,9 +119,25 @@ and computes series identity in ClickHouse with
 `cityHash64(metric_name, service_name, mapSort(resource_attributes),
 mapSort(attributes_map_str))`.
 
-PostHog-style logs for Loki/LogQL are in `scripts/create_logs_posthog_schema.sql`.
-The Loki push API writes Loki stream labels and structured metadata into the
-OpenTelemetry-shaped `logs34` table:
+Snuffle-native logs for Loki/LogQL are in `scripts/create_logs_snuffle_schema.sql`.
+This is the optimized layout for new deployments:
+
+- `logs`: one row per log line with tenant, timestamp, expiry, stream id, body,
+  and per-entry fields
+- `log_streams`: one row per stream id with stream labels and resource
+  attributes stored once, plus materialized service/severity columns
+- `log_stream_stats`: minute rollups by stream for active-stream pruning and
+  fast count/rate/bytes LogQL aggregations
+
+This layout intentionally does not preserve PostHog physical columns. It stores
+repeated stream/resource labels once, keeps the hot table narrow, and uses the
+stream dictionary for selector pruning while Snuffle reconstructs the logical
+Loki label surface at query time.
+
+PostHog-style logs remain supported with `CH_LOG_SCHEMA_LAYOUT=posthog` and
+`scripts/create_logs_posthog_schema.sql`. In that mode the Loki push API writes
+Loki stream labels and structured metadata into the OpenTelemetry-shaped
+`logs34` table:
 
 - `service_name` / `service.name` become the `service_name` column
 - `level`, `severity`, and `severity_text` become `severity_text`
@@ -193,9 +209,17 @@ Environment variables:
 - `CH_EXEMPLARS_TABLE`: exemplar table, default `metrics_exemplars`
 - `CH_METRICS_TABLE`: metric metadata table, default
   `metrics_metadata`
-- `CH_LOGS_TABLE`: OpenTelemetry/PostHog logs table, default `logs34`
-- `CH_LOG_ATTRIBUTES_TABLE`: logs attribute discovery table, default
-  `log_attributes2`; `CH_LOG_ATTRIBUTE_TABLE` is also accepted
+- `CH_LOG_SCHEMA_LAYOUT`: logs storage layout, `snuffle` or `posthog`; defaults
+  to `posthog` when `CH_SCHEMA_LAYOUT=posthog`, otherwise `snuffle`
+- `CH_LOGS_TABLE`: logs table, default `logs` for the Snuffle log layout and
+  `logs34` for the PostHog log layout
+- `CH_LOG_STREAMS_TABLE`: Snuffle log stream dictionary table, default
+  `log_streams`
+- `CH_LOG_ATTRIBUTES_TABLE`: PostHog log attribute table, default
+  `log_attributes2` for PostHog logs and empty for Snuffle logs;
+  `CH_LOG_ATTRIBUTE_TABLE` is also accepted
+- `CH_LOG_STREAM_STATS_TABLE`: Snuffle log minute rollup table, default
+  `log_stream_stats`
 - `CH_TIMEOUT_SECONDS`: ClickHouse timeout, default `30`
 - `SIDECAR_HOST`: listen host, default `0.0.0.0`
 - `SIDECAR_PORT`: listen port, default `9091`
@@ -242,11 +266,11 @@ Start ClickHouse:
 docker compose up -d clickhouse
 ```
 
-Create the PostHog metrics and logs schemas:
+Create the PostHog metrics schema and Snuffle-native logs schema:
 
 ```bash
 docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_metrics_posthog_schema.sql
-docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_logs_posthog_schema.sql
+docker exec -i snuffle-clickhouse clickhouse-client --multiquery < scripts/create_logs_snuffle_schema.sql
 ```
 
 Run the sidecar:
@@ -255,11 +279,18 @@ Run the sidecar:
 CH_ADDR=localhost:9000 \
 CH_DATABASE=default \
 CH_SCHEMA_LAYOUT=posthog \
+CH_LOG_SCHEMA_LAYOUT=snuffle \
 CH_SAMPLES_TABLE=metrics1 \
-CH_LOGS_TABLE=logs34 \
-CH_LOG_ATTRIBUTES_TABLE=log_attributes2 \
+CH_LOGS_TABLE=logs \
+CH_LOG_STREAMS_TABLE=log_streams \
+CH_LOG_STREAM_STATS_TABLE=log_stream_stats \
 go run ./cmd/snuffle
 ```
+
+For PostHog-compatible logs instead, create
+`scripts/create_logs_posthog_schema.sql` and run with
+`CH_LOG_SCHEMA_LAYOUT=posthog`, `CH_LOGS_TABLE=logs34`, and
+`CH_LOG_ATTRIBUTES_TABLE=log_attributes2`.
 
 Run the PostHog metrics and logs regression benchmark suite:
 
@@ -267,18 +298,20 @@ Run the PostHog metrics and logs regression benchmark suite:
 make perf-test
 ```
 
-By default this runs `PERF_RUNS=posthog_metrics,posthog_logs` three times
-(`PERF_REPEAT=3`) and compares the slowest candidate for each named run. The
-metrics run generates TSBS Prometheus remote-write data, replays it through
-`/api/v1/write`, and queries the PostHog-style `metrics1` schema. The logs run
-seeds synthetic PostHog-shaped rows into `logs34` and queries them through
-LogQL. Attempt artifacts are stored under `.perf/<run>/attempt-<n>/`, selected
-run results are copied to `.perf/<run>/perf-results.current.json`, and accepted
-suite baselines are kept in `perf-results.json`. Use
-`PERF_RUNS=posthog_metrics` or `PERF_RUNS=posthog_logs` for a targeted run,
-`BRIDGE_BENCH_SCENARIO=<scenario>` for a targeted query scenario, and
-`PERF_REPEAT=1` for a local smoke pass. In CI the same suite runs with
-`PERF_FAIL_ON_SLOWER=true`, so a slower selected candidate fails the workflow.
+By default this runs `PERF_RUNS=posthog_metrics,posthog_logs,snuffle_logs` once
+(`PERF_REPEAT=1`) with CI-sized data. The metrics run generates TSBS
+Prometheus remote-write data, replays it through `/api/v1/write`, and queries
+the PostHog-style `metrics1` schema. The PostHog logs run seeds synthetic
+PostHog-shaped rows into `logs34`; the Snuffle logs run seeds the
+Snuffle-native `logs` schema and queries it through LogQL. Attempt
+artifacts are stored under
+`.perf/<run>/attempt-<n>/`, selected run results are copied to
+`.perf/<run>/perf-results.current.json`, and accepted suite baselines are kept
+in `perf-results.json`. Use `PERF_RUNS=posthog_metrics`,
+`PERF_RUNS=posthog_logs`, or `PERF_RUNS=snuffle_logs` for a targeted run,
+`BRIDGE_BENCH_SCENARIO=<scenario>` for a targeted query scenario, and env vars
+like `TSBS_SCALE`, `POSTHOG_LOG_ROWS`, or `BRIDGE_BENCHTIME` for larger local
+runs.
 Set `PERF_START_CLICKHOUSE=0`, `CH_ADDR`, and `CH_DATABASE` to use an existing
 ClickHouse/database.
 

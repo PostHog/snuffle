@@ -1401,9 +1401,23 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 	if limit <= 0 || limit > maxRows {
 		limit = maxRows
 	}
+	if cfg.postHogLogSchemaLayout() {
+		return fmt.Sprintf(
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			tableName(cfg.CHDatabase, cfg.LogsTable),
+			strings.Join(where, " AND "),
+			order,
+			limit,
+		)
+	}
 	return fmt.Sprintf(
-		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
-		tableName(cfg.CHDatabase, cfg.LogsTable),
+		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+		logQLSnuffleLabelValueExpr("service_name"),
+		logQLSnuffleLabelValueExpr("severity_text"),
+		logQLSnuffleLabelValueExpr("trace_id"),
+		logQLSnuffleLabelValueExpr("span_id"),
+		logQLSnuffleAttributesMapExpr(),
+		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
 		order,
 		limit,
@@ -1411,11 +1425,42 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 }
 
 func logQLLogsSourceSQL(cfg Config, where []string) string {
+	if cfg.postHogLogSchemaLayout() {
+		return fmt.Sprintf(
+			"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s)",
+			tableName(cfg.CHDatabase, cfg.LogsTable),
+			strings.Join(where, " AND "),
+		)
+	}
 	return fmt.Sprintf(
-		"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s)",
-		tableName(cfg.CHDatabase, cfg.LogsTable),
+		"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, labels, fields, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s)",
+		logQLSnuffleLabelValueExpr("service_name"),
+		logQLSnuffleLabelValueExpr("severity_text"),
+		logQLSnuffleLabelValueExpr("trace_id"),
+		logQLSnuffleLabelValueExpr("span_id"),
+		logQLSnuffleAttributesMapExpr(),
+		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
 	)
+}
+
+func logQLLogsTableSQL(cfg Config) string {
+	if cfg.postHogLogSchemaLayout() {
+		return tableName(cfg.CHDatabase, cfg.LogsTable)
+	}
+	return fmt.Sprintf(
+		"(SELECT logs.team_id AS team_id, logs.timestamp AS timestamp, logs.time_bucket AS time_bucket, logs.observed_ns AS observed_ns, logs.body AS body, logs.stream_id AS stream_id, logs.fields AS fields, streams.resource_attributes AS resource_attributes, streams.labels AS labels FROM %s AS logs ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		tableName(cfg.CHDatabase, cfg.LogsTable),
+		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
+		logQLSnuffleFullSortingMergeJoinSettings(cfg),
+	)
+}
+
+func logQLSnuffleFullSortingMergeJoinSettings(cfg Config) string {
+	if cfg.postHogLogSchemaLayout() {
+		return ""
+	}
+	return " SETTINGS join_algorithm = 'full_sorting_merge'"
 }
 
 func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
@@ -1427,7 +1472,7 @@ func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) 
 		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
 	}
 	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLMatcherCondition(matcher))
+		filters = append(filters, logQLMatcherCondition(cfg, matcher))
 	}
 	canPushLine := true
 	for _, stage := range selector.stages {
@@ -1441,8 +1486,8 @@ func logQLBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) 
 	return filters
 }
 
-func logQLMatcherCondition(m logQLLabelMatcher) string {
-	return logQLStringCondition(logQLStreamLabelValueExpr(m.name), m.op, m.value, true)
+func logQLMatcherCondition(cfg Config, m logQLLabelMatcher) string {
+	return logQLStringCondition(logQLStreamLabelValueExpr(cfg, m.name), m.op, m.value, true)
 }
 
 func logQLLineFilterCondition(f logQLLineFilter) string {
@@ -1491,7 +1536,10 @@ func logQLStringCondition(expr, op, value string, anchorRegex bool) string {
 	}
 }
 
-func logQLStreamLabelValueExpr(name string) string {
+func logQLStreamLabelValueExpr(cfg Config, name string) string {
+	if !cfg.postHogLogSchemaLayout() {
+		return logQLSnuffleLabelValueExpr(name)
+	}
 	switch name {
 	case "service_name":
 		return "service_name"
@@ -1513,8 +1561,57 @@ func logQLStreamLabelValueExpr(name string) string {
 	}
 }
 
-func logQLLabelValueExpr(name string) string {
-	return logQLStreamLabelValueExpr(name)
+func logQLLabelValueExpr(cfg Config, name string) string {
+	return logQLStreamLabelValueExpr(cfg, name)
+}
+
+func logQLSnuffleLabelValueExpr(name string) string {
+	switch name {
+	case "service_name":
+		return "if(mapContains(labels, 'service_name'), labels['service_name'], if(mapContains(fields, 'service_name'), fields['service_name'], if(mapContains(labels, 'service.name'), labels['service.name'], fields['service.name'])))"
+	case "service.name":
+		return "if(mapContains(labels, 'service.name'), labels['service.name'], if(mapContains(fields, 'service.name'), fields['service.name'], if(mapContains(labels, 'service_name'), labels['service_name'], fields['service_name'])))"
+	case "level", "severity", "severity_text", "detected_level":
+		return "multiIf(mapContains(labels, 'level'), labels['level'], mapContains(fields, 'level'), fields['level'], mapContains(labels, 'severity_text'), labels['severity_text'], mapContains(fields, 'severity_text'), fields['severity_text'], mapContains(labels, 'detected_level'), labels['detected_level'], fields['detected_level'])"
+	case "trace_id":
+		return "if(mapContains(labels, 'trace_id'), labels['trace_id'], fields['trace_id'])"
+	case "span_id":
+		return "if(mapContains(labels, 'span_id'), labels['span_id'], fields['span_id'])"
+	default:
+		key := sqlString(name)
+		return "if(mapContains(labels, " + key + "), labels[" + key + "], if(mapContains(fields, " + key + "), fields[" + key + "], resource_attributes[" + key + "]))"
+	}
+}
+
+func logQLSnuffleAttributesMapExpr() string {
+	return "mapApply((k, v) -> (concat(k, '__str'), v), mapConcat(labels, fields))"
+}
+
+func logQLSnuffleStreamOnlyLabelValueExpr(name string) string {
+	switch name {
+	case "service_name", "service.name":
+		return "if(mapContains(labels, 'service_name'), labels['service_name'], if(mapContains(labels, 'service.name'), labels['service.name'], resource_attributes['service.name']))"
+	case "level", "severity", "severity_text", "detected_level":
+		return "multiIf(mapContains(labels, 'level'), labels['level'], mapContains(labels, 'severity_text'), labels['severity_text'], mapContains(labels, 'detected_level'), labels['detected_level'], '')"
+	case "trace_id":
+		return "labels['trace_id']"
+	case "span_id":
+		return "labels['span_id']"
+	default:
+		key := sqlString(name)
+		return "if(mapContains(labels, " + key + "), labels[" + key + "], resource_attributes[" + key + "])"
+	}
+}
+
+func logQLSnuffleStreamLabelKeyCondition(expr, name string) string {
+	switch name {
+	case "service_name", "service.name":
+		return expr + " IN ('service_name', 'service.name')"
+	case "level", "severity", "severity_text", "detected_level":
+		return expr + " IN ('level', 'severity_text', 'detected_level')"
+	default:
+		return expr + " = " + sqlString(name)
+	}
 }
 
 func chTimeNanos(ns int64) string {

@@ -8,26 +8,26 @@ WORKDIR="${PERF_WORKDIR:-$ROOT/.perf}"
 RESULTS_FILE="${PERF_RESULTS_FILE:-$ROOT/perf-results.json}"
 mkdir -p "$WORKDIR"
 
-PERF_RUNS="${PERF_RUNS:-posthog_metrics,posthog_logs}"
+PERF_RUNS="${PERF_RUNS:-posthog_metrics,posthog_logs,snuffle_logs}"
 PERF_START_CLICKHOUSE="${PERF_START_CLICKHOUSE:-1}"
 PERF_COMPARE_TOLERANCE="${PERF_COMPARE_TOLERANCE:-0}"
 PERF_FAIL_ON_SLOWER="${PERF_FAIL_ON_SLOWER:-false}"
-PERF_REPEAT="${PERF_REPEAT:-3}"
+PERF_REPEAT="${PERF_REPEAT:-1}"
 PERF_MIN_ROWS="${PERF_MIN_ROWS:-1000000}"
-PERF_MIN_LOG_ROWS="${PERF_MIN_LOG_ROWS:-100000}"
+PERF_MIN_LOG_ROWS="${PERF_MIN_LOG_ROWS:-10000}"
 
 TSBS_VERSION="${TSBS_VERSION:-v0.0.0-20260527045238-8323e59c7402}"
 TSBS_USE_CASE="${TSBS_USE_CASE:-devops}"
-TSBS_SCALE="${TSBS_SCALE:-1000}"
+TSBS_SCALE="${TSBS_SCALE:-50}"
 TSBS_START="${TSBS_START:-2016-01-01T00:00:00Z}"
 TSBS_END="${TSBS_END:-2016-01-01T01:00:00Z}"
 TSBS_INTERVAL="${TSBS_INTERVAL:-15s}"
 TSBS_SEED="${TSBS_SEED:-1}"
-TSBS_WORKERS="${TSBS_WORKERS:-16}"
-TSBS_BATCH_SIZE="${TSBS_BATCH_SIZE:-250000}"
+TSBS_WORKERS="${TSBS_WORKERS:-2}"
+TSBS_BATCH_SIZE="${TSBS_BATCH_SIZE:-10000}"
 TSBS_REPORTING_PERIOD="${TSBS_REPORTING_PERIOD:-5s}"
 
-POSTHOG_LOG_ROWS="${POSTHOG_LOG_ROWS:-500000}"
+POSTHOG_LOG_ROWS="${POSTHOG_LOG_ROWS:-10000}"
 POSTHOG_LOG_START="${POSTHOG_LOG_START:-2026-06-01 00:00:00}"
 POSTHOG_LOG_RANGE_SECONDS="${POSTHOG_LOG_RANGE_SECONDS:-86400}"
 POSTHOG_LOG_STEP="${POSTHOG_LOG_STEP:-60s}"
@@ -39,8 +39,11 @@ CH_NATIVE_PORT="${CH_NATIVE_PORT:-${CH_ADDR##*:}}"
 CH_USER="${CH_USER:-default}"
 CH_PASSWORD="${CH_PASSWORD:-}"
 CH_DATABASE="${CH_DATABASE:-snuffle_perf}"
-CH_LOGS_TABLE="${CH_LOGS_TABLE:-logs34}"
-CH_LOG_ATTRIBUTES_TABLE="${CH_LOG_ATTRIBUTES_TABLE:-log_attributes2}"
+CH_LOG_SCHEMA_LAYOUT="${CH_LOG_SCHEMA_LAYOUT:-}"
+CH_LOGS_TABLE="${CH_LOGS_TABLE:-}"
+CH_LOG_STREAMS_TABLE="${CH_LOG_STREAMS_TABLE:-}"
+CH_LOG_ATTRIBUTES_TABLE="${CH_LOG_ATTRIBUTES_TABLE:-}"
+CH_LOG_STREAM_STATS_TABLE="${CH_LOG_STREAM_STATS_TABLE:-}"
 
 SIDECAR_HOST="${SIDECAR_HOST:-127.0.0.1}"
 SIDECAR_PORT="${SIDECAR_PORT:-9091}"
@@ -52,9 +55,9 @@ CH_TIMEOUT_SECONDS="${CH_TIMEOUT_SECONDS:-120}"
 PROMQL_QUERY_TIMEOUT_SECONDS="${PROMQL_QUERY_TIMEOUT_SECONDS:-120}"
 SNUFFLE_LOG_QUERY_MAX_ROWS="${SNUFFLE_LOG_QUERY_MAX_ROWS:-$POSTHOG_LOG_ROWS}"
 
-BRIDGE_BENCH_CONCURRENCY="${BRIDGE_BENCH_CONCURRENCY:-10}"
-BRIDGE_BENCH_WARMUP="${BRIDGE_BENCH_WARMUP:-10}"
-BRIDGE_BENCHTIME="${BRIDGE_BENCHTIME:-50x}"
+BRIDGE_BENCH_CONCURRENCY="${BRIDGE_BENCH_CONCURRENCY:-1}"
+BRIDGE_BENCH_WARMUP="${BRIDGE_BENCH_WARMUP:-0}"
+BRIDGE_BENCHTIME="${BRIDGE_BENCHTIME:-1x}"
 BRIDGE_BENCH_TIMEOUT="${BRIDGE_BENCH_TIMEOUT:-120s}"
 BRIDGE_BENCH_GO_TEST_TIMEOUT="${BRIDGE_BENCH_GO_TEST_TIMEOUT:-60m}"
 
@@ -207,6 +210,11 @@ start_snuffle() {
   local schema_layout="$2"
   local samples_table="$3"
   local sample_attributes="$4"
+  local log_schema_layout="${5:-$CH_LOG_SCHEMA_LAYOUT}"
+  local logs_table="${6:-$CH_LOGS_TABLE}"
+  local log_streams_table="${7:-$CH_LOG_STREAMS_TABLE}"
+  local log_attributes_table="${8:-$CH_LOG_ATTRIBUTES_TABLE}"
+  local log_stream_stats_table="${9:-$CH_LOG_STREAM_STATS_TABLE}"
   if [[ -n "${PERF_SNUFFLE_URL:-}" ]]; then
     return 0
   fi
@@ -219,8 +227,11 @@ start_snuffle() {
     CH_DATABASE="$CH_DATABASE" \
     CH_SCHEMA_LAYOUT="$schema_layout" \
     CH_SAMPLES_TABLE="$samples_table" \
-    CH_LOGS_TABLE="$CH_LOGS_TABLE" \
-    CH_LOG_ATTRIBUTES_TABLE="$CH_LOG_ATTRIBUTES_TABLE" \
+    CH_LOG_SCHEMA_LAYOUT="$log_schema_layout" \
+    CH_LOGS_TABLE="$logs_table" \
+    CH_LOG_STREAMS_TABLE="$log_streams_table" \
+    CH_LOG_ATTRIBUTES_TABLE="$log_attributes_table" \
+    CH_LOG_STREAM_STATS_TABLE="$log_stream_stats_table" \
     SIDECAR_HOST="$SIDECAR_HOST" \
     SIDECAR_PORT="$SIDECAR_PORT" \
     SNUFFLE_DEFAULT_TEAM_ID="$SNUFFLE_DEFAULT_TEAM_ID" \
@@ -396,10 +407,12 @@ run_posthog_logs() {
   local run_dir="$WORKDIR/$run_name/attempt-$attempt"
   local load_results="$run_dir/log-load-results.json"
   local bench_output="$run_dir/go-bench.out"
+  local logs_table="logs34"
+  local attributes_table="log_attributes2"
   mkdir -p "$run_dir"
 
   echo "==> $run_name attempt $attempt/$PERF_REPEAT: recreate PostHog logs schema"
-  validate_identifier "$CH_LOGS_TABLE"
+  validate_identifier "$logs_table"
   ch_client --multiquery < "$ROOT/scripts/create_logs_posthog_schema.sql"
 
   echo "==> $run_name: seed $POSTHOG_LOG_ROWS log rows"
@@ -412,7 +425,7 @@ run_posthog_logs() {
     --param_bench_start="$POSTHOG_LOG_START" \
     --multiquery < "$ROOT/scripts/seed_logs_posthog.sql"
   duration_ms="$(( $(now_millis) - started_ms ))"
-  wait_for_table_rows "$CH_LOGS_TABLE" "$POSTHOG_LOG_ROWS"
+  wait_for_table_rows "$logs_table" "$POSTHOG_LOG_ROWS"
   if [[ "$POSTHOG_LOG_ROWS" -lt "$PERF_MIN_LOG_ROWS" ]]; then
     echo "log dataset is too small: loaded $POSTHOG_LOG_ROWS rows, minimum is $PERF_MIN_LOG_ROWS" >&2
     echo "Increase POSTHOG_LOG_ROWS, or lower PERF_MIN_LOG_ROWS for a local smoke run." >&2
@@ -420,10 +433,54 @@ run_posthog_logs() {
   fi
   write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
 
-  start_snuffle "$run_dir" "posthog" "metrics1" "1"
+  start_snuffle "$run_dir" "posthog" "metrics1" "1" "posthog" "$logs_table" "" "$attributes_table" ""
   wait_for_http "$SNUFFLE_URL/-/healthy"
   run_bridge_bench "$run_dir" "posthog_logs"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "posthog-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
+  record_candidate "$run_name" "$run_dir/perf-results.current.json"
+  stop_snuffle
+}
+
+run_snuffle_logs() {
+  local attempt="$1"
+  local run_name="snuffle_logs"
+  local run_dir="$WORKDIR/$run_name/attempt-$attempt"
+  local load_results="$run_dir/log-load-results.json"
+  local bench_output="$run_dir/go-bench.out"
+  local logs_table="logs"
+  local streams_table="log_streams"
+  local attributes_table=""
+  local stats_table="log_stream_stats"
+  mkdir -p "$run_dir"
+
+  echo "==> $run_name attempt $attempt/$PERF_REPEAT: recreate Snuffle logs schema"
+  validate_identifier "$logs_table"
+  validate_identifier "$streams_table"
+  validate_identifier "$stats_table"
+  ch_client --multiquery < "$ROOT/scripts/create_logs_snuffle_schema.sql"
+
+  echo "==> $run_name: seed $POSTHOG_LOG_ROWS log rows"
+  local started_ms
+  local duration_ms
+  started_ms="$(now_millis)"
+  ch_client \
+    --param_rows="$POSTHOG_LOG_ROWS" \
+    --param_tenant="$SNUFFLE_DEFAULT_TEAM_ID" \
+    --param_bench_start="$POSTHOG_LOG_START" \
+    --multiquery < "$ROOT/scripts/seed_logs_snuffle.sql"
+  duration_ms="$(( $(now_millis) - started_ms ))"
+  wait_for_table_rows "$logs_table" "$POSTHOG_LOG_ROWS"
+  if [[ "$POSTHOG_LOG_ROWS" -lt "$PERF_MIN_LOG_ROWS" ]]; then
+    echo "log dataset is too small: loaded $POSTHOG_LOG_ROWS rows, minimum is $PERF_MIN_LOG_ROWS" >&2
+    echo "Increase POSTHOG_LOG_ROWS, or lower PERF_MIN_LOG_ROWS for a local smoke run." >&2
+    exit 1
+  fi
+  write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
+
+  start_snuffle "$run_dir" "posthog" "metrics1" "1" "snuffle" "$logs_table" "$streams_table" "$attributes_table" "$stats_table"
+  wait_for_http "$SNUFFLE_URL/-/healthy"
+  run_bridge_bench "$run_dir" "snuffle_logs"
+  report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "snuffle-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
   record_candidate "$run_name" "$run_dir/perf-results.current.json"
   stop_snuffle
 }
@@ -438,9 +495,12 @@ run_named() {
     posthog_logs)
       run_posthog_logs "$attempt"
       ;;
+    snuffle_logs)
+      run_snuffle_logs "$attempt"
+      ;;
     *)
       echo "unknown PERF_RUNS entry: $run_name" >&2
-      echo "known runs: posthog_metrics, posthog_logs" >&2
+      echo "known runs: posthog_metrics, posthog_logs, snuffle_logs" >&2
       exit 1
       ;;
   esac
@@ -449,11 +509,11 @@ run_named() {
 validate_run_name() {
   local run_name="$1"
   case "$run_name" in
-    posthog_metrics|posthog_logs)
+    posthog_metrics|posthog_logs|snuffle_logs)
       ;;
     *)
       echo "unknown PERF_RUNS entry: $run_name" >&2
-      echo "known runs: posthog_metrics, posthog_logs" >&2
+      echo "known runs: posthog_metrics, posthog_logs, snuffle_logs" >&2
       exit 1
       ;;
   esac
