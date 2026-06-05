@@ -10,7 +10,7 @@ DROP TABLE IF EXISTS log_streams SYNC;
 CREATE TABLE log_streams
 (
     team_id Int32 CODEC(T64, Default),
-    stream_id UInt64 CODEC(Delta, Default),
+    stream_id UInt64,
     labels Map(LowCardinality(String), String),
     resource_attributes Map(LowCardinality(String), String),
     service_name LowCardinality(String) MATERIALIZED if(mapContains(labels, 'service_name'), labels['service_name'], if(mapContains(labels, 'service.name'), labels['service.name'], resource_attributes['service.name'])),
@@ -37,7 +37,7 @@ CREATE TABLE log_stream_stats
 (
     team_id Int32 CODEC(T64, Default),
     bucket DateTime('UTC') CODEC(DoubleDelta, Default),
-    stream_id UInt64 CODEC(Delta, Default),
+    stream_id UInt64,
     log_count UInt64 CODEC(T64, Default),
     byte_count UInt64 CODEC(T64, Default)
 )
@@ -55,7 +55,7 @@ CREATE TABLE log_stream_labels
     team_id Int32 CODEC(T64, Default),
     label_name LowCardinality(String),
     label_value String,
-    stream_id UInt64 CODEC(Delta, Default)
+    stream_id UInt64
 )
 ENGINE = ReplacingMergeTree
 ORDER BY (team_id, stream_id, label_name, label_value)
@@ -69,7 +69,7 @@ CREATE TABLE logs
     timestamp DateTime64(6, 'UTC') CODEC(DoubleDelta, Default),
     time_bucket DateTime ALIAS toStartOfDay(timestamp),
     expires_at DateTime64(6, 'UTC') CODEC(DoubleDelta, Default),
-    stream_id UInt64 CODEC(Delta, Default),
+    stream_id UInt64,
     observed_ns Int64 CODEC(Delta, Default),
     body String,
     fields Map(LowCardinality(String), String),
