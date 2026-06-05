@@ -979,7 +979,7 @@ func (s *Server) tryPostHogNestedCountRangeQuery(ctx context.Context, expr *pars
 	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
 	where = append(where, nonStaleSampleSQL("value"))
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniqExact(%s)) AS count_value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
+		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
 		postHogUniqGroupExpr(groupExprs),
 		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
 		strings.Join(where, " AND "),
@@ -1020,7 +1020,7 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 		strings.Join(where, " AND "),
 	)
 	sql := fmt.Sprintf(
-		"SELECT toInt64(%d) AS ts, toFloat64(uniqExact(%s)) AS count_value FROM (%s) WHERE %s",
+		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM (%s) WHERE %s",
 		evalTime.UnixMilli(),
 		postHogUniqGroupExpr(uniqExprs),
 		perSeries,
@@ -1230,7 +1230,7 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 }
 
 func nestedCountDistinctGroupSQL(groupColumn string) string {
-	return "toFloat64(uniqExact(ifNull(" + groupColumn + ", '')))"
+	return "toFloat64(uniq(ifNull(" + groupColumn + ", '')))"
 }
 
 func nestedCountGroupLabelsSQL(cfg Config, metric, groupName string) (string, string) {

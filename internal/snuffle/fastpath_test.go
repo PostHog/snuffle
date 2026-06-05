@@ -146,7 +146,7 @@ func TestNestedCountTimestampSamplesRangeSQLUsesEvalTimestamps(t *testing.T) {
 		"label_name = 'ready'",
 		"label_name = 'cpu'",
 		"`default`.`samples` ANY LEFT JOIN group_labels USING id",
-		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
+		"toFloat64(uniq(ifNull(`__group_0`, ''))) AS value",
 		"modulo(toUnixTimestamp64Milli(timestamp) - 1778398980000, 60000) = 0",
 		nonStaleSampleSQL("value"),
 		"GROUP BY ts ORDER BY ts",
@@ -390,7 +390,7 @@ func TestNestedCountSamplesInstantSQLUsesLookbackWindow(t *testing.T) {
 		"argMax(value, timestamp)",
 		nonStaleSampleSQL("value"),
 		"active_ids ANY LEFT JOIN group_labels USING id",
-		"toFloat64(uniqExact(ifNull(`__group_0`, ''))) AS value",
+		"toFloat64(uniq(ifNull(`__group_0`, ''))) AS value",
 		"SELECT toInt64(1778398980000) AS ts",
 	} {
 		if !strings.Contains(sql, want) {
