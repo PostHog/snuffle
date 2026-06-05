@@ -912,7 +912,7 @@ func logQLSnuffleStatsLabelIndexMatcherSafe(matcher logQLLabelMatcher) bool {
 	}
 	switch matcher.op {
 	case "=":
-		return true
+		return matcher.value != ""
 	case "=~":
 		re, err := regexp.Compile(promRegexToCH(matcher.value))
 		return err == nil && !re.MatchString("")
@@ -936,10 +936,10 @@ func logQLSnuffleStatsIndexedTableSQL(cfg Config, plan *logQLMetricSQLPlan) stri
 	}
 	for i, matcher := range plan.rangeAgg.selector.matchers {
 		joins = append(joins, fmt.Sprintf(
-			"ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND label_name = %s AND %s) AS filter_label_%d USING (team_id, stream_id)",
+			"ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND %s AND %s) AS filter_label_%d USING (team_id, stream_id)",
 			tableName(cfg.CHDatabase, cfg.LogStreamLabelsTable),
 			teamFilter(cfg),
-			sqlString(matcher.name),
+			logQLSnuffleStreamLabelKeyCondition("label_name", matcher.name),
 			logQLSnuffleStatsLabelIndexMatcherCondition(matcher),
 			i,
 		))

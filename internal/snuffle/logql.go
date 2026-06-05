@@ -814,7 +814,7 @@ func parseLogQLLabelFilterStage(input string) ([]logQLLabelFilter, error) {
 }
 
 func (m logQLLabelMatcher) matches(labels map[string]string) bool {
-	value := labels[m.name]
+	value := logQLMatcherLabelValue(labels, m.name)
 	switch m.op {
 	case "=":
 		return value == m.value
@@ -826,6 +826,38 @@ func (m logQLLabelMatcher) matches(labels map[string]string) bool {
 		return m.re == nil || !m.re.MatchString(value)
 	default:
 		return false
+	}
+}
+
+func logQLMatcherLabelValue(labels map[string]string, name string) string {
+	if len(labels) == 0 {
+		return ""
+	}
+	switch name {
+	case "service_name", "service.name":
+		if value := labels[name]; value != "" {
+			return value
+		}
+		if value := labels["service_name"]; value != "" {
+			return value
+		}
+		return labels["service.name"]
+	case "level", "severity", "severity_text", "detected_level":
+		if value := labels[name]; value != "" {
+			return value
+		}
+		if value := labels["level"]; value != "" {
+			return value
+		}
+		if value := labels["severity_text"]; value != "" {
+			return value
+		}
+		if value := labels["detected_level"]; value != "" {
+			return value
+		}
+		return labels["severity"]
+	default:
+		return labels[name]
 	}
 }
 

@@ -21,6 +21,9 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Run perf suite
+        env:
+          PERF_FAIL_ON_SLOWER: "true"
+          PERF_COMPARE_TOLERANCE: "0"
         run: make perf-test
       - name: Upload perf artifacts
         if: always()

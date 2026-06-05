@@ -681,6 +681,69 @@ func TestLogQLMetricSnuffleStatsSQLSafe(t *testing.T) {
 	}
 }
 
+func TestLogQLMetricSnuffleStatsIndexHandlesAliasesAndEmptyMatchers(t *testing.T) {
+	cfg := Config{
+		CHDatabase:           "snuffle",
+		LogSchemaLayout:      "snuffle",
+		LogStreamsTable:      "log_streams",
+		LogStreamLabelsTable: "log_stream_labels",
+		LogStreamStatsTable:  "log_stream_stats",
+	}
+
+	aliasExpr, err := parseLogQL(`sum(count_over_time({severity="error"}[5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL alias query returned error: %v", err)
+	}
+	aliasPlan, ok := buildLogQLMetricSQLPlan(cfg, aliasExpr)
+	if !ok || aliasPlan == nil {
+		t.Fatalf("buildLogQLMetricSQLPlan did not accept alias query")
+	}
+	if got := logQLSnuffleStatsLabelIndexJoinCount(cfg, aliasPlan); got != 1 {
+		t.Fatalf("severity alias index join count = %d, want 1", got)
+	}
+	aliasSQL := logQLSnuffleStatsIndexedTableSQL(cfg, aliasPlan)
+	if !strings.Contains(aliasSQL, "label_name IN ('level', 'severity_text', 'detected_level')") {
+		t.Fatalf("alias SQL %q should use severity label aliases", aliasSQL)
+	}
+	if strings.Contains(aliasSQL, "label_name = 'severity'") {
+		t.Fatalf("alias SQL %q should not require a physical severity label", aliasSQL)
+	}
+
+	emptyExpr, err := parseLogQL(`sum(count_over_time({app=""}[5m]))`)
+	if err != nil {
+		t.Fatalf("parseLogQL empty matcher query returned error: %v", err)
+	}
+	emptyPlan, ok := buildLogQLMetricSQLPlan(cfg, emptyExpr)
+	if !ok || emptyPlan == nil {
+		t.Fatalf("buildLogQLMetricSQLPlan did not accept empty matcher query")
+	}
+	if !logQLMetricSnuffleStatsSQLSafe(cfg, emptyPlan, time.Minute) {
+		t.Fatalf("empty matcher can still use stream stats without the label index")
+	}
+	if got := logQLSnuffleStatsLabelIndexJoinCount(cfg, emptyPlan); got != 0 {
+		t.Fatalf("empty exact matcher index join count = %d, want 0", got)
+	}
+}
+
+func TestLogQLLabelMatcherMatchesCoreAliases(t *testing.T) {
+	labels := map[string]string{
+		"service_name":  "checkout",
+		"severity_text": "error",
+	}
+
+	tests := []logQLLabelMatcher{
+		{name: "service.name", op: "=", value: "checkout"},
+		{name: "severity", op: "=", value: "error"},
+		{name: "level", op: "=", value: "error"},
+		{name: "detected_level", op: "=", value: "error"},
+	}
+	for _, matcher := range tests {
+		if !matcher.matches(labels) {
+			t.Fatalf("matcher %#v should match labels %#v", matcher, labels)
+		}
+	}
+}
+
 func TestApplyLogQLPipelineParsersAndFilters(t *testing.T) {
 	selector, err := parseLogQLSelector(`{service_name="api"} | json | status >= 500 | line_format "{{.method}} {{.path}}" | label_format route=path`)
 	if err != nil {
