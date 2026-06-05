@@ -18,8 +18,8 @@ CREATE TABLE metrics_series
     id UInt64,
     metric_name LowCardinality(String),
     labels_json String,
-    min_time DateTime64(3, 'UTC'),
-    max_time DateTime64(3, 'UTC')
+    min_time DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
+    max_time DateTime64(3, 'UTC') CODEC(DoubleDelta, Default)
 )
 ENGINE = MergeTree
 ORDER BY (team_id, metric_name, id)
@@ -62,9 +62,9 @@ CREATE TABLE metrics_samples
 (
     team_id UInt64,
     metric_name LowCardinality(String),
-    timestamp DateTime64(3, 'UTC'),
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
-    value Float64
+    value Float64 CODEC(Gorilla, Default)
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
@@ -75,7 +75,7 @@ CREATE TABLE metrics_histograms
 (
     team_id UInt64,
     metric_name LowCardinality(String),
-    timestamp DateTime64(3, 'UTC'),
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
     histogram String,
     version UInt64
@@ -88,9 +88,9 @@ SETTINGS index_granularity = 1024;
 CREATE TABLE metrics_exemplars
 (
     team_id UInt64,
-    timestamp DateTime64(3, 'UTC'),
+    timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
-    value Float64,
+    value Float64 CODEC(Gorilla, Default),
     labels_json String
 )
 ENGINE = MergeTree
