@@ -662,7 +662,7 @@ func logQLUnwrapMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration
 		return false
 	}
 	switch plan.rangeAgg.fn {
-	case "sum_over_time":
+	case "sum_over_time", "avg_over_time", "min_over_time", "max_over_time", "stdvar_over_time", "stddev_over_time":
 	default:
 		return false
 	}

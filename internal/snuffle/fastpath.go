@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,6 +70,9 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 				return data, ok, err
 			}
 			if data, ok, err := s.tryPostHogFastAggregateRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
+				return data, ok, err
+			}
+			if data, ok, err := s.tryPostHogAggregateRangeUnionQuery(ctx, aggregate, start, end, step); ok || err != nil {
 				return data, ok, err
 			}
 		}
@@ -340,6 +344,9 @@ func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExp
 		return queryData{}, false, nil
 	}
 	if s.cfg.postHogSchemaLayout() {
+		if data, ok, err := s.tryPostHogInstantAggregateUnionQuery(ctx, expr, evalTime); ok || err != nil {
+			return data, ok, err
+		}
 		selector, ok := expr.Expr.(*parser.VectorSelector)
 		if !ok {
 			return queryData{}, false, nil
@@ -497,6 +504,275 @@ func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *pa
 		return queryData{}, true, err
 	}
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+// postHogAggregateUnionPlan describes one ClickHouse query for an
+// `agg by (...) (branch or branch or ...)` expression over the PostHog layout,
+// where every branch is an equivalent selector or range-function expression.
+type postHogAggregateUnionPlan struct {
+	gridVals string
+	where    []string
+	groupAny []string
+}
+
+func (s *Server) tryPostHogInstantAggregateUnionQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
+	if expr.Without {
+		return queryData{}, false, nil
+	}
+	aggSQL, ok := aggregateSQL(expr, "sample_value")
+	if !ok {
+		return queryData{}, false, nil
+	}
+	plan, ok := s.postHogAggregateUnionPlan(expr, evalTime, evalTime, time.Second)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql := postHogAggregateUnionSQL(s.cfg, plan, expr.Grouping, evalTime, time.Second.Milliseconds(), aggSQL)
+	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
+}
+
+func (s *Server) tryPostHogAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration) (queryData, bool, error) {
+	if expr.Without {
+		return queryData{}, false, nil
+	}
+	aggSQL, ok := aggregateSQL(expr, "sample_value")
+	if !ok {
+		return queryData{}, false, nil
+	}
+	plan, ok := s.postHogAggregateUnionPlan(expr, start, end, step)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	sql := postHogAggregateUnionSQL(s.cfg, plan, expr.Grouping, start, step.Milliseconds(), aggSQL)
+	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
+	if err != nil {
+		return queryData{}, true, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+}
+
+func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, end time.Time, step time.Duration) (*postHogAggregateUnionPlan, bool) {
+	branches, ok := seriesExprBranches(expr.Expr)
+	if !ok || len(branches) == 0 || len(branches) > maxAggregateUnionSelectors {
+		return nil, false
+	}
+	if len(branches) == 1 && branches[0].kind == seriesExprSelector && branches[0].transform.identity() {
+		// the dedicated plain selector aggregate paths handle it
+		return nil, false
+	}
+
+	first := branches[0]
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(first.node, start, end, step)
+	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
+		return nil, false
+	}
+	if source.sumOverTime != nil || source.runningSumWrap {
+		return nil, false
+	}
+	selectors := make([]*parser.VectorSelector, 0, len(branches))
+	selectors = append(selectors, first.selector)
+	for _, branch := range branches[1:] {
+		if !first.equivalentTo(branch) || !postHogMatchersPushdownSafe(branch.selector.LabelMatchers) {
+			return nil, false
+		}
+		branchSource, _, branchMint, branchMaxt, ok := s.aggregateRangeSourceSQL(branch.node, start, end, step)
+		if !ok || branchMint != mint || branchMaxt != maxt || branchSource.gridExpr != source.gridExpr {
+			return nil, false
+		}
+		selectors = append(selectors, branch.selector)
+	}
+
+	matcherCondition, ok := postHogUnionMatcherCondition(selectors)
+	if !ok {
+		return nil, false
+	}
+	groupAny := make([]string, 0, len(expr.Grouping))
+	for i, name := range expr.Grouping {
+		groupExpr, ok := postHogSampleGroupExpr(name)
+		if !ok {
+			return nil, false
+		}
+		groupAny = append(groupAny, "any("+groupExpr+") AS "+quoteIdent(groupAlias(i)))
+	}
+
+	where := []string{teamFilter(s.cfg)}
+	where = append(where, sampleTimeFilters(s.cfg, mint, maxt)...)
+	if matcherCondition != "" {
+		where = append(where, matcherCondition)
+	}
+	if source.filterStaleSamples {
+		where = append(where, nonStaleSampleSQL("value"))
+	}
+	return &postHogAggregateUnionPlan{
+		gridVals: transformGridValsSQL(source.gridExpr, first.transform),
+		where:    where,
+		groupAny: groupAny,
+	}, true
+}
+
+func postHogAggregateUnionSQL(cfg Config, plan *postHogAggregateUnionPlan, grouping []string, start time.Time, stepMillis int64, aggSQL string) string {
+	perSeriesSelects := make([]string, 0, len(plan.groupAny)+2)
+	perSeriesSelects = append(perSeriesSelects, postHogSeriesIDExpr()+" AS series_id")
+	perSeriesSelects = append(perSeriesSelects, plan.groupAny...)
+	perSeriesSelects = append(perSeriesSelects, plan.gridVals+" AS vals")
+	perSeries := fmt.Sprintf(
+		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
+		strings.Join(perSeriesSelects, ", "),
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(plan.where, " AND "),
+	)
+
+	groupAliases := make([]string, 0, len(grouping))
+	for i := range grouping {
+		groupAliases = append(groupAliases, quoteIdent(groupAlias(i)))
+	}
+	selectParts := append([]string{}, groupAliases...)
+	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
+	selectParts = append(selectParts, aggSQL+" AS value")
+	groupByParts := append(append([]string{}, groupAliases...), "idx")
+
+	sql := fmt.Sprintf(
+		"WITH per_series AS (%s) SELECT %s FROM per_series ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
+		perSeries,
+		strings.Join(selectParts, ", "),
+		nonStaleNullableSampleSQL("sample_value"),
+		strings.Join(groupByParts, ", "),
+		strings.Join(groupByParts, ", "),
+	)
+	return withMaxThreads(sql, cfg.AggregateThreads)
+}
+
+// postHogUnionMatcherCondition builds one WHERE condition matching rows
+// selected by any of the union's selectors. Returns "" when a branch matches
+// all rows.
+func postHogUnionMatcherCondition(selectors []*parser.VectorSelector) (string, bool) {
+	if condition, ok := postHogUnionInCondition(selectors); ok {
+		return condition, true
+	}
+	branchConditions := make([]string, 0, len(selectors))
+	for _, selector := range selectors {
+		conditions, ok := postHogSelectorMatcherConditions(selector.LabelMatchers)
+		if !ok {
+			return "", false
+		}
+		if len(conditions) == 0 {
+			return "", true
+		}
+		branchConditions = append(branchConditions, "("+strings.Join(conditions, " AND ")+")")
+	}
+	if len(branchConditions) == 1 {
+		return branchConditions[0], true
+	}
+	return "(" + strings.Join(branchConditions, " OR ") + ")", true
+}
+
+func postHogSelectorMatcherConditions(matchers []*labels.Matcher) ([]string, bool) {
+	conditions := make([]string, 0, len(matchers))
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
+			continue
+		}
+		condition, ok := postHogMatcherCondition(matcher)
+		if !ok {
+			return nil, false
+		}
+		conditions = append(conditions, condition)
+	}
+	return conditions, true
+}
+
+// postHogUnionInCondition recognizes selectors that differ on exactly one
+// equality matcher and emits `common AND label_expr IN (...)` so the per-row
+// label lookup runs once instead of once per branch.
+func postHogUnionInCondition(selectors []*parser.VectorSelector) (string, bool) {
+	if len(selectors) < 2 {
+		return "", false
+	}
+	matcherMaps := make([]map[string]*labels.Matcher, len(selectors))
+	for i, selector := range selectors {
+		matcherMap := make(map[string]*labels.Matcher, len(selector.LabelMatchers))
+		for _, matcher := range selector.LabelMatchers {
+			if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
+				continue
+			}
+			if _, dup := matcherMap[matcher.Name]; dup {
+				return "", false
+			}
+			matcherMap[matcher.Name] = matcher
+		}
+		if i > 0 && len(matcherMap) != len(matcherMaps[0]) {
+			return "", false
+		}
+		matcherMaps[i] = matcherMap
+	}
+
+	names := make([]string, 0, len(matcherMaps[0]))
+	for name := range matcherMaps[0] {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	varying := ""
+	common := make([]string, 0, len(names))
+	for _, name := range names {
+		firstMatcher := matcherMaps[0][name]
+		same := true
+		for _, matcherMap := range matcherMaps[1:] {
+			other, ok := matcherMap[name]
+			if !ok {
+				return "", false
+			}
+			if other.Type != firstMatcher.Type || other.Value != firstMatcher.Value {
+				same = false
+			}
+		}
+		if same {
+			condition, ok := postHogMatcherCondition(firstMatcher)
+			if !ok {
+				return "", false
+			}
+			common = append(common, condition)
+			continue
+		}
+		if varying != "" {
+			return "", false
+		}
+		for _, matcherMap := range matcherMaps {
+			if matcherMap[name].Type != labels.MatchEqual {
+				return "", false
+			}
+		}
+		varying = name
+	}
+	if varying == "" {
+		return "", false
+	}
+
+	values := make([]string, 0, len(selectors))
+	seen := make(map[string]struct{}, len(selectors))
+	for _, matcherMap := range matcherMaps {
+		value := matcherMap[varying].Value
+		if _, dup := seen[value]; dup {
+			continue
+		}
+		seen[value] = struct{}{}
+		values = append(values, sqlString(value))
+	}
+	var column string
+	switch varying {
+	case labels.MetricName:
+		column = "metric_name"
+	case "service_name":
+		column = "service_name"
+	default:
+		column = postHogLabelValueExpr(varying)
+	}
+	conditions := append(common, column+" IN ("+strings.Join(values, ",")+")")
+	return "(" + strings.Join(conditions, " AND ") + ")", true
 }
 
 func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {

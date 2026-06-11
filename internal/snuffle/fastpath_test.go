@@ -80,6 +80,105 @@ func TestFastAggregateRangeUnionRejectsLargeUnions(t *testing.T) {
 	}
 }
 
+func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
+	cfg := Config{
+		CHDatabase:    "default",
+		SchemaLayout:  "posthog",
+		SamplesTable:  "metrics1",
+		LookbackDelta: 5 * time.Minute,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (hostname) (increase(usage_user{hostname="host_0"}[5m]) / 5 or increase(usage_user{hostname="host_1"}[5m]) / 5)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	start := time.Unix(1700000000, 0).UTC()
+	plan, ok := s.postHogAggregateUnionPlan(aggregate, start, start.Add(time.Hour), time.Minute)
+	if !ok {
+		t.Fatal("postHogAggregateUnionPlan returned ok=false")
+	}
+
+	sql := postHogAggregateUnionSQL(cfg, plan, aggregate.Grouping, start, time.Minute.Milliseconds(), "sum(sample_value)")
+	for _, want := range []string{
+		"timeSeriesRateToGrid",
+		"IN ('host_0','host_1')",
+		"metric_name = 'usage_user'",
+		"GROUP BY series_id",
+		"x / 5",
+		"`default`.`metrics1`",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("union SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	// the varying hostname expression must be factored into one IN lookup, not
+	// one map lookup per branch
+	_, where, found := strings.Cut(sql, " WHERE ")
+	if !found {
+		t.Fatalf("union SQL has no WHERE clause:\n%s", sql)
+	}
+	if got := strings.Count(where, "mapContains(attributes_map_str, 'hostname__str')"); got != 1 {
+		t.Fatalf("hostname lookup count in WHERE = %d, want 1:\n%s", got, sql)
+	}
+	if got := strings.Count(sql, "FROM `default`.`metrics1`"); got != 1 {
+		t.Fatalf("samples table scan count = %d, want 1:\n%s", got, sql)
+	}
+}
+
+func TestPostHogAggregateUnionPlanRejectsMixedTransforms(t *testing.T) {
+	s := &Server{cfg: Config{SchemaLayout: "posthog", SamplesTable: "metrics1", LookbackDelta: 5 * time.Minute}}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (hostname) (increase(usage_user{hostname="host_0"}[5m]) / 5 or increase(usage_user{hostname="host_1"}[5m]) / 6)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	start := time.Unix(1700000000, 0).UTC()
+	if plan, ok := s.postHogAggregateUnionPlan(expr.(*parser.AggregateExpr), start, start.Add(time.Hour), time.Minute); ok {
+		t.Fatalf("mixed scalar transforms should be rejected, got plan %#v", plan)
+	}
+}
+
+func TestPostHogAggregateUnionPlanRejectsPlainSingleSelector(t *testing.T) {
+	s := &Server{cfg: Config{SchemaLayout: "posthog", SamplesTable: "metrics1", LookbackDelta: 5 * time.Minute}}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (region) (usage_user{hostname="host_0"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	start := time.Unix(1700000000, 0).UTC()
+	if plan, ok := s.postHogAggregateUnionPlan(expr.(*parser.AggregateExpr), start, start.Add(time.Hour), time.Minute); ok {
+		t.Fatalf("plain single selector should use the dedicated path, got plan %#v", plan)
+	}
+}
+
+func TestPostHogUnionMatcherConditionFallsBackToOr(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`up{job="api",env="prod"} or up{job="worker",env="dev"}`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	branches, ok := seriesExprBranches(expr)
+	if !ok || len(branches) != 2 {
+		t.Fatalf("seriesExprBranches ok=%v len=%d, want 2 branches", ok, len(branches))
+	}
+	selectors := []*parser.VectorSelector{branches[0].selector, branches[1].selector}
+	condition, ok := postHogUnionMatcherCondition(selectors)
+	if !ok {
+		t.Fatal("postHogUnionMatcherCondition returned ok=false")
+	}
+	// two labels vary, so the IN factoring must not apply
+	if !strings.Contains(condition, " OR ") {
+		t.Fatalf("condition = %q, want OR of branch conjunctions", condition)
+	}
+	for _, want := range []string{"'api'", "'worker'", "'prod'", "'dev'"} {
+		if !strings.Contains(condition, want) {
+			t.Fatalf("condition %q does not contain %s", condition, want)
+		}
+	}
+}
+
 func TestNestedCountRangeSQLUsesSeriesBounds(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",

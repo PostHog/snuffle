@@ -14,6 +14,7 @@ import (
 	"text/template"
 	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 type logQLExpr struct {
@@ -150,13 +151,129 @@ type logRow struct {
 	labels       map[string]string
 	streamLabels map[string]string
 	fields       map[string]string
-	unwrap       float64
-	haveUnwrap   bool
+	// streamKey is the precomputed labelsKey of labels for rows produced by
+	// scanLogStreamRows, whose labels map is shared across rows of one stream
+	// and must be treated as read-only
+	streamKey  string
+	unwrap     float64
+	haveUnwrap bool
 }
 
 type logStreamResult struct {
 	Stream map[string]string `json:"stream"`
 	Values [][]string        `json:"values"`
+}
+
+// MarshalJSON writes the stream result without per-element reflection; the
+// values array dominates large stream responses. The encoder still re-escapes
+// HTML characters via compact, matching encoding/json output exactly.
+func (r logStreamResult) MarshalJSON() ([]byte, error) {
+	size := 32 + 16*len(r.Values)
+	for _, pair := range r.Values {
+		for _, item := range pair {
+			size += len(item) + 4
+		}
+	}
+	for key, value := range r.Stream {
+		size += len(key) + len(value) + 8
+	}
+	buf := make([]byte, 0, size)
+
+	buf = append(buf, `{"stream":`...)
+	if r.Stream == nil {
+		buf = append(buf, "null"...)
+	} else {
+		buf = append(buf, '{')
+		keys := appendSortedMapKeys(make([]string, 0, len(r.Stream)), r.Stream)
+		for i, key := range keys {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			buf = appendJSONString(buf, key)
+			buf = append(buf, ':')
+			buf = appendJSONString(buf, r.Stream[key])
+		}
+		buf = append(buf, '}')
+	}
+
+	buf = append(buf, `,"values":`...)
+	if r.Values == nil {
+		buf = append(buf, "null"...)
+		return append(buf, '}'), nil
+	}
+	buf = append(buf, '[')
+	for i, pair := range r.Values {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		if pair == nil {
+			buf = append(buf, "null"...)
+			continue
+		}
+		buf = append(buf, '[')
+		for j, item := range pair {
+			if j > 0 {
+				buf = append(buf, ',')
+			}
+			buf = appendJSONString(buf, item)
+		}
+		buf = append(buf, ']')
+	}
+	buf = append(buf, ']', '}')
+	return buf, nil
+}
+
+const jsonHexDigits = "0123456789abcdef"
+
+// appendJSONString appends s as a JSON string literal using the same escaping
+// as encoding/json with HTML escaping enabled, so the bytes are identical
+// whether they reach the client directly or through a json.Encoder.
+func appendJSONString(buf []byte, s string) []byte {
+	buf = append(buf, '"')
+	start := 0
+	for i := 0; i < len(s); {
+		if b := s[i]; b < utf8.RuneSelf {
+			if b >= ' ' && b != '"' && b != '\\' && b != '<' && b != '>' && b != '&' {
+				i++
+				continue
+			}
+			buf = append(buf, s[start:i]...)
+			switch b {
+			case '\\', '"':
+				buf = append(buf, '\\', b)
+			case '\n':
+				buf = append(buf, '\\', 'n')
+			case '\r':
+				buf = append(buf, '\\', 'r')
+			case '\t':
+				buf = append(buf, '\\', 't')
+			default:
+				// control characters and <, >, &
+				buf = append(buf, '\\', 'u', '0', '0', jsonHexDigits[b>>4], jsonHexDigits[b&0xF])
+			}
+			i++
+			start = i
+			continue
+		}
+		c, size := utf8.DecodeRuneInString(s[i:])
+		if c == utf8.RuneError && size == 1 {
+			buf = append(buf, s[start:i]...)
+			buf = append(buf, `\ufffd`...)
+			i += size
+			start = i
+			continue
+		}
+		if c == '\u2028' || c == '\u2029' {
+			buf = append(buf, s[start:i]...)
+			buf = append(buf, '\\', 'u', '2', '0', '2', jsonHexDigits[c&0xF])
+			i += size
+			start = i
+			continue
+		}
+		i += size
+	}
+	buf = append(buf, s[start:]...)
+	return append(buf, '"')
 }
 
 type logMetricVectorResult struct {
@@ -1456,6 +1573,45 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 	)
 }
 
+// logQLRawStreamSelectSQL is the stream-response variant of logQLRawSelectSQL.
+// Stream labels never read resource attributes, so the column is dropped from
+// the select to avoid decoding one Map per row.
+func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
+	where := logQLBaseFilters(cfg, selector, startNS, endNS)
+	order := "ASC"
+	if strings.ToLower(direction) == "backward" {
+		order = "DESC"
+	}
+	maxRows := cfg.LogQueryMaxRows
+	if maxRows <= 0 {
+		maxRows = 100000
+	}
+	if limit <= 0 || limit > maxRows {
+		limit = maxRows
+	}
+	if cfg.postHogLogSchemaLayout() {
+		return fmt.Sprintf(
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			tableName(cfg.CHDatabase, cfg.LogsTable),
+			strings.Join(where, " AND "),
+			order,
+			limit,
+		)
+	}
+	return fmt.Sprintf(
+		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, %s AS attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+		logQLSnuffleLabelValueExpr("service_name"),
+		logQLSnuffleLabelValueExpr("severity_text"),
+		logQLSnuffleLabelValueExpr("trace_id"),
+		logQLSnuffleLabelValueExpr("span_id"),
+		logQLSnuffleAttributesMapExpr(),
+		logQLLogsTableSQL(cfg),
+		strings.Join(where, " AND "),
+		order,
+		limit,
+	)
+}
+
 func logQLLogsSourceSQL(cfg Config, where []string) string {
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
@@ -1670,6 +1826,86 @@ func scanLogRows(ctx context.Context, client *ClickHouseClient, sql string) ([]l
 	return rows, err
 }
 
+// scanLogStreamRows scans raw log rows for a fully-pushed selector. Stream
+// responses only read labels, line, and timestamps, so it skips the per-row
+// fields map and the streamLabels clone, shares one labels map per unique
+// stream, and folds the pushed equality-matcher annotation into that map.
+func scanLogStreamRows(ctx context.Context, client *ClickHouseClient, sql string, selector logQLSelector) ([]logRow, error) {
+	type streamEntry struct {
+		labels map[string]string
+		key    string
+	}
+	rows := make([]logRow, 0, 1024)
+	cache := make(map[string]*streamEntry, 64)
+	attrKeys := make([]string, 0, 32)
+	var keyBuf strings.Builder
+	err := client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var out logRow
+		var serviceName string
+		var severityText string
+		var traceID string
+		var spanID string
+		var attrs map[string]string
+		if err := row.Scan(&out.tsNS, &out.observedNS, &out.line, &serviceName, &severityText, &traceID, &spanID, &attrs); err != nil {
+			return err
+		}
+		keyBuf.Reset()
+		keyBuf.WriteString(serviceName)
+		keyBuf.WriteByte(0)
+		keyBuf.WriteString(severityText)
+		keyBuf.WriteByte(0)
+		keyBuf.WriteString(traceID)
+		keyBuf.WriteByte(0)
+		keyBuf.WriteString(spanID)
+		keyBuf.WriteByte(0)
+		attrKeys = appendSortedMapKeys(attrKeys[:0], attrs)
+		for _, key := range attrKeys {
+			keyBuf.WriteString(key)
+			keyBuf.WriteByte(0)
+			keyBuf.WriteString(attrs[key])
+			keyBuf.WriteByte(0)
+		}
+		cacheKey := keyBuf.String()
+		entry, ok := cache[cacheKey]
+		if !ok {
+			labels := logLabelsFromCoreColumns(serviceName, severityText, traceID, spanID)
+			for key, value := range attrs {
+				if key == legacyLokiStreamLabelsAttributeKey || key == legacyLokiEntryMetadataAttributeKey {
+					continue
+				}
+				key = strings.TrimSuffix(key, "__str")
+				if key == "" {
+					continue
+				}
+				labels[key] = value
+			}
+			for _, matcher := range selector.matchers {
+				if matcher.op != "=" {
+					continue
+				}
+				if _, ok := labels[matcher.name]; !ok {
+					labels[matcher.name] = matcher.value
+				}
+			}
+			entry = &streamEntry{labels: labels, key: labelsKey(labels)}
+			cache[cacheKey] = entry
+		}
+		out.labels = entry.labels
+		out.streamKey = entry.key
+		rows = append(rows, out)
+		return nil
+	})
+	return rows, err
+}
+
+func appendSortedMapKeys(dst []string, m map[string]string) []string {
+	for key := range m {
+		dst = append(dst, key)
+	}
+	sort.Strings(dst)
+	return dst
+}
+
 func labelsFromLogColumns(serviceName, severityText, traceID, spanID string, resourceAttrs, attrs map[string]string) map[string]string {
 	labels, _, _ := labelsAndFieldsFromLogColumns(serviceName, severityText, traceID, spanID, resourceAttrs, attrs)
 	return labels
@@ -1798,7 +2034,10 @@ func logStreamResults(rows []logRow, limit int, direction string) []logStreamRes
 	byKey := make(map[string]int)
 	results := make([]logStreamResult, 0)
 	for _, row := range rows {
-		key := labelsKey(row.labels)
+		key := row.streamKey
+		if key == "" {
+			key = labelsKey(row.labels)
+		}
 		idx, ok := byKey[key]
 		if !ok {
 			idx = len(results)

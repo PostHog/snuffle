@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -620,6 +621,110 @@ func TestLogQLMetricBucketSQLSafeIncludesBytes(t *testing.T) {
 	}
 	if !logQLMetricBucketSQLSafe(plan, time.Minute) {
 		t.Fatal("bytes_over_time with window divisible by step should use bucket SQL")
+	}
+}
+
+func TestLogStreamResultMarshalMatchesStdlib(t *testing.T) {
+	type plainStreamResult struct {
+		Stream map[string]string `json:"stream"`
+		Values [][]string        `json:"values"`
+	}
+	cases := []logStreamResult{
+		{
+			Stream: map[string]string{"app": "x", "weird": "quote \" back \\ slash"},
+			Values: [][]string{
+				{"123", "line with <html> & entities"},
+				{"456", "ctrl \x01 tab\t nl\n cr\r sep  "},
+			},
+		},
+		{Stream: nil, Values: nil},
+		{Stream: map[string]string{}, Values: [][]string{}},
+		{
+			Stream: map[string]string{"k": "invalid \xff utf8"},
+			Values: [][]string{{"1", string([]byte{0xC3, 0x28})}, nil},
+		},
+	}
+	for i, r := range cases {
+		got, err := json.Marshal(r)
+		if err != nil {
+			t.Fatalf("case %d: Marshal returned error: %v", i, err)
+		}
+		want, err := json.Marshal(plainStreamResult{Stream: r.Stream, Values: r.Values})
+		if err != nil {
+			t.Fatalf("case %d: stdlib Marshal returned error: %v", i, err)
+		}
+		if string(got) != string(want) {
+			t.Fatalf("case %d:\ngot  %s\nwant %s", i, got, want)
+		}
+	}
+}
+
+func TestWriteLokiStreamsResponseMatchesWriteJSON(t *testing.T) {
+	streams := []logStreamResult{
+		{
+			Stream: map[string]string{"app": "x", "html": "<b>&amp;</b>", "quote": "a\"b\\c"},
+			Values: [][]string{
+				{"1780272000000000000", "line with <html> & stuff\nnewline\ttab"},
+				{"1780272001000000000", "plain"},
+			},
+		},
+		{
+			Stream: map[string]string{"app": "y"},
+			Values: [][]string{{"42", "ctrl \x02 and invalid \xff utf8"}},
+		},
+	}
+	data := lokiQueryData{ResultType: "streams", Result: streams, Stats: lokiEmptyStats()}
+
+	direct := httptest.NewRecorder()
+	if !writeLokiStreamsResponse(direct, data, streams) {
+		t.Fatal("writeLokiStreamsResponse returned false")
+	}
+	std := httptest.NewRecorder()
+	writeJSON(std, http.StatusOK, lokiResponse{Status: "success", Data: data})
+
+	if direct.Code != std.Code {
+		t.Fatalf("status = %d, want %d", direct.Code, std.Code)
+	}
+	if got, want := direct.Body.String(), std.Body.String(); got != want {
+		t.Fatalf("direct response differs from encoding/json:\ngot  %q\nwant %q", got, want)
+	}
+	if got, want := direct.Header().Get("Content-Type"), std.Header().Get("Content-Type"); got != want {
+		t.Fatalf("content type = %q, want %q", got, want)
+	}
+}
+
+func TestLogQLUnwrapMetricBucketSQLSafeFunctions(t *testing.T) {
+	tests := []struct {
+		fn   string
+		safe bool
+	}{
+		{fn: "sum_over_time", safe: true},
+		{fn: "avg_over_time", safe: true},
+		{fn: "min_over_time", safe: true},
+		{fn: "max_over_time", safe: true},
+		{fn: "stdvar_over_time", safe: true},
+		{fn: "stddev_over_time", safe: true},
+		{fn: "first_over_time", safe: false},
+		{fn: "last_over_time", safe: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.fn, func(t *testing.T) {
+			query := fmt.Sprintf(`%s({app="api"} | json | unwrap duration [5m]) by (service_name)`, tt.fn)
+			expr, err := parseLogQL(query)
+			if err != nil {
+				t.Fatalf("parseLogQL returned error: %v", err)
+			}
+			plan, ok := buildLogQLMetricSQLPlan(Config{}, expr)
+			if !ok || plan == nil {
+				t.Fatalf("buildLogQLMetricSQLPlan returned false for %s", tt.fn)
+			}
+			if got := logQLUnwrapMetricBucketSQLSafe(plan, time.Minute); got != tt.safe {
+				t.Fatalf("logQLUnwrapMetricBucketSQLSafe(%s) = %v, want %v", tt.fn, got, tt.safe)
+			}
+			if logQLUnwrapMetricBucketSQLSafe(plan, 7*time.Second) {
+				t.Fatalf("window not divisible by step should not be bucket safe for %s", tt.fn)
+			}
+		})
 	}
 }
 

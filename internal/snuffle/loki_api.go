@@ -278,13 +278,24 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 	candidateLimit := logQLCandidateLimit(selector, limit, maxRows)
 	fullyPushed := logQLSelectorFullyPushed(selector)
 	for {
-		sql := logQLRawSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
-		rows, err := scanLogRows(ctx, s.client, sql)
+		var rows []logRow
+		var err error
+		if fullyPushed {
+			// the lean scan shares labels per stream and applies the pushed
+			// equality-matcher annotation itself
+			sql := logQLRawStreamSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
+			rows, err = scanLogStreamRows(ctx, s.client, sql, selector)
+		} else {
+			sql := logQLRawSelectSQL(s.cfg, selector, startNS, endNS, candidateLimit, direction)
+			rows, err = scanLogRows(ctx, s.client, sql)
+		}
 		if err != nil {
 			return nil, err
 		}
 		rawCount := len(rows)
-		rows = finalizeLogQLRowsAfterSQLFilter(rows, selector, fullyPushed)
+		if !fullyPushed {
+			rows = applyLogQLSelector(rows, selector)
+		}
 		if len(rows) >= limit || rawCount < candidateLimit || candidateLimit >= maxRows {
 			if len(rows) > limit {
 				rows = rows[:limit]
@@ -1806,7 +1817,68 @@ func lokiLogUUID(labels map[string]string, timestamp time.Time, line string) str
 }
 
 func writeLokiSuccess(w http.ResponseWriter, data any) {
+	if queryData, ok := data.(lokiQueryData); ok {
+		if streams, ok := queryData.Result.([]logStreamResult); ok {
+			if writeLokiStreamsResponse(w, queryData, streams) {
+				return
+			}
+		}
+	}
 	writeJSON(w, http.StatusOK, lokiResponse{Status: "success", Data: data})
+}
+
+// writeLokiStreamsResponse writes a streams query response without reflection.
+// The output is byte-identical to writeJSON of the same lokiResponse; large
+// stream responses are dominated by the values arrays, which encoding/json
+// walks element by element.
+func writeLokiStreamsResponse(w http.ResponseWriter, queryData lokiQueryData, streams []logStreamResult) bool {
+	var statsJSON []byte
+	if queryData.Stats != nil {
+		encoded, err := json.Marshal(queryData.Stats)
+		if err != nil {
+			return false
+		}
+		statsJSON = encoded
+	}
+
+	size := 96 + len(statsJSON)
+	for i := range streams {
+		size += 32
+		for key, value := range streams[i].Stream {
+			size += len(key) + len(value) + 8
+		}
+		for _, pair := range streams[i].Values {
+			size += 16
+			for _, item := range pair {
+				size += len(item) + 4
+			}
+		}
+	}
+	buf := make([]byte, 0, size)
+	buf = append(buf, `{"status":"success","data":{"resultType":`...)
+	buf = appendJSONString(buf, queryData.ResultType)
+	buf = append(buf, `,"result":[`...)
+	for i := range streams {
+		if i > 0 {
+			buf = append(buf, ',')
+		}
+		encoded, err := streams[i].MarshalJSON()
+		if err != nil {
+			return false
+		}
+		buf = append(buf, encoded...)
+	}
+	buf = append(buf, ']')
+	if statsJSON != nil {
+		buf = append(buf, `,"stats":`...)
+		buf = append(buf, statsJSON...)
+	}
+	buf = append(buf, '}', '}', '\n')
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(buf)
+	return true
 }
 
 func writeLokiError(w http.ResponseWriter, code int, errorType string, err error) {

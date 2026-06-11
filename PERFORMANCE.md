@@ -33,8 +33,11 @@ The metrics run uses TSBS `devops` data in Prometheus remote-write format:
 - tenant: `team_id = 0`
 
 The PostHog logs run uses `scripts/seed_logs_posthog.sql`; the Snuffle logs run
-uses `scripts/seed_logs_snuffle.sql`. By default each log run inserts 10,000
-rows over a 24-hour window starting at `2026-06-01 00:00:00` UTC.
+uses `scripts/seed_logs_snuffle.sql`. By default each log run inserts 1,000,000
+rows over a 24-hour window starting at `2026-06-01 00:00:00` UTC. This volume is
+chosen so the metric/aggregation scenarios exercise the bucket-aggregation
+pushdown rather than a dataset small enough that a per-row `CROSS JOIN` against
+the eval grid would win; raw-log scenarios stay bounded by `POSTHOG_LOG_LIMIT`.
 
 ## Repeatable Benchmark Runbook
 
@@ -260,8 +263,9 @@ accepting a change.
 - `TSBS_WORKERS`: concurrent remote-write workers. Default `2`.
 - `TSBS_BATCH_SIZE`: TimeSeries messages per remote-write request. Default
   `10000`.
-- `POSTHOG_LOG_ROWS`: synthetic logs inserted for `posthog_logs`. Default
-  `10000`.
+- `POSTHOG_LOG_ROWS`: synthetic logs inserted for each logs run. Default
+  `1000000`. Lower it (for example `POSTHOG_LOG_ROWS=10000`) for a quick local
+  smoke run.
 - `POSTHOG_LOG_START`, `POSTHOG_LOG_RANGE_SECONDS`, `POSTHOG_LOG_STEP`, and
   `POSTHOG_LOG_LIMIT`: LogQL benchmark time range and response limits.
 - `BRIDGE_BENCH_CONCURRENCY`: concurrent query requests per scenario. Default
