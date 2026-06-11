@@ -1153,15 +1153,15 @@ func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn,
 	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
 
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s) SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, %s AS value FROM %s ANY LEFT JOIN group_labels USING id WHERE %s GROUP BY ts ORDER BY ts",
+		"WITH group_labels AS (%s), active_samples AS (SELECT timestamp, id FROM %s WHERE %s) SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, %s AS value FROM active_samples ANY LEFT JOIN group_labels USING id GROUP BY ts ORDER BY ts",
 		groupLabels,
+		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		strings.Join(sampleWhere, " AND "),
 		outputStartMillis,
 		evalStartMillis,
 		stepMillis,
 		stepMillis,
 		nestedCountDistinctGroupSQL(groupColumn),
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		strings.Join(sampleWhere, " AND "),
 	), true
 }
 
