@@ -435,6 +435,60 @@ func TestAggregateRangeSourceSQLWrapsRunningSum(t *testing.T) {
 	}
 }
 
+func TestAggregateRangeSourceSQLRunningSumDeltaUsesPreviousSample(t *testing.T) {
+	cfg := Config{
+		LookbackDelta:       5 * time.Minute,
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	s := newServer(cfg)
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`quantile(1, running_sum(delta(node_cpu_seconds_total{ready=~"true"}[15s])))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+
+	start := time.Unix(1700000000, 0).UTC()
+	end := time.Unix(1700000060, 0).UTC()
+	source, _, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if mint != start.Add(-30*time.Second).UnixMilli() || maxt != end.UnixMilli() {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+	if !strings.Contains(source.gridExpr, ", 15, 30)(timestamp, value)") {
+		t.Fatalf("delta grid should include one previous sample interval:\n%s", source.gridExpr)
+	}
+}
+
+func TestAggregateRangeSourceSQLPlainDeltaDoesNotUsePreviousSample(t *testing.T) {
+	cfg := Config{
+		LookbackDelta:       5 * time.Minute,
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	s := newServer(cfg)
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`quantile(1, delta(node_cpu_seconds_total{ready=~"true"}[15s]))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+
+	start := time.Unix(1700000000, 0).UTC()
+	end := time.Unix(1700000060, 0).UTC()
+	source, _, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if mint != start.Add(-15*time.Second).UnixMilli() || maxt != end.UnixMilli() {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+	if !strings.Contains(source.gridExpr, ", 15, 15)(timestamp, value)") {
+		t.Fatalf("plain delta grid should keep the requested range:\n%s", source.gridExpr)
+	}
+}
+
 func TestRewriteImplicitMetricsQLSubquerySteps(t *testing.T) {
 	query := `quantile(1, sum_over_time(delta(foo{label="[5m]"}[1m])[5m]))`
 	got := rewriteImplicitMetricsQLSubquerySteps(query, 30*time.Second)

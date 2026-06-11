@@ -312,8 +312,9 @@ func (s *Server) queryRangeGridResults(ctx context.Context, sql string, matchers
 }
 
 type rangeGridFunctionSpec struct {
-	name     string
-	increase bool
+	name               string
+	increase           bool
+	usesPreviousSample bool
 }
 
 const maxAggregateUnionSelectors = 1024
@@ -327,9 +328,9 @@ func rangeGridFunction(name string) (rangeGridFunctionSpec, bool) {
 	case "increase":
 		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true}, true
 	case "delta":
-		return rangeGridFunctionSpec{name: "timeSeriesDeltaToGrid"}, true
+		return rangeGridFunctionSpec{name: "timeSeriesDeltaToGrid", usesPreviousSample: true}, true
 	case "idelta":
-		return rangeGridFunctionSpec{name: "timeSeriesInstantDeltaToGrid"}, true
+		return rangeGridFunctionSpec{name: "timeSeriesInstantDeltaToGrid", usesPreviousSample: true}, true
 	default:
 		return rangeGridFunctionSpec{}, false
 	}
@@ -1807,6 +1808,10 @@ type selectorGridSource struct {
 	end   time.Time
 }
 
+type aggregateRangeSourceOptions struct {
+	metricsQLPreviousSample bool
+}
+
 type aggregateRangeSource struct {
 	gridExpr           string
 	gridStart          time.Time
@@ -1825,6 +1830,10 @@ type rangeSourceSumOverTime struct {
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
+	return s.aggregateRangeSourceSQLWithOptions(expr, start, end, step, aggregateRangeSourceOptions{})
+}
+
+func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end time.Time, step time.Duration, opts aggregateRangeSourceOptions) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
 	if selector, ok := expr.(*parser.VectorSelector); ok {
 		source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
 		if !ok {
@@ -1838,7 +1847,9 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
 	if call.Func.Name == "running_sum" {
-		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(call.Args[0], start, end, step)
+		childOpts := opts
+		childOpts.metricsQLPreviousSample = true
+		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQLWithOptions(call.Args[0], start, end, step, childOpts)
 		if !ok {
 			return aggregateRangeSource{}, nil, 0, 0, false
 		}
@@ -1846,7 +1857,7 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 		return source, selector, mint, maxt, true
 	}
 	if call.Func.Name == "sum_over_time" {
-		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step)
+		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step, opts)
 	}
 	fn, ok := rangeGridFunction(call.Func.Name)
 	if !ok {
@@ -1866,9 +1877,10 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	}
 	shiftedStart := start.Add(-offset)
 	shiftedEnd := end.Add(-offset)
-	mint := shiftedStart.Add(-matrix.Range).UnixMilli()
+	gridRange := matrix.Range + metricsQLPreviousSampleLookback(s.cfg, opts, fn)
+	mint := shiftedStart.Add(-gridRange).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
-	rangeSeconds := formatDurationSeconds(matrix.Range)
+	rangeSeconds := formatDurationSeconds(gridRange)
 	gridExpr := fmt.Sprintf(
 		"%s(%s, %s, %s, %s)(timestamp, value)",
 		fn.name,
@@ -1883,7 +1895,14 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step, filterStaleSamples: true}, selector, mint, maxt, true
 }
 
-func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
+func metricsQLPreviousSampleLookback(cfg Config, opts aggregateRangeSourceOptions, fn rangeGridFunctionSpec) time.Duration {
+	if !opts.metricsQLPreviousSample || !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
+		return 0
+	}
+	return cfg.RemoteWriteInterval
+}
+
+func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration, opts aggregateRangeSourceOptions) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
 	subquery, ok := expr.(*parser.SubqueryExpr)
 	if !ok || subquery.Range <= 0 || subquery.OriginalOffset != 0 || subquery.Offset != 0 || subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
 		return aggregateRangeSource{}, nil, 0, 0, false
@@ -1896,7 +1915,7 @@ func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
 	innerStart := start.Add(-subquery.Range)
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(subquery.Expr, innerStart, end, subqueryStep)
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQLWithOptions(subquery.Expr, innerStart, end, subqueryStep, opts)
 	if !ok {
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
