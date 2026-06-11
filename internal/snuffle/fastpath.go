@@ -312,6 +312,8 @@ type rangeGridFunctionSpec struct {
 	increase bool
 }
 
+const maxAggregateUnionSelectors = 1024
+
 func rangeGridFunction(name string) (rangeGridFunctionSpec, bool) {
 	switch name {
 	case "rate":
@@ -349,6 +351,9 @@ func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExp
 		return s.tryPostHogInstantAggregate(ctx, expr, selector, window, evalTime, aggSQL)
 	}
 	if data, ok, err := s.tryFastRangeFunctionAggregate(ctx, expr, evalTime, aggSQL); ok || err != nil {
+		return data, ok, err
+	}
+	if data, ok, err := s.tryFastAggregateUnionQuery(ctx, expr, evalTime, aggSQL); ok || err != nil {
 		return data, ok, err
 	}
 	selector, ok := expr.Expr.(*parser.VectorSelector)
@@ -631,12 +636,51 @@ func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.Aggreg
 	if !ok {
 		return queryData{}, false, nil
 	}
+	latest := latestSamplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
 
+	return s.queryLabelIndexInstantAggregate(ctx, expr, selectedSeries, latest, selector.LabelMatchers, evalTime, aggSQL)
+}
+
+func (s *Server) tryFastAggregateUnionQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
+	selectors, ok := orVectorSelectors(expr.Expr)
+	if !ok || len(selectors) < 2 || len(selectors) > maxAggregateUnionSelectors {
+		return queryData{}, false, nil
+	}
+
+	var mint int64
+	var maxt int64
+	selectedProjection := []string{"id"}
+	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
+	selectedParts := make([]string, 0, len(selectors))
+	for i, selector := range selectors {
+		window, ok := selectorWindowFor(selector, evalTime, s.cfg.LookbackDelta)
+		if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+			return queryData{}, false, nil
+		}
+		if i == 0 {
+			mint = window.mint
+			maxt = window.maxt
+		} else if window.mint != mint || window.maxt != maxt {
+			return queryData{}, false, nil
+		}
+		selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, selectedProjection)
+		if !ok {
+			return queryData{}, false, nil
+		}
+		selectedParts = append(selectedParts, selectedSeries)
+	}
+
+	selectedSeries := strings.Join(selectedParts, " UNION DISTINCT ")
+	latest := latestSamplesForSelectedSeriesUnionSQL(s.cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
+	return s.queryLabelIndexInstantAggregate(ctx, expr, selectedSeries, latest, nil, evalTime, aggSQL)
+}
+
+func (s *Server) queryLabelIndexInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selectedSeries, latest string, groupMatchers []*labels.Matcher, evalTime time.Time, aggSQL string) (queryData, bool, error) {
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, selector.LabelMatchers, expr.Grouping)
+	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
 	withParts := []string{
 		"selected_series AS (" + selectedSeries + ")",
-		"latest AS (" + latestSamplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt) + ")",
+		"latest AS (" + latest + ")",
 	}
 	if groupLabels != "" {
 		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
@@ -698,7 +742,7 @@ func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.Ag
 
 func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64, aggSQL string) (queryData, bool, error) {
 	selectors, ok := orVectorSelectors(expr.Expr)
-	if !ok || len(selectors) < 2 || len(selectors) > 8 {
+	if !ok || len(selectors) < 2 || len(selectors) > maxAggregateUnionSelectors {
 		return queryData{}, false, nil
 	}
 
@@ -2256,6 +2300,53 @@ func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, m
 		source,
 	)
 	return fmt.Sprintf("SELECT id, value, ts_col FROM (%s) WHERE %s", latest, nonStaleSampleSQL("value"))
+}
+
+func latestSamplesForSelectedSeriesUnionSQL(cfg Config, metricNames []string, mint, maxt int64) string {
+	where := []string{teamFilter(cfg)}
+	where = append(where, sampleTimeFilters(cfg, mint, maxt)...)
+	if condition := metricNamesCondition(metricNames); condition != "" {
+		where = append(where, condition)
+	}
+	where = append(where, sampleSelectedSeriesFilters(cfg)...)
+	source := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
+	latest := fmt.Sprintf(
+		"SELECT id, argMax(value, timestamp) AS value, max(timestamp) AS ts_col FROM (%s) GROUP BY id",
+		source,
+	)
+	return fmt.Sprintf("SELECT id, value, ts_col FROM (%s) WHERE %s", latest, nonStaleSampleSQL("value"))
+}
+
+func exactMetricNamesForSelectors(selectors []*parser.VectorSelector) []string {
+	names := make([]string, 0, len(selectors))
+	seen := make(map[string]struct{}, len(selectors))
+	for _, selector := range selectors {
+		name := exactMetricName(selector.LabelMatchers)
+		if name == "" {
+			return nil
+		}
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	return names
+}
+
+func metricNamesCondition(metricNames []string) string {
+	switch len(metricNames) {
+	case 0:
+		return ""
+	case 1:
+		return "metric_name = " + sqlString(metricNames[0])
+	default:
+		quoted := make([]string, 0, len(metricNames))
+		for _, name := range metricNames {
+			quoted = append(quoted, sqlString(name))
+		}
+		return "metric_name IN (" + strings.Join(quoted, ",") + ")"
+	}
 }
 
 func metricGroupProjection(grouping []string) []string {

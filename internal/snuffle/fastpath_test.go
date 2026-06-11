@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +31,11 @@ func TestOrVectorSelectorsFlattensSelectorUnion(t *testing.T) {
 
 func TestFastAggregateRangeUnionRejectsLargeUnions(t *testing.T) {
 	p := parser.NewParser(parser.Options{})
-	expr, err := p.ParseExpr(`sum(up{job="0"} or up{job="1"} or up{job="2"} or up{job="3"} or up{job="4"} or up{job="5"} or up{job="6"} or up{job="7"} or up{job="8"})`)
+	parts := make([]string, 0, maxAggregateUnionSelectors+1)
+	for i := range maxAggregateUnionSelectors + 1 {
+		parts = append(parts, `up{job="`+strconv.Itoa(i)+`"}`)
+	}
+	expr, err := p.ParseExpr(`sum(` + strings.Join(parts, " or ") + `)`)
 	if err != nil {
 		t.Fatalf("ParseExpr returned error: %v", err)
 	}
@@ -42,7 +47,7 @@ func TestFastAggregateRangeUnionRejectsLargeUnions(t *testing.T) {
 	if !ok {
 		t.Fatal("orVectorSelectors returned ok=false")
 	}
-	if len(selectors) <= 8 {
+	if len(selectors) <= maxAggregateUnionSelectors {
 		t.Fatalf("selector count = %d, want more than fast-path cap", len(selectors))
 	}
 }
@@ -461,6 +466,58 @@ func TestLatestSamplesForSelectedSeriesSQLSkipsSelectedIDsForMetricOnlyMatcher(t
 	}
 	if strings.Contains(sql, "id IN (SELECT id FROM selected_series)") {
 		t.Fatalf("metric-only latest SQL should use the sample metric_name key directly:\n%s", sql)
+	}
+}
+
+func TestLatestSamplesForSelectedSeriesUnionSQLFiltersSelectedIDsAndMetricNames(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		RemoteWriteInterval: 15 * time.Second,
+	}
+
+	sql := latestSamplesForSelectedSeriesUnionSQL(cfg, []string{"up", "process_start_time_seconds"}, 1000, 2000)
+	for _, want := range []string{
+		"argMax(value, timestamp)",
+		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"timestamp <= fromUnixTimestamp64Milli(2000, 'UTC')",
+		"metric_name IN ('up','process_start_time_seconds')",
+		"id IN (SELECT id FROM selected_series)",
+		nonStaleSampleSQL("value"),
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestExactMetricNamesForSelectorsRequiresExactMetrics(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum(up{job="api"} or process_start_time_seconds{job="api"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	selectors, ok := orVectorSelectors(aggregate.Expr)
+	if !ok {
+		t.Fatal("orVectorSelectors returned ok=false")
+	}
+	names := exactMetricNamesForSelectors(selectors)
+	if got, want := strings.Join(names, ","), "up,process_start_time_seconds"; got != want {
+		t.Fatalf("exactMetricNamesForSelectors = %q, want %q", got, want)
+	}
+
+	expr, err = p.ParseExpr(`sum({__name__=~"up|process_start_time_seconds", job="api"} or up{job="worker"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate = expr.(*parser.AggregateExpr)
+	selectors, ok = orVectorSelectors(aggregate.Expr)
+	if !ok {
+		t.Fatal("orVectorSelectors returned ok=false")
+	}
+	if names := exactMetricNamesForSelectors(selectors); names != nil {
+		t.Fatalf("exactMetricNamesForSelectors = %#v, want nil", names)
 	}
 }
 

@@ -220,8 +220,8 @@ snuffle manually and run one or more scenarios directly:
 ```bash
 go build -o .perf/snuffle ./cmd/snuffle
 CH_DATABASE=snuffle_perf \
-CH_SCHEMA_LAYOUT=posthog \
-CH_SAMPLES_TABLE=metrics1 \
+CH_SCHEMA_LAYOUT=current \
+CH_SAMPLES_TABLE=metrics_samples \
 CH_TIMEOUT_SECONDS=120 \
 PROMQL_QUERY_TIMEOUT_SECONDS=120 \
 REMOTE_WRITE_SAMPLE_INTERVAL=15s \
@@ -232,8 +232,8 @@ Then, in another shell:
 
 ```bash
 BRIDGE_BENCH_URL=http://127.0.0.1:9091 \
-BRIDGE_BENCH_PROFILE=posthog_metrics \
-BRIDGE_BENCH_SCENARIO=tsbs_topk,tsbs_range_sum_by_region \
+BRIDGE_BENCH_PROFILE=snuffle_metrics \
+BRIDGE_BENCH_SCENARIO=tsbs_topk,tsbs_instant_or_union,tsbs_range_sum_by_region \
 BRIDGE_BENCH_CONCURRENCY=10 \
 BRIDGE_BENCH_WARMUP=10 \
 go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest \
@@ -247,11 +247,13 @@ accepting a change.
 
 - `PERF_RUNS`: comma-separated run list. Default
   `posthog_metrics,posthog_logs,snuffle_logs`; available runs are
-  `posthog_metrics`, `posthog_logs`, and `snuffle_logs`.
+  `posthog_metrics`, `snuffle_metrics`, `posthog_logs`, and `snuffle_logs`.
 - `PERF_REPEAT`: number of full suite attempts before selecting the slowest
   candidate for each run. Default `1`.
 - `TSBS_SCALE`: number of hosts. Default `50`.
 - `TSBS_START`, `TSBS_END`, `TSBS_INTERVAL`, `TSBS_SEED`: generated data shape.
+- `BRIDGE_BENCH_TSBS_UNION_SELECTORS`: host selector count for the
+  `tsbs_instant_or_union` query. Default `32`.
 - `TSBS_WORKERS`: concurrent remote-write workers. Default `2`.
 - `TSBS_BATCH_SIZE`: TimeSeries messages per remote-write request. Default
   `10000`.

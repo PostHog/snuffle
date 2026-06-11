@@ -20,18 +20,28 @@ type bridgeScenario struct {
 }
 
 func bridgePostHogMetricScenarios() []bridgeScenario {
+	return bridgeTSBSMetricScenarios()
+}
+
+func bridgeSnuffleMetricScenarios() []bridgeScenario {
+	return bridgeTSBSMetricScenarios()
+}
+
+func bridgeTSBSMetricScenarios() []bridgeScenario {
 	metric := envString("BRIDGE_BENCH_TSBS_METRIC", "usage_user")
 	host := envString("BRIDGE_BENCH_TSBS_HOSTNAME", "host_42")
 	eval := envString("BRIDGE_BENCH_TSBS_QUERY_TIME", "1451608185")
 	rangeStart := envString("BRIDGE_BENCH_TSBS_RANGE_START", "1451607900")
 	rangeEnd := envString("BRIDGE_BENCH_TSBS_RANGE_END", eval)
 	step := envString("BRIDGE_BENCH_TSBS_STEP", "15s")
+	unionSelectors := envInt("BRIDGE_BENCH_TSBS_UNION_SELECTORS", 32, 2)
 
 	hostSelector := fmt.Sprintf(`%s{hostname=%q}`, metric, host)
 	metricSelector := fmt.Sprintf(`%s`, metric)
 	sumByRegion := fmt.Sprintf(`sum by (region) (%s)`, metric)
 	avgByEnvironment := fmt.Sprintf(`avg by (service_environment) (%s)`, metric)
 	topk := fmt.Sprintf(`topk(10, %s)`, metric)
+	instantUnion := tsbsInstantUnionQuery(metric, unionSelectors)
 	nestedCountHostname := fmt.Sprintf(`count(count(%s) by (hostname))`, metric)
 	nestedCountRegion := fmt.Sprintf(`count(count(%s) by (region))`, metric)
 	nestedCountFilteredHostname := fmt.Sprintf(`count(count(%s{service_environment="production"}) by (hostname))`, metric)
@@ -41,6 +51,7 @@ func bridgePostHogMetricScenarios() []bridgeScenario {
 		{name: "tsbs_sum_by_region", path: "/api/v1/query", params: map[string]string{"query": sumByRegion, "time": eval}},
 		{name: "tsbs_avg_by_environment", path: "/api/v1/query", params: map[string]string{"query": avgByEnvironment, "time": eval}},
 		{name: "tsbs_topk", path: "/api/v1/query", params: map[string]string{"query": topk, "time": eval}},
+		{name: "tsbs_instant_or_union", path: "/api/v1/query", params: map[string]string{"query": instantUnion, "time": eval}},
 		{name: "tsbs_range_selector", path: "/api/v1/query_range", params: map[string]string{"query": hostSelector, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_range_sum_by_region", path: "/api/v1/query_range", params: map[string]string{"query": sumByRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountHostname, "start": rangeStart, "end": rangeEnd, "step": step}},
@@ -48,6 +59,30 @@ func bridgePostHogMetricScenarios() []bridgeScenario {
 		{name: "tsbs_nested_count_filtered_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountFilteredHostname, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_series_metric", path: "/api/v1/series", params: map[string]string{"match[]": metricSelector, "start": rangeStart, "end": rangeEnd}},
 		{name: "tsbs_label_values_hostname", path: "/api/v1/label/hostname/values", params: map[string]string{"start": rangeStart, "end": rangeEnd}},
+	}
+}
+
+func tsbsInstantUnionQuery(metric string, selectors int) string {
+	parts := make([]string, 0, selectors)
+	for i := range selectors {
+		parts = append(parts, fmt.Sprintf(`%s{hostname=%q}`, metric, fmt.Sprintf("host_%d", i)))
+	}
+	return fmt.Sprintf(`max by (hostname) (%s)`, strings.Join(parts, " or "))
+}
+
+func TestTSBSInstantUnionQueryUsesLargeInstantAggregateUnion(t *testing.T) {
+	query := tsbsInstantUnionQuery("usage_user", 32)
+	for _, want := range []string{
+		`max by (hostname) (`,
+		`usage_user{hostname="host_0"}`,
+		`usage_user{hostname="host_31"}`,
+	} {
+		if !strings.Contains(query, want) {
+			t.Fatalf("query does not contain %q:\n%s", want, query)
+		}
+	}
+	if got := strings.Count(query, " or "); got != 31 {
+		t.Fatalf("or count = %d, want 31 in query:\n%s", got, query)
 	}
 }
 
@@ -190,6 +225,8 @@ func bridgeScenarios(profile string) ([]bridgeScenario, bool) {
 	switch profile {
 	case "posthog_metrics":
 		return bridgePostHogMetricScenarios(), true
+	case "snuffle_metrics":
+		return bridgeSnuffleMetricScenarios(), true
 	case "posthog_logs":
 		return bridgePostHogLogScenarios(), true
 	case "snuffle_logs":

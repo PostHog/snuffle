@@ -490,14 +490,14 @@ record_candidate() {
   fi
 }
 
-run_posthog_metrics() {
+run_tsbs_metrics() {
   local attempt="$1"
-  local run_name="posthog_metrics"
-  local schema_file="$ROOT/scripts/create_metrics_posthog_schema.sql"
-  local schema_layout="posthog"
-  local samples_table="metrics1"
-  local sample_attributes="1"
-  local source_name="tsbs-posthog-metrics"
+  local run_name="$2"
+  local schema_file="$3"
+  local schema_layout="$4"
+  local samples_table="$5"
+  local sample_attributes="$6"
+  local source_name="$7"
   local run_dir="$WORKDIR/$run_name/attempt-$attempt"
   local load_results="$run_dir/tsbs-load-results.json"
   local load_output="$run_dir/tsbs-load.out"
@@ -532,10 +532,18 @@ run_posthog_metrics() {
   fi
   wait_for_table_rows "$samples_table" "$expected_rows"
 
-  run_bridge_bench "$run_dir" "posthog_metrics"
+  run_bridge_bench "$run_dir" "$run_name"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$expected_rows" "$source_name" "$TSBS_VERSION" "$TSBS_USE_CASE" "$TSBS_SCALE" "$TSBS_START" "$TSBS_END" "$TSBS_INTERVAL" "$TSBS_SEED" "$TSBS_WORKERS" "$TSBS_BATCH_SIZE" "$attempt"
   record_candidate "$run_name" "$run_dir/perf-results.current.json"
   stop_snuffle
+}
+
+run_posthog_metrics() {
+  run_tsbs_metrics "$1" "posthog_metrics" "$ROOT/scripts/create_metrics_posthog_schema.sql" "posthog" "metrics1" "1" "tsbs-posthog-metrics"
+}
+
+run_snuffle_metrics() {
+  run_tsbs_metrics "$1" "snuffle_metrics" "$ROOT/scripts/create_metrics_schema.sql" "current" "metrics_samples" "0" "tsbs-snuffle-metrics"
 }
 
 run_posthog_logs() {
@@ -631,6 +639,9 @@ run_named() {
     posthog_metrics)
       run_posthog_metrics "$attempt"
       ;;
+    snuffle_metrics)
+      run_snuffle_metrics "$attempt"
+      ;;
     posthog_logs)
       run_posthog_logs "$attempt"
       ;;
@@ -639,7 +650,7 @@ run_named() {
       ;;
     *)
       echo "unknown PERF_RUNS entry: $run_name" >&2
-      echo "known runs: posthog_metrics, posthog_logs, snuffle_logs" >&2
+      echo "known runs: posthog_metrics, snuffle_metrics, posthog_logs, snuffle_logs" >&2
       exit 1
       ;;
   esac
@@ -648,11 +659,11 @@ run_named() {
 validate_run_name() {
   local run_name="$1"
   case "$run_name" in
-    posthog_metrics|posthog_logs|snuffle_logs)
+    posthog_metrics|snuffle_metrics|posthog_logs|snuffle_logs)
       ;;
     *)
       echo "unknown PERF_RUNS entry: $run_name" >&2
-      echo "known runs: posthog_metrics, posthog_logs, snuffle_logs" >&2
+      echo "known runs: posthog_metrics, snuffle_metrics, posthog_logs, snuffle_logs" >&2
       exit 1
       ;;
   esac
