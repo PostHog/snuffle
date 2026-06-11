@@ -350,10 +350,7 @@ func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExp
 		}
 		return s.tryPostHogInstantAggregate(ctx, expr, selector, window, evalTime, aggSQL)
 	}
-	if data, ok, err := s.tryFastRangeFunctionAggregate(ctx, expr, evalTime, aggSQL); ok || err != nil {
-		return data, ok, err
-	}
-	if data, ok, err := s.tryFastAggregateUnionQuery(ctx, expr, evalTime, aggSQL); ok || err != nil {
+	if data, ok, err := s.tryFastInstantSeriesExprAggregate(ctx, expr, evalTime, aggSQL); ok || err != nil {
 		return data, ok, err
 	}
 	selector, ok := expr.Expr.(*parser.VectorSelector)
@@ -641,46 +638,51 @@ func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.Aggreg
 	return s.queryLabelIndexInstantAggregate(ctx, expr, selectedSeries, latest, selector.LabelMatchers, evalTime, aggSQL)
 }
 
-func (s *Server) tryFastAggregateUnionQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
-	selectors, ok := orVectorSelectors(expr.Expr)
-	if !ok || len(selectors) < 2 || len(selectors) > maxAggregateUnionSelectors {
+func (s *Server) tryFastInstantSeriesExprAggregate(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
+	branches, ok := s.instantSeriesExprBranches(expr.Expr, evalTime)
+	if !ok || len(branches) == 0 || len(branches) > maxAggregateUnionSelectors {
+		return queryData{}, false, nil
+	}
+	if len(branches) == 1 && branches[0].kind == instantSeriesSelector && branches[0].transform.identity() {
 		return queryData{}, false, nil
 	}
 
-	var mint int64
-	var maxt int64
 	selectedProjection := []string{"id"}
 	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
-	selectedParts := make([]string, 0, len(selectors))
-	for i, selector := range selectors {
-		window, ok := selectorWindowFor(selector, evalTime, s.cfg.LookbackDelta)
-		if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
+	selectors := make([]*parser.VectorSelector, 0, len(branches))
+	first := branches[0]
+	for _, branch := range branches {
+		if !first.equivalentTo(branch) || !matchersPushdownSafe(branch.selector.LabelMatchers) {
 			return queryData{}, false, nil
 		}
-		if i == 0 {
-			mint = window.mint
-			maxt = window.maxt
-		} else if window.mint != mint || window.maxt != maxt {
-			return queryData{}, false, nil
-		}
-		selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, selectedProjection)
-		if !ok {
-			return queryData{}, false, nil
-		}
-		selectedParts = append(selectedParts, selectedSeries)
+		selectors = append(selectors, branch.selector)
 	}
 
-	selectedSeries := strings.Join(selectedParts, " UNION DISTINCT ")
-	latest := latestSamplesForSelectedSeriesUnionSQL(s.cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
-	return s.queryLabelIndexInstantAggregate(ctx, expr, selectedSeries, latest, nil, evalTime, aggSQL)
+	groupMatchers := first.selector.LabelMatchers
+	selectedSeries, ok := selectedSeriesForInstantBranchesSQL(s.cfg, branches, selectors, selectedProjection)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	if len(branches) > 1 {
+		groupMatchers = nil
+	}
+	sourceSQL, sourceName := s.instantSeriesExprSourceSQL(first, selectors)
+	if sourceSQL == "" {
+		return queryData{}, false, nil
+	}
+	return s.queryInstantSeriesAggregate(ctx, expr, selectedSeries, sourceName, sourceSQL, groupMatchers, evalTime, aggSQL)
 }
 
 func (s *Server) queryLabelIndexInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selectedSeries, latest string, groupMatchers []*labels.Matcher, evalTime time.Time, aggSQL string) (queryData, bool, error) {
+	return s.queryInstantSeriesAggregate(ctx, expr, selectedSeries, "latest", latest, groupMatchers, evalTime, aggSQL)
+}
+
+func (s *Server) queryInstantSeriesAggregate(ctx context.Context, expr *parser.AggregateExpr, selectedSeries, sourceName, sourceSQL string, groupMatchers []*labels.Matcher, evalTime time.Time, aggSQL string) (queryData, bool, error) {
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
 	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
 	withParts := []string{
 		"selected_series AS (" + selectedSeries + ")",
-		"latest AS (" + latest + ")",
+		sourceName + " AS (" + sourceSQL + ")",
 	}
 	if groupLabels != "" {
 		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
@@ -691,7 +693,7 @@ func (s *Server) queryLabelIndexInstantAggregate(ctx context.Context, expr *pars
 	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
 	selectParts = append(selectParts, aggSQL+" AS value")
 
-	source := aggregateSourceSQL("latest", expr.Grouping, groupJoin)
+	source := aggregateSourceSQL(sourceName, expr.Grouping, groupJoin)
 	sql := fmt.Sprintf(
 		"WITH %s SELECT %s FROM %s",
 		strings.Join(withParts, ", "),
@@ -1748,69 +1750,6 @@ func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
 	return staleAwareNullableGridSQL(grid)
 }
 
-func (s *Server) tryFastRangeFunctionAggregate(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time, aggSQL string) (queryData, bool, error) {
-	call, ok := expr.Expr.(*parser.Call)
-	if !ok || len(call.Args) != 1 {
-		return queryData{}, false, nil
-	}
-	fn, ok := rangeFunctionMode(call.Func.Name)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	matrix, ok := call.Args[0].(*parser.MatrixSelector)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
-	if !ok || selector.Anchored || selector.Smoothed {
-		return queryData{}, false, nil
-	}
-	window, ok := selectorWindowFor(selector, evalTime, matrix.Range)
-	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-
-	selectedProjection := []string{"id"}
-	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, window.mint, window.maxt, selectedProjection)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	perSeries := rangeFunctionPerSeriesSQL(s.cfg, window, selector.LabelMatchers, fn)
-	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, selector.LabelMatchers, expr.Grouping)
-	withParts := []string{
-		"selected_series AS (" + selectedSeries + ")",
-		"per_series AS (" + perSeries + ")",
-	}
-	if groupLabels != "" {
-		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
-	}
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
-	selectParts = append(selectParts, aggSQL+" AS value")
-
-	source := aggregateSourceSQL("per_series", expr.Grouping, groupJoin)
-	sql := fmt.Sprintf(
-		"WITH %s SELECT %s FROM %s",
-		strings.Join(withParts, ", "),
-		strings.Join(selectParts, ", "),
-		source,
-	)
-	if len(groupBy) > 0 {
-		sql += " GROUP BY " + strings.Join(groupBy, ", ")
-		sql += " ORDER BY " + strings.Join(groupBy, ", ")
-	}
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-
-	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
-}
-
 func (s *Server) queryInstantAggregateResults(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
 	results := make([]sampleResult, 0, 128)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -2046,6 +1985,214 @@ func selectorWindowFor(selector *parser.VectorSelector, evalTime time.Time, look
 	return selectorWindow{mint: ref - lookback.Milliseconds(), maxt: ref}, true
 }
 
+type instantSeriesExprKind int
+
+const (
+	instantSeriesSelector instantSeriesExprKind = iota
+	instantSeriesRangeFunction
+)
+
+type instantSeriesExprBranch struct {
+	kind      instantSeriesExprKind
+	selector  *parser.VectorSelector
+	window    selectorWindow
+	fn        rangeFunction
+	transform scalarTransform
+}
+
+func (b instantSeriesExprBranch) equivalentTo(other instantSeriesExprBranch) bool {
+	return b.kind == other.kind &&
+		b.window == other.window &&
+		b.fn == other.fn &&
+		b.transform.signature() == other.transform.signature()
+}
+
+type scalarTransformOp struct {
+	op         parser.ItemType
+	scalar     float64
+	scalarLeft bool
+}
+
+type scalarTransform struct {
+	ops []scalarTransformOp
+}
+
+func (t scalarTransform) identity() bool {
+	return len(t.ops) == 0
+}
+
+func (t scalarTransform) signature() string {
+	if len(t.ops) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(t.ops))
+	for _, op := range t.ops {
+		side := "right"
+		if op.scalarLeft {
+			side = "left"
+		}
+		parts = append(parts, fmt.Sprintf("%s:%s:%s", op.op.String(), side, strconv.FormatFloat(op.scalar, 'g', -1, 64)))
+	}
+	return strings.Join(parts, "|")
+}
+
+func (t scalarTransform) append(op parser.ItemType, scalar float64, scalarLeft bool) scalarTransform {
+	t.ops = append(t.ops, scalarTransformOp{op: op, scalar: scalar, scalarLeft: scalarLeft})
+	return t
+}
+
+func (t scalarTransform) apply(value string) string {
+	for _, op := range t.ops {
+		scalar := strconv.FormatFloat(op.scalar, 'g', -1, 64)
+		if op.scalarLeft {
+			value = scalarBinarySQL(op.op, scalar, value)
+		} else {
+			value = scalarBinarySQL(op.op, value, scalar)
+		}
+	}
+	return value
+}
+
+func scalarBinarySQL(op parser.ItemType, left, right string) string {
+	switch op {
+	case parser.ADD:
+		return "(" + left + " + " + right + ")"
+	case parser.SUB:
+		return "(" + left + " - " + right + ")"
+	case parser.MUL:
+		return "(" + left + " * " + right + ")"
+	case parser.DIV:
+		return "(" + left + " / " + right + ")"
+	default:
+		return left
+	}
+}
+
+func scalarArithmeticOperator(op parser.ItemType) bool {
+	switch op {
+	case parser.ADD, parser.SUB, parser.MUL, parser.DIV:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) instantSeriesExprBranches(expr parser.Expr, evalTime time.Time) ([]instantSeriesExprBranch, bool) {
+	switch e := expr.(type) {
+	case *parser.ParenExpr:
+		return s.instantSeriesExprBranches(e.Expr, evalTime)
+	case *parser.BinaryExpr:
+		if e.Op == parser.LOR {
+			if e.VectorMatching == nil || e.VectorMatching.Card != parser.CardManyToMany {
+				return nil, false
+			}
+			left, ok := s.instantSeriesExprBranches(e.LHS, evalTime)
+			if !ok {
+				return nil, false
+			}
+			right, ok := s.instantSeriesExprBranches(e.RHS, evalTime)
+			if !ok {
+				return nil, false
+			}
+			return append(left, right...), true
+		}
+	}
+	branch, ok := s.instantSeriesExprBranch(expr, evalTime)
+	if !ok {
+		return nil, false
+	}
+	return []instantSeriesExprBranch{branch}, true
+}
+
+func (s *Server) instantSeriesExprBranch(expr parser.Expr, evalTime time.Time) (instantSeriesExprBranch, bool) {
+	switch e := expr.(type) {
+	case *parser.ParenExpr:
+		return s.instantSeriesExprBranch(e.Expr, evalTime)
+	case *parser.VectorSelector:
+		if e.Anchored || e.Smoothed {
+			return instantSeriesExprBranch{}, false
+		}
+		window, ok := selectorWindowFor(e, evalTime, s.cfg.LookbackDelta)
+		if !ok {
+			return instantSeriesExprBranch{}, false
+		}
+		return instantSeriesExprBranch{kind: instantSeriesSelector, selector: e, window: window}, true
+	case *parser.Call:
+		if e.Func == nil || len(e.Args) != 1 {
+			return instantSeriesExprBranch{}, false
+		}
+		fn, ok := rangeFunctionMode(e.Func.Name)
+		if !ok {
+			return instantSeriesExprBranch{}, false
+		}
+		matrix, ok := e.Args[0].(*parser.MatrixSelector)
+		if !ok || matrix.Range <= 0 {
+			return instantSeriesExprBranch{}, false
+		}
+		selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
+		if !ok || selector.Anchored || selector.Smoothed {
+			return instantSeriesExprBranch{}, false
+		}
+		window, ok := selectorWindowFor(selector, evalTime, matrix.Range)
+		if !ok {
+			return instantSeriesExprBranch{}, false
+		}
+		return instantSeriesExprBranch{kind: instantSeriesRangeFunction, selector: selector, window: window, fn: fn}, true
+	case *parser.BinaryExpr:
+		if !scalarArithmeticOperator(e.Op) {
+			return instantSeriesExprBranch{}, false
+		}
+		if scalar, ok := finiteNumber(e.RHS); ok {
+			branch, ok := s.instantSeriesExprBranch(e.LHS, evalTime)
+			if !ok {
+				return instantSeriesExprBranch{}, false
+			}
+			branch.transform = branch.transform.append(e.Op, scalar, false)
+			return branch, true
+		}
+		if scalar, ok := finiteNumber(e.LHS); ok {
+			branch, ok := s.instantSeriesExprBranch(e.RHS, evalTime)
+			if !ok {
+				return instantSeriesExprBranch{}, false
+			}
+			branch.transform = branch.transform.append(e.Op, scalar, true)
+			return branch, true
+		}
+	}
+	return instantSeriesExprBranch{}, false
+}
+
+func (s *Server) instantSeriesExprSourceSQL(branch instantSeriesExprBranch, selectors []*parser.VectorSelector) (string, string) {
+	union := len(selectors) > 1
+	switch branch.kind {
+	case instantSeriesSelector:
+		var latest string
+		if union {
+			latest = latestSamplesForSelectedSeriesUnionSQL(s.cfg, exactMetricNamesForSelectors(selectors), branch.window.mint, branch.window.maxt)
+		} else {
+			latest = latestSamplesForSelectedSeriesSQL(s.cfg, branch.selector.LabelMatchers, branch.window.mint, branch.window.maxt)
+		}
+		return transformValueSQL(latest, branch.transform), "latest"
+	case instantSeriesRangeFunction:
+		var perSeries string
+		if union {
+			perSeries = rangeFunctionPerSeriesUnionSQL(s.cfg, branch.window, exactMetricNamesForSelectors(selectors), branch.fn)
+		} else {
+			perSeries = rangeFunctionPerSeriesSQL(s.cfg, branch.window, branch.selector.LabelMatchers, branch.fn)
+		}
+		return transformValueSQL(perSeries, branch.transform), "per_series"
+	default:
+		return "", ""
+	}
+}
+
+func transformValueSQL(source string, transform scalarTransform) string {
+	if transform.identity() {
+		return source
+	}
+	return fmt.Sprintf("SELECT id, %s AS value FROM (%s)", transform.apply("value"), source)
+}
+
 type rangeFunction struct {
 	counter bool
 	rate    bool
@@ -2071,6 +2218,10 @@ func rangeFunctionMode(name string) (rangeFunction, bool) {
 
 func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher) string {
 	source := samplesForSelectedSeriesSQL(cfg, matchers, window.mint, window.maxt)
+	return rangeFunctionSampleSourceFromSamplesSQL(source)
+}
+
+func rangeFunctionSampleSourceFromSamplesSQL(source string) string {
 	return fmt.Sprintf(
 		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id HAVING length(pts) > 1)",
 		source,
@@ -2079,6 +2230,21 @@ func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []
 
 func rangeFunctionPerSeriesSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher, fn rangeFunction) string {
 	source := rangeFunctionSampleSourceSQL(cfg, window, matchers)
+	return rangeFunctionPerSeriesFromSourceSQL(window, source, fn)
+}
+
+func rangeFunctionPerSeriesUnionSQL(cfg Config, window selectorWindow, metricNames []string, fn rangeFunction) string {
+	where := []string{teamFilter(cfg)}
+	where = append(where, sampleTimeFilters(cfg, window.mint, window.maxt)...)
+	if condition := metricNamesCondition(metricNames); condition != "" {
+		where = append(where, condition)
+	}
+	where = append(where, sampleSelectedSeriesFilters(cfg)...)
+	source := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
+	return rangeFunctionPerSeriesFromSourceSQL(window, rangeFunctionSampleSourceFromSamplesSQL(source), fn)
+}
+
+func rangeFunctionPerSeriesFromSourceSQL(window selectorWindow, source string, fn rangeFunction) string {
 	if fn.instant {
 		result := "if(last_v < prev_v, last_v, last_v - prev_v)"
 		if !fn.counter {
@@ -2142,11 +2308,28 @@ func aggregateSQL(expr *parser.AggregateExpr, valueColumn string) (string, bool)
 }
 
 func finiteNumber(expr parser.Expr) (float64, bool) {
-	lit, ok := expr.(*parser.NumberLiteral)
-	if !ok || math.IsNaN(lit.Val) || math.IsInf(lit.Val, 0) {
+	switch e := expr.(type) {
+	case *parser.NumberLiteral:
+		if math.IsNaN(e.Val) || math.IsInf(e.Val, 0) {
+			return 0, false
+		}
+		return e.Val, true
+	case *parser.UnaryExpr:
+		value, ok := finiteNumber(e.Expr)
+		if !ok {
+			return 0, false
+		}
+		switch e.Op {
+		case parser.ADD:
+			return value, true
+		case parser.SUB:
+			return -value, true
+		default:
+			return 0, false
+		}
+	default:
 		return 0, false
 	}
-	return lit.Val, true
 }
 
 func withMaxThreads(sql string, maxThreads int) string {
@@ -2257,6 +2440,173 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
+}
+
+func selectedSeriesForInstantBranchesSQL(cfg Config, branches []instantSeriesExprBranch, selectors []*parser.VectorSelector, selectParts []string) (string, bool) {
+	if len(branches) == 0 {
+		return "", false
+	}
+	if len(branches) > 1 {
+		if sql, ok := selectedSeriesExactMatcherUnionSQL(cfg, selectors, selectParts); ok {
+			return sql, true
+		}
+	}
+
+	selectedParts := make([]string, 0, len(branches))
+	for _, branch := range branches {
+		selectedSeries, ok := selectedSeriesSQL(cfg, branch.selector.LabelMatchers, branch.window.mint, branch.window.maxt, selectParts)
+		if !ok {
+			return "", false
+		}
+		selectedParts = append(selectedParts, selectedSeries)
+	}
+	if len(selectedParts) == 1 {
+		return selectedParts[0], true
+	}
+	return strings.Join(selectedParts, " UNION DISTINCT "), true
+}
+
+type exactLabelMatcher struct {
+	name  string
+	value string
+}
+
+type exactSelectorMatcherSet struct {
+	metric string
+	labels []exactLabelMatcher
+}
+
+func selectedSeriesExactMatcherUnionSQL(cfg Config, selectors []*parser.VectorSelector, selectParts []string) (string, bool) {
+	if len(selectors) < 2 || selectedSeriesNeedsBounds(selectParts) {
+		return "", false
+	}
+	sets := make([]exactSelectorMatcherSet, 0, len(selectors))
+	metricNames := make([]string, 0, len(selectors))
+	seenMetrics := make(map[string]struct{}, len(selectors))
+	for _, selector := range selectors {
+		set, ok := exactSelectorMatcherSetFor(selector.LabelMatchers)
+		if !ok {
+			return "", false
+		}
+		sets = append(sets, set)
+		if _, ok := seenMetrics[set.metric]; !ok {
+			seenMetrics[set.metric] = struct{}{}
+			metricNames = append(metricNames, set.metric)
+		}
+	}
+
+	matchedIDs := exactMatcherUnionIDsSQL(cfg, sets)
+	if selectPartsIDOnly(selectParts) {
+		return "SELECT id FROM (" + matchedIDs + ") GROUP BY id", true
+	}
+
+	where := []string{teamFilter(cfg), "id IN (" + matchedIDs + ")"}
+	if condition := metricNamesCondition(metricNames); condition != "" {
+		where = append(where, condition)
+	}
+	return fmt.Sprintf(
+		"SELECT %s FROM (SELECT id, metric_name, labels_json, min_time, max_time FROM %s WHERE %s) GROUP BY id",
+		strings.Join(selectedSeriesProjection(selectParts), ", "),
+		tableName(cfg.CHDatabase, cfg.SeriesTable),
+		strings.Join(where, " AND "),
+	), true
+}
+
+func selectPartsIDOnly(selectParts []string) bool {
+	return len(selectParts) == 1 && selectParts[0] == "id"
+}
+
+func exactSelectorMatcherSetFor(matchers []*labels.Matcher) (exactSelectorMatcherSet, bool) {
+	if len(matchers) == 0 {
+		return exactSelectorMatcherSet{}, false
+	}
+	var metric string
+	seenLabels := make(map[string]struct{}, len(matchers))
+	labelMatchers := make([]exactLabelMatcher, 0, len(matchers))
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) {
+			continue
+		}
+		if matcher.Name == labels.MetricName {
+			if matcher.Type != labels.MatchEqual || matcher.Value == "" {
+				return exactSelectorMatcherSet{}, false
+			}
+			if metric != "" && metric != matcher.Value {
+				return exactSelectorMatcherSet{}, false
+			}
+			metric = matcher.Value
+			continue
+		}
+		if matcher.Name == "" || matcher.Type != labels.MatchEqual || matcher.Matches("") {
+			return exactSelectorMatcherSet{}, false
+		}
+		if _, ok := seenLabels[matcher.Name]; ok {
+			return exactSelectorMatcherSet{}, false
+		}
+		seenLabels[matcher.Name] = struct{}{}
+		labelMatchers = append(labelMatchers, exactLabelMatcher{name: matcher.Name, value: matcher.Value})
+	}
+	if metric == "" || len(labelMatchers) == 0 {
+		return exactSelectorMatcherSet{}, false
+	}
+	return exactSelectorMatcherSet{metric: metric, labels: labelMatchers}, true
+}
+
+func exactMatcherUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string {
+	matcherRows := make([]string, 0, len(sets))
+	metricNames := make([]string, 0, len(sets))
+	labelNames := make([]string, 0, len(sets))
+	labelValues := make([]string, 0, len(sets))
+	seenMetricNames := make(map[string]struct{}, len(sets))
+	seenLabelNames := make(map[string]struct{}, len(sets))
+	seenLabelValues := make(map[string]struct{}, len(sets))
+	for branch, set := range sets {
+		if _, ok := seenMetricNames[set.metric]; !ok {
+			seenMetricNames[set.metric] = struct{}{}
+			metricNames = append(metricNames, set.metric)
+		}
+		for _, matcher := range set.labels {
+			if _, ok := seenLabelNames[matcher.name]; !ok {
+				seenLabelNames[matcher.name] = struct{}{}
+				labelNames = append(labelNames, matcher.name)
+			}
+			if _, ok := seenLabelValues[matcher.value]; !ok {
+				seenLabelValues[matcher.value] = struct{}{}
+				labelValues = append(labelValues, matcher.value)
+			}
+			matcherRows = append(matcherRows, fmt.Sprintf(
+				"(%d, %d, %s, %s, %s)",
+				branch,
+				len(set.labels),
+				sqlString(set.metric),
+				sqlString(matcher.name),
+				sqlString(matcher.value),
+			))
+		}
+	}
+	where := []string{teamFilter(cfg)}
+	if condition := metricNamesCondition(metricNames); condition != "" {
+		where = append(where, condition)
+	}
+	where = append(where, inCondition("label_name", labelNames))
+	where = append(where, inCondition("label_value", labelValues))
+	return fmt.Sprintf(
+		"SELECT id FROM (SELECT mr.branch AS branch, li.id AS id, mr.matcher_count AS matcher_count FROM %s AS li INNER JOIN %s AS mr ON li.metric_name = mr.metric_name AND li.label_name = mr.label_name AND li.label_value = mr.label_value WHERE %s GROUP BY branch, id, matcher_count HAVING uniqExact(li.label_name) = matcher_count) GROUP BY id",
+		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+		"values('branch UInt32, matcher_count UInt32, metric_name String, label_name String, label_value String', "+strings.Join(matcherRows, ", ")+")",
+		strings.Join(where, " AND "),
+	)
+}
+
+func inCondition(column string, values []string) string {
+	if len(values) == 1 {
+		return column + " = " + sqlString(values[0])
+	}
+	quoted := make([]string, 0, len(values))
+	for _, value := range values {
+		quoted = append(quoted, sqlString(value))
+	}
+	return column + " IN (" + strings.Join(quoted, ",") + ")"
 }
 
 func selectedSeriesNeedsBounds(selectParts []string) bool {

@@ -254,6 +254,9 @@ accepting a change.
 - `TSBS_START`, `TSBS_END`, `TSBS_INTERVAL`, `TSBS_SEED`: generated data shape.
 - `BRIDGE_BENCH_TSBS_UNION_SELECTORS`: host selector count for the
   `tsbs_instant_or_union` query. Default `32`.
+- `BRIDGE_BENCH_TSBS_UNION_RANGE` and `BRIDGE_BENCH_TSBS_UNION_DIVISOR`:
+  range-function window and scalar divisor for `tsbs_instant_or_union`.
+  Defaults `5m` and `5`.
 - `TSBS_WORKERS`: concurrent remote-write workers. Default `2`.
 - `TSBS_BATCH_SIZE`: TimeSeries messages per remote-write request. Default
   `10000`.

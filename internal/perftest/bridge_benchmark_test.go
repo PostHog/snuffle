@@ -35,13 +35,15 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 	rangeEnd := envString("BRIDGE_BENCH_TSBS_RANGE_END", eval)
 	step := envString("BRIDGE_BENCH_TSBS_STEP", "15s")
 	unionSelectors := envInt("BRIDGE_BENCH_TSBS_UNION_SELECTORS", 32, 2)
+	unionRange := envString("BRIDGE_BENCH_TSBS_UNION_RANGE", "5m")
+	unionDivisor := envString("BRIDGE_BENCH_TSBS_UNION_DIVISOR", "5")
 
 	hostSelector := fmt.Sprintf(`%s{hostname=%q}`, metric, host)
 	metricSelector := fmt.Sprintf(`%s`, metric)
 	sumByRegion := fmt.Sprintf(`sum by (region) (%s)`, metric)
 	avgByEnvironment := fmt.Sprintf(`avg by (service_environment) (%s)`, metric)
 	topk := fmt.Sprintf(`topk(10, %s)`, metric)
-	instantUnion := tsbsInstantUnionQuery(metric, unionSelectors)
+	instantUnion := tsbsInstantUnionQuery(metric, unionSelectors, unionRange, unionDivisor)
 	nestedCountHostname := fmt.Sprintf(`count(count(%s) by (hostname))`, metric)
 	nestedCountRegion := fmt.Sprintf(`count(count(%s) by (region))`, metric)
 	nestedCountFilteredHostname := fmt.Sprintf(`count(count(%s{service_environment="production"}) by (hostname))`, metric)
@@ -62,20 +64,21 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 	}
 }
 
-func tsbsInstantUnionQuery(metric string, selectors int) string {
+func tsbsInstantUnionQuery(metric string, selectors int, window, divisor string) string {
 	parts := make([]string, 0, selectors)
 	for i := range selectors {
-		parts = append(parts, fmt.Sprintf(`%s{hostname=%q}`, metric, fmt.Sprintf("host_%d", i)))
+		selector := fmt.Sprintf(`%s{hostname=%q}`, metric, fmt.Sprintf("host_%d", i))
+		parts = append(parts, fmt.Sprintf(`increase(%s[%s]) / %s`, selector, window, divisor))
 	}
-	return fmt.Sprintf(`max by (hostname) (%s)`, strings.Join(parts, " or "))
+	return fmt.Sprintf(`sum by (hostname) (%s)`, strings.Join(parts, " or "))
 }
 
 func TestTSBSInstantUnionQueryUsesLargeInstantAggregateUnion(t *testing.T) {
-	query := tsbsInstantUnionQuery("usage_user", 32)
+	query := tsbsInstantUnionQuery("usage_user", 32, "5m", "5")
 	for _, want := range []string{
-		`max by (hostname) (`,
-		`usage_user{hostname="host_0"}`,
-		`usage_user{hostname="host_31"}`,
+		`sum by (hostname) (`,
+		`increase(usage_user{hostname="host_0"}[5m]) / 5`,
+		`increase(usage_user{hostname="host_31"}[5m]) / 5`,
 	} {
 		if !strings.Contains(query, want) {
 			t.Fatalf("query does not contain %q:\n%s", want, query)

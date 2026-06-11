@@ -491,6 +491,145 @@ func TestLatestSamplesForSelectedSeriesUnionSQLFiltersSelectedIDsAndMetricNames(
 	}
 }
 
+func TestSelectedSeriesExactMatcherUnionSQLUsesSingleLabelIndexScan(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		TeamID:          42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (topic, consumer_group) (
+		increase(warpstream_consumer_group_max_offset{topic="a",consumer_group="a_ws"}[5m]) / 5
+		or
+		increase(warpstream_consumer_group_max_offset{topic="b",consumer_group="b_ws"}[5m]) / 5
+	)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	s := &Server{cfg: Config{LookbackDelta: 5 * time.Minute}}
+	branches, ok := s.instantSeriesExprBranches(aggregate.Expr, time.Unix(1700000000, 0).UTC())
+	if !ok {
+		t.Fatal("instantSeriesExprBranches returned ok=false")
+	}
+	selectors := []*parser.VectorSelector{branches[0].selector, branches[1].selector}
+
+	sql, ok := selectedSeriesExactMatcherUnionSQL(cfg, selectors, []string{"id"})
+	if !ok {
+		t.Fatal("selectedSeriesExactMatcherUnionSQL returned ok=false")
+	}
+	for _, want := range []string{
+		"`default`.`label_index` AS li",
+		"INNER JOIN values('branch UInt32, matcher_count UInt32, metric_name String, label_name String, label_value String'",
+		"(0, 2, 'warpstream_consumer_group_max_offset', 'topic', 'a')",
+		"li.metric_name = mr.metric_name",
+		"li.label_name = mr.label_name",
+		"li.label_value = mr.label_value",
+		"metric_name = 'warpstream_consumer_group_max_offset'",
+		"label_name IN ('topic','consumer_group')",
+		"label_value IN ('a','a_ws','b','b_ws')",
+		"uniqExact(li.label_name) = matcher_count",
+		"topic",
+		"consumer_group",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "`default`.`series`") {
+		t.Fatalf("id-only exact matcher union should not scan series table:\n%s", sql)
+	}
+}
+
+func TestSelectedSeriesExactMatcherUnionSQLRejectsNonExactMatchers(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum(up{job=~"api|worker"} or up{job="db"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	selectors, ok := orVectorSelectors(aggregate.Expr)
+	if !ok {
+		t.Fatal("orVectorSelectors returned ok=false")
+	}
+	if sql, ok := selectedSeriesExactMatcherUnionSQL(Config{}, selectors, []string{"id"}); ok {
+		t.Fatalf("selectedSeriesExactMatcherUnionSQL returned ok=true with SQL:\n%s", sql)
+	}
+}
+
+func TestInstantSeriesExprBranchesSupportRangeFunctionScalarUnion(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SamplesTable:    "samples",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		LookbackDelta:   5 * time.Minute,
+		TeamID:          42,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (topic, consumer_group) (
+		increase(warpstream_consumer_group_max_offset{topic="a",consumer_group="a_ws"}[5m]) / 5
+		or
+		increase(warpstream_consumer_group_max_offset{topic="b",consumer_group="b_ws"}[5m]) / 5
+	)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	branches, ok := s.instantSeriesExprBranches(aggregate.Expr, time.Unix(1700000000, 0).UTC())
+	if !ok {
+		t.Fatal("instantSeriesExprBranches returned ok=false")
+	}
+	if len(branches) != 2 {
+		t.Fatalf("branch count = %d, want 2", len(branches))
+	}
+	if !branches[0].equivalentTo(branches[1]) {
+		t.Fatalf("branches should have equivalent range-function/scalar shape: %#v vs %#v", branches[0], branches[1])
+	}
+	if branches[0].kind != instantSeriesRangeFunction || branches[0].transform.identity() {
+		t.Fatalf("branch did not capture range-function scalar transform: %#v", branches[0])
+	}
+	source, sourceName := s.instantSeriesExprSourceSQL(branches[0], []*parser.VectorSelector{branches[0].selector, branches[1].selector})
+	if sourceName != "per_series" {
+		t.Fatalf("sourceName = %q, want per_series", sourceName)
+	}
+	for _, want := range []string{
+		"`default`.`samples`",
+		"metric_name = 'warpstream_consumer_group_max_offset'",
+		"id IN (SELECT id FROM selected_series)",
+		"arraySort",
+		"reset_correction",
+		"SELECT id, (value / 5) AS value",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("source SQL does not contain %q:\n%s", want, source)
+		}
+	}
+}
+
+func TestInstantSeriesExprBranchesRejectMixedUnionComputations(t *testing.T) {
+	cfg := Config{LookbackDelta: 5 * time.Minute}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum(increase(up{job="api"}[5m]) / 5 or rate(up{job="worker"}[5m]))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	branches, ok := s.instantSeriesExprBranches(aggregate.Expr, time.Unix(1700000000, 0).UTC())
+	if !ok {
+		t.Fatal("instantSeriesExprBranches returned ok=false")
+	}
+	if len(branches) != 2 {
+		t.Fatalf("branch count = %d, want 2", len(branches))
+	}
+	if branches[0].equivalentTo(branches[1]) {
+		t.Fatalf("mixed increase/division and rate branches should not be equivalent: %#v vs %#v", branches[0], branches[1])
+	}
+}
+
 func TestExactMetricNamesForSelectorsRequiresExactMetrics(t *testing.T) {
 	p := parser.NewParser(parser.Options{})
 	expr, err := p.ParseExpr(`sum(up{job="api"} or process_start_time_seconds{job="api"})`)
