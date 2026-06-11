@@ -54,6 +54,7 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 		{name: "tsbs_avg_by_environment", path: "/api/v1/query", params: map[string]string{"query": avgByEnvironment, "time": eval}},
 		{name: "tsbs_topk", path: "/api/v1/query", params: map[string]string{"query": topk, "time": eval}},
 		{name: "tsbs_instant_or_union", path: "/api/v1/query", params: map[string]string{"query": instantUnion, "time": eval}},
+		{name: "tsbs_range_or_union", path: "/api/v1/query_range", params: map[string]string{"query": instantUnion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_range_selector", path: "/api/v1/query_range", params: map[string]string{"query": hostSelector, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_range_sum_by_region", path: "/api/v1/query_range", params: map[string]string{"query": sumByRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountHostname, "start": rangeStart, "end": rangeEnd, "step": step}},

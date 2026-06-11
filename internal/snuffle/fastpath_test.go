@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"context"
 	"strconv"
 	"strings"
 	"testing"
@@ -9,7 +10,7 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
-func TestOrVectorSelectorsFlattensSelectorUnion(t *testing.T) {
+func TestSeriesExprBranchesFlattenSelectorUnion(t *testing.T) {
 	p := parser.NewParser(parser.Options{})
 	expr, err := p.ParseExpr(`sum by (job) ((up{job="api"} or up{job="worker"} or process_start_time_seconds{job="api"}))`)
 	if err != nil {
@@ -20,12 +21,33 @@ func TestOrVectorSelectorsFlattensSelectorUnion(t *testing.T) {
 		t.Fatalf("expr is %T, want *parser.AggregateExpr", expr)
 	}
 
-	selectors, ok := orVectorSelectors(aggregate.Expr)
+	branches, ok := seriesExprBranches(aggregate.Expr)
 	if !ok {
-		t.Fatal("orVectorSelectors returned ok=false")
+		t.Fatal("seriesExprBranches returned ok=false")
 	}
-	if len(selectors) != 3 {
-		t.Fatalf("selector count = %d, want 3", len(selectors))
+	if len(branches) != 3 {
+		t.Fatalf("branch count = %d, want 3", len(branches))
+	}
+	for _, branch := range branches {
+		if branch.kind != seriesExprSelector || !branch.transform.identity() {
+			t.Fatalf("plain selector branch parsed as %#v", branch)
+		}
+	}
+}
+
+func TestSeriesExprBranchesRejectMatchingModifiers(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	for _, query := range []string{
+		`up{job="api"} or on (job) up{job="worker"}`,
+		`up{job="api"} or ignoring (instance) up{job="worker"}`,
+	} {
+		expr, err := p.ParseExpr(query)
+		if err != nil {
+			t.Fatalf("ParseExpr(%q) returned error: %v", query, err)
+		}
+		if branches, ok := seriesExprBranches(expr); ok {
+			t.Fatalf("seriesExprBranches(%q) = %#v, want rejection", query, branches)
+		}
 	}
 }
 
@@ -43,12 +65,18 @@ func TestFastAggregateRangeUnionRejectsLargeUnions(t *testing.T) {
 	if !ok {
 		t.Fatalf("expr is %T, want *parser.AggregateExpr", expr)
 	}
-	selectors, ok := orVectorSelectors(aggregate.Expr)
+	branches, ok := seriesExprBranches(aggregate.Expr)
 	if !ok {
-		t.Fatal("orVectorSelectors returned ok=false")
+		t.Fatal("seriesExprBranches returned ok=false")
 	}
-	if len(selectors) <= maxAggregateUnionSelectors {
-		t.Fatalf("selector count = %d, want more than fast-path cap", len(selectors))
+	if len(branches) <= maxAggregateUnionSelectors {
+		t.Fatalf("branch count = %d, want more than fast-path cap", len(branches))
+	}
+
+	s := &Server{cfg: Config{LookbackDelta: 5 * time.Minute}}
+	start := time.Unix(1700000000, 0).UTC()
+	if _, handled, err := s.tryFastAggregateRangeUnionQuery(context.Background(), aggregate, start, start.Add(time.Hour), time.Minute, time.Minute.Milliseconds(), "sum(sample_value)"); handled || err != nil {
+		t.Fatalf("tryFastAggregateRangeUnionQuery handled=%v err=%v, want unhandled", handled, err)
 	}
 }
 
@@ -550,10 +578,7 @@ func TestSelectedSeriesExactMatcherUnionSQLRejectsNonExactMatchers(t *testing.T)
 		t.Fatalf("ParseExpr returned error: %v", err)
 	}
 	aggregate := expr.(*parser.AggregateExpr)
-	selectors, ok := orVectorSelectors(aggregate.Expr)
-	if !ok {
-		t.Fatal("orVectorSelectors returned ok=false")
-	}
+	selectors := branchSelectors(t, aggregate.Expr)
 	if sql, ok := selectedSeriesExactMatcherUnionSQL(Config{}, selectors, []string{"id"}); ok {
 		t.Fatalf("selectedSeriesExactMatcherUnionSQL returned ok=true with SQL:\n%s", sql)
 	}
@@ -610,6 +635,134 @@ func TestInstantSeriesExprBranchesSupportRangeFunctionScalarUnion(t *testing.T) 
 	}
 }
 
+func TestRangeUnionSupportsRangeFunctionScalarBranches(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SamplesTable:    "samples",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		LookbackDelta:   5 * time.Minute,
+		TeamID:          42,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (topic, consumer_group) (
+		increase(warpstream_consumer_group_max_offset{topic="a",consumer_group="a_ws"}[5m]) / 5
+		or
+		increase(warpstream_consumer_group_max_offset{topic="b",consumer_group="b_ws"}[5m]) / 5
+	)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	branches, ok := seriesExprBranches(aggregate.Expr)
+	if !ok {
+		t.Fatal("seriesExprBranches returned ok=false")
+	}
+	if len(branches) != 2 {
+		t.Fatalf("branch count = %d, want 2", len(branches))
+	}
+	if !branches[0].equivalentTo(branches[1]) {
+		t.Fatalf("branches should have equivalent range-function/scalar shape: %#v vs %#v", branches[0], branches[1])
+	}
+
+	start := time.Unix(1700000000, 0).UTC()
+	end := start.Add(time.Hour)
+	step := time.Minute
+	source, mint, maxt, ok := s.rangeUnionBranchSource(branches[0], start, end, step)
+	if !ok {
+		t.Fatal("rangeUnionBranchSource returned ok=false")
+	}
+	otherSource, otherMint, otherMaxt, ok := s.rangeUnionBranchSource(branches[1], start, end, step)
+	if !ok || otherMint != mint || otherMaxt != maxt || otherSource.gridExpr != source.gridExpr {
+		t.Fatalf("equivalent branches should produce the same grid source: %q vs %q", source.gridExpr, otherSource.gridExpr)
+	}
+	if !source.filterStaleSamples {
+		t.Fatal("range-function branch should filter stale samples")
+	}
+	for _, want := range []string{"timeSeriesRateToGrid", "x * 300", "(x / 5)"} {
+		if !strings.Contains(source.gridExpr, want) {
+			t.Fatalf("grid expression does not contain %q:\n%s", want, source.gridExpr)
+		}
+	}
+
+	selectors := branchSelectors(t, aggregate.Expr)
+	windows := []selectorWindow{{mint: mint, maxt: maxt}, {mint: mint, maxt: maxt}}
+	selectedSeries, ok := selectedSeriesUnionSQL(cfg, selectors, windows, []string{"id"})
+	if !ok {
+		t.Fatal("selectedSeriesUnionSQL returned ok=false")
+	}
+	sampleSource := samplesForSelectedSeriesUnionSQL(cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
+	sql := fastAggregateRangeSQL(cfg, aggregate, selectedSeries, nil, source, sampleSource, start, step.Milliseconds(), "sum(sample_value)")
+	for _, want := range []string{
+		"`default`.`samples`",
+		"metric_name = 'warpstream_consumer_group_max_offset'",
+		"id IN (SELECT id FROM selected_series)",
+		"timeSeriesRateToGrid",
+		"(x / 5)",
+		"GROUP BY `__group_0`, `__group_1`, idx",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+}
+
+func TestRangeUnionRejectsMixedBranches(t *testing.T) {
+	s := &Server{cfg: Config{LookbackDelta: 5 * time.Minute}}
+	p := parser.NewParser(parser.Options{})
+	start := time.Unix(1700000000, 0).UTC()
+	for _, query := range []string{
+		`sum(increase(up{job="api"}[5m]) / 5 or rate(up{job="worker"}[5m]))`,
+		`sum(increase(up{job="api"}[5m]) / 5 or increase(up{job="worker"}[10m]) / 5)`,
+		`sum(increase(up{job="api"}[5m]) / 5 or increase(up{job="worker"}[5m]) / 6)`,
+		`sum(increase(up{job="api"}[5m]) / 5 or increase(up{job="worker"}[5m] offset 1m) / 5)`,
+	} {
+		expr, err := p.ParseExpr(query)
+		if err != nil {
+			t.Fatalf("ParseExpr(%q) returned error: %v", query, err)
+		}
+		aggregate := expr.(*parser.AggregateExpr)
+		if _, handled, err := s.tryFastAggregateRangeUnionQuery(context.Background(), aggregate, start, start.Add(time.Hour), time.Minute, time.Minute.Milliseconds(), "sum(sample_value)"); handled || err != nil {
+			t.Fatalf("tryFastAggregateRangeUnionQuery(%q) handled=%v err=%v, want unhandled", query, handled, err)
+		}
+	}
+}
+
+func TestRangeUnionSupportsSingleScalarTransformBranch(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SamplesTable:    "samples",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		LookbackDelta:   5 * time.Minute,
+		TeamID:          42,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (job) (increase(up{job="api"}[5m]) / 5)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	branches, ok := seriesExprBranches(aggregate.Expr)
+	if !ok || len(branches) != 1 {
+		t.Fatalf("branches = %#v ok=%v, want one branch", branches, ok)
+	}
+	if branches[0].transform.identity() {
+		t.Fatal("branch should capture the scalar transform")
+	}
+
+	start := time.Unix(1700000000, 0).UTC()
+	source, _, _, ok := s.rangeUnionBranchSource(branches[0], start, start.Add(time.Hour), time.Minute)
+	if !ok {
+		t.Fatal("rangeUnionBranchSource returned ok=false")
+	}
+	if !strings.Contains(source.gridExpr, "(x / 5)") {
+		t.Fatalf("grid expression does not apply transform:\n%s", source.gridExpr)
+	}
+}
+
 func TestInstantSeriesExprBranchesRejectMixedUnionComputations(t *testing.T) {
 	cfg := Config{LookbackDelta: 5 * time.Minute}
 	s := &Server{cfg: cfg}
@@ -638,11 +791,7 @@ func TestExactMetricNamesForSelectorsRequiresExactMetrics(t *testing.T) {
 		t.Fatalf("ParseExpr returned error: %v", err)
 	}
 	aggregate := expr.(*parser.AggregateExpr)
-	selectors, ok := orVectorSelectors(aggregate.Expr)
-	if !ok {
-		t.Fatal("orVectorSelectors returned ok=false")
-	}
-	names := exactMetricNamesForSelectors(selectors)
+	names := exactMetricNamesForSelectors(branchSelectors(t, aggregate.Expr))
 	if got, want := strings.Join(names, ","), "up,process_start_time_seconds"; got != want {
 		t.Fatalf("exactMetricNamesForSelectors = %q, want %q", got, want)
 	}
@@ -652,13 +801,22 @@ func TestExactMetricNamesForSelectorsRequiresExactMetrics(t *testing.T) {
 		t.Fatalf("ParseExpr returned error: %v", err)
 	}
 	aggregate = expr.(*parser.AggregateExpr)
-	selectors, ok = orVectorSelectors(aggregate.Expr)
-	if !ok {
-		t.Fatal("orVectorSelectors returned ok=false")
-	}
-	if names := exactMetricNamesForSelectors(selectors); names != nil {
+	if names := exactMetricNamesForSelectors(branchSelectors(t, aggregate.Expr)); names != nil {
 		t.Fatalf("exactMetricNamesForSelectors = %#v, want nil", names)
 	}
+}
+
+func branchSelectors(t *testing.T, expr parser.Expr) []*parser.VectorSelector {
+	t.Helper()
+	branches, ok := seriesExprBranches(expr)
+	if !ok {
+		t.Fatal("seriesExprBranches returned ok=false")
+	}
+	selectors := make([]*parser.VectorSelector, 0, len(branches))
+	for _, branch := range branches {
+		selectors = append(selectors, branch.selector)
+	}
+	return selectors
 }
 
 func TestPostHogSampleGroupSQLSupportsMapLabels(t *testing.T) {

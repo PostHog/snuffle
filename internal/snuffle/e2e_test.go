@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -95,6 +97,7 @@ func TestEndToEndClickHouse(t *testing.T) {
 
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
+	assertUnionQueries(t, api.URL)
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
@@ -306,6 +309,69 @@ func assertRangeQuery(t *testing.T, baseURL string) {
 	}
 	if got := sampleString(data.Result[0].Values[1]); got != "25" {
 		t.Fatalf("range query final value = %q", got)
+	}
+}
+
+func assertUnionQueries(t *testing.T, baseURL string) {
+	t.Helper()
+	// The fast union path handles plain `or`; `or on (job, instance)` is
+	// rejected and evaluated by the Prometheus engine, so the two spellings of
+	// the same expression must agree.
+	fastBody := `increase(` + e2eCounterMetric + `{job="api"}[2m]) / 5 or increase(` + e2eCounterMetric + `{job="none"}[2m]) / 5`
+	engineBody := `increase(` + e2eCounterMetric + `{job="api"}[2m]) / 5 or on (job, instance) increase(` + e2eCounterMetric + `{job="none"}[2m]) / 5`
+
+	rangeParams := func(query string) url.Values {
+		return url.Values{
+			"query": {`sum by (job) (` + query + `)`},
+			"start": {"1700000010"},
+			"end":   {"1700000130"},
+			"step":  {"10s"},
+		}
+	}
+	fast := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", rangeParams(fastBody))
+	engine := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", rangeParams(engineBody))
+	if fast.ResultType != "matrix" || len(fast.Result) != 1 || len(fast.Result[0].Values) == 0 {
+		t.Fatalf("range union query result = %#v", fast)
+	}
+	if got := fast.Result[0].Metric["job"]; got != "api" {
+		t.Fatalf("range union query job = %q", got)
+	}
+	assertSameSampleValues(t, "range union", fast.Result[0].Values, engine.Result[0].Values)
+
+	instantParams := func(query string) url.Values {
+		return url.Values{
+			"query": {`sum by (job) (` + query + `)`},
+			"time":  {"1700000070"},
+		}
+	}
+	fastInstant := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", instantParams(fastBody))
+	engineInstant := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", instantParams(engineBody))
+	if fastInstant.ResultType != "vector" || len(fastInstant.Result) != 1 {
+		t.Fatalf("instant union query result = %#v", fastInstant)
+	}
+	assertSameSampleValues(t, "instant union", [][]any{fastInstant.Result[0].Value}, [][]any{engineInstant.Result[0].Value})
+}
+
+func assertSameSampleValues(t *testing.T, name string, got, want [][]any) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s sample count = %d, want %d (got %#v, want %#v)", name, len(got), len(want), got, want)
+	}
+	for i := range got {
+		if gotTS, wantTS := fmt.Sprint(got[i][0]), fmt.Sprint(want[i][0]); gotTS != wantTS {
+			t.Fatalf("%s sample %d timestamp = %s, want %s", name, i, gotTS, wantTS)
+		}
+		gotValue, err := strconv.ParseFloat(sampleString(got[i]), 64)
+		if err != nil {
+			t.Fatalf("%s sample %d value parse: %v", name, i, err)
+		}
+		wantValue, err := strconv.ParseFloat(sampleString(want[i]), 64)
+		if err != nil {
+			t.Fatalf("%s sample %d want value parse: %v", name, i, err)
+		}
+		if diff := math.Abs(gotValue - wantValue); diff > 1e-9*math.Max(math.Abs(gotValue), math.Abs(wantValue))+1e-12 {
+			t.Fatalf("%s sample %d value = %v, want %v", name, i, gotValue, wantValue)
+		}
 	}
 }
 
