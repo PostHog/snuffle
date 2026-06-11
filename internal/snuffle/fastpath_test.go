@@ -435,34 +435,7 @@ func TestAggregateRangeSourceSQLWrapsRunningSum(t *testing.T) {
 	}
 }
 
-func TestAggregateRangeSourceSQLRunningSumDeltaUsesPreviousSample(t *testing.T) {
-	cfg := Config{
-		LookbackDelta:       5 * time.Minute,
-		RemoteWriteInterval: 15 * time.Second,
-	}
-	s := newServer(cfg)
-	p := parser.NewParser(parser.Options{})
-	expr, err := p.ParseExpr(`quantile(1, running_sum(delta(node_cpu_seconds_total{ready=~"true"}[15s])))`)
-	if err != nil {
-		t.Fatalf("ParseExpr returned error: %v", err)
-	}
-	aggregate := expr.(*parser.AggregateExpr)
-
-	start := time.Unix(1700000000, 0).UTC()
-	end := time.Unix(1700000060, 0).UTC()
-	source, _, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
-	if !ok {
-		t.Fatal("aggregateRangeSourceSQL returned ok=false")
-	}
-	if mint != start.Add(-30*time.Second).UnixMilli() || maxt != end.UnixMilli() {
-		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
-	}
-	if !strings.Contains(source.gridExpr, ", 15, 30)(timestamp, value)") {
-		t.Fatalf("delta grid should include one previous sample interval:\n%s", source.gridExpr)
-	}
-}
-
-func TestAggregateRangeSourceSQLPlainDeltaDoesNotUsePreviousSample(t *testing.T) {
+func TestAggregateRangeSourceSQLDeltaUsesPreviousSample(t *testing.T) {
 	cfg := Config{
 		LookbackDelta:       5 * time.Minute,
 		RemoteWriteInterval: 15 * time.Second,
@@ -481,11 +454,11 @@ func TestAggregateRangeSourceSQLPlainDeltaDoesNotUsePreviousSample(t *testing.T)
 	if !ok {
 		t.Fatal("aggregateRangeSourceSQL returned ok=false")
 	}
-	if mint != start.Add(-15*time.Second).UnixMilli() || maxt != end.UnixMilli() {
+	if mint != start.Add(-30*time.Second).UnixMilli() || maxt != end.UnixMilli() {
 		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
 	}
-	if !strings.Contains(source.gridExpr, ", 15, 15)(timestamp, value)") {
-		t.Fatalf("plain delta grid should keep the requested range:\n%s", source.gridExpr)
+	if !strings.Contains(source.gridExpr, ", 15, 30)(timestamp, value)") {
+		t.Fatalf("delta grid should include one previous sample interval:\n%s", source.gridExpr)
 	}
 }
 
@@ -541,6 +514,38 @@ func TestAggregateRangeSourceSQLWrapsSumOverTimeSubquery(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
+	}
+}
+
+func TestAggregateRangeSourceSQLSumOverTimeDeltaUsesPreviousSample(t *testing.T) {
+	cfg := Config{
+		LookbackDelta:       5 * time.Minute,
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	s := newServer(cfg)
+	expr, rewritten, err := s.parseFastRangeExpr(`quantile(1, sum_over_time(delta(node_cpu_seconds_total{ready=~"true"}[15s])[5m]))`, 15*time.Second)
+	if err != nil {
+		t.Fatalf("parseFastRangeExpr returned error: %v", err)
+	}
+	if !rewritten {
+		t.Fatal("parseFastRangeExpr should rewrite the MetricsQL implicit subquery step")
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+
+	start := time.Unix(1700000000, 0).UTC()
+	end := time.Unix(1700000060, 0).UTC()
+	source, _, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if source.sumOverTime == nil {
+		t.Fatal("sum_over_time over a subquery should mark the range source for rollup wrapping")
+	}
+	if mint != start.Add(-5*time.Minute-30*time.Second).UnixMilli() || maxt != end.UnixMilli() {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+	if !strings.Contains(source.gridExpr, ", 15, 30)(timestamp, value)") {
+		t.Fatalf("delta subquery grid should include one previous sample interval:\n%s", source.gridExpr)
 	}
 }
 

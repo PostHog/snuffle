@@ -1808,10 +1808,6 @@ type selectorGridSource struct {
 	end   time.Time
 }
 
-type aggregateRangeSourceOptions struct {
-	metricsQLPreviousSample bool
-}
-
 type aggregateRangeSource struct {
 	gridExpr           string
 	gridStart          time.Time
@@ -1830,10 +1826,6 @@ type rangeSourceSumOverTime struct {
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
-	return s.aggregateRangeSourceSQLWithOptions(expr, start, end, step, aggregateRangeSourceOptions{})
-}
-
-func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end time.Time, step time.Duration, opts aggregateRangeSourceOptions) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
 	if selector, ok := expr.(*parser.VectorSelector); ok {
 		source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
 		if !ok {
@@ -1847,9 +1839,7 @@ func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
 	if call.Func.Name == "running_sum" {
-		childOpts := opts
-		childOpts.metricsQLPreviousSample = true
-		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQLWithOptions(call.Args[0], start, end, step, childOpts)
+		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(call.Args[0], start, end, step)
 		if !ok {
 			return aggregateRangeSource{}, nil, 0, 0, false
 		}
@@ -1857,7 +1847,7 @@ func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end
 		return source, selector, mint, maxt, true
 	}
 	if call.Func.Name == "sum_over_time" {
-		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step, opts)
+		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step)
 	}
 	fn, ok := rangeGridFunction(call.Func.Name)
 	if !ok {
@@ -1877,7 +1867,7 @@ func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end
 	}
 	shiftedStart := start.Add(-offset)
 	shiftedEnd := end.Add(-offset)
-	gridRange := matrix.Range + metricsQLPreviousSampleLookback(s.cfg, opts, fn)
+	gridRange := matrix.Range + previousSampleLookback(s.cfg, fn)
 	mint := shiftedStart.Add(-gridRange).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
 	rangeSeconds := formatDurationSeconds(gridRange)
@@ -1895,14 +1885,14 @@ func (s *Server) aggregateRangeSourceSQLWithOptions(expr parser.Expr, start, end
 	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step, filterStaleSamples: true}, selector, mint, maxt, true
 }
 
-func metricsQLPreviousSampleLookback(cfg Config, opts aggregateRangeSourceOptions, fn rangeGridFunctionSpec) time.Duration {
-	if !opts.metricsQLPreviousSample || !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
+func previousSampleLookback(cfg Config, fn rangeGridFunctionSpec) time.Duration {
+	if !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
 		return 0
 	}
 	return cfg.RemoteWriteInterval
 }
 
-func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration, opts aggregateRangeSourceOptions) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
+func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
 	subquery, ok := expr.(*parser.SubqueryExpr)
 	if !ok || subquery.Range <= 0 || subquery.OriginalOffset != 0 || subquery.Offset != 0 || subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
 		return aggregateRangeSource{}, nil, 0, 0, false
@@ -1915,7 +1905,7 @@ func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
 	innerStart := start.Add(-subquery.Range)
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQLWithOptions(subquery.Expr, innerStart, end, subqueryStep, opts)
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(subquery.Expr, innerStart, end, subqueryStep)
 	if !ok {
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
