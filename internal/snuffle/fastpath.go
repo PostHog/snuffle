@@ -93,10 +93,6 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 		}
 	}
 	hasRunningSum := exprHasFunction(expr, "running_sum")
-	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
-	if steps < 64 && !hasRunningSum && !hasMetricsQLRewrite {
-		return queryData{}, false, nil
-	}
 	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr, start, end, step)
 	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
 		if hasRunningSum || hasMetricsQLRewrite {
@@ -322,11 +318,11 @@ const maxAggregateUnionSelectors = 1024
 func rangeGridFunction(name string) (rangeGridFunctionSpec, bool) {
 	switch name {
 	case "rate":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid"}, true
+		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", usesPreviousSample: true}, true
 	case "irate":
-		return rangeGridFunctionSpec{name: "timeSeriesInstantRateToGrid"}, true
+		return rangeGridFunctionSpec{name: "timeSeriesInstantRateToGrid", usesPreviousSample: true}, true
 	case "increase":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true}, true
+		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true, usesPreviousSample: true}, true
 	case "delta":
 		return rangeGridFunctionSpec{name: "timeSeriesDeltaToGrid", usesPreviousSample: true}, true
 	case "idelta":
@@ -1870,17 +1866,17 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	gridRange := matrix.Range + previousSampleLookback(s.cfg, fn)
 	mint := shiftedStart.Add(-gridRange).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
-	rangeSeconds := formatDurationSeconds(gridRange)
+	gridRangeSeconds := formatDurationSeconds(gridRange)
 	gridExpr := fmt.Sprintf(
 		"%s(%s, %s, %s, %s)(timestamp, value)",
 		fn.name,
 		chTimeMillis(shiftedStart.UnixMilli()),
 		chTimeMillis(shiftedEnd.UnixMilli()),
 		formatDurationSeconds(step),
-		rangeSeconds,
+		gridRangeSeconds,
 	)
 	if fn.increase {
-		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", rangeSeconds, gridExpr)
+		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", formatDurationSeconds(matrix.Range), gridExpr)
 	}
 	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step, filterStaleSamples: true}, selector, mint, maxt, true
 }
@@ -2305,16 +2301,18 @@ const (
 )
 
 type instantSeriesExprBranch struct {
-	kind      instantSeriesExprKind
-	selector  *parser.VectorSelector
-	window    selectorWindow
-	fn        rangeFunction
-	transform scalarTransform
+	kind        instantSeriesExprKind
+	selector    *parser.VectorSelector
+	window      selectorWindow
+	matrixRange time.Duration
+	fn          rangeFunction
+	transform   scalarTransform
 }
 
 func (b instantSeriesExprBranch) equivalentTo(other instantSeriesExprBranch) bool {
 	return b.kind == other.kind &&
 		b.window == other.window &&
+		b.matrixRange == other.matrixRange &&
 		b.fn == other.fn &&
 		b.transform.signature() == other.transform.signature()
 }
@@ -2520,11 +2518,11 @@ func (s *Server) instantSeriesExprBranchFor(branch seriesExprBranch, evalTime ti
 		if !ok {
 			return instantSeriesExprBranch{}, false
 		}
-		window, ok := selectorWindowFor(branch.selector, evalTime, branch.matrixRange)
+		window, ok := selectorWindowFor(branch.selector, evalTime, branch.matrixRange+rangeFunctionPreviousSampleLookback(s.cfg, fn))
 		if !ok {
 			return instantSeriesExprBranch{}, false
 		}
-		return instantSeriesExprBranch{kind: instantSeriesRangeFunction, selector: branch.selector, window: window, fn: fn, transform: branch.transform}, true
+		return instantSeriesExprBranch{kind: instantSeriesRangeFunction, selector: branch.selector, window: window, matrixRange: branch.matrixRange, fn: fn, transform: branch.transform}, true
 	default:
 		return instantSeriesExprBranch{}, false
 	}
@@ -2548,6 +2546,9 @@ func (s *Server) instantSeriesExprSourceSQL(branch instantSeriesExprBranch, sele
 		} else {
 			perSeries = rangeFunctionPerSeriesSQL(s.cfg, branch.window, branch.selector.LabelMatchers, branch.fn)
 		}
+		if branch.fn.increase {
+			perSeries = fmt.Sprintf("SELECT id, value * %s AS value FROM (%s)", formatDurationSeconds(branch.matrixRange), perSeries)
+		}
 		return transformValueSQL(perSeries, branch.transform), "per_series"
 	default:
 		return "", ""
@@ -2569,26 +2570,35 @@ func transformGridValsSQL(gridExpr string, transform scalarTransform) string {
 }
 
 type rangeFunction struct {
-	counter bool
-	rate    bool
-	instant bool
+	counter            bool
+	rate               bool
+	instant            bool
+	increase           bool
+	usesPreviousSample bool
 }
 
 func rangeFunctionMode(name string) (rangeFunction, bool) {
 	switch name {
 	case "rate":
-		return rangeFunction{counter: true, rate: true}, true
+		return rangeFunction{counter: true, rate: true, usesPreviousSample: true}, true
 	case "irate":
-		return rangeFunction{counter: true, rate: true, instant: true}, true
+		return rangeFunction{counter: true, rate: true, instant: true, usesPreviousSample: true}, true
 	case "increase":
-		return rangeFunction{counter: true, rate: false}, true
+		return rangeFunction{counter: true, rate: true, increase: true, usesPreviousSample: true}, true
 	case "delta":
-		return rangeFunction{counter: false, rate: false}, true
+		return rangeFunction{counter: false, rate: false, usesPreviousSample: true}, true
 	case "idelta":
-		return rangeFunction{counter: false, rate: false, instant: true}, true
+		return rangeFunction{counter: false, rate: false, instant: true, usesPreviousSample: true}, true
 	default:
 		return rangeFunction{}, false
 	}
+}
+
+func rangeFunctionPreviousSampleLookback(cfg Config, fn rangeFunction) time.Duration {
+	if !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
+		return 0
+	}
+	return cfg.RemoteWriteInterval
 }
 
 func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher) string {

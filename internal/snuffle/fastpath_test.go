@@ -462,6 +462,70 @@ func TestAggregateRangeSourceSQLDeltaUsesPreviousSample(t *testing.T) {
 	}
 }
 
+func TestAggregateRangeSourceSQLRateFunctionsUsePreviousSample(t *testing.T) {
+	cfg := Config{
+		LookbackDelta:       5 * time.Minute,
+		RemoteWriteInterval: 15 * time.Second,
+	}
+	s := newServer(cfg)
+	p := parser.NewParser(parser.Options{})
+
+	for _, tc := range []struct {
+		name      string
+		query     string
+		gridFunc  string
+		windowSQL string
+		extraSQL  string
+		mint      int64
+	}{
+		{
+			name:      "rate",
+			query:     `quantile(1, rate(node_cpu_seconds_total{ready=~"true"}[15s]))`,
+			gridFunc:  "timeSeriesRateToGrid",
+			windowSQL: ", 15, 30)(timestamp, value)",
+			mint:      time.Unix(1700000000, 0).UTC().Add(-30 * time.Second).UnixMilli(),
+		},
+		{
+			name:      "irate",
+			query:     `quantile(1, irate(node_cpu_seconds_total{ready=~"true"}[15s]))`,
+			gridFunc:  "timeSeriesInstantRateToGrid",
+			windowSQL: ", 15, 30)(timestamp, value)",
+			mint:      time.Unix(1700000000, 0).UTC().Add(-30 * time.Second).UnixMilli(),
+		},
+		{
+			name:      "increase",
+			query:     `quantile(1, increase(node_cpu_seconds_total{ready=~"true"}[5m]))`,
+			gridFunc:  "timeSeriesRateToGrid",
+			windowSQL: ", 15, 315)(timestamp, value)",
+			extraSQL:  "x * 300",
+			mint:      time.Unix(1700000000, 0).UTC().Add(-315 * time.Second).UnixMilli(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expr, err := p.ParseExpr(tc.query)
+			if err != nil {
+				t.Fatalf("ParseExpr returned error: %v", err)
+			}
+			aggregate := expr.(*parser.AggregateExpr)
+
+			start := time.Unix(1700000000, 0).UTC()
+			end := time.Unix(1700000060, 0).UTC()
+			source, _, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
+			if !ok {
+				t.Fatal("aggregateRangeSourceSQL returned ok=false")
+			}
+			if mint != tc.mint || maxt != end.UnixMilli() {
+				t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+			}
+			for _, want := range []string{tc.gridFunc, tc.windowSQL, tc.extraSQL} {
+				if want != "" && !strings.Contains(source.gridExpr, want) {
+					t.Fatalf("grid expression does not contain %q:\n%s", want, source.gridExpr)
+				}
+			}
+		})
+	}
+}
+
 func TestRewriteImplicitMetricsQLSubquerySteps(t *testing.T) {
 	query := `quantile(1, sum_over_time(delta(foo{label="[5m]"}[1m])[5m]))`
 	got := rewriteImplicitMetricsQLSubquerySteps(query, 30*time.Second)
@@ -790,6 +854,81 @@ func TestInstantSeriesExprBranchesSupportRangeFunctionScalarUnion(t *testing.T) 
 		if !strings.Contains(source, want) {
 			t.Fatalf("source SQL does not contain %q:\n%s", want, source)
 		}
+	}
+}
+
+func TestInstantSeriesExprRangeFunctionsUsePreviousSample(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		SeriesTable:         "series",
+		LabelIndexTable:     "label_index",
+		LookbackDelta:       5 * time.Minute,
+		RemoteWriteInterval: 15 * time.Second,
+		TeamID:              42,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	evalTime := time.Unix(1700000000, 0).UTC()
+
+	for _, tc := range []struct {
+		name      string
+		query     string
+		mint      int64
+		sourceSQL []string
+	}{
+		{
+			name:  "rate",
+			query: `sum(rate(up{job="api"}[15s]))`,
+			mint:  evalTime.Add(-30 * time.Second).UnixMilli(),
+			sourceSQL: []string{
+				"timestamp >= fromUnixTimestamp64Milli(1699999970000, 'UTC')",
+				"/ 30",
+			},
+		},
+		{
+			name:  "irate",
+			query: `sum(irate(up{job="api"}[15s]))`,
+			mint:  evalTime.Add(-30 * time.Second).UnixMilli(),
+			sourceSQL: []string{
+				"timestamp >= fromUnixTimestamp64Milli(1699999970000, 'UTC')",
+				"vals[-2] AS prev_v",
+			},
+		},
+		{
+			name:  "increase",
+			query: `sum(increase(up{job="api"}[5m]))`,
+			mint:  evalTime.Add(-315 * time.Second).UnixMilli(),
+			sourceSQL: []string{
+				"timestamp >= fromUnixTimestamp64Milli(1699999685000, 'UTC')",
+				"/ 315",
+				"value * 300",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			expr, err := p.ParseExpr(tc.query)
+			if err != nil {
+				t.Fatalf("ParseExpr returned error: %v", err)
+			}
+			aggregate := expr.(*parser.AggregateExpr)
+			branches, ok := s.instantSeriesExprBranches(aggregate.Expr, evalTime)
+			if !ok || len(branches) != 1 {
+				t.Fatalf("instantSeriesExprBranches returned %#v ok=%v, want one branch", branches, ok)
+			}
+			if branches[0].window.mint != tc.mint || branches[0].window.maxt != evalTime.UnixMilli() {
+				t.Fatalf("window = %#v", branches[0].window)
+			}
+			source, sourceName := s.instantSeriesExprSourceSQL(branches[0], []*parser.VectorSelector{branches[0].selector})
+			if sourceName != "per_series" {
+				t.Fatalf("sourceName = %q, want per_series", sourceName)
+			}
+			for _, want := range tc.sourceSQL {
+				if !strings.Contains(source, want) {
+					t.Fatalf("source SQL does not contain %q:\n%s", want, source)
+				}
+			}
+		})
 	}
 }
 
