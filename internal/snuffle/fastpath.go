@@ -318,11 +318,11 @@ const maxAggregateUnionSelectors = 1024
 func rangeGridFunction(name string) (rangeGridFunctionSpec, bool) {
 	switch name {
 	case "rate":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", usesPreviousSample: true}, true
+		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid"}, true
 	case "irate":
-		return rangeGridFunctionSpec{name: "timeSeriesInstantRateToGrid", usesPreviousSample: true}, true
+		return rangeGridFunctionSpec{name: "timeSeriesInstantRateToGrid"}, true
 	case "increase":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true, usesPreviousSample: true}, true
+		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true}, true
 	case "delta":
 		return rangeGridFunctionSpec{name: "timeSeriesDeltaToGrid", usesPreviousSample: true}, true
 	case "idelta":
@@ -2580,11 +2580,11 @@ type rangeFunction struct {
 func rangeFunctionMode(name string) (rangeFunction, bool) {
 	switch name {
 	case "rate":
-		return rangeFunction{counter: true, rate: true, usesPreviousSample: true}, true
+		return rangeFunction{counter: true, rate: true}, true
 	case "irate":
-		return rangeFunction{counter: true, rate: true, instant: true, usesPreviousSample: true}, true
+		return rangeFunction{counter: true, rate: true, instant: true}, true
 	case "increase":
-		return rangeFunction{counter: true, rate: true, increase: true, usesPreviousSample: true}, true
+		return rangeFunction{counter: true, rate: true, increase: true}, true
 	case "delta":
 		return rangeFunction{counter: false, rate: false, usesPreviousSample: true}, true
 	case "idelta":

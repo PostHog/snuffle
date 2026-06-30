@@ -462,7 +462,7 @@ func TestAggregateRangeSourceSQLDeltaUsesPreviousSample(t *testing.T) {
 	}
 }
 
-func TestAggregateRangeSourceSQLRateFunctionsUsePreviousSample(t *testing.T) {
+func TestAggregateRangeSourceSQLRateFunctionsUsePromQLRange(t *testing.T) {
 	cfg := Config{
 		LookbackDelta:       5 * time.Minute,
 		RemoteWriteInterval: 15 * time.Second,
@@ -482,23 +482,23 @@ func TestAggregateRangeSourceSQLRateFunctionsUsePreviousSample(t *testing.T) {
 			name:      "rate",
 			query:     `quantile(1, rate(node_cpu_seconds_total{ready=~"true"}[15s]))`,
 			gridFunc:  "timeSeriesRateToGrid",
-			windowSQL: ", 15, 30)(timestamp, value)",
-			mint:      time.Unix(1700000000, 0).UTC().Add(-30 * time.Second).UnixMilli(),
+			windowSQL: ", 15, 15)(timestamp, value)",
+			mint:      time.Unix(1700000000, 0).UTC().Add(-15 * time.Second).UnixMilli(),
 		},
 		{
 			name:      "irate",
 			query:     `quantile(1, irate(node_cpu_seconds_total{ready=~"true"}[15s]))`,
 			gridFunc:  "timeSeriesInstantRateToGrid",
-			windowSQL: ", 15, 30)(timestamp, value)",
-			mint:      time.Unix(1700000000, 0).UTC().Add(-30 * time.Second).UnixMilli(),
+			windowSQL: ", 15, 15)(timestamp, value)",
+			mint:      time.Unix(1700000000, 0).UTC().Add(-15 * time.Second).UnixMilli(),
 		},
 		{
 			name:      "increase",
 			query:     `quantile(1, increase(node_cpu_seconds_total{ready=~"true"}[5m]))`,
 			gridFunc:  "timeSeriesRateToGrid",
-			windowSQL: ", 15, 315)(timestamp, value)",
+			windowSQL: ", 15, 300)(timestamp, value)",
 			extraSQL:  "x * 300",
-			mint:      time.Unix(1700000000, 0).UTC().Add(-315 * time.Second).UnixMilli(),
+			mint:      time.Unix(1700000000, 0).UTC().Add(-300 * time.Second).UnixMilli(),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -857,7 +857,7 @@ func TestInstantSeriesExprBranchesSupportRangeFunctionScalarUnion(t *testing.T) 
 	}
 }
 
-func TestInstantSeriesExprRangeFunctionsUsePreviousSample(t *testing.T) {
+func TestInstantSeriesExprRateFunctionsUsePromQLRange(t *testing.T) {
 	cfg := Config{
 		CHDatabase:          "default",
 		SamplesTable:        "samples",
@@ -880,28 +880,28 @@ func TestInstantSeriesExprRangeFunctionsUsePreviousSample(t *testing.T) {
 		{
 			name:  "rate",
 			query: `sum(rate(up{job="api"}[15s]))`,
-			mint:  evalTime.Add(-30 * time.Second).UnixMilli(),
+			mint:  evalTime.Add(-15 * time.Second).UnixMilli(),
 			sourceSQL: []string{
-				"timestamp >= fromUnixTimestamp64Milli(1699999970000, 'UTC')",
-				"/ 30",
+				"timestamp >= fromUnixTimestamp64Milli(1699999985000, 'UTC')",
+				"/ 15",
 			},
 		},
 		{
 			name:  "irate",
 			query: `sum(irate(up{job="api"}[15s]))`,
-			mint:  evalTime.Add(-30 * time.Second).UnixMilli(),
+			mint:  evalTime.Add(-15 * time.Second).UnixMilli(),
 			sourceSQL: []string{
-				"timestamp >= fromUnixTimestamp64Milli(1699999970000, 'UTC')",
+				"timestamp >= fromUnixTimestamp64Milli(1699999985000, 'UTC')",
 				"vals[-2] AS prev_v",
 			},
 		},
 		{
 			name:  "increase",
 			query: `sum(increase(up{job="api"}[5m]))`,
-			mint:  evalTime.Add(-315 * time.Second).UnixMilli(),
+			mint:  evalTime.Add(-300 * time.Second).UnixMilli(),
 			sourceSQL: []string{
-				"timestamp >= fromUnixTimestamp64Milli(1699999685000, 'UTC')",
-				"/ 315",
+				"timestamp >= fromUnixTimestamp64Milli(1699999700000, 'UTC')",
+				"/ 300",
 				"value * 300",
 			},
 		},
