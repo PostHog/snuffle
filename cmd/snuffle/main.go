@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 
-	"github.com/rorylshanks/snuffle/internal/snuffle"
+	"github.com/PostHog/snuffle/internal/snuffle"
 )
 
 func main() {

@@ -1,4 +1,4 @@
-module github.com/rorylshanks/snuffle
+module github.com/PostHog/snuffle
 
 go 1.26.1
 
