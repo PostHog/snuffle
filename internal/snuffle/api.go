@@ -523,7 +523,7 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	seen := map[uint64]map[string]string{}
+	seen := map[uint64]*seriesMeta{}
 	for _, matchers := range matcherSets {
 		series, err := q.selectActiveSeries(ctx, start.UnixMilli(), end.UnixMilli(), matchers...)
 		if err != nil {
@@ -531,33 +531,56 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		for _, s := range series {
-			seen[s.id] = s.labelMap
+			seen[s.id] = s
 		}
 	}
-	result := make([]map[string]string, 0, len(seen))
-	for _, labels := range seen {
-		result = append(result, labels)
-	}
-	writeAPISuccess(w, result)
+	writeAPISuccess(w, sortedSeriesLabelMaps(seen))
 }
 
 func (q *CHQuerier) activeSeriesJSONRows(ctx context.Context, mint, maxt int64, matcherSets [][]*labels.Matcher) ([]seriesJSONRow, bool, error) {
-	seen := make(map[uint64]string)
+	seen := make(map[uint64]seriesJSONRow)
 	for _, matchers := range matcherSets {
 		rows, ok, err := q.selectActiveSeriesJSON(ctx, mint, maxt, matchers...)
 		if !ok || err != nil {
 			return nil, ok, err
 		}
 		for _, row := range rows {
-			seen[row.id] = row.labels
+			seen[row.id] = row
 		}
 	}
-	rows := make([]seriesJSONRow, 0, len(seen))
-	for id, labels := range seen {
-		rows = append(rows, seriesJSONRow{id: id, labels: labels})
+	return sortedSeriesJSONRows(seen), true, nil
+}
+
+func sortedSeriesLabelMaps(seen map[uint64]*seriesMeta) []map[string]string {
+	series := make([]*seriesMeta, 0, len(seen))
+	for _, s := range seen {
+		series = append(series, s)
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].id < rows[j].id })
-	return rows, true, nil
+	sort.Slice(series, func(i, j int) bool {
+		if cmp := labels.Compare(series[i].labels, series[j].labels); cmp != 0 {
+			return cmp < 0
+		}
+		return series[i].id < series[j].id
+	})
+	result := make([]map[string]string, 0, len(series))
+	for _, s := range series {
+		result = append(result, s.labelMap)
+	}
+	return result
+}
+
+func sortedSeriesJSONRows(seen map[uint64]seriesJSONRow) []seriesJSONRow {
+	rows := make([]seriesJSONRow, 0, len(seen))
+	for _, row := range seen {
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		if cmp := labels.Compare(rows[i].labelSet, rows[j].labelSet); cmp != 0 {
+			return cmp < 0
+		}
+		return rows[i].id < rows[j].id
+	})
+	return rows
 }
 
 type metadataResult struct {

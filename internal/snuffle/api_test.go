@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 func TestParseTeamPath(t *testing.T) {
@@ -117,5 +119,33 @@ func TestGzipJSONHandlerSkipsNonJSON(t *testing.T) {
 	}
 	if rec.Body.String() != "payload" {
 		t.Fatalf("body = %q, want payload", rec.Body.String())
+	}
+}
+
+func TestSortedSeriesLabelMapsOrdersByPrometheusLabels(t *testing.T) {
+	apiLabels := map[string]string{labels.MetricName: "up", "job": "api"}
+	workerLabels := map[string]string{labels.MetricName: "up", "job": "worker"}
+	seen := map[uint64]*seriesMeta{
+		100: {id: 100, labelMap: workerLabels, labels: labels.FromMap(workerLabels)},
+		200: {id: 200, labelMap: apiLabels, labels: labels.FromMap(apiLabels)},
+	}
+
+	got := sortedSeriesLabelMaps(seen)
+	if len(got) != 2 || got[0]["job"] != "api" || got[1]["job"] != "worker" {
+		t.Fatalf("sortedSeriesLabelMaps = %#v", got)
+	}
+}
+
+func TestSortedSeriesJSONRowsOrdersByPrometheusLabels(t *testing.T) {
+	apiLabels := map[string]string{labels.MetricName: "up", "job": "api"}
+	workerLabels := map[string]string{labels.MetricName: "up", "job": "worker"}
+	seen := map[uint64]seriesJSONRow{
+		100: {id: 100, labels: `{"__name__":"up","job":"worker"}`, labelSet: labels.FromMap(workerLabels)},
+		200: {id: 200, labels: `{"__name__":"up","job":"api"}`, labelSet: labels.FromMap(apiLabels)},
+	}
+
+	got := sortedSeriesJSONRows(seen)
+	if len(got) != 2 || got[0].labels != `{"__name__":"up","job":"api"}` || got[1].labels != `{"__name__":"up","job":"worker"}` {
+		t.Fatalf("sortedSeriesJSONRows = %#v", got)
 	}
 }

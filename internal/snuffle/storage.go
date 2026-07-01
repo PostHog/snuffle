@@ -230,8 +230,9 @@ type seriesMeta struct {
 }
 
 type seriesJSONRow struct {
-	id     uint64
-	labels string
+	id       uint64
+	labels   string
+	labelSet labels.Labels
 }
 
 func (q *CHQuerier) selectSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
@@ -308,7 +309,7 @@ func (q *CHQuerier) selectActiveSeriesJSON(ctx context.Context, mint, maxt int64
 			if err != nil {
 				return nil, true, err
 			}
-			rows = append(rows, seriesJSONRow{id: s.id, labels: string(raw)})
+			rows = append(rows, seriesJSONRow{id: s.id, labels: string(raw), labelSet: s.labels})
 		}
 		return rows, true, nil
 	}
@@ -332,6 +333,11 @@ func (q *CHQuerier) selectActiveSeriesJSON(ctx context.Context, mint, maxt int64
 		if err := row.Scan(&out.id, &out.labels); err != nil {
 			return err
 		}
+		labelMap, err := parseLabelsJSON(json.RawMessage(out.labels))
+		if err != nil {
+			return err
+		}
+		out.labelSet = labels.FromMap(labelMap)
 		rows = append(rows, out)
 		return nil
 	})

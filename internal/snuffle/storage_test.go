@@ -57,6 +57,25 @@ func TestParseLabelsJSONAcceptsObjectAndEncodedString(t *testing.T) {
 	}
 }
 
+func TestSortedLimitedSortsLabelValues(t *testing.T) {
+	values := map[string]struct{}{
+		"worker": {},
+		"api":    {},
+		"db":     {},
+	}
+
+	got := sortedLimited(values, 0)
+	want := []string{"api", "db", "worker"}
+	if len(got) != len(want) {
+		t.Fatalf("sortedLimited length = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("sortedLimited[%d] = %q, want %q; full result %#v", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",
