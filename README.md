@@ -298,6 +298,17 @@ Run the PostHog metrics and logs regression benchmark suite:
 make perf-test
 ```
 
+Run the Codex Autoresearch-ready Snuffle metrics TSBS benchmark:
+
+```bash
+make autoresearch-snuffle-metrics
+```
+
+This targets only the Snuffle-native metrics schema, writes comparison state
+under ignored `.perf/`, and prints `METRIC snuffle_metrics_score=<number>` for
+Autoresearch. Lower is better; the score includes ingest, query latency,
+ClickHouse CPU, and metrics-table storage.
+
 By default this runs `PERF_RUNS=posthog_metrics,posthog_logs,snuffle_logs` once
 (`PERF_REPEAT=1`) with CI-sized data. The metrics run generates TSBS
 Prometheus remote-write data, replays it through `/api/v1/write`, and queries

@@ -185,7 +185,12 @@ collect_clickhouse_memory() {
         count() AS query_count,
         toUInt64(max(memory_usage)) AS peak_memory_bytes,
         toFloat64(ifNull(avgOrNull(memory_usage), 0)) AS avg_peak_memory_bytes,
-        toUInt64(sum(memory_usage)) AS total_peak_memory_bytes
+        toUInt64(sum(memory_usage)) AS total_peak_memory_bytes,
+        toUInt64(sum(ProfileEvents['OSCPUVirtualTimeMicroseconds'])) AS total_cpu_time_us,
+        toUInt64(sum(ProfileEvents['UserTimeMicroseconds'] + ProfileEvents['SystemTimeMicroseconds'])) AS total_user_system_time_us,
+        toUInt64(sum(query_duration_ms)) AS total_query_duration_ms,
+        toUInt64(sum(read_rows)) AS read_rows,
+        toUInt64(sum(read_bytes)) AS read_bytes
       FROM system.query_log
       WHERE current_database = {database:String}
         AND type = 'QueryFinish'
@@ -195,6 +200,25 @@ collect_clickhouse_memory() {
         AND event_time_microseconds >= parseDateTime64BestEffort({window_start:String}, 6)
         AND event_time_microseconds < parseDateTime64BestEffort({window_end:String}, 6)
       FORMAT TSVRaw" > "$output_file"; then
+    printf '0\t0\t0\t0\t0\t0\t0\t0\t0\n' > "$output_file"
+  fi
+}
+
+collect_clickhouse_storage() {
+  local output_file="$1"
+  if ! ch_client \
+    --param_database="$CH_DATABASE" \
+    --query "
+      SELECT
+        toUInt64(sum(bytes_on_disk)) AS active_bytes_on_disk,
+        toUInt64(sum(data_compressed_bytes)) AS active_compressed_bytes,
+        toUInt64(sum(rows)) AS active_rows,
+        toUInt64(count()) AS active_parts
+      FROM system.parts
+      WHERE database = {database:String}
+        AND active
+        AND startsWith(table, 'metrics_')
+      FORMAT TSVRaw" > "$output_file"; then
     printf '0\t0\t0\t0\n' > "$output_file"
   fi
 }
@@ -203,6 +227,7 @@ write_memory_result() {
   local output_file="$1"
   local process_state="$2"
   local clickhouse_state="$3"
+  local storage_state="$4"
   local snuffle_peak_rss_bytes=0
   local snuffle_peak_hwm_bytes=0
   local snuffle_memory_samples=0
@@ -210,12 +235,24 @@ write_memory_result() {
   local clickhouse_peak_memory_bytes=0
   local clickhouse_avg_peak_memory_bytes=0
   local clickhouse_total_peak_memory_bytes=0
+  local clickhouse_total_cpu_time_us=0
+  local clickhouse_total_user_system_time_us=0
+  local clickhouse_total_query_duration_ms=0
+  local clickhouse_read_rows=0
+  local clickhouse_read_bytes=0
+  local clickhouse_active_bytes_on_disk=0
+  local clickhouse_active_compressed_bytes=0
+  local clickhouse_active_rows=0
+  local clickhouse_active_parts=0
 
   if [[ -s "$process_state" ]]; then
     read -r snuffle_peak_rss_bytes snuffle_peak_hwm_bytes snuffle_memory_samples < "$process_state" || true
   fi
   if [[ -s "$clickhouse_state" ]]; then
-    IFS=$'\t' read -r clickhouse_query_count clickhouse_peak_memory_bytes clickhouse_avg_peak_memory_bytes clickhouse_total_peak_memory_bytes < "$clickhouse_state" || true
+    IFS=$'\t' read -r clickhouse_query_count clickhouse_peak_memory_bytes clickhouse_avg_peak_memory_bytes clickhouse_total_peak_memory_bytes clickhouse_total_cpu_time_us clickhouse_total_user_system_time_us clickhouse_total_query_duration_ms clickhouse_read_rows clickhouse_read_bytes < "$clickhouse_state" || true
+  fi
+  if [[ -s "$storage_state" ]]; then
+    IFS=$'\t' read -r clickhouse_active_bytes_on_disk clickhouse_active_compressed_bytes clickhouse_active_rows clickhouse_active_parts < "$storage_state" || true
   fi
 
   printf '{\n' > "$output_file"
@@ -225,7 +262,16 @@ write_memory_result() {
   printf '  "clickhouse_query_count": %s,\n' "${clickhouse_query_count:-0}" >> "$output_file"
   printf '  "clickhouse_peak_memory_bytes": %s,\n' "${clickhouse_peak_memory_bytes:-0}" >> "$output_file"
   printf '  "clickhouse_avg_peak_memory_bytes": %s,\n' "${clickhouse_avg_peak_memory_bytes:-0}" >> "$output_file"
-  printf '  "clickhouse_total_peak_memory_bytes": %s\n' "${clickhouse_total_peak_memory_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_total_peak_memory_bytes": %s,\n' "${clickhouse_total_peak_memory_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_total_cpu_time_us": %s,\n' "${clickhouse_total_cpu_time_us:-0}" >> "$output_file"
+  printf '  "clickhouse_total_user_system_time_us": %s,\n' "${clickhouse_total_user_system_time_us:-0}" >> "$output_file"
+  printf '  "clickhouse_total_query_duration_ms": %s,\n' "${clickhouse_total_query_duration_ms:-0}" >> "$output_file"
+  printf '  "clickhouse_read_rows": %s,\n' "${clickhouse_read_rows:-0}" >> "$output_file"
+  printf '  "clickhouse_read_bytes": %s,\n' "${clickhouse_read_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_active_bytes_on_disk": %s,\n' "${clickhouse_active_bytes_on_disk:-0}" >> "$output_file"
+  printf '  "clickhouse_active_compressed_bytes": %s,\n' "${clickhouse_active_compressed_bytes:-0}" >> "$output_file"
+  printf '  "clickhouse_active_rows": %s,\n' "${clickhouse_active_rows:-0}" >> "$output_file"
+  printf '  "clickhouse_active_parts": %s\n' "${clickhouse_active_parts:-0}" >> "$output_file"
   printf '}\n' >> "$output_file"
 }
 
@@ -389,6 +435,7 @@ run_bridge_bench() {
   local bench_output="$run_dir/go-bench.out"
   local process_memory_state="$run_dir/process-memory.state"
   local clickhouse_memory_state="$run_dir/clickhouse-memory.tsv"
+  local clickhouse_storage_state="$run_dir/clickhouse-storage.tsv"
   local memory_output="$run_dir/memory-results.json"
   local query_window_start
   local query_window_end
@@ -414,7 +461,8 @@ run_bridge_bench() {
   query_window_end="$(clickhouse_now64)"
   ch_client --query "SYSTEM FLUSH LOGS" >/dev/null 2>&1 || true
   collect_clickhouse_memory "$query_window_start" "$query_window_end" "$clickhouse_memory_state"
-  write_memory_result "$memory_output" "$process_memory_state" "$clickhouse_memory_state"
+  collect_clickhouse_storage "$clickhouse_storage_state"
+  write_memory_result "$memory_output" "$process_memory_state" "$clickhouse_memory_state" "$clickhouse_storage_state"
   if [[ "$bench_status" -ne 0 ]]; then
     return "$bench_status"
   fi

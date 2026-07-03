@@ -10,3 +10,4 @@ promql-sidecar
 .perf/
 *.json
 !perf-results.json
+autoresearch.*

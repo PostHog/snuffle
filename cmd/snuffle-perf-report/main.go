@@ -64,13 +64,22 @@ type querySummary struct {
 }
 
 type memorySummary struct {
-	SnufflePeakRSSBytes            uint64  `json:"snuffle_peak_rss_bytes,omitempty"`
-	SnufflePeakHWMBytes            uint64  `json:"snuffle_peak_hwm_bytes,omitempty"`
-	SnuffleMemorySamples           uint64  `json:"snuffle_memory_samples,omitempty"`
-	ClickHouseQueryCount           uint64  `json:"clickhouse_query_count,omitempty"`
-	ClickHousePeakMemoryBytes      uint64  `json:"clickhouse_peak_memory_bytes,omitempty"`
-	ClickHouseAvgPeakMemoryBytes   float64 `json:"clickhouse_avg_peak_memory_bytes,omitempty"`
-	ClickHouseTotalPeakMemoryBytes uint64  `json:"clickhouse_total_peak_memory_bytes,omitempty"`
+	SnufflePeakRSSBytes             uint64  `json:"snuffle_peak_rss_bytes,omitempty"`
+	SnufflePeakHWMBytes             uint64  `json:"snuffle_peak_hwm_bytes,omitempty"`
+	SnuffleMemorySamples            uint64  `json:"snuffle_memory_samples,omitempty"`
+	ClickHouseQueryCount            uint64  `json:"clickhouse_query_count,omitempty"`
+	ClickHousePeakMemoryBytes       uint64  `json:"clickhouse_peak_memory_bytes,omitempty"`
+	ClickHouseAvgPeakMemoryBytes    float64 `json:"clickhouse_avg_peak_memory_bytes,omitempty"`
+	ClickHouseTotalPeakMemoryBytes  uint64  `json:"clickhouse_total_peak_memory_bytes,omitempty"`
+	ClickHouseTotalCPUTimeUS        uint64  `json:"clickhouse_total_cpu_time_us,omitempty"`
+	ClickHouseTotalUserSystemTimeUS uint64  `json:"clickhouse_total_user_system_time_us,omitempty"`
+	ClickHouseTotalQueryDurationMS  uint64  `json:"clickhouse_total_query_duration_ms,omitempty"`
+	ClickHouseReadRows              uint64  `json:"clickhouse_read_rows,omitempty"`
+	ClickHouseReadBytes             uint64  `json:"clickhouse_read_bytes,omitempty"`
+	ClickHouseActiveBytesOnDisk     uint64  `json:"clickhouse_active_bytes_on_disk,omitempty"`
+	ClickHouseActiveCompressedBytes uint64  `json:"clickhouse_active_compressed_bytes,omitempty"`
+	ClickHouseActiveRows            uint64  `json:"clickhouse_active_rows,omitempty"`
+	ClickHouseActiveParts           uint64  `json:"clickhouse_active_parts,omitempty"`
 }
 
 type benchmarkResult struct {
@@ -112,6 +121,8 @@ func main() {
 	tolerance := flag.Float64("tolerance", 0, "allowed slower ratio before reporting a regression")
 	failOnSlower := flag.Bool("fail-on-slower", false, "exit non-zero when the current run is slower")
 	buildOnly := flag.Bool("build-only", false, "write current-output without reading or updating the baseline")
+	emitAutoresearchMetricsPath := flag.String("emit-autoresearch-metrics", "", "read a current result json and print Codex Autoresearch METRIC lines")
+	metricName := flag.String("metric-name", "snuffle_metrics_score", "primary metric name for --emit-autoresearch-metrics")
 	var candidatePaths stringList
 	flag.Var(&candidatePaths, "candidate", "candidate result json path; repeat for multiple candidates")
 	candidatesCSV := flag.String("candidates", "", "comma-separated candidate result json paths")
@@ -130,6 +141,17 @@ func main() {
 	flag.StringVar(&source.Concurrency, "query-concurrency", "", "query benchmark concurrency")
 	flag.StringVar(&source.Benchtime, "query-benchtime", "", "query benchmark benchtime")
 	flag.Parse()
+
+	if *emitAutoresearchMetricsPath != "" {
+		result, err := readPerfResult(*emitAutoresearchMetricsPath)
+		if err != nil {
+			fatalf("read autoresearch metrics result: %v", err)
+		}
+		if err := emitAutoresearchMetrics(*metricName, *emitAutoresearchMetricsPath, result); err != nil {
+			fatalf("%v", err)
+		}
+		return
+	}
 
 	if strings.TrimSpace(*runName) == "" {
 		fatalf("--run-name is required")
@@ -548,6 +570,75 @@ func fallbackSlowScore(result perfResult) float64 {
 		values = append(values, result.Query.GeomeanAvgMS)
 	}
 	return geomean(values)
+}
+
+func emitAutoresearchMetrics(metricName, artifactPath string, result perfResult) error {
+	score, err := autoresearchScore(result)
+	if err != nil {
+		return err
+	}
+	ingestMSPer1KRows := 1_000_000 / result.Ingest.RowRate
+	fmt.Printf("METRIC %s=%.6f\n", metricName, score)
+	fmt.Printf("METRIC snuffle_metrics_ingest_ms_per_1k_rows=%.6f\n", ingestMSPer1KRows)
+	fmt.Printf("METRIC snuffle_metrics_query_geomean_ms=%.6f\n", result.Query.GeomeanAvgMS)
+	fmt.Printf("METRIC snuffle_metrics_query_total_avg_ms=%.6f\n", result.Query.TotalAvgMS)
+	fmt.Printf("METRIC snuffle_metrics_row_rate=%.6f\n", result.Ingest.RowRate)
+	fmt.Printf("METRIC snuffle_metrics_scenarios=%d\n", len(result.Benchmarks))
+	if result.Memory != nil {
+		fmt.Printf("METRIC snuffle_metrics_peak_rss_mb=%.6f\n", float64(result.Memory.SnufflePeakRSSBytes)/(1024*1024))
+		fmt.Printf("METRIC snuffle_metrics_clickhouse_peak_memory_mb=%.6f\n", float64(result.Memory.ClickHousePeakMemoryBytes)/(1024*1024))
+		fmt.Printf("METRIC snuffle_metrics_clickhouse_cpu_ms_per_query=%.6f\n", clickhouseCPUTimeMSPerQuery(result))
+		fmt.Printf("METRIC snuffle_metrics_storage_bytes_per_row=%.6f\n", storageBytesPerRow(result))
+		fmt.Printf("METRIC snuffle_metrics_storage_mb=%.6f\n", float64(result.Memory.ClickHouseActiveBytesOnDisk)/(1024*1024))
+		fmt.Printf("METRIC snuffle_metrics_clickhouse_read_mb=%.6f\n", float64(result.Memory.ClickHouseReadBytes)/(1024*1024))
+	}
+	fmt.Printf("ARTIFACT snuffle_metrics_result=%s\n", artifactPath)
+	return nil
+}
+
+func autoresearchScore(result perfResult) (float64, error) {
+	if result.Ingest.RowRate <= 0 {
+		return 0, fmt.Errorf("snuffle_metrics row_rate must be positive")
+	}
+	if len(result.Benchmarks) == 0 {
+		return 0, fmt.Errorf("snuffle_metrics result has no benchmark scenarios")
+	}
+	storage := storageBytesPerRow(result)
+	if storage <= 0 {
+		return 0, fmt.Errorf("snuffle_metrics storage bytes per row must be positive")
+	}
+	cpuMSPerQuery := clickhouseCPUTimeMSPerQuery(result)
+	if cpuMSPerQuery <= 0 {
+		return 0, fmt.Errorf("snuffle_metrics ClickHouse CPU ms per query must be positive")
+	}
+	values := make([]float64, 0, len(result.Benchmarks)+3)
+	values = append(values, 1_000_000/result.Ingest.RowRate)
+	values = append(values, storage, cpuMSPerQuery)
+	for _, benchmark := range result.Benchmarks {
+		if benchmark.AvgMS <= 0 {
+			return 0, fmt.Errorf("snuffle_metrics scenario %s avg_ms must be positive", benchmark.Name)
+		}
+		values = append(values, benchmark.AvgMS)
+	}
+	score := geomean(values)
+	if score <= 0 || math.IsNaN(score) || math.IsInf(score, 0) {
+		return 0, fmt.Errorf("snuffle_metrics score is not finite")
+	}
+	return score, nil
+}
+
+func storageBytesPerRow(result perfResult) float64 {
+	if result.Memory == nil || result.Ingest.Rows == 0 || result.Memory.ClickHouseActiveBytesOnDisk == 0 {
+		return 0
+	}
+	return float64(result.Memory.ClickHouseActiveBytesOnDisk) / float64(result.Ingest.Rows)
+}
+
+func clickhouseCPUTimeMSPerQuery(result perfResult) float64 {
+	if result.Memory == nil || result.Memory.ClickHouseQueryCount == 0 || result.Memory.ClickHouseTotalCPUTimeUS == 0 {
+		return 0
+	}
+	return float64(result.Memory.ClickHouseTotalCPUTimeUS) / 1000 / float64(result.Memory.ClickHouseQueryCount)
 }
 
 func geomean(values []float64) float64 {

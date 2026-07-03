@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
@@ -829,6 +830,79 @@ func TestSelectedSeriesExactMatcherUnionSQLUsesSingleLabelIndexScan(t *testing.T
 	}
 }
 
+func TestSelectedSeriesExactMatcherUnionSQLFactorsSingleLabelValues(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		TeamID:          42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (hostname) (
+		increase(usage_user{hostname="host_0"}[5m]) / 5
+		or
+		increase(usage_user{hostname="host_1"}[5m]) / 5
+	)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	selectors := branchSelectors(t, aggregate.Expr)
+
+	sql, ok := selectedSeriesExactMatcherUnionSQL(cfg, selectors, []string{"id"})
+	if !ok {
+		t.Fatal("selectedSeriesExactMatcherUnionSQL returned ok=false")
+	}
+	for _, want := range []string{
+		"`default`.`label_index`",
+		"metric_name = 'usage_user'",
+		"label_name = 'hostname'",
+		"label_value IN ('host_0','host_1')",
+		"GROUP BY id",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"values(", "`default`.`series`", "uniqExact"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
+func TestSelectedSeriesSQLOnlyReadsRequestedColumns(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		SeriesTable:     "series",
+		LabelIndexTable: "label_index",
+		TeamID:          42,
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "usage_user"),
+		labels.MustNewMatcher(labels.MatchEqual, "hostname", "host_42"),
+	}
+	sql, ok := selectedSeriesSQL(cfg, matchers, 1000, 2000, []string{"id"})
+	if !ok {
+		t.Fatal("selectedSeriesSQL returned ok=false")
+	}
+	for _, want := range []string{
+		"SELECT id FROM (SELECT id FROM `default`.`series`",
+		"metric_name = 'usage_user'",
+		"label_name = 'hostname'",
+		"label_value = 'host_42'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"labels_json", "min_time", "max_time"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
 func TestSelectedSeriesExactMatcherUnionSQLRejectsNonExactMatchers(t *testing.T) {
 	p := parser.NewParser(parser.Options{})
 	expr, err := p.ParseExpr(`sum(up{job=~"api|worker"} or up{job="db"})`)
@@ -1026,13 +1100,18 @@ func TestRangeUnionSupportsRangeFunctionScalarBranches(t *testing.T) {
 		t.Fatal("selectedSeriesUnionSQL returned ok=false")
 	}
 	sampleSource := samplesForSelectedSeriesUnionSQL(cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
-	sql := fastAggregateRangeSQL(cfg, aggregate, selectedSeries, nil, source, sampleSource, start, step.Milliseconds(), "sum(sample_value)")
+	groupMatchers := commonExactMetricMatchers(selectors)
+	if groupMatchers == nil {
+		t.Fatal("commonExactMetricMatchers returned nil")
+	}
+	sql := fastAggregateRangeSQL(cfg, aggregate, selectedSeries, groupMatchers, source, sampleSource, start, step.Milliseconds(), "sum(sample_value)")
 	for _, want := range []string{
 		"`default`.`samples`",
 		"metric_name = 'warpstream_consumer_group_max_offset'",
 		"id IN (SELECT id FROM selected_series)",
 		"timeSeriesRateToGrid",
 		"(x / 5)",
+		"label_name IN ('topic', 'consumer_group') AND metric_name = 'warpstream_consumer_group_max_offset' AND id IN (SELECT id FROM selected_series)",
 		"GROUP BY `__group_0`, `__group_1`, idx",
 	} {
 		if !strings.Contains(sql, want) {
@@ -1136,6 +1215,27 @@ func TestExactMetricNamesForSelectorsRequiresExactMetrics(t *testing.T) {
 	aggregate = expr.(*parser.AggregateExpr)
 	if names := exactMetricNamesForSelectors(branchSelectors(t, aggregate.Expr)); names != nil {
 		t.Fatalf("exactMetricNamesForSelectors = %#v, want nil", names)
+	}
+}
+
+func TestCommonExactMetricMatchersRequiresOneMetric(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum(up{job="api"} or up{job="worker"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	if matchers := commonExactMetricMatchers(branchSelectors(t, aggregate.Expr)); matchers == nil {
+		t.Fatal("commonExactMetricMatchers returned nil for same-metric union")
+	}
+
+	expr, err = p.ParseExpr(`sum(up{job="api"} or process_start_time_seconds{job="worker"})`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate = expr.(*parser.AggregateExpr)
+	if matchers := commonExactMetricMatchers(branchSelectors(t, aggregate.Expr)); matchers != nil {
+		t.Fatalf("commonExactMetricMatchers = %#v, want nil for mixed metrics", matchers)
 	}
 }
 

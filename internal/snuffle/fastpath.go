@@ -937,7 +937,7 @@ func (s *Server) tryFastInstantSeriesExprAggregate(ctx context.Context, expr *pa
 		return queryData{}, false, nil
 	}
 	if len(branches) > 1 {
-		groupMatchers = nil
+		groupMatchers = commonExactMetricMatchers(selectors)
 	}
 	sourceSQL, sourceName := s.instantSeriesExprSourceSQL(first, selectors)
 	if sourceSQL == "" {
@@ -1057,7 +1057,7 @@ func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *pars
 	groupMatchers := first.selector.LabelMatchers
 	sampleSource := samplesForSelectedSeriesSQL(s.cfg, groupMatchers, mint, maxt)
 	if len(branches) > 1 {
-		groupMatchers = nil
+		groupMatchers = commonExactMetricMatchers(selectors)
 		sampleSource = samplesForSelectedSeriesUnionSQL(s.cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
 	}
 	return s.queryFastAggregateRangeFromSamples(ctx, expr, selectedSeries, groupMatchers, source, sampleSource, start, stepMillis, aggSQL)
@@ -2792,8 +2792,9 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 	}
 	where = append(where, seriesPreFilters(cfg, matchers)...)
 	return fmt.Sprintf(
-		"SELECT %s FROM (SELECT id, metric_name, labels_json, min_time, max_time FROM %s WHERE %s) GROUP BY id",
+		"SELECT %s FROM (SELECT %s FROM %s WHERE %s) GROUP BY id",
 		strings.Join(selectedSeriesProjection(selectParts), ", "),
+		selectedSeriesSourceColumns(selectParts),
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
@@ -2870,8 +2871,9 @@ func selectedSeriesExactMatcherUnionSQL(cfg Config, selectors []*parser.VectorSe
 		where = append(where, condition)
 	}
 	return fmt.Sprintf(
-		"SELECT %s FROM (SELECT id, metric_name, labels_json, min_time, max_time FROM %s WHERE %s) GROUP BY id",
+		"SELECT %s FROM (SELECT %s FROM %s WHERE %s) GROUP BY id",
 		strings.Join(selectedSeriesProjection(selectParts), ", "),
+		selectedSeriesSourceColumns(selectParts),
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
@@ -2918,6 +2920,10 @@ func exactSelectorMatcherSetFor(matchers []*labels.Matcher) (exactSelectorMatche
 }
 
 func exactMatcherUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string {
+	if sql, ok := singleExactLabelUnionIDsSQL(cfg, sets); ok {
+		return sql
+	}
+
 	matcherRows := make([]string, 0, len(sets))
 	metricNames := make([]string, 0, len(sets))
 	labelNames := make([]string, 0, len(sets))
@@ -2963,6 +2969,44 @@ func exactMatcherUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string 
 	)
 }
 
+func singleExactLabelUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) (string, bool) {
+	if len(sets) == 0 {
+		return "", false
+	}
+	metric := sets[0].metric
+	labelName := ""
+	values := make([]string, 0, len(sets))
+	seenValues := make(map[string]struct{}, len(sets))
+	for _, set := range sets {
+		if set.metric != metric || len(set.labels) != 1 {
+			return "", false
+		}
+		label := set.labels[0]
+		if labelName == "" {
+			labelName = label.name
+		}
+		if label.name != labelName {
+			return "", false
+		}
+		if _, ok := seenValues[label.value]; ok {
+			continue
+		}
+		seenValues[label.value] = struct{}{}
+		values = append(values, label.value)
+	}
+	where := []string{
+		teamFilter(cfg),
+		"metric_name = " + sqlString(metric),
+		"label_name = " + sqlString(labelName),
+		inCondition("label_value", values),
+	}
+	return fmt.Sprintf(
+		"SELECT id FROM %s WHERE %s GROUP BY id",
+		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
+		strings.Join(where, " AND "),
+	), true
+}
+
 func inCondition(column string, values []string) string {
 	if len(values) == 1 {
 		return column + " = " + sqlString(values[0])
@@ -3002,6 +3046,29 @@ func selectedSeriesProjection(selectParts []string) []string {
 		}
 	}
 	return projected
+}
+
+func selectedSeriesSourceColumns(selectParts []string) string {
+	all := "id, metric_name, labels_json, min_time, max_time"
+	columns := []string{"id"}
+	add := func(column string) {
+		for _, existing := range columns {
+			if existing == column {
+				return
+			}
+		}
+		columns = append(columns, column)
+	}
+	for _, part := range selectParts {
+		switch part {
+		case "id":
+		case "metric_name", "labels_json", "min_time", "max_time":
+			add(part)
+		default:
+			return all
+		}
+	}
+	return strings.Join(columns, ", ")
 }
 
 func latestSamplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
@@ -3051,6 +3118,17 @@ func exactMetricNamesForSelectors(selectors []*parser.VectorSelector) []string {
 		names = append(names, name)
 	}
 	return names
+}
+
+func commonExactMetricMatchers(selectors []*parser.VectorSelector) []*labels.Matcher {
+	if len(selectors) == 0 {
+		return nil
+	}
+	names := exactMetricNamesForSelectors(selectors)
+	if len(names) != 1 {
+		return nil
+	}
+	return selectors[0].LabelMatchers
 }
 
 func metricNamesCondition(metricNames []string) string {

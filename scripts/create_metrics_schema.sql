@@ -14,7 +14,7 @@ DROP TABLE IF EXISTS metrics_series SYNC;
 
 CREATE TABLE metrics_series
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     id UInt64,
     metric_name LowCardinality(String),
     labels_json String,
@@ -34,7 +34,7 @@ ALTER TABLE metrics_series
 
 CREATE TABLE metrics_label_index
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     metric_name LowCardinality(String),
     label_name LowCardinality(String),
     label_value LowCardinality(String),
@@ -45,13 +45,6 @@ ORDER BY (team_id, metric_name, label_name, label_value, id)
 SETTINGS index_granularity = 1024, deduplicate_merge_projection_mode = 'rebuild';
 
 ALTER TABLE metrics_label_index
-    ADD PROJECTION by_label_value
-    (
-        SELECT team_id, metric_name, label_name, label_value, id
-        ORDER BY (team_id, label_name, label_value, id, metric_name)
-    );
-
-ALTER TABLE metrics_label_index
     ADD PROJECTION by_id_label
     (
         SELECT team_id, metric_name, label_name, label_value, id
@@ -60,7 +53,7 @@ ALTER TABLE metrics_label_index
 
 CREATE TABLE metrics_samples
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
@@ -73,7 +66,7 @@ SETTINGS index_granularity = 8192;
 
 CREATE TABLE metrics_histograms
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     metric_name LowCardinality(String),
     timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
@@ -87,7 +80,7 @@ SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_exemplars
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     timestamp DateTime64(3, 'UTC') CODEC(DoubleDelta, Default),
     id UInt64,
     value Float64 CODEC(Gorilla, Default),
@@ -100,7 +93,7 @@ SETTINGS index_granularity = 1024;
 
 CREATE TABLE metrics_metadata
 (
-    team_id UInt64,
+    team_id UInt64 CODEC(T64, Default),
     metric_family_name LowCardinality(String),
     type LowCardinality(String),
     unit String,

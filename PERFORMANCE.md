@@ -63,6 +63,24 @@ data, then runs the HTTP benchmark profile for that run.
 make perf-test
 ```
 
+For a Codex Autoresearch packet focused only on the Snuffle-native metrics
+schema:
+
+```bash
+make autoresearch-snuffle-metrics
+```
+
+That target sets `PERF_RUNS=snuffle_metrics`, uses the TSBS `devops` metric
+dataset, keeps comparison state in ignored `.perf/`, and prints
+`METRIC snuffle_metrics_score=<number>`. The score is the geometric mean of
+TSBS ingest milliseconds per 1,000 rows, metrics-table storage bytes per row,
+ClickHouse CPU milliseconds per query, and each TSBS query scenario `avg_ms`;
+lower is better. Secondary `METRIC` lines report ingest, query, scenario count,
+CPU, storage, read volume, and memory dimensions for guardrails. The target
+defaults to two warmup requests and `BRIDGE_BENCHTIME=3x`; override
+`AUTORESEARCH_BRIDGE_BENCH_WARMUP` or `AUTORESEARCH_BRIDGE_BENCHTIME` for
+smoke or final runs.
+
 The first run takes longer because it generates `.perf/tsbs-*.prom`. Later runs
 reuse that generated file unless `PERF_REGENERATE_DATA=1` is set.
 

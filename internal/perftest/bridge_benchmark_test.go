@@ -90,6 +90,34 @@ func TestTSBSInstantUnionQueryUsesLargeInstantAggregateUnion(t *testing.T) {
 	}
 }
 
+func TestValidateBridgePayloadChecksPrometheusResults(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		data string
+	}{
+		{name: "instant", url: "http://bench/api/v1/query", data: `{"resultType":"vector","result":[{}]}`},
+		{name: "range", url: "http://bench/api/v1/query_range", data: `{"resultType":"matrix","result":[{}]}`},
+		{name: "series", url: "http://bench/api/v1/series", data: `[{}]`},
+		{name: "label_values", url: "http://bench/api/v1/label/hostname/values", data: `["host_0"]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateBridgePayload(tc.url, json.RawMessage(tc.data)); err != nil {
+				t.Fatalf("validateBridgePayload returned error: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateBridgePayloadRejectsEmptyPrometheusResults(t *testing.T) {
+	if err := validateBridgePayload("http://bench/api/v1/query", json.RawMessage(`{"resultType":"vector","result":[]}`)); err == nil {
+		t.Fatal("validateBridgePayload returned nil for empty vector result")
+	}
+	if err := validateBridgePayload("http://bench/api/v1/label/hostname/values", json.RawMessage(`[]`)); err == nil {
+		t.Fatal("validateBridgePayload returned nil for empty label values")
+	}
+}
+
 func bridgePostHogLogScenarios() []bridgeScenario {
 	start := envString("BRIDGE_BENCH_LOG_START_NS", "1780272000000000000")
 	end := envString("BRIDGE_BENCH_LOG_END_NS", "1780358399000000000")
@@ -170,7 +198,7 @@ func BenchmarkBridgeHTTP(b *testing.B) {
 func benchmarkBridgeScenario(b *testing.B, client *http.Client, baseURL string, sc bridgeScenario, warmup, concurrency int) {
 	targetURL := bridgeURL(baseURL, sc)
 	for i := 0; i < warmup; i++ {
-		if result := fetchBridge(client, targetURL); result.errText != "" {
+		if result := fetchBridge(client, targetURL, i == 0); result.errText != "" {
 			b.Fatalf("warmup failed: %s", result.errText)
 		}
 	}
@@ -182,7 +210,7 @@ func benchmarkBridgeScenario(b *testing.B, client *http.Client, baseURL string, 
 	b.ResetTimer()
 	if concurrency == 1 {
 		for i := 0; i < b.N; i++ {
-			result := fetchBridge(client, targetURL)
+			result := fetchBridge(client, targetURL, false)
 			latencies = append(latencies, float64(result.elapsed.Microseconds())/1000)
 			bytesTotal += int64(result.bytes)
 			if firstError == "" {
@@ -198,7 +226,7 @@ func benchmarkBridgeScenario(b *testing.B, client *http.Client, baseURL string, 
 			go func() {
 				defer wg.Done()
 				for range jobs {
-					results <- fetchBridge(client, targetURL)
+					results <- fetchBridge(client, targetURL, false)
 				}
 			}()
 		}
@@ -274,7 +302,7 @@ func checkBridgeHealthy(client *http.Client, baseURL string) error {
 	return nil
 }
 
-func fetchBridge(client *http.Client, targetURL string) bridgeFetchResult {
+func fetchBridge(client *http.Client, targetURL string, validate bool) bridgeFetchResult {
 	started := time.Now()
 	resp, err := client.Get(targetURL)
 	if err != nil {
@@ -304,6 +332,64 @@ func fetchBridge(client *http.Client, targetURL string) bridgeFetchResult {
 		} else {
 			result.errText = string(body)
 		}
+		return result
+	}
+	if validate {
+		var payload struct {
+			Data json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			result.errText = err.Error()
+			return result
+		}
+		if err := validateBridgePayload(targetURL, payload.Data); err != nil {
+			result.errText = err.Error()
+		}
 	}
 	return result
+}
+
+func validateBridgePayload(targetURL string, data json.RawMessage) error {
+	u, err := url.Parse(targetURL)
+	if err != nil {
+		return err
+	}
+	switch {
+	case strings.HasSuffix(u.Path, "/api/v1/query"):
+		return validatePrometheusResult(data, "vector")
+	case strings.HasSuffix(u.Path, "/api/v1/query_range"):
+		return validatePrometheusResult(data, "matrix")
+	case strings.Contains(u.Path, "/api/v1/series"), strings.Contains(u.Path, "/api/v1/label/"):
+		return validateJSONList(data, "data")
+	default:
+		return nil
+	}
+}
+
+func validatePrometheusResult(data json.RawMessage, resultType string) error {
+	var payload struct {
+		ResultType string            `json:"resultType"`
+		Result     []json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return err
+	}
+	if payload.ResultType != resultType {
+		return fmt.Errorf("resultType %q, want %q", payload.ResultType, resultType)
+	}
+	if len(payload.Result) == 0 {
+		return fmt.Errorf("%s result is empty", resultType)
+	}
+	return nil
+}
+
+func validateJSONList(data json.RawMessage, name string) error {
+	var values []json.RawMessage
+	if err := json.Unmarshal(data, &values); err != nil {
+		return err
+	}
+	if len(values) == 0 {
+		return fmt.Errorf("%s is empty", name)
+	}
+	return nil
 }
