@@ -1,10 +1,13 @@
 package snuffle
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
+
+const sampleTimestampBucketMillis = int64(10 * 60 * 1000)
 
 func sampleBaseFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
 	filters := []string{teamFilter(cfg)}
@@ -24,8 +27,25 @@ func sampleTimeFilters(cfg Config, mint, maxt int64) []string {
 			"time_bucket >= toStartOfDay("+chTimeMillis(mint)+")",
 			"time_bucket <= toStartOfDay("+chTimeMillis(maxt)+")",
 		)
+	} else {
+		filters = append(filters,
+			"toStartOfTenMinutes(timestamp) >= toStartOfTenMinutes("+chTimeMillis(mint)+")",
+			"toStartOfTenMinutes(timestamp) <= toStartOfTenMinutes("+chTimeMillis(maxt)+")",
+		)
 	}
 	return filters
+}
+
+func sampleStepBucketFilters(cfg Config, startMillis, stepMillis, steps int64) []string {
+	if cfg.postHogSchemaLayout() || steps <= 0 || stepMillis < sampleTimestampBucketMillis {
+		return nil
+	}
+	return []string{fmt.Sprintf(
+		"toStartOfTenMinutes(timestamp) IN (SELECT toStartOfTenMinutes(fromUnixTimestamp64Milli(toInt64(%d) + toInt64(number) * %d, 'UTC')) FROM numbers(toUInt64(%d)))",
+		startMillis,
+		stepMillis,
+		steps,
+	)}
 }
 
 func postHogServiceNameFilters(cfg Config, matchers []*labels.Matcher) []string {

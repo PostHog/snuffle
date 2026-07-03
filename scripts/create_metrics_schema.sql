@@ -68,8 +68,8 @@ CREATE TABLE metrics_samples
 )
 ENGINE = MergeTree
 PARTITION BY toYYYYMMDD(timestamp)
-ORDER BY (team_id, metric_name, id, timestamp)
-SETTINGS index_granularity = 1024;
+ORDER BY (team_id, metric_name, toStartOfTenMinutes(timestamp), id, timestamp)
+SETTINGS index_granularity = 8192;
 
 CREATE TABLE metrics_histograms
 (

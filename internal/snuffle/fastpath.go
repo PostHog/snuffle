@@ -1422,6 +1422,7 @@ func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher,
 	bucketStartMillis := bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval)
 	bucketEndMillis := bucketTimestampMS(evalEndMillis, cfg.RemoteWriteInterval)
 	sampleWhere := sampleBaseFilters(cfg, matchers, bucketStartMillis, bucketEndMillis)
+	sampleWhere = append(sampleWhere, sampleStepBucketFilters(cfg, evalStartMillis, stepMillis, steps)...)
 	sampleWhere = append(sampleWhere, idFilters...)
 	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
 
@@ -1449,6 +1450,7 @@ func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn,
 	if stepMillis != cfg.RemoteWriteInterval.Milliseconds() {
 		sampleWhere = append(sampleWhere, fmt.Sprintf("modulo(toUnixTimestamp64Milli(timestamp) - %d, %d) = 0", evalStartMillis, stepMillis))
 	}
+	sampleWhere = append(sampleWhere, sampleStepBucketFilters(cfg, evalStartMillis, stepMillis, steps)...)
 	sampleWhere = append(sampleWhere, idFilters...)
 	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
 

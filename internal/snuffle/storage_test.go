@@ -99,6 +99,8 @@ func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 		"`default`.`label_index`",
 		"team_id = 0",
 		"metric_name = 'http_requests_total'",
+		"toStartOfTenMinutes(timestamp) >= toStartOfTenMinutes(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"toStartOfTenMinutes(timestamp) <= toStartOfTenMinutes(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"label_name = 'job'",
 		"label_value = 'api'",
 		nonStaleSampleSQL("value"),

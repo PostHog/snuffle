@@ -295,6 +295,42 @@ func TestNestedCountTimestampSamplesRangeSQLUsesEvalTimestamps(t *testing.T) {
 	}
 }
 
+func TestNestedCountTimestampSamplesRangeSQLAddsLargeStepBucketPredicate(t *testing.T) {
+	cfg := Config{
+		CHDatabase:          "default",
+		SamplesTable:        "samples",
+		LabelIndexTable:     "label_index",
+		RemoteWriteInterval: 15 * time.Second,
+		TeamID:              42,
+	}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`count(count(node_cpu_seconds_total{type=~".*", ready=~"true"}) by (cpu))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	outer := expr.(*parser.AggregateExpr)
+	inner := outer.Expr.(*parser.AggregateExpr)
+	selector := inner.Expr.(*parser.VectorSelector)
+
+	start := time.Unix(1778398800, 0).UTC()
+	stepMillis := (30 * time.Minute).Milliseconds()
+	sql, ok := nestedCountTimestampSamplesRangeSQL(cfg, selector.LabelMatchers, inner.Grouping, start, start, stepMillis, 4, 5*time.Minute)
+	if !ok {
+		t.Fatal("nestedCountTimestampSamplesRangeSQL returned ok=false")
+	}
+
+	for _, want := range []string{
+		"toStartOfTenMinutes(timestamp) >= toStartOfTenMinutes(fromUnixTimestamp64Milli(1778398800000, 'UTC'))",
+		"toStartOfTenMinutes(timestamp) <= toStartOfTenMinutes(fromUnixTimestamp64Milli(1778404200000, 'UTC'))",
+		"toStartOfTenMinutes(timestamp) IN (SELECT toStartOfTenMinutes(fromUnixTimestamp64Milli(toInt64(1778398800000) + toInt64(number) * 1800000, 'UTC')) FROM numbers(toUInt64(4)))",
+		"modulo(toUnixTimestamp64Milli(timestamp) - 1778398800000, 1800000) = 0",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+}
+
 func TestNestedCountTimestampSamplesRangeSQLBucketsUnalignedEvalTimes(t *testing.T) {
 	cfg := Config{
 		CHDatabase:          "default",
