@@ -292,10 +292,16 @@ For PostHog-compatible logs instead, create
 `CH_LOG_SCHEMA_LAYOUT=posthog`, `CH_LOGS_TABLE=logs34`, and
 `CH_LOG_ATTRIBUTES_TABLE=log_attributes2`.
 
-Run the PostHog metrics and logs regression benchmark suite:
+Run the Snuffle metrics and logs regression benchmark suite:
 
 ```bash
 make perf-test
+```
+
+Run the PostHog-compatible suite explicitly:
+
+```bash
+make perf-test-posthog
 ```
 
 Run the Codex Autoresearch-ready Snuffle metrics TSBS benchmark:
@@ -309,22 +315,23 @@ under ignored `.perf/`, and prints `METRIC snuffle_metrics_score=<number>` for
 Autoresearch. Lower is better; the score includes ingest, query latency,
 ClickHouse CPU, and metrics-table storage.
 
-By default this runs `PERF_RUNS=posthog_metrics,posthog_logs,snuffle_logs` once
+By default this runs `PERF_RUNS=snuffle_metrics,snuffle_logs` once
 (`PERF_REPEAT=1`) with CI-sized data. The metrics run generates TSBS
 Prometheus remote-write data, replays it through `/api/v1/write`, and queries
-the PostHog-style `metrics1` schema. The PostHog logs run seeds synthetic
-PostHog-shaped rows into `logs34`; the Snuffle logs run seeds the
-Snuffle-native `logs` schema and queries it through LogQL. Attempt
-artifacts are stored under
+the Snuffle-native metrics schema. The logs run seeds the Snuffle-native
+`logs` schema and queries it through LogQL. `make perf-test-posthog` runs
+`PERF_RUNS=posthog_metrics,posthog_logs` against `.perf/perf-results-posthog.json`.
+Attempt artifacts are stored under
 `.perf/<run>/attempt-<n>/`, selected run results are copied to
 `.perf/<run>/perf-results.current.json`, and accepted suite baselines are kept
 in `perf-results.json`. Each run result also records managed Snuffle RSS and
 ClickHouse query-memory totals from the benchmark window. Use
-`PERF_RUNS=posthog_metrics`,
-`PERF_RUNS=posthog_logs`, or `PERF_RUNS=snuffle_logs` for a targeted run,
+`PERF_RUNS=snuffle_metrics`, `PERF_RUNS=snuffle_logs`,
+`PERF_RUNS=posthog_metrics`, or `PERF_RUNS=posthog_logs` for a targeted run,
 `BRIDGE_BENCH_SCENARIO=<scenario>` for a targeted query scenario, and env vars
-like `TSBS_SCALE`, `POSTHOG_LOG_ROWS`, or `BRIDGE_BENCHTIME` for larger local
-runs.
+like `TSBS_SCALE`, `POSTHOG_LOG_ROWS`, `POSTHOG_LOG_START`, or
+`BRIDGE_BENCHTIME` for larger local runs. The default log window starts at
+yesterday's UTC midnight so schema TTLs do not expire freshly seeded data.
 Set `PERF_START_CLICKHOUSE=0`, `CH_ADDR`, and `CH_DATABASE` to use an existing
 ClickHouse/database.
 

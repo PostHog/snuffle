@@ -7,15 +7,16 @@ sidecar does not call ClickHouse `prometheusQuery` or `prometheusQueryRange`.
 
 ## Dataset
 
-The default repeatable regression benchmark runs a suite:
+The default repeatable regression benchmark runs the Snuffle-native suite:
 
-- `posthog_metrics`: TSBS `devops` data replayed through Prometheus
-  remote-write into the PostHog-style `metrics1` schema.
-- `posthog_logs`: synthetic OpenTelemetry/PostHog-shaped log rows inserted into
-  `logs34`, then queried through the Loki-compatible LogQL API.
+- `snuffle_metrics`: TSBS `devops` data replayed through Prometheus
+  remote-write into the Snuffle-native metrics schema.
 - `snuffle_logs`: synthetic log rows inserted into the Snuffle-native
   `logs`/`log_streams`/`log_stream_stats` schema, then queried through the same
   Loki-compatible LogQL API.
+
+The PostHog-compatible runs remain available through `make perf-test-posthog`
+or explicit `PERF_RUNS=posthog_metrics,posthog_logs`.
 
 The metrics run uses TSBS `devops` data in Prometheus remote-write format:
 
@@ -32,12 +33,13 @@ The metrics run uses TSBS `devops` data in Prometheus remote-write format:
 - database: `snuffle_perf`
 - tenant: `team_id = 0`
 
-The PostHog logs run uses `scripts/seed_logs_posthog.sql`; the Snuffle logs run
-uses `scripts/seed_logs_snuffle.sql`. By default each log run inserts 1,000,000
-rows over a 24-hour window starting at `2026-06-01 00:00:00` UTC. This volume is
+The Snuffle logs run uses `scripts/seed_logs_snuffle.sql`. By default it
+inserts 1,000,000 rows over a 24-hour window starting at yesterday's UTC
+midnight. This volume is
 chosen so the metric/aggregation scenarios exercise the bucket-aggregation
 pushdown rather than a dataset small enough that a per-row `CROSS JOIN` against
 the eval grid would win; raw-log scenarios stay bounded by `POSTHOG_LOG_LIMIT`.
+The PostHog logs run uses `scripts/seed_logs_posthog.sql` when selected.
 
 ## Repeatable Benchmark Runbook
 
@@ -54,13 +56,19 @@ data, then runs the HTTP benchmark profile for that run.
 - The machine should be otherwise quiet. A concurrent ClickHouse build,
   integration test, merge, or large compile can easily move these numbers.
 - The target database is disposable. By default the harness uses
-  `CH_DATABASE=snuffle_perf` and recreates the PostHog metrics or logs tables
-  for each run.
+  `CH_DATABASE=snuffle_perf` and recreates the selected benchmark tables for
+  each run.
 
 ### One-Command Run
 
 ```bash
 make perf-test
+```
+
+For PostHog-compatible metrics and logs:
+
+```bash
+make perf-test-posthog
 ```
 
 For a Codex Autoresearch packet focused only on the Snuffle-native metrics
@@ -119,17 +127,17 @@ candidates to make the command exit non-zero.
    `PERF_START_CLICKHOUSE=0`.
 2. Waits for ClickHouse and creates `CH_DATABASE`, default `snuffle_perf`.
 3. Recreates the benchmark schema for the current run:
-   `scripts/create_metrics_posthog_schema.sql`,
-   `scripts/create_logs_posthog_schema.sql`, or
-   `scripts/create_logs_snuffle_schema.sql`.
+   `scripts/create_metrics_schema.sql`,
+   `scripts/create_logs_snuffle_schema.sql`,
+   `scripts/create_metrics_posthog_schema.sql`, or
+   `scripts/create_logs_posthog_schema.sql`.
 4. Builds `cmd/snuffle` into `.perf/snuffle`.
 5. Starts snuffle on `SIDECAR_HOST:SIDECAR_PORT`, default
    `127.0.0.1:9091`, unless `PERF_SNUFFLE_URL` points at an already-running
    server.
 6. For metrics runs, generates the pinned TSBS dataset if missing and replays
    it through `/api/v1/write` with `cmd/snuffle-tsbs-replay`.
-7. For logs runs, inserts synthetic rows with
-   `scripts/seed_logs_posthog.sql`.
+7. For logs runs, inserts synthetic rows with the selected log seed SQL.
 8. Flushes ClickHouse async inserts and waits until the target table reaches
    the expected row count.
 9. Runs `BenchmarkBridgeHTTP` with the selected profile while sampling managed
@@ -267,7 +275,7 @@ accepting a change.
 ### Common Knobs
 
 - `PERF_RUNS`: comma-separated run list. Default
-  `posthog_metrics,posthog_logs,snuffle_logs`; available runs are
+  `snuffle_metrics,snuffle_logs`; available runs are
   `posthog_metrics`, `snuffle_metrics`, `posthog_logs`, and `snuffle_logs`.
 - `PERF_REPEAT`: number of full suite attempts before selecting the slowest
   candidate for each run. Default `1`.
@@ -286,6 +294,8 @@ accepting a change.
   smoke run.
 - `POSTHOG_LOG_START`, `POSTHOG_LOG_RANGE_SECONDS`, `POSTHOG_LOG_STEP`, and
   `POSTHOG_LOG_LIMIT`: LogQL benchmark time range and response limits.
+  `POSTHOG_LOG_START` defaults to yesterday's UTC midnight so schema TTLs do
+  not expire freshly seeded logs.
 - `BRIDGE_BENCH_CONCURRENCY`: concurrent query requests per scenario. Default
   `1`.
 - `BRIDGE_BENCH_WARMUP`: warmup requests before timing. Default `0`.
