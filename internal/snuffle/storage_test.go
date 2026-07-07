@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
@@ -73,6 +74,44 @@ func TestSortedLimitedSortsLabelValues(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("sortedLimited[%d] = %q, want %q; full result %#v", i, got[i], want[i], got)
 		}
+	}
+}
+
+func TestSeriesSetFromMetaSortsByLabels(t *testing.T) {
+	workerLabels := labels.FromStrings(labels.MetricName, "up", "type", "worker")
+	apiLabels := labels.FromStrings(labels.MetricName, "up", "type", "api")
+	dbLabels := labels.FromStrings(labels.MetricName, "up", "type", "db")
+
+	set := seriesSetFromMeta([]*seriesMeta{
+		{id: 1, labels: workerLabels},
+		{id: 2, labels: apiLabels},
+		{id: 3, labels: dbLabels},
+	}, true)
+
+	var got []string
+	for set.Next() {
+		got = append(got, set.At().Labels().Get("type"))
+	}
+	want := []string{"api", "db", "worker"}
+	if len(got) != len(want) {
+		t.Fatalf("series count = %d, want %d: %#v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("series order = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestShouldSortSeriesForInstantQueries(t *testing.T) {
+	if !shouldSortSeries(false, &storage.SelectHints{Step: 0}) {
+		t.Fatal("instant query series should be sorted")
+	}
+	if shouldSortSeries(false, &storage.SelectHints{Step: 60_000}) {
+		t.Fatal("range query series should not be sorted before evaluation")
+	}
+	if !shouldSortSeries(true, &storage.SelectHints{Step: 60_000}) {
+		t.Fatal("explicitly requested series sort should be respected")
 	}
 }
 
