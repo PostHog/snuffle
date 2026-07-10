@@ -39,6 +39,35 @@ func TestConfigFromEnvTeamSettings(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvTLSSettings(t *testing.T) {
+	t.Setenv("SNUFFLE_TLS_ENABLED", "")
+	t.Setenv("SNUFFLE_TLS_CERT_FILE", "")
+	t.Setenv("SNUFFLE_TLS_KEY_FILE", "")
+	if ConfigFromEnv().TLSEnabled {
+		t.Fatal("TLS enabled without configuration")
+	}
+
+	t.Setenv("SNUFFLE_TLS_ENABLED", "true")
+	if !ConfigFromEnv().TLSEnabled {
+		t.Fatal("TLS not enabled explicitly")
+	}
+
+	t.Setenv("SNUFFLE_TLS_ENABLED", "")
+	t.Setenv("SNUFFLE_TLS_CERT_FILE", "/tls/cert.pem")
+	t.Setenv("SNUFFLE_TLS_KEY_FILE", "/tls/key.pem")
+	cfg := ConfigFromEnv()
+	if !cfg.TLSEnabled || cfg.TLSCertFile != "/tls/cert.pem" || cfg.TLSKeyFile != "/tls/key.pem" {
+		t.Fatalf("TLS config = enabled %t cert %q key %q", cfg.TLSEnabled, cfg.TLSCertFile, cfg.TLSKeyFile)
+	}
+}
+
+func TestConfigFromEnvAllowUnauthenticated(t *testing.T) {
+	t.Setenv("SNUFFLE_ALLOW_UNAUTHENTICATED", "true")
+	if !ConfigFromEnv().AllowUnauthenticated {
+		t.Fatal("unauthenticated requests not enabled")
+	}
+}
+
 func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	t.Setenv("CH_AGGREGATE_MAX_THREADS", "")
 	t.Setenv("CH_SCHEMA_LAYOUT", "")

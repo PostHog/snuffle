@@ -34,6 +34,10 @@ type Server struct {
 
 func Run(cfg Config) error {
 	server := newServer(cfg)
+	tlsConfig, err := serverTLSConfig(cfg)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	server.startSelfScraper(ctx)
@@ -46,8 +50,12 @@ func Run(cfg Config) error {
 		Addr:              addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		TLSConfig:         tlsConfig,
 	}
-	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "schema_layout", cfg.SchemaLayout, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
+	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "tls", tlsConfig != nil, "schema_layout", cfg.SchemaLayout, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
+	if tlsConfig != nil {
+		return srv.ListenAndServeTLS("", "")
+	}
 	return srv.ListenAndServe()
 }
 
@@ -86,19 +94,33 @@ func newServer(cfg Config) *Server {
 }
 
 func (s *Server) routes(mux *http.ServeMux) {
-	mux.Handle("/-/healthy", s.instrumentHandler("/-/healthy", http.HandlerFunc(s.handleHealthy)))
-	mux.Handle("/-/ready", s.instrumentHandler("/-/ready", http.HandlerFunc(s.handleHealthy)))
-	mux.Handle("/metrics", s.instrumentHandler("/metrics", s.metrics.handler()))
+	routes := http.NewServeMux()
+	routes.Handle("/-/healthy", s.instrumentHandler("/-/healthy", http.HandlerFunc(s.handleHealthy)))
+	routes.Handle("/-/ready", s.instrumentHandler("/-/ready", http.HandlerFunc(s.handleHealthy)))
+	routes.Handle("/metrics", s.instrumentHandler("/metrics", s.metrics.handler()))
 	if s.cfg.Pprof {
-		registerPprofRoutes(mux)
+		registerPprofRoutes(routes)
 	}
 
 	api := s.apiRoutes()
-	mux.Handle("/api/v1/", gzipJSONHandler(api))
+	routes.Handle("/api/v1/", gzipJSONHandler(api))
 	loki := s.lokiRoutes()
-	mux.Handle("/loki/api/v1/", gzipJSONHandler(loki))
-	mux.HandleFunc("/t/", s.handleTeamPath(mux))
-	mux.HandleFunc("/team/", s.handleTeamPath(mux))
+	routes.Handle("/loki/api/v1/", gzipJSONHandler(loki))
+	routes.HandleFunc("/t/", s.handleTeamPath(routes))
+	routes.HandleFunc("/team/", s.handleTeamPath(routes))
+	mux.Handle("/", s.clickHouseAuthHandler(routes))
+}
+
+func (s *Server) clickHouseAuthHandler(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		username, password, ok := r.BasicAuth()
+		if !ok && s.cfg.AllowUnauthenticated {
+			username, password = s.cfg.CHUser, s.cfg.CHPassword
+		}
+		ctx, closeConn := s.client.withRequestCredentials(r.Context(), username, password)
+		defer closeConn()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
 }
 
 func registerPprofRoutes(mux *http.ServeMux) {

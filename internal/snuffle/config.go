@@ -11,6 +11,7 @@ type Config struct {
 	CHAddr               string
 	CHUser               string
 	CHPassword           string
+	AllowUnauthenticated bool
 	CHDatabase           string
 	SchemaLayout         string
 	SeriesTable          string
@@ -30,6 +31,9 @@ type Config struct {
 	ExemplarsTable       string
 	HTTPHost             string
 	HTTPPort             string
+	TLSEnabled           bool
+	TLSCertFile          string
+	TLSKeyFile           string
 	CHTimeout            time.Duration
 	QueryTimeout         time.Duration
 	LookbackDelta        time.Duration
@@ -55,6 +59,8 @@ type Config struct {
 
 func ConfigFromEnv() Config {
 	httpPort := getenv("SIDECAR_PORT", "9091")
+	tlsCertFile := os.Getenv("SNUFFLE_TLS_CERT_FILE")
+	tlsKeyFile := os.Getenv("SNUFFLE_TLS_KEY_FILE")
 	defaultTeamID := envUint64("SNUFFLE_DEFAULT_TEAM_ID", 0)
 	schemaLayout := storageSchemaLayout(getenv("CH_SCHEMA_LAYOUT", getenv("SNUFFLE_SCHEMA_LAYOUT", string(schemaLayoutCurrent))))
 	logSchemaLayoutDefault := string(logSchemaLayoutSnuffle)
@@ -94,6 +100,7 @@ func ConfigFromEnv() Config {
 		CHAddr:               getenv("CH_ADDR", "localhost:9000"),
 		CHUser:               getenv("CH_USER", "default"),
 		CHPassword:           os.Getenv("CH_PASSWORD"),
+		AllowUnauthenticated: envBool("SNUFFLE_ALLOW_UNAUTHENTICATED", false),
 		CHDatabase:           getenv("CH_DATABASE", "default"),
 		SchemaLayout:         string(schemaLayout),
 		SeriesTable:          getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", seriesTableDefault)),
@@ -113,6 +120,9 @@ func ConfigFromEnv() Config {
 		ExemplarsTable:       getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
 		HTTPHost:             getenv("SIDECAR_HOST", "0.0.0.0"),
 		HTTPPort:             httpPort,
+		TLSEnabled:           envBool("SNUFFLE_TLS_ENABLED", tlsCertFile != "" || tlsKeyFile != ""),
+		TLSCertFile:          tlsCertFile,
+		TLSKeyFile:           tlsKeyFile,
 		CHTimeout:            envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
 		QueryTimeout:         envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
 		LookbackDelta:        envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),

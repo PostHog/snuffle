@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -17,21 +18,43 @@ import (
 type ClickHouseClient struct {
 	conn    clickhouse.Conn
 	connErr error
+	cfg     Config
 	metrics *bridgeMetrics
 }
+
+// ponytail: request-scoped pools bound credential lifetime; add a bounded per-user pool only if handshake latency matters.
+type requestClickHouseConnection struct {
+	username string
+	password string
+	once     sync.Once
+	conn     clickhouse.Conn
+	err      error
+}
+
+type requestClickHouseConnectionKey struct{}
 
 func NewClickHouseClient(cfg Config, metrics ...*bridgeMetrics) *ClickHouseClient {
 	var bridgeMetrics *bridgeMetrics
 	if len(metrics) > 0 {
 		bridgeMetrics = metrics[0]
 	}
-	conn, err := clickhouse.Open(&clickhouse.Options{
+	conn, err := openClickHouse(cfg, cfg.CHUser, cfg.CHPassword)
+	return &ClickHouseClient{
+		conn:    conn,
+		connErr: err,
+		cfg:     cfg,
+		metrics: bridgeMetrics,
+	}
+}
+
+func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, error) {
+	return clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
 		Addr:     clickHouseAddrs(cfg),
 		Auth: clickhouse.Auth{
 			Database: cfg.CHDatabase,
-			Username: cfg.CHUser,
-			Password: cfg.CHPassword,
+			Username: username,
+			Password: password,
 		},
 		Settings: clickhouse.Settings{
 			"allow_experimental_time_series_aggregate_functions": 1,
@@ -41,11 +64,26 @@ func NewClickHouseClient(cfg Config, metrics ...*bridgeMetrics) *ClickHouseClien
 		MaxIdleConns:    8,
 		ConnMaxLifetime: time.Hour,
 	})
-	return &ClickHouseClient{
-		conn:    conn,
-		connErr: err,
-		metrics: bridgeMetrics,
+}
+
+func (c *ClickHouseClient) withRequestCredentials(ctx context.Context, username, password string) (context.Context, func()) {
+	requestConn := &requestClickHouseConnection{username: username, password: password}
+	return context.WithValue(ctx, requestClickHouseConnectionKey{}, requestConn), func() {
+		if requestConn.conn != nil {
+			_ = requestConn.conn.Close()
+		}
 	}
+}
+
+func (c *ClickHouseClient) connection(ctx context.Context) (clickhouse.Conn, error) {
+	requestConn, ok := ctx.Value(requestClickHouseConnectionKey{}).(*requestClickHouseConnection)
+	if !ok {
+		return c.conn, c.connErr
+	}
+	requestConn.once.Do(func() {
+		requestConn.conn, requestConn.err = openClickHouse(c.cfg, requestConn.username, requestConn.password)
+	})
+	return requestConn.conn, requestConn.err
 }
 
 func clickHouseAddrs(cfg Config) []string {
@@ -111,10 +149,11 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		scannedRows.Add(progress.Rows)
 		readBytes.Add(progress.Bytes)
 	}))
-	if c.connErr != nil {
-		return fmt.Errorf("connect clickhouse: %w", c.connErr)
+	conn, err := c.connection(ctx)
+	if err != nil {
+		return fmt.Errorf("connect clickhouse: %w", err)
 	}
-	result, err := c.conn.Query(ctx, sql)
+	result, err := conn.Query(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("start clickhouse query: %w", err)
 	}
@@ -133,10 +172,11 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 }
 
 func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
-	if c.connErr != nil {
-		return fmt.Errorf("connect clickhouse: %w", c.connErr)
+	conn, err := c.connection(ctx)
+	if err != nil {
+		return fmt.Errorf("connect clickhouse: %w", err)
 	}
-	if err := c.conn.Exec(ctx, sql); err != nil {
+	if err := conn.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("execute clickhouse statement: %w", err)
 	}
 	return nil
@@ -172,8 +212,9 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 		}
 		c.metrics.observeClickHouseInsert(table, mode, status, time.Since(started), count, writtenBytes.Load())
 	}()
-	if c.connErr != nil {
-		return fmt.Errorf("connect clickhouse: %w", c.connErr)
+	conn, err := c.connection(ctx)
+	if err != nil {
+		return fmt.Errorf("connect clickhouse: %w", err)
 	}
 	insertMode := "native insert"
 	if async {
@@ -183,7 +224,7 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
 		writtenBytes.Add(progress.WroteBytes)
 	}))
-	batch, err := c.conn.PrepareBatch(ctx, sql)
+	batch, err := conn.PrepareBatch(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("prepare %s: %w", insertMode, err)
 	}
@@ -235,10 +276,11 @@ func insertTableName(sql string) string {
 }
 
 func (c *ClickHouseClient) Ping(ctx context.Context) error {
-	if c.connErr != nil {
-		return c.connErr
+	conn, err := c.connection(ctx)
+	if err != nil {
+		return err
 	}
-	return c.conn.Ping(ctx)
+	return conn.Ping(ctx)
 }
 
 var identifierRE = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)

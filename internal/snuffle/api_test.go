@@ -53,6 +53,46 @@ func TestTeamIDFromRequest(t *testing.T) {
 	}
 }
 
+func TestClickHouseCredentialsPassThrough(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		fallback      bool
+		basicUser     string
+		basicPassword string
+		haveBasic     bool
+		wantUser      string
+		wantPassword  string
+	}{
+		{name: "request credentials", fallback: true, basicUser: "alice", basicPassword: "secret", haveBasic: true, wantUser: "alice", wantPassword: "secret"},
+		{name: "passwordless request credentials", fallback: true, basicUser: "alice", haveBasic: true, wantUser: "alice"},
+		{name: "missing credentials", wantUser: "", wantPassword: ""},
+		{name: "configured fallback", fallback: true, wantUser: "configured-user", wantPassword: "configured-password"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newServer(Config{
+				CHUser:               "configured-user",
+				CHPassword:           "configured-password",
+				AllowUnauthenticated: tc.fallback,
+			})
+			handler := server.clickHouseAuthHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requestConn, ok := r.Context().Value(requestClickHouseConnectionKey{}).(*requestClickHouseConnection)
+				if !ok {
+					t.Fatal("request did not contain ClickHouse credentials")
+				}
+				if requestConn.username != tc.wantUser || requestConn.password != tc.wantPassword {
+					t.Fatalf("ClickHouse credentials = (%q, %q), want (%q, %q)", requestConn.username, requestConn.password, tc.wantUser, tc.wantPassword)
+				}
+			}))
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/query", nil)
+			if tc.haveBasic {
+				req.SetBasicAuth(tc.basicUser, tc.basicPassword)
+			}
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+		})
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	server := newServer(Config{})
 	mux := http.NewServeMux()
