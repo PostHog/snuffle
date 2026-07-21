@@ -115,6 +115,23 @@ func TestShouldSortSeriesForInstantQueries(t *testing.T) {
 	}
 }
 
+func TestFutureSeriesSetWaitsForSelection(t *testing.T) {
+	future := &selectFuture{done: make(chan struct{})}
+	set := &futureSeriesSet{future: future}
+	next := make(chan bool, 1)
+	go func() { next <- set.Next() }()
+	select {
+	case <-next:
+		t.Fatal("Next returned before selection completed")
+	default:
+	}
+	future.series = []*seriesMeta{{labels: labels.FromStrings(labels.MetricName, "up")}}
+	close(future.done)
+	if !<-next || set.At().Labels().Get(labels.MetricName) != "up" {
+		t.Fatal("future series was not returned")
+	}
+}
+
 func TestSelectCacheKeyIncludesHintsAndMatchers(t *testing.T) {
 	hints := &storage.SelectHints{Start: 1000, End: 2000, Step: 100, Func: "sum", Grouping: []string{"instance"}, By: true}
 	matchers := []*labels.Matcher{

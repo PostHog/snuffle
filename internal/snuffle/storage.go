@@ -34,7 +34,7 @@ type CHQuerier struct {
 	queryable *CHQueryable
 	mint      int64
 	maxt      int64
-	selects   map[string][]*seriesMeta
+	selects   map[string]*selectFuture
 }
 
 func (q *CHQuerier) Close() error {
@@ -47,50 +47,63 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 	}
 	sortResult := shouldSortSeries(sortSeries, hints)
 	cacheKey := selectCacheKey(sortSeries, hints, matchers)
-	if series, ok := q.selects[cacheKey]; ok {
-		return seriesSetFromMeta(series, sortResult)
+	if future, ok := q.selects[cacheKey]; ok {
+		return &futureSeriesSet{future: future, sortSeries: sortResult}
 	}
+	if q.selects == nil {
+		q.selects = make(map[string]*selectFuture)
+	}
+	future := &selectFuture{done: make(chan struct{})}
+	q.selects[cacheKey] = future
+	go func() {
+		future.series, future.err = q.selectSeriesMeta(ctx, hints, matchers...)
+		close(future.done)
+	}()
+	return &futureSeriesSet{future: future, sortSeries: sortResult}
+}
+
+func (q *CHQuerier) selectSeriesMeta(ctx context.Context, hints *storage.SelectHints, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	if q.queryable.cfg.postHogSchemaLayout() {
 		latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
 		series, err := q.selectPostHogSeriesSamples(ctx, q.mint, q.maxt, latestOnly, matchers...)
 		if err != nil {
-			return storage.ErrSeriesSet(err)
+			return nil, err
 		}
 		if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
 			series = series[:hints.Limit]
 		}
-		return q.cacheSelect(cacheKey, series, sortResult)
+		return series, nil
 	}
 
 	latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
 	if latestOnly {
 		series, ok, err := q.selectLatestSeriesSamples(ctx, q.mint, q.maxt, matchers...)
 		if err != nil {
-			return storage.ErrSeriesSet(err)
+			return nil, err
 		}
 		if ok {
 			if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
 				series = series[:hints.Limit]
 			}
-			return q.cacheSelect(cacheKey, series, sortResult)
+			return series, nil
 		}
 	}
 
 	series, err := q.selectSeries(ctx, q.mint, q.maxt, matchers...)
 	if err != nil {
-		return storage.ErrSeriesSet(err)
+		return nil, err
 	}
 	if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
 		series = series[:hints.Limit]
 	}
 
 	if err := q.loadSamples(ctx, series, q.mint, q.maxt, latestOnly, matchers); err != nil {
-		return storage.ErrSeriesSet(err)
+		return nil, err
 	}
 	if err := q.loadHistograms(ctx, series, q.mint, q.maxt, matchers); err != nil {
-		return storage.ErrSeriesSet(err)
+		return nil, err
 	}
-	return q.cacheSelect(cacheKey, series, sortResult)
+	return series, nil
 }
 
 func matchersUnsatisfiable(matchers []*labels.Matcher) bool {
@@ -138,17 +151,52 @@ func selectCacheKey(sortSeries bool, hints *storage.SelectHints, matchers []*lab
 	return key.String()
 }
 
-func (q *CHQuerier) cacheSelect(key string, series []*seriesMeta, sortSeries bool) storage.SeriesSet {
-	result := seriesSetFromMeta(series, sortSeries)
-	if q.selects == nil {
-		q.selects = make(map[string][]*seriesMeta)
-	}
-	q.selects[key] = series
-	return result
-}
-
 func shouldSortSeries(sortSeries bool, hints *storage.SelectHints) bool {
 	return sortSeries || (hints != nil && hints.Step == 0)
+}
+
+type selectFuture struct {
+	done   chan struct{}
+	series []*seriesMeta
+	err    error
+}
+
+type futureSeriesSet struct {
+	future     *selectFuture
+	sortSeries bool
+	set        storage.SeriesSet
+}
+
+func (s *futureSeriesSet) wait() {
+	if s.set != nil {
+		return
+	}
+	<-s.future.done
+	if s.future.err != nil {
+		s.set = storage.ErrSeriesSet(s.future.err)
+		return
+	}
+	s.set = seriesSetFromMeta(s.future.series, s.sortSeries)
+}
+
+func (s *futureSeriesSet) Next() bool {
+	s.wait()
+	return s.set.Next()
+}
+
+func (s *futureSeriesSet) At() storage.Series {
+	s.wait()
+	return s.set.At()
+}
+
+func (s *futureSeriesSet) Err() error {
+	s.wait()
+	return s.set.Err()
+}
+
+func (s *futureSeriesSet) Warnings() annotations.Annotations {
+	s.wait()
+	return s.set.Warnings()
 }
 
 func seriesSetFromMeta(series []*seriesMeta, sortSeries bool) storage.SeriesSet {
@@ -156,6 +204,7 @@ func seriesSetFromMeta(series []*seriesMeta, sortSeries bool) storage.SeriesSet 
 		return storage.EmptySeriesSet()
 	}
 	if sortSeries {
+		series = append([]*seriesMeta(nil), series...)
 		sort.Slice(series, func(i, j int) bool {
 			return labels.Compare(series[i].labels, series[j].labels) < 0
 		})
