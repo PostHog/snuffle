@@ -137,6 +137,21 @@ func TestSelectCacheKeyIncludesHintsAndMatchers(t *testing.T) {
 	}
 }
 
+func TestMatchersUnsatisfiableIntersectsFiniteMatcherValues(t *testing.T) {
+	if !matchersUnsatisfiable([]*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, "type", "ingestion-.*"),
+		labels.MustNewMatcher(labels.MatchRegexp, "type", "offline|online"),
+	}) {
+		t.Fatal("disjoint type matchers should be unsatisfiable")
+	}
+	if matchersUnsatisfiable([]*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, "type", "off.*"),
+		labels.MustNewMatcher(labels.MatchRegexp, "type", "offline|online"),
+	}) {
+		t.Fatal("overlapping type matchers should be satisfiable")
+	}
+}
+
 func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",

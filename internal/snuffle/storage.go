@@ -42,6 +42,9 @@ func (q *CHQuerier) Close() error {
 }
 
 func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	if matchersUnsatisfiable(matchers) {
+		return storage.EmptySeriesSet()
+	}
 	sortResult := shouldSortSeries(sortSeries, hints)
 	cacheKey := selectCacheKey(sortSeries, hints, matchers)
 	if series, ok := q.selects[cacheKey]; ok {
@@ -88,6 +91,42 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 		return storage.ErrSeriesSet(err)
 	}
 	return q.cacheSelect(cacheKey, series, sortResult)
+}
+
+func matchersUnsatisfiable(matchers []*labels.Matcher) bool {
+	byName := make(map[string][]*labels.Matcher)
+	for _, matcher := range matchers {
+		byName[matcher.Name] = append(byName[matcher.Name], matcher)
+	}
+	for _, matcher := range matchers {
+		var candidates []string
+		switch matcher.Type {
+		case labels.MatchEqual:
+			candidates = []string{matcher.Value}
+		case labels.MatchRegexp:
+			candidates = matcher.SetMatches()
+		}
+		if len(candidates) == 0 {
+			continue
+		}
+		for _, candidate := range candidates {
+			matchesAll := true
+			for _, other := range byName[matcher.Name] {
+				if !other.Matches(candidate) {
+					matchesAll = false
+					break
+				}
+			}
+			if matchesAll {
+				candidates = nil
+				break
+			}
+		}
+		if len(candidates) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func selectCacheKey(sortSeries bool, hints *storage.SelectHints, matchers []*labels.Matcher) string {
