@@ -3434,7 +3434,7 @@ func labelIndexGroupLabelsSQLWithSelectedFilter(cfg Config, matchers []*labels.M
 	if metric != "" {
 		where = append(where, "metric_name = "+sqlString(metric))
 	}
-	if filterToSelected && (metric == "" || !metricOnlyMatchers(matchers)) {
+	if filterToSelected && metric == "" {
 		where = append(where, "id IN (SELECT id FROM selected_series)")
 	}
 	return fmt.Sprintf(
