@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"context"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -1094,29 +1095,41 @@ func TestRangeUnionSupportsRangeFunctionScalarBranches(t *testing.T) {
 	}
 
 	selectors := branchSelectors(t, aggregate.Expr)
-	windows := []selectorWindow{{mint: mint, maxt: maxt}, {mint: mint, maxt: maxt}}
-	selectedSeries, ok := selectedSeriesUnionSQL(cfg, selectors, windows, []string{"id"})
+	selectedSeries, groupValues, ok := selectedSeriesExactMatcherUnionBranchesSQL(cfg, selectors, aggregate.Grouping)
 	if !ok {
-		t.Fatal("selectedSeriesUnionSQL returned ok=false")
+		t.Fatal("selectedSeriesExactMatcherUnionBranchesSQL returned ok=false")
 	}
-	sampleSource := samplesForSelectedSeriesUnionSQL(cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
-	groupMatchers := commonExactMetricMatchers(selectors)
-	if groupMatchers == nil {
-		t.Fatal("commonExactMetricMatchers returned nil")
+	wantGroupValues := [][]string{{"a", "b"}, {"a_ws", "b_ws"}}
+	if !reflect.DeepEqual(groupValues, wantGroupValues) {
+		t.Fatalf("group values = %#v, want %#v", groupValues, wantGroupValues)
 	}
-	sql := fastAggregateRangeSQL(cfg, aggregate, selectedSeries, groupMatchers, source, sampleSource, start, step.Milliseconds(), "sum(sample_value)")
+	where := []string{teamFilter(cfg)}
+	where = append(where, sampleTimeFilters(cfg, mint, maxt)...)
+	where = append(where, metricNamesCondition(exactMetricNamesForSelectors(selectors)))
+	sampleSource := rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
+	sql := fastAggregateRangeExactUnionSQL(cfg, selectedSeries, groupValues, source, sampleSource, start, step.Milliseconds(), "sum(sample_value)")
 	for _, want := range []string{
 		"`default`.`samples`",
 		"metric_name = 'warpstream_consumer_group_max_offset'",
-		"id IN (SELECT id FROM selected_series)",
+		"min(branch) AS branch",
+		"ALL INNER JOIN selected_series USING id",
 		"timeSeriesRateToGrid",
 		"(x / 5)",
-		"label_name IN ('topic', 'consumer_group') AND metric_name = 'warpstream_consumer_group_max_offset' AND id IN (SELECT id FROM selected_series)",
+		"arrayElement(['a','b'], toUInt64(branch) + 1) AS `__group_0`",
+		"arrayElement(['a_ws','b_ws'], toUInt64(branch) + 1) AS `__group_1`",
 		"GROUP BY `__group_0`, `__group_1`, idx",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
+	}
+	for _, notWant := range []string{"group_labels", "id IN (SELECT id FROM selected_series)"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+	if sql, _, ok := selectedSeriesExactMatcherUnionBranchesSQL(cfg, selectors, []string{"instance"}); ok {
+		t.Fatalf("unknown grouping label returned ok=true with SQL:\n%s", sql)
 	}
 }
 

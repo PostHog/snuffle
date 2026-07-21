@@ -1042,6 +1042,22 @@ func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *pars
 		}
 		selectors = append(selectors, branch.selector)
 	}
+	if source.sumOverTime == nil && !source.runningSumWrap {
+		if selectedSeries, groupValues, ok := selectedSeriesExactMatcherUnionBranchesSQL(s.cfg, selectors, expr.Grouping); ok {
+			where := []string{teamFilter(s.cfg)}
+			where = append(where, sampleTimeFilters(s.cfg, mint, maxt)...)
+			if condition := metricNamesCondition(exactMetricNamesForSelectors(selectors)); condition != "" {
+				where = append(where, condition)
+			}
+			sampleSource := rawSamplesSourceSQL(s.cfg, strings.Join(where, " AND "))
+			sql := fastAggregateRangeExactUnionSQL(s.cfg, selectedSeries, groupValues, source, sampleSource, start, stepMillis, aggSQL)
+			results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
+			if err != nil {
+				return queryData{}, true, err
+			}
+			return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+		}
+	}
 
 	selectedProjection := []string{"id"}
 	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
@@ -1118,6 +1134,44 @@ func fastAggregateRangeSQL(cfg Config, expr *parser.AggregateExpr, selectedSerie
 		nonStaleNullableSampleSQL("sample_value"),
 		strings.Join(groupByParts, ", "),
 		strings.Join(orderByParts, ", "),
+	)
+	return withMaxThreads(sql, cfg.AggregateThreads)
+}
+
+func fastAggregateRangeExactUnionSQL(cfg Config, selectedSeries string, groupValues [][]string, source aggregateRangeSource, sampleSource string, start time.Time, stepMillis int64, aggSQL string) string {
+	if source.filterStaleSamples {
+		sampleSource = "SELECT * FROM (" + sampleSource + ") WHERE " + nonStaleSampleSQL("value")
+	}
+	perSeries := fmt.Sprintf(
+		"SELECT samples.id AS id, any(selected_series.branch) AS branch, %s AS vals FROM (%s) AS samples ALL INNER JOIN selected_series USING id GROUP BY samples.id",
+		source.gridExpr,
+		sampleSource,
+	)
+
+	groupSelect := make([]string, 0, len(groupValues))
+	groupBy := make([]string, 0, len(groupValues)+1)
+	for i, values := range groupValues {
+		quoted := make([]string, 0, len(values))
+		for _, value := range values {
+			quoted = append(quoted, sqlString(value))
+		}
+		alias := quoteIdent(groupAlias(i))
+		groupSelect = append(groupSelect, "arrayElement(["+strings.Join(quoted, ",")+"], toUInt64(branch) + 1) AS "+alias)
+		groupBy = append(groupBy, alias)
+	}
+	groupBy = append(groupBy, "idx")
+
+	selectParts := append([]string{}, groupSelect...)
+	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
+	selectParts = append(selectParts, aggSQL+" AS value")
+	sql := fmt.Sprintf(
+		"WITH selected_series AS (%s), per_series AS (%s) SELECT %s FROM per_series ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
+		selectedSeries,
+		perSeries,
+		strings.Join(selectParts, ", "),
+		nonStaleNullableSampleSQL("sample_value"),
+		strings.Join(groupBy, ", "),
+		strings.Join(groupBy, ", "),
 	)
 	return withMaxThreads(sql, cfg.AggregateThreads)
 }
@@ -2879,6 +2933,39 @@ func selectedSeriesExactMatcherUnionSQL(cfg Config, selectors []*parser.VectorSe
 	), true
 }
 
+func selectedSeriesExactMatcherUnionBranchesSQL(cfg Config, selectors []*parser.VectorSelector, grouping []string) (string, [][]string, bool) {
+	if len(selectors) < 2 || len(grouping) == 0 {
+		return "", nil, false
+	}
+	sets := make([]exactSelectorMatcherSet, 0, len(selectors))
+	groupValues := make([][]string, len(grouping))
+	for _, selector := range selectors {
+		set, ok := exactSelectorMatcherSetFor(selector.LabelMatchers)
+		if !ok || len(set.labels) < 2 {
+			return "", nil, false
+		}
+		sets = append(sets, set)
+		for i, name := range grouping {
+			value := set.metric
+			found := name == labels.MetricName
+			if !found {
+				for _, matcher := range set.labels {
+					if matcher.name == name {
+						value = matcher.value
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				return "", nil, false
+			}
+			groupValues[i] = append(groupValues[i], value)
+		}
+	}
+	return "SELECT id, min(branch) AS branch FROM (" + exactMatcherUnionBranchIDsSQL(cfg, sets) + ") GROUP BY id", groupValues, true
+}
+
 func selectPartsIDOnly(selectParts []string) bool {
 	return len(selectParts) == 1 && selectParts[0] == "id"
 }
@@ -2923,7 +3010,10 @@ func exactMatcherUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string 
 	if sql, ok := singleExactLabelUnionIDsSQL(cfg, sets); ok {
 		return sql
 	}
+	return "SELECT id FROM (" + exactMatcherUnionBranchIDsSQL(cfg, sets) + ") GROUP BY id"
+}
 
+func exactMatcherUnionBranchIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string {
 	matcherRows := make([]string, 0, len(sets))
 	metricNames := make([]string, 0, len(sets))
 	labelNames := make([]string, 0, len(sets))
@@ -2962,7 +3052,7 @@ func exactMatcherUnionIDsSQL(cfg Config, sets []exactSelectorMatcherSet) string 
 	where = append(where, inCondition("label_name", labelNames))
 	where = append(where, inCondition("label_value", labelValues))
 	return fmt.Sprintf(
-		"SELECT id FROM (SELECT mr.branch AS branch, li.id AS id, mr.matcher_count AS matcher_count FROM %s AS li INNER JOIN %s AS mr ON li.metric_name = mr.metric_name AND li.label_name = mr.label_name AND li.label_value = mr.label_value WHERE %s GROUP BY branch, id, matcher_count HAVING uniqExact(li.label_name) = matcher_count) GROUP BY id",
+		"SELECT mr.branch AS branch, li.id AS id FROM %s AS li INNER JOIN %s AS mr ON li.metric_name = mr.metric_name AND li.label_name = mr.label_name AND li.label_value = mr.label_value WHERE %s GROUP BY branch, id, matcher_count HAVING uniqExact(li.label_name) = matcher_count",
 		tableName(cfg.CHDatabase, cfg.LabelIndexTable),
 		"values('branch UInt32, matcher_count UInt32, metric_name String, label_name String, label_value String', "+strings.Join(matcherRows, ", ")+")",
 		strings.Join(where, " AND "),
