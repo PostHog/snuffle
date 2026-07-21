@@ -115,6 +115,28 @@ func TestShouldSortSeriesForInstantQueries(t *testing.T) {
 	}
 }
 
+func TestSelectCacheKeyIncludesHintsAndMatchers(t *testing.T) {
+	hints := &storage.SelectHints{Start: 1000, End: 2000, Step: 100, Func: "sum", Grouping: []string{"instance"}, By: true}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"),
+		labels.MustNewMatcher(labels.MatchEqual, "job", "api"),
+	}
+	key := selectCacheKey(false, hints, matchers)
+	if got := selectCacheKey(false, hints, matchers); got != key {
+		t.Fatalf("identical select key = %q, want %q", got, key)
+	}
+	changedHints := *hints
+	changedHints.Start++
+	if got := selectCacheKey(false, &changedHints, matchers); got == key {
+		t.Fatal("different select hints produced the same cache key")
+	}
+	changedMatchers := append([]*labels.Matcher{}, matchers...)
+	changedMatchers[1] = labels.MustNewMatcher(labels.MatchEqual, "job", "worker")
+	if got := selectCacheKey(false, hints, changedMatchers); got == key {
+		t.Fatal("different matchers produced the same cache key")
+	}
+}
+
 func TestLatestSamplesSQLFromMatchers(t *testing.T) {
 	cfg := Config{
 		CHDatabase:      "default",

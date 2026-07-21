@@ -34,6 +34,7 @@ type CHQuerier struct {
 	queryable *CHQueryable
 	mint      int64
 	maxt      int64
+	selects   map[string][]*seriesMeta
 }
 
 func (q *CHQuerier) Close() error {
@@ -42,6 +43,10 @@ func (q *CHQuerier) Close() error {
 
 func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
 	sortResult := shouldSortSeries(sortSeries, hints)
+	cacheKey := selectCacheKey(sortSeries, hints, matchers)
+	if series, ok := q.selects[cacheKey]; ok {
+		return seriesSetFromMeta(series, sortResult)
+	}
 	if q.queryable.cfg.postHogSchemaLayout() {
 		latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
 		series, err := q.selectPostHogSeriesSamples(ctx, q.mint, q.maxt, latestOnly, matchers...)
@@ -51,7 +56,7 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 		if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
 			series = series[:hints.Limit]
 		}
-		return seriesSetFromMeta(series, sortResult)
+		return q.cacheSelect(cacheKey, series, sortResult)
 	}
 
 	latestOnly := hints != nil && hints.Range == 0 && hints.Step == 0 && q.queryable.cfg.HistogramsTable == ""
@@ -64,7 +69,7 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 			if hints != nil && hints.Limit > 0 && len(series) > hints.Limit {
 				series = series[:hints.Limit]
 			}
-			return seriesSetFromMeta(series, sortResult)
+			return q.cacheSelect(cacheKey, series, sortResult)
 		}
 	}
 
@@ -82,7 +87,25 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 	if err := q.loadHistograms(ctx, series, q.mint, q.maxt, matchers); err != nil {
 		return storage.ErrSeriesSet(err)
 	}
-	return seriesSetFromMeta(series, sortResult)
+	return q.cacheSelect(cacheKey, series, sortResult)
+}
+
+func selectCacheKey(sortSeries bool, hints *storage.SelectHints, matchers []*labels.Matcher) string {
+	var key strings.Builder
+	fmt.Fprintf(&key, "%t|%#v", sortSeries, hints)
+	for _, matcher := range matchers {
+		fmt.Fprintf(&key, "|%d:%q:%q", matcher.Type, matcher.Name, matcher.Value)
+	}
+	return key.String()
+}
+
+func (q *CHQuerier) cacheSelect(key string, series []*seriesMeta, sortSeries bool) storage.SeriesSet {
+	result := seriesSetFromMeta(series, sortSeries)
+	if q.selects == nil {
+		q.selects = make(map[string][]*seriesMeta)
+	}
+	q.selects[key] = series
+	return result
 }
 
 func shouldSortSeries(sortSeries bool, hints *storage.SelectHints) bool {
