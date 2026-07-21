@@ -1107,6 +1107,11 @@ func fastAggregateRangeSQL(cfg Config, expr *parser.AggregateExpr, selectedSerie
 
 	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
 	groupLabels, groupJoin := labelIndexGroupLabelsSQL(cfg, groupMatchers, expr.Grouping)
+	if exactGroups, ok := exactMatcherGroupSQL(groupMatchers, expr.Grouping); ok {
+		groupSelect = exactGroups
+		groupLabels = ""
+		groupJoin = ""
+	}
 	withParts := []string{
 		"selected_series AS (" + selectedSeries + ")",
 		"per_series AS (" + perSeries + ")",
@@ -1865,6 +1870,7 @@ type aggregateRangeSource struct {
 	gridStart          time.Time
 	gridEnd            time.Time
 	gridStep           time.Duration
+	avgOverTime        time.Duration
 	filterStaleSamples bool
 	runningSumWrap     bool
 	sumOverTime        *rangeSourceSumOverTime
@@ -1901,10 +1907,6 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	if call.Func.Name == "sum_over_time" {
 		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step)
 	}
-	fn, ok := rangeGridFunction(call.Func.Name)
-	if !ok {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
 	matrix, ok := call.Args[0].(*parser.MatrixSelector)
 	if !ok || matrix.Range <= 0 {
 		return aggregateRangeSource{}, nil, 0, 0, false
@@ -1919,6 +1921,19 @@ func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time,
 	}
 	shiftedStart := start.Add(-offset)
 	shiftedEnd := end.Add(-offset)
+	if call.Func.Name == "avg_over_time" {
+		return aggregateRangeSource{
+			gridStart:          shiftedStart,
+			gridEnd:            shiftedEnd,
+			gridStep:           step,
+			avgOverTime:        matrix.Range,
+			filterStaleSamples: true,
+		}, selector, shiftedStart.Add(-matrix.Range).UnixMilli() + 1, shiftedEnd.UnixMilli(), true
+	}
+	fn, ok := rangeGridFunction(call.Func.Name)
+	if !ok {
+		return aggregateRangeSource{}, nil, 0, 0, false
+	}
 	gridRange := matrix.Range + previousSampleLookback(s.cfg, fn)
 	mint := shiftedStart.Add(-gridRange).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
@@ -1973,6 +1988,16 @@ func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.
 func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) string {
 	if source.filterStaleSamples {
 		sampleSource = "SELECT * FROM (" + sampleSource + ") WHERE " + nonStaleSampleSQL("value")
+	}
+	if source.avgOverTime > 0 {
+		return fmt.Sprintf(
+			"SELECT id, arrayMap(eval_ms -> arrayReduce('avgOrNull', arrayFilter((v, ts_ms) -> ts_ms > eval_ms - %d AND ts_ms <= eval_ms, vals, ts)), range(toInt64(%d), toInt64(%d), toInt64(%d))) AS vals FROM (%s)",
+			source.avgOverTime.Milliseconds(),
+			source.gridStart.UnixMilli(),
+			source.gridEnd.UnixMilli()+source.gridStep.Milliseconds(),
+			source.gridStep.Milliseconds(),
+			sampleArraySourceFromSamplesSQL(sampleSource),
+		)
 	}
 	perSeries := fmt.Sprintf(
 		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
@@ -2663,8 +2688,12 @@ func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []
 }
 
 func rangeFunctionSampleSourceFromSamplesSQL(source string) string {
+	return "SELECT * FROM (" + sampleArraySourceFromSamplesSQL(source) + ") WHERE length(vals) > 1"
+}
+
+func sampleArraySourceFromSamplesSQL(source string) string {
 	return fmt.Sprintf(
-		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id HAVING length(pts) > 1)",
+		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id)",
 		source,
 	)
 }
@@ -3305,6 +3334,32 @@ func labelIndexGroupSQL(grouping []string) ([]string, []string) {
 		groupBy = append(groupBy, quoteIdent(alias))
 	}
 	return selects, groupBy
+}
+
+func exactMatcherGroupSQL(matchers []*labels.Matcher, grouping []string) ([]string, bool) {
+	set, ok := exactSelectorMatcherSetFor(matchers)
+	if !ok {
+		return nil, false
+	}
+	selects := make([]string, 0, len(grouping))
+	for i, name := range grouping {
+		value := set.metric
+		found := name == labels.MetricName
+		if !found {
+			for _, matcher := range set.labels {
+				if matcher.name == name {
+					value = matcher.value
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			return nil, false
+		}
+		selects = append(selects, sqlString(value)+" AS "+quoteIdent(groupAlias(i)))
+	}
+	return selects, true
 }
 
 func postHogSampleGroupSQL(grouping []string) ([]string, []string, []string, bool) {

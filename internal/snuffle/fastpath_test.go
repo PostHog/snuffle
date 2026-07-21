@@ -564,6 +564,65 @@ func TestAggregateRangeSourceSQLRateFunctionsUsePromQLRange(t *testing.T) {
 	}
 }
 
+func TestAggregateRangeSourceSQLAvgOverTime(t *testing.T) {
+	cfg := Config{
+		CHDatabase:      "default",
+		LabelIndexTable: "label_index",
+		TeamID:          42,
+	}
+	s := newServer(cfg)
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`quantile by (topic, consumer_group) (0.5, avg_over_time(warpstream_consumer_group_estimated_lag{topic="events",consumer_group="events_ws"}[5m]))`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	start := time.Unix(1700000000, 0).UTC()
+	end := time.Unix(1700000060, 0).UTC()
+	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(aggregate.Expr, start, end, 15*time.Second)
+	if !ok {
+		t.Fatal("aggregateRangeSourceSQL returned ok=false")
+	}
+	if source.avgOverTime != 5*time.Minute {
+		t.Fatalf("avgOverTime = %s, want 5m", source.avgOverTime)
+	}
+	if mint != start.Add(-5*time.Minute).UnixMilli()+1 || maxt != end.UnixMilli() {
+		t.Fatalf("mint/maxt = %d/%d", mint, maxt)
+	}
+
+	perSeries := rangeSourcePerSeriesSQL(source, "SELECT id, timestamp, value FROM samples")
+	for _, want := range []string{
+		"arrayReduce('avgOrNull'",
+		"arrayFilter((v, ts_ms)",
+		"range(toInt64(1700000000000), toInt64(1700000075000), toInt64(15000))",
+		"groupArray((toUnixTimestamp64Milli(timestamp), value))",
+		nonStaleSampleSQL("value"),
+	} {
+		if !strings.Contains(perSeries, want) {
+			t.Fatalf("per-series SQL does not contain %q:\n%s", want, perSeries)
+		}
+	}
+	if strings.Contains(perSeries, "length(vals) > 1") {
+		t.Fatalf("avg_over_time must preserve single-sample windows:\n%s", perSeries)
+	}
+
+	sql := fastAggregateRangeSQL(cfg, aggregate, "SELECT id FROM selected", selector.LabelMatchers, source, "SELECT id, timestamp, value FROM samples", start, 15000, "quantileExact(0.5)(sample_value)")
+	for _, want := range []string{
+		"'events' AS `__group_0`",
+		"'events_ws' AS `__group_1`",
+		"GROUP BY `__group_0`, `__group_1`, idx",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("aggregate SQL does not contain %q:\n%s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"group_labels", "label_index"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("aggregate SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
 func TestRewriteImplicitMetricsQLSubquerySteps(t *testing.T) {
 	query := `quantile(1, sum_over_time(delta(foo{label="[5m]"}[1m])[5m]))`
 	got := rewriteImplicitMetricsQLSubquerySteps(query, 30*time.Second)
