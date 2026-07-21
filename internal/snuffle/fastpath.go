@@ -2838,6 +2838,11 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 	if len(selectParts) == 0 {
 		selectParts = []string{"id"}
 	}
+	if selectPartsIDOnly(selectParts) {
+		if sql, ok := selectedSeriesIDsFromLabelIndexSQL(cfg, matchers); ok {
+			return sql, true
+		}
+	}
 	where := []string{
 		teamFilter(cfg),
 	}
@@ -2852,6 +2857,48 @@ func selectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64,
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
+}
+
+func selectedSeriesIDsFromLabelIndexSQL(cfg Config, matchers []*labels.Matcher) (string, bool) {
+	metric := exactMetricName(matchers)
+	if metric == "" || cfg.LabelIndexTable == "" {
+		return "", false
+	}
+	base := -1
+	for i, matcher := range matchers {
+		membership, _, ok := labelIndexMembershipCondition(matcher)
+		if ok && membership == "IN" && (base < 0 || matcher.Type == labels.MatchEqual) {
+			base = i
+			if matcher.Type == labels.MatchEqual {
+				break
+			}
+		}
+	}
+	if base < 0 {
+		return "", false
+	}
+
+	table := tableName(cfg.CHDatabase, cfg.LabelIndexTable)
+	filters := []string{teamFilter(cfg), "metric_name = " + sqlString(metric)}
+	for i, matcher := range matchers {
+		if matcherIsNoop(matcher) || matcher.Name == labels.MetricName {
+			continue
+		}
+		membership, condition, ok := labelIndexMembershipCondition(matcher)
+		if !ok {
+			return "", false
+		}
+		predicate := "label_name = " + sqlString(matcher.Name) + " AND " + condition
+		if i == base {
+			filters = append(filters, predicate)
+			continue
+		}
+		filters = append(filters, fmt.Sprintf(
+			"id %s (SELECT id FROM %s WHERE %s AND metric_name = %s AND %s)",
+			membership, table, teamFilter(cfg), sqlString(metric), predicate,
+		))
+	}
+	return fmt.Sprintf("SELECT id FROM %s WHERE %s GROUP BY id", table, strings.Join(filters, " AND ")), true
 }
 
 func selectedSeriesForInstantBranchesSQL(cfg Config, branches []instantSeriesExprBranch, selectors []*parser.VectorSelector, selectParts []string) (string, bool) {

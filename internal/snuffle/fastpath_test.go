@@ -888,7 +888,7 @@ func TestSelectedSeriesSQLOnlyReadsRequestedColumns(t *testing.T) {
 		t.Fatal("selectedSeriesSQL returned ok=false")
 	}
 	for _, want := range []string{
-		"SELECT id FROM (SELECT id FROM `default`.`series`",
+		"SELECT id FROM `default`.`label_index`",
 		"metric_name = 'usage_user'",
 		"label_name = 'hostname'",
 		"label_value = 'host_42'",
@@ -897,9 +897,35 @@ func TestSelectedSeriesSQLOnlyReadsRequestedColumns(t *testing.T) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
 	}
-	for _, notWant := range []string{"labels_json", "min_time", "max_time"} {
+	for _, notWant := range []string{"`default`.`series`", "labels_json", "min_time", "max_time"} {
 		if strings.Contains(sql, notWant) {
 			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
+		}
+	}
+}
+
+func TestSelectedSeriesIDSQLIntersectsLabelIndexMatchers(t *testing.T) {
+	cfg := Config{CHDatabase: "default", SeriesTable: "series", LabelIndexTable: "label_index", TeamID: 42}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "usage_user"),
+		labels.MustNewMatcher(labels.MatchRegexp, "type", "offline|online"),
+		labels.MustNewMatcher(labels.MatchEqual, "job", "clickhouse"),
+		labels.MustNewMatcher(labels.MatchNotEqual, "shard", "test"),
+	}
+
+	sql, ok := selectedSeriesSQL(cfg, matchers, 1000, 2000, []string{"id"})
+	if !ok {
+		t.Fatal("selectedSeriesSQL returned ok=false")
+	}
+	for _, want := range []string{
+		"label_name = 'job' AND label_value = 'clickhouse'",
+		"id IN (SELECT id FROM `default`.`label_index`",
+		"label_name = 'type' AND label_value IN ('offline','online')",
+		"id NOT IN (SELECT id FROM `default`.`label_index`",
+		"label_name = 'shard' AND label_value = 'test'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
 	}
 }
