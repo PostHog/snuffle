@@ -21,6 +21,7 @@ type Config struct {
 	LabelPostingsTable   string
 	ActivityTable        string
 	MetricsTable         string
+	MetricSeriesTable    string
 	LogSchemaLayout      string
 	LogsTable            string
 	LogStreamsTable      string
@@ -47,6 +48,8 @@ type Config struct {
 	DefaultTeamID        uint64
 	TeamHeader           string
 	TeamQueryParam       string
+	TeamSource           string
+	CHQuerySettings      map[string]any
 	Pprof                bool
 	SelfScrapeEnabled    bool
 	SelfScrapeInterval   time.Duration
@@ -75,6 +78,10 @@ func ConfigFromEnv() Config {
 	histogramsTableDefault := "metrics_histograms"
 	exemplarsTableDefault := "metrics_exemplars"
 	metadataTableDefault := "metrics_metadata"
+	metricSeriesTableDefault := ""
+	if schemaLayout == schemaLayoutPostHog {
+		metricSeriesTableDefault = "metric_series"
+	}
 	logsTableDefault := "logs"
 	logStreamsTableDefault := "log_streams"
 	logStreamLabelsTableDefault := "log_stream_labels"
@@ -110,6 +117,9 @@ func ConfigFromEnv() Config {
 		LabelPostingsTable:   getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:        getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:         getenv("CH_METRICS_TABLE", metadataTableDefault),
+		// metric_series carries per-metric OTel type/unit for /api/v1/metadata
+		// in posthog layout; unused in the native layout.
+		MetricSeriesTable:    getenv("CH_METRIC_SERIES_TABLE", metricSeriesTableDefault),
 		LogSchemaLayout:      string(logSchemaLayout),
 		LogsTable:            getenv("CH_LOGS_TABLE", logsTableDefault),
 		LogStreamsTable:      getenv("CH_LOG_STREAMS_TABLE", logStreamsTableDefault),
@@ -136,6 +146,8 @@ func ConfigFromEnv() Config {
 		DefaultTeamID:        defaultTeamID,
 		TeamHeader:           getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:       getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
+		TeamSource:           getenv("SNUFFLE_TEAM_SOURCE", "any"),
+		CHQuerySettings:      parseQuerySettings(getenv("CH_QUERY_SETTINGS", "")),
 		Pprof:                envBool("SNUFFLE_PPROF", false),
 		SelfScrapeEnabled:    envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
 		SelfScrapeInterval:   envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
@@ -184,6 +196,31 @@ func envUint64(key string, fallback uint64) uint64 {
 		return fallback
 	}
 	return parsed
+}
+
+// parseQuerySettings turns "k=v,k=v" into a settings map. Integer-looking
+// values become ints (ClickHouse numeric settings reject quoted strings);
+// everything else stays a string. Blank entries are skipped.
+func parseQuerySettings(raw string) map[string]any {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	settings := make(map[string]any)
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, found := strings.Cut(strings.TrimSpace(pair), "=")
+		if !found || key == "" {
+			continue
+		}
+		if n, err := strconv.Atoi(value); err == nil {
+			settings[key] = n
+		} else {
+			settings[key] = value
+		}
+	}
+	if len(settings) == 0 {
+		return nil
+	}
+	return settings
 }
 
 func envBool(key string, fallback bool) bool {

@@ -129,6 +129,38 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 	}
 }
 
+func TestPostHogAggregateUnionPlanFactorsJobAliasIntoServiceName(t *testing.T) {
+	// `job` is an alias of the service_name column, so a union over job values
+	// must factor to one `service_name IN (...)` on the primary key, not a map
+	// lookup per branch.
+	cfg := Config{
+		CHDatabase:    "default",
+		SchemaLayout:  "posthog",
+		SamplesTable:  "metrics1",
+		LookbackDelta: 5 * time.Minute,
+	}
+	s := &Server{cfg: cfg}
+	p := parser.NewParser(parser.Options{})
+	expr, err := p.ParseExpr(`sum by (job) (increase(http_requests_total{job="api"}[5m]) / 5 or increase(http_requests_total{job="worker"}[5m]) / 5)`)
+	if err != nil {
+		t.Fatalf("ParseExpr returned error: %v", err)
+	}
+	aggregate := expr.(*parser.AggregateExpr)
+	start := time.Unix(1700000000, 0).UTC()
+	plan, ok := s.postHogAggregateUnionPlan(aggregate, start, start.Add(time.Hour), time.Minute)
+	if !ok {
+		t.Fatal("postHogAggregateUnionPlan returned ok=false")
+	}
+
+	sql := postHogAggregateUnionSQL(cfg, plan, aggregate.Grouping, start, time.Minute.Milliseconds(), "sum(sample_value)")
+	if !strings.Contains(sql, "service_name IN ('api','worker')") {
+		t.Fatalf("job union must factor into service_name IN:\n%s", sql)
+	}
+	if strings.Contains(sql, "job__str") {
+		t.Fatalf("job union must not look up job as a metric attribute:\n%s", sql)
+	}
+}
+
 func TestPostHogAggregateUnionPlanRejectsMixedTransforms(t *testing.T) {
 	s := &Server{cfg: Config{SchemaLayout: "posthog", SamplesTable: "metrics1", LookbackDelta: 5 * time.Minute}}
 	p := parser.NewParser(parser.Options{})
@@ -1367,6 +1399,20 @@ func TestPostHogSampleGroupSQLSupportsMapLabels(t *testing.T) {
 	}
 	if got := strings.Join(perIDSelects, ", "); !strings.Contains(got, "attributes_map_str['region__str']") || !strings.Contains(got, "resource_attributes['region']") {
 		t.Fatalf("expected map-backed group expression, got %s", got)
+	}
+}
+
+func TestPostHogSampleGroupSQLSupportsJobAndInstanceAliases(t *testing.T) {
+	_, _, perIDSelects, ok := postHogSampleGroupSQL([]string{"job", "instance"})
+	if !ok {
+		t.Fatal("expected job/instance aliases to be grouped from their columns")
+	}
+	got := strings.Join(perIDSelects, ", ")
+	if !strings.Contains(got, "service_name") || !strings.Contains(got, "resource_attributes['service.instance.id']") {
+		t.Fatalf("expected job/instance column expressions, got %s", got)
+	}
+	if strings.Contains(got, "job__str") || strings.Contains(got, "instance__str") {
+		t.Fatalf("job/instance must group from columns, not metric attributes: %s", got)
 	}
 }
 

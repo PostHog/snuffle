@@ -249,17 +249,41 @@ func postHogMatcherCanSkip(matcher *labels.Matcher) bool {
 	}
 }
 
-func postHogMatcherCondition(matcher *labels.Matcher) (string, bool) {
-	switch matcher.Name {
+// postHogLabelColumnExpr maps a Prometheus label name to the ClickHouse
+// expression that yields its value in posthog layout.
+//
+// `job` and `instance` are aliases, not stored labels: PostHog's remote-write
+// ingest (rust/capture-logs/src/endpoints/prometheus.rs) moves `job` into the
+// service_name column and `instance` into the service.instance.id resource
+// attribute, so Grafana queries written against a Prometheus datasource must
+// read them back through the same mapping. The aliases win over any
+// job__str/instance__str rows written before the mapping existed.
+//
+// Every other name keeps the metric-attribute-then-resource fallback.
+func postHogLabelColumnExpr(name string) (string, bool) {
+	switch name {
 	case labels.MetricName:
-		return metricMatcherCondition(matcher)
-	case "service_name":
-		return stringColumnMatcherCondition("service_name", matcher)
+		return "metric_name", true
+	case "service_name", "job":
+		return "service_name", true
+	case "instance":
+		return "resource_attributes['service.instance.id']", true
 	case "":
 		return "", false
 	default:
-		return stringColumnMatcherCondition(postHogLabelValueExpr(matcher.Name), matcher)
+		return postHogLabelValueExpr(name), true
 	}
+}
+
+func postHogMatcherCondition(matcher *labels.Matcher) (string, bool) {
+	if matcher.Name == labels.MetricName {
+		return metricMatcherCondition(matcher)
+	}
+	column, ok := postHogLabelColumnExpr(matcher.Name)
+	if !ok {
+		return "", false
+	}
+	return stringColumnMatcherCondition(column, matcher)
 }
 
 func postHogLabelValueExpr(name string) string {
@@ -297,6 +321,44 @@ func postHogMatchersPushdownSafe(matchers []*labels.Matcher) bool {
 	return true
 }
 
+// postHogMetadataSQL reads per-metric OTel type/unit/monotonicity from
+// metric_series for /api/v1/metadata. metric_series is keyed by
+// (team_id, metric_name, series_fingerprint) and versioned by last_seen, so
+// argMax over last_seen picks the latest row per metric name.
+func postHogMetadataSQL(cfg Config, metric string, limit int) string {
+	where := []string{teamFilter(cfg)}
+	if metric != "" {
+		where = append(where, "metric_name = "+sqlString(metric))
+	}
+	return fmt.Sprintf(
+		"SELECT metric_name, argMax(metric_type, last_seen) AS metric_type, argMax(is_monotonic, last_seen) AS is_monotonic, argMax(unit, last_seen) AS unit FROM %s WHERE %s GROUP BY metric_name ORDER BY metric_name%s",
+		tableName(cfg.CHDatabase, cfg.MetricSeriesTable),
+		strings.Join(where, " AND "),
+		sqlLimit(limit),
+	)
+}
+
+// postHogMetricTypeToPrometheus maps OTel metric_type + is_monotonic onto the
+// Prometheus family type Grafana expects from /api/v1/metadata. A monotonic
+// OTel sum is a counter; a non-monotonic sum is a gauge.
+func postHogMetricTypeToPrometheus(metricType string, isMonotonic bool) string {
+	switch metricType {
+	case "sum":
+		if isMonotonic {
+			return "counter"
+		}
+		return "gauge"
+	case "gauge":
+		return "gauge"
+	case "histogram", "exponential_histogram":
+		return "histogram"
+	case "summary":
+		return "summary"
+	default:
+		return "unknown"
+	}
+}
+
 func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[string]string) map[string]string {
 	out := make(map[string]string, len(resourceAttrs)+len(attrs)+2)
 	for key, value := range resourceAttrs {
@@ -318,6 +380,14 @@ func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[st
 		}
 		out[key] = value
 	}
+	// Column aliases are set after the attribute loops so they win over a
+	// legacy job__str/instance__str attribute from pre-mapping rows.
+	if serviceName != "" {
+		out["job"] = serviceName
+	}
+	if instanceID := resourceAttrs["service.instance.id"]; instanceID != "" {
+		out["instance"] = instanceID
+	}
 	out[labels.MetricName] = metricName
 	return out
 }
@@ -336,7 +406,11 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 		}
 		return sortedLimited(names, limit), nil
 	}
-	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}}
+	// `job` is always seeded: it is an alias of the service_name column, so it
+	// exists wherever service_name does. `instance` is an alias of the
+	// service.instance.id resource attribute; it is added only when discovery
+	// has actually seen that key (see below).
+	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}, "job": {}}
 	attrTable := q.queryable.cfg.AttributeTable
 	if attrTable != "" {
 		sql := fmt.Sprintf(
@@ -350,6 +424,9 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 		if err := q.addStringRows(ctx, names, sql); err != nil {
 			return nil, err
 		}
+	}
+	if _, ok := names["service.instance.id"]; ok {
+		names["instance"] = struct{}{}
 	}
 	return sortedLimited(names, limit), nil
 }
@@ -380,10 +457,25 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 			chTimeMillis(q.maxt),
 			sqlLimit(limit),
 		)
-	case "service_name":
+	case "service_name", "job":
+		// `job` is an alias of the service_name column.
 		sql = fmt.Sprintf(
 			"SELECT DISTINCT service_name AS label_value FROM %s WHERE %s AND timestamp >= %s AND timestamp <= %s ORDER BY label_value%s",
 			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.SamplesTable),
+			teamFilter(q.queryable.cfg),
+			chTimeMillis(q.mint),
+			chTimeMillis(q.maxt),
+			sqlLimit(limit),
+		)
+	case "instance":
+		// `instance` is an alias of the service.instance.id resource attribute.
+		attrTable := q.queryable.cfg.AttributeTable
+		if attrTable == "" {
+			return nil, nil
+		}
+		sql = fmt.Sprintf(
+			"SELECT DISTINCT attribute_value AS label_value FROM %s WHERE %s AND attribute_type = 'resource' AND attribute_key = 'service.instance.id' AND time_bucket >= toStartOfInterval(%s, toIntervalMinute(10)) AND time_bucket <= toStartOfInterval(%s, toIntervalMinute(10)) ORDER BY label_value%s",
+			tableName(q.queryable.cfg.CHDatabase, attrTable),
 			teamFilter(q.queryable.cfg),
 			chTimeMillis(q.mint),
 			chTimeMillis(q.maxt),

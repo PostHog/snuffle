@@ -53,7 +53,11 @@ func postHogServiceNameFilters(cfg Config, matchers []*labels.Matcher) []string 
 		return nil
 	}
 	for _, matcher := range matchers {
-		if matcher.Name != "service.name" && matcher.Name != "service_name" {
+		// `job` is an alias of the service_name column (see
+		// postHogLabelColumnExpr); treating it the same keeps the
+		// (team_id, time_bucket, service_name, ...) primary-key prefix on
+		// {job="..."} selectors instead of falling back to a map scan.
+		if matcher.Name != "service.name" && matcher.Name != "service_name" && matcher.Name != "job" {
 			continue
 		}
 		switch matcher.Type {

@@ -93,6 +93,113 @@ func TestClickHouseCredentialsPassThrough(t *testing.T) {
 	}
 }
 
+func TestBuildInfoEndpoint(t *testing.T) {
+	// Grafana calls /api/v1/status/buildinfo on datasource "Save & Test" and
+	// semver-parses data.version to toggle features; it must be served on the
+	// Prometheus surface (Loki has its own) and carry a parseable version.
+	server := newServer(Config{})
+	mux := http.NewServeMux()
+	server.routes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/status/buildinfo", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("buildinfo status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"status":"success"`) {
+		t.Fatalf("buildinfo body missing success envelope: %s", body)
+	}
+	if !strings.Contains(body, `"version":"3.11.0"`) {
+		t.Fatalf("buildinfo must report the vendored Prometheus engine version 3.11.0: %s", body)
+	}
+	// No team header or path needed — Grafana calls this before any
+	// team-scoped request, so it must not 400 for a missing tenant.
+}
+
+func TestPostHogMetricTypeToPrometheus(t *testing.T) {
+	// OTel metric_type + is_monotonic on metric_series maps onto the Prometheus
+	// family type Grafana expects from /api/v1/metadata.
+	cases := []struct {
+		metricType string
+		monotonic  bool
+		want       string
+	}{
+		{"sum", true, "counter"},
+		{"sum", false, "gauge"},
+		{"gauge", false, "gauge"},
+		{"histogram", false, "histogram"},
+		{"exponential_histogram", false, "histogram"},
+		{"summary", false, "summary"},
+		{"mystery", false, "unknown"},
+	}
+	for _, tc := range cases {
+		if got := postHogMetricTypeToPrometheus(tc.metricType, tc.monotonic); got != tc.want {
+			t.Fatalf("postHogMetricTypeToPrometheus(%q, %v) = %q, want %q", tc.metricType, tc.monotonic, got, tc.want)
+		}
+	}
+}
+
+func TestPostHogMetadataSQL(t *testing.T) {
+	cfg := Config{
+		CHDatabase:        "posthog",
+		SchemaLayout:      "posthog",
+		MetricSeriesTable: "metric_series",
+		TeamID:            7,
+	}
+	sql := postHogMetadataSQL(cfg, "", 100)
+	for _, want := range []string{
+		"`posthog`.`metric_series`",
+		"team_id = 7",
+		"argMax(metric_type, last_seen)",
+		"argMax(is_monotonic, last_seen)",
+		"argMax(unit, last_seen)",
+		"GROUP BY metric_name",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("posthog metadata SQL missing %q:\n%s", want, sql)
+		}
+	}
+
+	sql = postHogMetadataSQL(cfg, "http_requests_total", 100)
+	if !strings.Contains(sql, "metric_name = 'http_requests_total'") {
+		t.Fatalf("metadata SQL should filter by metric when given:\n%s", sql)
+	}
+}
+
+func TestTeamSourceHeaderMode(t *testing.T) {
+	server := &Server{cfg: Config{
+		DefaultTeamID:  3,
+		TeamHeader:     "X-Team-ID",
+		TeamQueryParam: "team_id",
+		TeamSource:     "header",
+	}}
+
+	// Header wins.
+	req := httptest.NewRequest("GET", "/api/v1/query?team_id=5", nil)
+	req.Header.Set("X-Team-ID", "9")
+	if got, err := server.teamIDFromRequest(req); err != nil || got != 9 {
+		t.Fatalf("header team = (%d, %v), want 9", got, err)
+	}
+
+	// Query param and default are ignored in header mode; missing header errors.
+	req = httptest.NewRequest("GET", "/api/v1/query?team_id=5", nil)
+	if _, err := server.teamIDFromRequest(req); err == nil {
+		t.Fatal("header mode must reject a request without the team header")
+	}
+
+	// The /t/ and /team/ path prefixes are not registered in header mode.
+	mux := http.NewServeMux()
+	server.routes(mux)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/t/42/api/v1/query", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("/t/ in header mode = %d, want 404", rec.Code)
+	}
+}
+
 func TestMetricsEndpoint(t *testing.T) {
 	server := newServer(Config{})
 	mux := http.NewServeMux()

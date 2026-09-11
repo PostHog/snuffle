@@ -804,14 +804,9 @@ func postHogUnionInCondition(selectors []*parser.VectorSelector) (string, bool) 
 		seen[value] = struct{}{}
 		values = append(values, sqlString(value))
 	}
-	var column string
-	switch varying {
-	case labels.MetricName:
-		column = "metric_name"
-	case "service_name":
-		column = "service_name"
-	default:
-		column = postHogLabelValueExpr(varying)
+	column, ok := postHogLabelColumnExpr(varying)
+	if !ok {
+		return "", false
 	}
 	conditions := append(common, column+" IN ("+strings.Join(values, ",")+")")
 	return "(" + strings.Join(conditions, " AND ") + ")", true
@@ -3485,16 +3480,7 @@ func postHogUniqGroupExpr(exprs []string) string {
 }
 
 func postHogSampleGroupExpr(name string) (string, bool) {
-	switch name {
-	case labels.MetricName:
-		return "metric_name", true
-	case "service_name":
-		return "service_name", true
-	case "":
-		return "", false
-	default:
-		return postHogLabelValueExpr(name), true
-	}
+	return postHogLabelColumnExpr(name)
 }
 
 func aggregateSourceSQL(base string, grouping []string, groupJoin string) string {

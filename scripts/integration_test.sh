@@ -54,6 +54,13 @@ done
 
 go test ./...
 
-SNUFFLE_E2E=1 \
-SNUFFLE_E2E_CH_ADDR="$CH_ADDR" \
-go test -count=1 -run '^TestEndToEndClickHouse$' ./internal/snuffle -timeout=3m
+# Run the end-to-end suite in both storage layouts. The posthog layout reads
+# PostHog's metrics1/metric_attributes tables and is the deployment shape
+# Grafana uses; it must not regress against real ClickHouse.
+for layout in current posthog; do
+  echo "== e2e layout: $layout =="
+  SNUFFLE_E2E=1 \
+  SNUFFLE_E2E_CH_ADDR="$CH_ADDR" \
+  CH_SCHEMA_LAYOUT="$layout" \
+  go test -count=1 -run '^TestEndToEndClickHouse$' ./internal/snuffle -timeout=3m
+done

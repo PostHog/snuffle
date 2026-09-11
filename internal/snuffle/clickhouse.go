@@ -47,6 +47,34 @@ func NewClickHouseClient(cfg Config, metrics ...*bridgeMetrics) *ClickHouseClien
 	}
 }
 
+// buildClickHouseSettings merges the built-in connection settings with any
+// CH_QUERY_SETTINGS overrides, applied to both the shared and per-request
+// pools. Deployers use this to cap cost on a shared cluster (e.g.
+// max_bytes_to_read, max_execution_time) without a ClickHouse settings
+// profile.
+func buildClickHouseSettings(cfg Config) clickhouse.Settings {
+	settings := clickhouse.Settings{
+		"allow_experimental_time_series_aggregate_functions": 1,
+		// Every selector filters the label index on its sort-key prefix
+		// (team_id, metric_name, label_name, label_value), which no
+		// projection can improve on. ClickHouse still scans each
+		// projection's primary index to decide that, and the label index
+		// has ~900k marks, so the rejected analysis costs ~65ms per query.
+		"optimize_use_projections": 0,
+		// Remote write arrives pre-batched, so the async insert buffer is
+		// there to coalesce writers, not to build a batch. ClickHouse's 10MB
+		// default is far above anything one request contributes, so every
+		// insert waited out the busy timeout (50-200ms) instead of flushing
+		// on size. Bounding it flushes once a request's worth of data has
+		// landed; small writers still coalesce on the timer as before.
+		"async_insert_max_data_size": 1048576,
+	}
+	for key, value := range cfg.CHQuerySettings {
+		settings[key] = value
+	}
+	return settings
+}
+
 func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, error) {
 	return clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
@@ -56,22 +84,7 @@ func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, err
 			Username: username,
 			Password: password,
 		},
-		Settings: clickhouse.Settings{
-			"allow_experimental_time_series_aggregate_functions": 1,
-			// Every selector filters the label index on its sort-key prefix
-			// (team_id, metric_name, label_name, label_value), which no
-			// projection can improve on. ClickHouse still scans each
-			// projection's primary index to decide that, and the label index
-			// has ~900k marks, so the rejected analysis costs ~65ms per query.
-			"optimize_use_projections": 0,
-			// Remote write arrives pre-batched, so the async insert buffer is
-			// there to coalesce writers, not to build a batch. ClickHouse's 10MB
-			// default is far above anything one request contributes, so every
-			// insert waited out the busy timeout (50-200ms) instead of flushing
-			// on size. Bounding it flushes once a request's worth of data has
-			// landed; small writers still coalesce on the timer as before.
-			"async_insert_max_data_size": 1048576,
-		},
+		Settings:        buildClickHouseSettings(cfg),
 		DialTimeout:     cfg.CHTimeout,
 		MaxOpenConns:    32,
 		MaxIdleConns:    8,

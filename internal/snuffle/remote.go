@@ -55,7 +55,7 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 			writeAPIError(w, http.StatusBadRequest, "bad_data", fmt.Errorf("decode remote write protobuf: %w", err))
 			return
 		}
-		batch, err = buildRemoteWriteBatch(&req, s.cfg.RemoteWriteInterval, s.cfg.TeamID, s.cfg.SampleAttributes || s.cfg.postHogSchemaLayout())
+		batch, err = buildRemoteWriteBatch(&req, s.cfg.RemoteWriteInterval, s.cfg.TeamID, s.cfg.SampleAttributes || s.cfg.postHogSchemaLayout(), s.cfg.postHogSchemaLayout())
 	}
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
@@ -180,13 +180,14 @@ type remoteWriteLabel struct {
 }
 
 type remoteWriteSampleRow struct {
-	TeamID      uint64
-	MetricName  string
-	TimestampMS int64
-	ID          uint64
-	Value       float64
-	ServiceName string
-	Attributes  map[string]string
+	TeamID             uint64
+	MetricName         string
+	TimestampMS        int64
+	ID                 uint64
+	Value              float64
+	ServiceName        string
+	ResourceAttributes map[string]string
+	Attributes         map[string]string
 }
 
 type remoteWriteSampleColumns struct {
@@ -229,7 +230,7 @@ type remoteWriteMetadataRow struct {
 	UpdatedAtMS      int64
 }
 
-func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64, includeSampleAttributes bool) (remoteWriteBatch, error) {
+func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duration, teamID uint64, includeSampleAttributes bool, posthogLayout bool) (remoteWriteBatch, error) {
 	timeseriesCount := len(req.GetTimeseries())
 	sampleIntervalMS := sampleInterval.Milliseconds()
 	sampleCountHint := 0
@@ -275,10 +276,12 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 			return remoteWriteBatch{}, err
 		}
 		var sampleAttributes map[string]string
+		var resourceAttributes map[string]string
 		var serviceName string
 		if includeSampleAttributes {
-			sampleAttributes = sampleAttributesFromRemoteWriteLabels(rowLabels)
-			serviceName = serviceNameFromRemoteWriteLabels(rowLabels)
+			sampleAttributes = sampleAttributesFromRemoteWriteLabels(rowLabels, posthogLayout)
+			resourceAttributes = resourceAttributesFromRemoteWriteLabels(rowLabels)
+			serviceName = serviceNameFromRemoteWriteLabels(rowLabels, posthogLayout)
 		}
 
 		var minMS int64
@@ -313,13 +316,14 @@ func buildRemoteWriteBatch(req *prompb.WriteRequest, sampleInterval time.Duratio
 				}
 			}
 			batch.sampleRows = append(batch.sampleRows, remoteWriteSampleRow{
-				TeamID:      teamID,
-				MetricName:  metricName,
-				TimestampMS: bucketMS,
-				ID:          id,
-				Value:       sample.Value,
-				ServiceName: serviceName,
-				Attributes:  sampleAttributes,
+				TeamID:             teamID,
+				MetricName:         metricName,
+				TimestampMS:        bucketMS,
+				ID:                 id,
+				Value:              sample.Value,
+				ServiceName:        serviceName,
+				ResourceAttributes: resourceAttributes,
+				Attributes:         sampleAttributes,
 			})
 		}
 		for _, histogram := range ts.GetHistograms() {
@@ -557,24 +561,61 @@ func labelsJSONFromRemoteWriteLabels(input []remoteWriteLabel) (string, error) {
 	return string(buf), nil
 }
 
-func sampleAttributesFromRemoteWriteLabels(input []remoteWriteLabel) map[string]string {
+// posthogServiceLabels are the Prometheus label names the read side aliases
+// onto columns (see postHogLabelColumnExpr). The writer must not also store
+// them as metric attributes, or a series would carry the same value twice and
+// the column-derived alias would mask the attribute copy.
+var posthogServiceLabels = map[string]struct{}{"job": {}, "instance": {}, "service.name": {}}
+
+func sampleAttributesFromRemoteWriteLabels(input []remoteWriteLabel, posthogLayout bool) map[string]string {
 	attributes := make(map[string]string, len(input))
 	for _, label := range input {
 		if label.Name == labels.MetricName || label.Name == "" {
 			continue
+		}
+		if posthogLayout {
+			if _, isService := posthogServiceLabels[label.Name]; isService {
+				continue
+			}
 		}
 		attributes[label.Name+"__str"] = label.Value
 	}
 	return attributes
 }
 
-func serviceNameFromRemoteWriteLabels(input []remoteWriteLabel) string {
+func serviceNameFromRemoteWriteLabels(input []remoteWriteLabel, posthogLayout bool) string {
 	for _, label := range input {
 		if label.Name == "service.name" || label.Name == "service_name" {
 			return label.Value
 		}
+		if posthogLayout && label.Name == "job" {
+			return label.Value
+		}
 	}
 	return ""
+}
+
+// resourceAttributesFromRemoteWriteLabels mirrors the Rust ingest mapping
+// (rust/capture-logs/src/endpoints/prometheus.rs): `job` fills the
+// service.name resource attribute and `instance` fills service.instance.id,
+// so rows Snuffle inserts into metrics1 have the same shape as rows that
+// arrived over Kafka. PostHog's own ingest never calls this; it only shapes
+// Snuffle-seeded data (e2e, dev fixtures, the self-scraper).
+func resourceAttributesFromRemoteWriteLabels(input []remoteWriteLabel) map[string]string {
+	attrs := make(map[string]string, 2)
+	for _, label := range input {
+		switch label.Name {
+		case "job":
+			if label.Value != "" {
+				attrs["service.name"] = label.Value
+			}
+		case "instance":
+			if label.Value != "" {
+				attrs["service.instance.id"] = label.Value
+			}
+		}
+	}
+	return attrs
 }
 
 func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
@@ -889,7 +930,10 @@ func (s *Server) insertPostHogRemoteSampleRows(ctx context.Context, batchRows re
 			timestamps[i] = row.TimestampMS
 			values[i] = row.Value
 			serviceNames[i] = row.ServiceName
-			resourceAttributes[i] = map[string]string{}
+			resourceAttributes[i] = row.ResourceAttributes
+			if resourceAttributes[i] == nil {
+				resourceAttributes[i] = map[string]string{}
+			}
 			attributes[i] = row.Attributes
 			if attributes[i] == nil {
 				attributes[i] = map[string]string{}

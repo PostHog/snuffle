@@ -123,6 +123,43 @@ func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvTeamSource(t *testing.T) {
+	t.Setenv("SNUFFLE_TEAM_SOURCE", "header")
+	cfg := ConfigFromEnv()
+	if cfg.TeamSource != "header" {
+		t.Fatalf("TeamSource = %q, want header", cfg.TeamSource)
+	}
+}
+
+func TestConfigFromEnvQuerySettings(t *testing.T) {
+	t.Setenv("CH_QUERY_SETTINGS", "max_bytes_to_read=50000000000,max_execution_time=30,read_overflow_mode=throw")
+	cfg := ConfigFromEnv()
+	if cfg.CHQuerySettings["max_bytes_to_read"] != 50000000000 {
+		t.Fatalf("max_bytes_to_read = %#v", cfg.CHQuerySettings["max_bytes_to_read"])
+	}
+	if cfg.CHQuerySettings["max_execution_time"] != 30 {
+		t.Fatalf("max_execution_time = %#v", cfg.CHQuerySettings["max_execution_time"])
+	}
+	if cfg.CHQuerySettings["read_overflow_mode"] != "throw" {
+		t.Fatalf("read_overflow_mode = %#v", cfg.CHQuerySettings["read_overflow_mode"])
+	}
+}
+
+func TestBuildClickHouseSettingsMergesQuerySettings(t *testing.T) {
+	cfg := Config{CHQuerySettings: map[string]any{"max_bytes_to_read": 50000000000, "read_overflow_mode": "throw"}}
+	settings := buildClickHouseSettings(cfg)
+	if settings["max_bytes_to_read"] != 50000000000 {
+		t.Fatalf("merged max_bytes_to_read = %#v", settings["max_bytes_to_read"])
+	}
+	if settings["read_overflow_mode"] != "throw" {
+		t.Fatalf("merged read_overflow_mode = %#v", settings["read_overflow_mode"])
+	}
+	// Built-in defaults must survive the merge.
+	if settings["allow_experimental_time_series_aggregate_functions"] != 1 {
+		t.Fatalf("built-in setting lost: %#v", settings)
+	}
+}
+
 func TestConfigFromEnvLogSettings(t *testing.T) {
 	t.Setenv("SNUFFLE_LOG_RETENTION", "48h")
 	t.Setenv("SNUFFLE_LOG_QUERY_MAX_ROWS", "1234")

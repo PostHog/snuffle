@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/pprof"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -106,8 +107,12 @@ func (s *Server) routes(mux *http.ServeMux) {
 	routes.Handle("/api/v1/", gzipJSONHandler(api))
 	loki := s.lokiRoutes()
 	routes.Handle("/loki/api/v1/", gzipJSONHandler(loki))
-	routes.HandleFunc("/t/", s.handleTeamPath(routes))
-	routes.HandleFunc("/team/", s.handleTeamPath(routes))
+	if s.cfg.TeamSource != "header" {
+		// Tenant-in-path is a caller-asserted override; it must not exist in
+		// proxied ("header") mode, where only the trusted header picks a team.
+		routes.HandleFunc("/t/", s.handleTeamPath(routes))
+		routes.HandleFunc("/team/", s.handleTeamPath(routes))
+	}
 	mux.Handle("/", s.clickHouseAuthHandler(routes))
 }
 
@@ -150,7 +155,32 @@ func (s *Server) apiRoutes() *http.ServeMux {
 	mux.HandleFunc("/api/v1/rules", s.teamHandler((*Server).handleRules))
 	mux.HandleFunc("/api/v1/alerts", s.teamHandler((*Server).handleAlerts))
 	mux.HandleFunc("/api/v1/query_exemplars", s.teamHandler((*Server).handleQueryExemplars))
+	// buildinfo is not team-scoped: Grafana probes it on datasource "Save &
+	// Test" before it ever sends a team-scoped query, so requiring the tenant
+	// header here would make every new datasource setup fail.
+	mux.HandleFunc("/api/v1/status/buildinfo", s.handleBuildInfo)
 	return mux
+}
+
+// buildVersion reports the Prometheus version whose engine Snuffle vendors
+// (go.mod github.com/prometheus/prometheus v0.311.x == Prometheus 3.11).
+// Grafana semver-parses data.version on datasource load to toggle features,
+// so this must be a real version, not "snuffle". buildRevision is injected at
+// build time via -ldflags "-X .../snuffle.buildRevision=$GIT_SHA".
+var (
+	buildVersion  = "3.11.0"
+	buildRevision = ""
+)
+
+func (s *Server) handleBuildInfo(w http.ResponseWriter, r *http.Request) {
+	writeAPISuccess(w, map[string]string{
+		"version":   buildVersion,
+		"revision":  buildRevision,
+		"branch":    "",
+		"buildUser": "snuffle",
+		"buildDate": "",
+		"goVersion": runtime.Version(),
+	})
 }
 
 type requestTeamIDKey struct{}
@@ -230,6 +260,16 @@ func parseTeamPath(path string) (uint64, string, error) {
 }
 
 func (s *Server) teamIDFromRequest(r *http.Request) (uint64, error) {
+	// In "header" (proxied) mode the team must come from the tenant header and
+	// nothing else: the caller-asserted path prefix, query param, and default
+	// are all ignored, because behind a reverse proxy only the trusted header
+	// set by the proxy may pick a tenant.
+	if s.cfg.TeamSource == "header" {
+		if value := strings.TrimSpace(r.Header.Get(s.cfg.TeamHeader)); value != "" {
+			return parseTeamID(value)
+		}
+		return 0, fmt.Errorf("missing %s header", s.cfg.TeamHeader)
+	}
 	if value, ok := r.Context().Value(requestTeamIDKey{}).(uint64); ok {
 		return value, nil
 	}
@@ -616,6 +656,12 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	// In posthog layout there is no metrics_metadata table; per-metric
+	// type/unit come from metric_series instead.
+	if s.cfg.postHogSchemaLayout() {
+		s.handlePostHogMetadata(w, r)
+		return
+	}
 	if s.cfg.MetricsTable == "" {
 		writeAPISuccess(w, map[string][]metadataResult{})
 		return
@@ -665,6 +711,45 @@ func (s *Server) handleMetadata(w http.ResponseWriter, r *http.Request) {
 type exemplarQueryResult struct {
 	SeriesLabels map[string]string   `json:"seriesLabels"`
 	Exemplars    []exemplarAPIResult `json:"exemplars"`
+}
+
+// handlePostHogMetadata serves /api/v1/metadata from metric_series. Remote-
+// write series are stored under their exposed names (`_bucket`, `_sum`,
+// `_count`, `_total`), so the map is keyed per series name, not per family —
+// document that autocomplete hints are per-series. help is empty: PostHog
+// does not ingest HELP text. Degrades to {} when the table is empty.
+func (s *Server) handlePostHogMetadata(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.MetricSeriesTable == "" {
+		writeAPISuccess(w, map[string][]metadataResult{})
+		return
+	}
+	limit, err := parseLimit(r.Form.Get("limit"))
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+	sql := postHogMetadataSQL(s.cfg, r.Form.Get("metric"), limit)
+
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
+	defer cancel()
+	result := map[string][]metadataResult{}
+	err = s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		var metricName, metricType, unit string
+		var isMonotonic bool
+		if err := row.Scan(&metricName, &metricType, &isMonotonic, &unit); err != nil {
+			return err
+		}
+		result[metricName] = []metadataResult{{
+			Type: postHogMetricTypeToPrometheus(metricType, isMonotonic),
+			Unit: unit,
+		}}
+		return nil
+	})
+	if err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
+	writeAPISuccess(w, result)
 }
 
 type exemplarAPIResult struct {

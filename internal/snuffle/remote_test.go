@@ -37,7 +37,7 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 		Unit:             "requests",
 	}}}
 
-	batch, err := buildRemoteWriteBatch(req, 0, 7, false)
+	batch, err := buildRemoteWriteBatch(req, 0, 7, false, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -59,6 +59,51 @@ func TestBuildRemoteWriteBatch(t *testing.T) {
 	}
 	if len(batch.metadataRows) != 1 || batch.metadataRows[0].Type != "counter" {
 		t.Fatalf("metadata rows should contain metadata: %#v", batch.metadataRows)
+	}
+}
+
+func TestBuildRemoteWriteBatchPostHogMapsJobAndInstanceToResource(t *testing.T) {
+	// The read side aliases `job` -> service_name and `instance` ->
+	// resource_attributes['service.instance.id'], matching the Rust ingest
+	// (rust/capture-logs/src/endpoints/prometheus.rs). Snuffle's own writer
+	// must produce the same shape, or e2e seeds and dev fixtures read back a
+	// different series than production rows.
+	req := &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{
+		{
+			Labels: []prompb.Label{
+				{Name: labels.MetricName, Value: "http_requests_total"},
+				{Name: "job", Value: "api"},
+				{Name: "instance", Value: "host-a"},
+				{Name: "status", Value: "200"},
+			},
+			Samples: []prompb.Sample{{Timestamp: 1000, Value: 1}},
+		},
+	}}
+
+	batch, err := buildRemoteWriteBatch(req, 0, 7, true, true)
+	if err != nil {
+		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
+	}
+	if len(batch.sampleRows) != 1 {
+		t.Fatalf("sampleRows length = %d, want 1", len(batch.sampleRows))
+	}
+	row := batch.sampleRows[0]
+	if row.ServiceName != "api" {
+		t.Fatalf("ServiceName = %q, want %q", row.ServiceName, "api")
+	}
+	if row.ResourceAttributes["service.name"] != "api" {
+		t.Fatalf("ResourceAttributes[service.name] = %q, want %q", row.ResourceAttributes["service.name"], "api")
+	}
+	if row.ResourceAttributes["service.instance.id"] != "host-a" {
+		t.Fatalf("ResourceAttributes[service.instance.id] = %q, want %q", row.ResourceAttributes["service.instance.id"], "host-a")
+	}
+	for _, key := range []string{"job__str", "instance__str", "service.name__str"} {
+		if _, ok := row.Attributes[key]; ok {
+			t.Fatalf("job/instance/service.name must not be stored as metric attributes: %#v", row.Attributes)
+		}
+	}
+	if row.Attributes["status__str"] != "200" {
+		t.Fatalf("ordinary labels still become metric attributes: %#v", row.Attributes)
 	}
 }
 
@@ -87,7 +132,7 @@ func TestBuildRemoteWriteBatchPreservesStaleNaNSamples(t *testing.T) {
 		},
 	}}
 
-	batch, err := buildRemoteWriteBatch(req, 0, 0, false)
+	batch, err := buildRemoteWriteBatch(req, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -121,7 +166,7 @@ func TestBuildRemoteWriteBatchAcceptsNativeHistograms(t *testing.T) {
 			Timestamp: 1000,
 		}},
 	}}}
-	batch, err := buildRemoteWriteBatch(req, 0, 0, false)
+	batch, err := buildRemoteWriteBatch(req, 0, 0, false, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}
@@ -160,7 +205,7 @@ func TestBuildRemoteWriteBatchBucketsSamples(t *testing.T) {
 		},
 	}}}
 
-	batch, err := buildRemoteWriteBatch(req, 15*time.Second, 0, false)
+	batch, err := buildRemoteWriteBatch(req, 15*time.Second, 0, false, false)
 	if err != nil {
 		t.Fatalf("buildRemoteWriteBatch returned error: %v", err)
 	}

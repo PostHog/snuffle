@@ -258,6 +258,7 @@ metadata, or logs includes the resolved tenant filter.
 | Labels and series | `GET\|POST /api/v1/labels`, `/api/v1/label/<name>/values`, `/api/v1/series` |
 | Metadata and exemplars | `GET\|POST /api/v1/metadata`, `/api/v1/query_exemplars` |
 | Remote storage | `POST /api/v1/write`, `POST /api/v1/read` |
+| Build information | `GET /api/v1/status/buildinfo` |
 | Compatibility stubs | `GET\|POST /api/v1/rules`, `/api/v1/alerts` |
 
 PromQL compatibility comes from Prometheus's own parser and evaluation engine,
@@ -329,6 +330,23 @@ the hot log table narrow while retaining selector and aggregation support.
 In PostHog metrics mode, Snuffle builds Prometheus labels from `metric_name`,
 `service_name`, `resource_attributes`, and `attributes_map_str`, and computes
 series identity in ClickHouse.
+
+Two label names are aliases, not stored labels. PostHog's remote-write ingest
+moves `job` into the `service_name` column and `instance` into the
+`service.instance.id` resource attribute, so Snuffle reverses that mapping on
+read: `{job="api"}` filters the `service_name` column and `{instance="x"}`
+reads `resource_attributes['service.instance.id']`, and both appear in
+`/api/v1/labels` and `/api/v1/label/<name>/values`. Queries written against a
+Prometheus datasource keep working without rewriting `job`/`instance` to
+`service_name`/`service.instance.id`. Other OpenTelemetry-style names (for
+example `k8s.pod.name`) are served as-is; PromQL 3.x and current Grafana accept
+dotted label names.
+
+`/api/v1/metadata` in this mode reads per-metric OTel type and unit from
+`metric_series` (see `CH_METRIC_SERIES_TABLE`). Remote-write histograms are
+stored under their exposed names (`_bucket`, `_sum`, `_count`), so metadata is
+keyed per series name rather than per family; `help` is empty because PostHog
+does not ingest `HELP` text.
 
 In PostHog logs mode, Loki stream labels and structured metadata map onto the
 OpenTelemetry-shaped `logs34` columns. Service, severity, trace, span, resource,
@@ -434,7 +452,10 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `SNUFFLE_DEFAULT_TEAM_ID` | `0` | Tenant used when no path, header, or query tenant is provided |
 | `SNUFFLE_TEAM_HEADER` | `X-Team-ID` | Tenant request header |
 | `SNUFFLE_TEAM_QUERY_PARAM` | `team_id` | Tenant query parameter |
-| `SNUFFLE_SELF_SCRAPE_ENABLED` | `true` | Write Snuffle's own metrics into the configured metrics tables |
+| `SNUFFLE_TEAM_SOURCE` | `any` | Tenant resolution: `any` accepts path, header, query param, or default; `header` accepts only the tenant header and disables `/t/` and `/team/` — use behind a reverse proxy that owns tenant selection |
+| `CH_METRIC_SERIES_TABLE` | `metric_series` (posthog) / empty | PostHog per-metric type/unit table for `/api/v1/metadata` |
+| `CH_QUERY_SETTINGS` | empty | Extra ClickHouse connection settings as `k=v,k=v` (for example `max_bytes_to_read=50000000000,read_overflow_mode=throw`) |
+| `SNUFFLE_SELF_SCRAPE_ENABLED` | `true` | Write Snuffle's own metrics into the configured metrics tables. Set `false` when the ClickHouse user is read-only — in posthog layout the self-scraper INSERTs into the samples table and would otherwise fail every interval |
 | `SNUFFLE_SELF_SCRAPE_INTERVAL` | `15s` | Self-scrape interval; `0` disables downstream writes while keeping `/metrics` |
 | `SNUFFLE_SELF_SCRAPE_TEAM_ID` | default team | Tenant for self-scraped metrics |
 | `SNUFFLE_SELF_SCRAPE_JOB` | `snuffle` | `job` label for self-scraped metrics |

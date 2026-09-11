@@ -371,6 +371,76 @@ func TestPostHogSeriesSamplesSQLUsesPostHogTablesAndAttributePredicates(t *testi
 	}
 }
 
+func TestPostHogSeriesSamplesSQLAliasesJobAndInstance(t *testing.T) {
+	// PostHog's remote-write ingest stores the Prometheus `job` label in the
+	// service_name column and `instance` in resource_attributes['service.instance.id']
+	// (rust/capture-logs/src/endpoints/prometheus.rs). A customer pointing Grafana
+	// at a remote-written project queries `job`/`instance`, so the read side must
+	// reverse the mapping exactly.
+	cfg := Config{
+		CHDatabase:   "posthog",
+		SchemaLayout: "posthog",
+		SamplesTable: "metrics1",
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "job", "checkout"),
+		labels.MustNewMatcher(labels.MatchEqual, "instance", "host-a"),
+	}
+
+	sql := postHogSeriesSamplesSQL(cfg, matchers, 1000, 2000, false)
+	for _, want := range []string{
+		"service_name = 'checkout'",
+		"resource_attributes['service.instance.id'] = 'host-a'",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	for _, notWant := range []string{"job__str", "instance__str"} {
+		if strings.Contains(sql, notWant) {
+			t.Fatalf("job/instance must not be looked up as metric attributes %q:\n%s", notWant, sql)
+		}
+	}
+}
+
+func TestPostHogLabelMapAliasesJobAndInstance(t *testing.T) {
+	got := postHogLabelMap(
+		"http_requests_total",
+		"checkout",
+		map[string]string{"service.instance.id": "host-a", "k8s.pod.name": "api-6d9"},
+		map[string]string{"status__str": "200"},
+	)
+	for key, want := range map[string]string{
+		"__name__":            "http_requests_total",
+		"service_name":        "checkout",
+		"job":                 "checkout",
+		"service.instance.id": "host-a",
+		"instance":            "host-a",
+		"k8s.pod.name":        "api-6d9",
+		"status":              "200",
+	} {
+		if got[key] != want {
+			t.Fatalf("label %q = %q, want %q (map %#v)", key, got[key], want, got)
+		}
+	}
+}
+
+func TestPostHogLabelMapColumnAliasesWinOverLegacyAttributes(t *testing.T) {
+	// Rows written before the writer learned the mapping carry job__str /
+	// instance__str in attributes_map_str. The column-derived aliases must win,
+	// or one series would show two different job values depending on age.
+	got := postHogLabelMap(
+		"http_requests_total",
+		"checkout",
+		map[string]string{"service.instance.id": "host-a"},
+		map[string]string{"job__str": "stale", "instance__str": "stale"},
+	)
+	if got["job"] != "checkout" || got["instance"] != "host-a" {
+		t.Fatalf("column aliases must override legacy attributes: %#v", got)
+	}
+}
+
 func TestPostHogLoadSamplesSQLFiltersByComputedSeriesID(t *testing.T) {
 	cfg := Config{
 		CHDatabase:   "posthog",

@@ -24,6 +24,7 @@ PARTITION BY toDate(time_bucket)
 ORDER BY (team_id, attribute_type, time_bucket, resource_fingerprint, attribute_key, attribute_value)
 SETTINGS
     deduplicate_merge_projection_mode = 'drop',
+    allow_dimensions_outside_sorting_key = 1,
     index_granularity = 8192;
 
 CREATE TABLE metrics1

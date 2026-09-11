@@ -104,6 +104,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	}
 	assertLabels(t, api.URL)
 	assertLabelValues(t, api.URL)
+	if cfg.postHogSchemaLayout() {
+		assertAliasLabelValues(t, api.URL)
+	}
 	assertSeries(t, api.URL)
 	if !cfg.postHogSchemaLayout() {
 		assertMetadata(t, api.URL)
@@ -420,6 +423,23 @@ func assertLabelValues(t *testing.T, baseURL string) {
 		"end":     {"1700000070"},
 	})
 	assertStringPresent(t, values, "api")
+}
+
+func assertAliasLabelValues(t *testing.T, baseURL string) {
+	t.Helper()
+	// No match[]: the alias endpoints must answer from their backing columns —
+	// job from the service_name column, instance from the service.instance.id
+	// resource attribute — not from attribute discovery.
+	jobs := apiGet[[]string](t, baseURL, "/api/v1/label/job/values", url.Values{
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
+	})
+	assertStringPresent(t, jobs, "api")
+	instances := apiGet[[]string](t, baseURL, "/api/v1/label/instance/values", url.Values{
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
+	})
+	assertStringPresent(t, instances, "host-a")
 }
 
 func assertSeries(t *testing.T, baseURL string) {
