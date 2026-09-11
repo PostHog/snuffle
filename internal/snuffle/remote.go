@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"runtime"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/cespare/xxhash/v2"
@@ -641,7 +642,7 @@ func (s *Server) insertRemoteWriteBatch(ctx context.Context, batch remoteWriteBa
 	}
 	started = time.Now()
 	if err := s.insertRemoteSampleRows(ctx, batch); err != nil {
-		return remoteWritePhaseError("insert samples", s.cfg.SamplesTable, batch.sampleCount, s.cfg.CHTimeout, batchSummary, started, err)
+		return remoteWritePhaseError("insert samples", s.remoteSampleTargetTable(), batch.sampleCount, s.cfg.CHTimeout, batchSummary, started, err)
 	}
 	started = time.Now()
 	if err := s.insertRemoteHistogramRows(ctx, batch.histogramRows); err != nil {
@@ -832,6 +833,13 @@ func (s *Server) insertRemoteSeriesRows(ctx context.Context, rows []remoteWriteS
 	})
 }
 
+func (s *Server) remoteSampleTargetTable() string {
+	if s.cfg.postHogSchemaLayout() {
+		return s.cfg.MetricsInputTable
+	}
+	return s.cfg.SamplesTable
+}
+
 func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWriteBatch) error {
 	if batchRows.sampleCount == 0 {
 		return nil
@@ -873,54 +881,72 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 	})
 }
 
+// postHogEmptyResourceFingerprint is cityHash64(map()), the fingerprint the
+// series table materializes for the empty resource_attributes map these rows
+// carry, so the samples table agrees with it.
+const postHogEmptyResourceFingerprint = uint64(4761183170873013810)
+
+// insertPostHogRemoteSampleRows writes into the metrics2_input table; its
+// materialized views fan each row out to the samples, series, and attribute
+// tables. Remote-write labels are stored as attributes without the __str
+// suffix the native attributes_map_str column uses.
 func (s *Server) insertPostHogRemoteSampleRows(ctx context.Context, batchRows remoteWriteBatch) error {
-	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, timestamp, observed_timestamp, value, service_name, resource_attributes, attributes_map_str)", tableName(s.cfg.CHDatabase, s.cfg.SamplesTable))
+	sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, series_fingerprint, resource_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, value, count, has_labels, resource_attributes, attributes)", tableName(s.cfg.CHDatabase, s.cfg.MetricsInputTable))
 	return s.client.InsertColumns(ctx, sql, func(batch clickHouseBatch) (int, error) {
-		teamIDs := make([]int32, len(batchRows.sampleRows))
-		metricNames := make([]string, len(batchRows.sampleRows))
-		timestamps := make([]int64, len(batchRows.sampleRows))
-		values := make([]float64, len(batchRows.sampleRows))
-		serviceNames := make([]string, len(batchRows.sampleRows))
-		resourceAttributes := make([]map[string]string, len(batchRows.sampleRows))
-		attributes := make([]map[string]string, len(batchRows.sampleRows))
+		n := len(batchRows.sampleRows)
+		observed := time.Now().UTC()
+		expiry := observed.Add(s.cfg.MetricsRetention)
+		teamIDs := make([]int32, n)
+		metricNames := make([]string, n)
+		fingerprints := make([]uint64, n)
+		resourceFingerprints := make([]uint64, n)
+		timestamps := make([]time.Time, n)
+		observedTimestamps := make([]time.Time, n)
+		expiries := make([]time.Time, n)
+		serviceNames := make([]string, n)
+		values := make([]float64, n)
+		counts := make([]uint64, n)
+		hasLabels := make([]bool, n)
+		resourceAttributes := make([]map[string]string, n)
+		attributes := make([]map[string]string, n)
+		emptyResourceAttributes := map[string]string{}
+		attributesByID := make(map[uint64]map[string]string, 64)
 		for i, row := range batchRows.sampleRows {
 			teamIDs[i] = int32(row.TeamID)
 			metricNames[i] = row.MetricName
-			timestamps[i] = row.TimestampMS
-			values[i] = row.Value
+			fingerprints[i] = row.ID
+			resourceFingerprints[i] = postHogEmptyResourceFingerprint
+			timestamps[i] = time.UnixMilli(row.TimestampMS).UTC()
+			observedTimestamps[i] = observed
+			expiries[i] = expiry
 			serviceNames[i] = row.ServiceName
-			resourceAttributes[i] = map[string]string{}
-			attributes[i] = row.Attributes
-			if attributes[i] == nil {
-				attributes[i] = map[string]string{}
+			values[i] = row.Value
+			counts[i] = 1
+			hasLabels[i] = true
+			resourceAttributes[i] = emptyResourceAttributes
+			attrs, ok := attributesByID[row.ID]
+			if !ok {
+				attrs = postHogSampleAttributes(row.Attributes)
+				attributesByID[row.ID] = attrs
+			}
+			attributes[i] = attrs
+		}
+		columns := []any{teamIDs, metricNames, fingerprints, resourceFingerprints, timestamps, observedTimestamps, expiries, serviceNames, values, counts, hasLabels, resourceAttributes, attributes}
+		for i, column := range columns {
+			if err := batch.Column(i).Append(column); err != nil {
+				return 0, err
 			}
 		}
-		if err := batch.Column(0).Append(teamIDs); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(1).Append(metricNames); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(2).Append(timestamps); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(3).Append(timestamps); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(4).Append(values); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(5).Append(serviceNames); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(6).Append(resourceAttributes); err != nil {
-			return 0, err
-		}
-		if err := batch.Column(7).Append(attributes); err != nil {
-			return 0, err
-		}
-		return len(batchRows.sampleRows), nil
+		return n, nil
 	})
+}
+
+func postHogSampleAttributes(attributes map[string]string) map[string]string {
+	out := make(map[string]string, len(attributes))
+	for key, value := range attributes {
+		out[strings.TrimSuffix(key, "__str")] = value
+	}
+	return out
 }
 
 func appendRemoteSampleColumns(batch clickHouseBatch, columns remoteWriteSampleColumns) (int, error) {

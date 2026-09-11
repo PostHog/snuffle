@@ -21,6 +21,7 @@ type Config struct {
 	LabelPostingsTable   string
 	ActivityTable        string
 	MetricsTable         string
+	MetricsInputTable    string
 	LogSchemaLayout      string
 	LogsTable            string
 	LogStreamsTable      string
@@ -55,6 +56,7 @@ type Config struct {
 	SelfScrapeInstance   string
 	LogRetention         time.Duration
 	LogQueryMaxRows      int
+	MetricsRetention     time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -75,6 +77,8 @@ func ConfigFromEnv() Config {
 	histogramsTableDefault := "metrics_histograms"
 	exemplarsTableDefault := "metrics_exemplars"
 	metadataTableDefault := "metrics_metadata"
+	attributeTableDefault := "metric_attributes"
+	metricsInputTableDefault := ""
 	logsTableDefault := "logs"
 	logStreamsTableDefault := "log_streams"
 	logStreamLabelsTableDefault := "log_stream_labels"
@@ -82,9 +86,11 @@ func ConfigFromEnv() Config {
 	logStreamStatsTableDefault := "log_stream_stats"
 	aggregateThreadsDefault := 1
 	if schemaLayout == schemaLayoutPostHog {
-		seriesTableDefault = ""
-		samplesTableDefault = "metrics"
+		seriesTableDefault = "metric_series2"
+		samplesTableDefault = "metrics2"
 		labelIndexTableDefault = ""
+		attributeTableDefault = "metric_attributes2"
+		metricsInputTableDefault = "metrics2_input"
 		histogramsTableDefault = ""
 		exemplarsTableDefault = ""
 		metadataTableDefault = ""
@@ -93,7 +99,7 @@ func ConfigFromEnv() Config {
 		logsTableDefault = "logs34"
 		logStreamsTableDefault = ""
 		logStreamLabelsTableDefault = ""
-		logAttributesTableDefault = "log_attributes2"
+		logAttributesTableDefault = "log_attributes3"
 		logStreamStatsTableDefault = ""
 	}
 	return Config{
@@ -106,10 +112,11 @@ func ConfigFromEnv() Config {
 		SeriesTable:          getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", seriesTableDefault)),
 		SamplesTable:         getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
 		LabelIndexTable:      getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
-		AttributeTable:       getenv("CH_ATTRIBUTE_TABLE", "metric_attributes"),
+		AttributeTable:       getenv("CH_ATTRIBUTE_TABLE", attributeTableDefault),
 		LabelPostingsTable:   getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:        getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:         getenv("CH_METRICS_TABLE", metadataTableDefault),
+		MetricsInputTable:    getenv("CH_METRICS_INPUT_TABLE", metricsInputTableDefault),
 		LogSchemaLayout:      string(logSchemaLayout),
 		LogsTable:            getenv("CH_LOGS_TABLE", logsTableDefault),
 		LogStreamsTable:      getenv("CH_LOG_STREAMS_TABLE", logStreamsTableDefault),
@@ -144,6 +151,7 @@ func ConfigFromEnv() Config {
 		SelfScrapeInstance:   getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
 		LogRetention:         envDuration("SNUFFLE_LOG_RETENTION", 30*24*time.Hour),
 		LogQueryMaxRows:      envInt("SNUFFLE_LOG_QUERY_MAX_ROWS", 100000, 1),
+		MetricsRetention:     envDuration("SNUFFLE_METRICS_RETENTION", 90*24*time.Hour),
 	}
 }
 

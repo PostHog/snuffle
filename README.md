@@ -293,9 +293,9 @@ Metrics and logs choose their layouts independently.
 | Data | Layout | Best for | Schema |
 | --- | --- | --- | --- |
 | Metrics | `current` (default) | New Snuffle deployments optimized around Prometheus series, samples, labels, histograms, exemplars, and metadata | [`scripts/create_metrics_schema.sql`](scripts/create_metrics_schema.sql) |
-| Metrics | `posthog` | Existing PostHog-style `metrics`/`metrics1` and `metric_attributes` tables | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
+| Metrics | `posthog` | Existing PostHog-style `metrics2`, `metric_series2`, and `metric_attributes2` tables | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
 | Logs | `snuffle` (default with `current` metrics) | New deployments with a narrow log table, stream dictionary, label index, and minute rollups | [`scripts/create_logs_snuffle_schema.sql`](scripts/create_logs_snuffle_schema.sql) |
-| Logs | `posthog` (default with `posthog` metrics) | Existing PostHog-style `logs34` and `log_attributes2` tables | [`scripts/create_logs_posthog_schema.sql`](scripts/create_logs_posthog_schema.sql) |
+| Logs | `posthog` (default with `posthog` metrics) | Existing PostHog-style `logs34` and `log_attributes3` tables | [`scripts/create_logs_posthog_schema.sql`](scripts/create_logs_posthog_schema.sql) |
 
 ### Snuffle-native metrics
 
@@ -326,9 +326,12 @@ the hot log table narrow while retaining selector and aggregation support.
 
 ### PostHog-compatible data
 
-In PostHog metrics mode, Snuffle builds Prometheus labels from `metric_name`,
-`service_name`, `resource_attributes`, and `attributes_map_str`, and computes
-series identity in ClickHouse.
+In PostHog metrics mode, series identity is the `series_fingerprint` shared by
+`metric_series2` and `metrics2`. Snuffle selects series from `metric_series2`,
+builds Prometheus labels from `metric_name`, `service_name`,
+`resource_attributes`, and `attributes`, and reads samples from `metrics2` by
+fingerprint. Remote write inserts into `metrics2_input`; its materialized views
+fan each row out to the samples, series, and attribute tables.
 
 In PostHog logs mode, Loki stream labels and structured metadata map onto the
 OpenTelemetry-shaped `logs34` columns. Service, severity, trace, span, resource,
@@ -392,10 +395,11 @@ Snuffle is configured with environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CH_SCHEMA_LAYOUT` | `current` | Metrics layout: `current` or `posthog`; `SNUFFLE_SCHEMA_LAYOUT` is accepted as a legacy fallback |
-| `CH_SERIES_TABLE` | `metrics_series` / empty | Series table; empty by default in PostHog mode |
-| `CH_SAMPLES_TABLE` | `metrics_samples` / `metrics` | Float sample table or PostHog metrics view |
+| `CH_SERIES_TABLE` | `metrics_series` / `metric_series2` | Series table |
+| `CH_SAMPLES_TABLE` | `metrics_samples` / `metrics2` | Float sample table |
 | `CH_LABEL_INDEX_TABLE` | `metrics_label_index` / empty | Metrics label index |
-| `CH_ATTRIBUTE_TABLE` | `metric_attributes` | PostHog attribute discovery table |
+| `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metric_attributes2` | PostHog attribute discovery table |
+| `CH_METRICS_INPUT_TABLE` | empty / `metrics2_input` | PostHog remote write target; its materialized views feed the samples, series, and attribute tables |
 | `CH_LABEL_POSTINGS_TABLE` | empty | Optional optimized metrics postings table |
 | `CH_ACTIVITY_TABLE` | empty | Optional series-activity table |
 | `CH_METRICS_TABLE` | `metrics_metadata` / empty | Metric metadata table |
@@ -406,7 +410,7 @@ Snuffle is configured with environment variables.
 | `CH_LOG_STREAMS_TABLE` | `log_streams` / empty | Snuffle log stream dictionary |
 | `CH_LOG_STREAM_LABELS_TABLE` | `log_stream_labels` / empty | Snuffle log label index |
 | `CH_LOG_STREAM_STATS_TABLE` | `log_stream_stats` / empty | Snuffle log minute rollups |
-| `CH_LOG_ATTRIBUTES_TABLE` | empty / `log_attributes2` | PostHog log attributes table; `CH_LOG_ATTRIBUTE_TABLE` is also accepted |
+| `CH_LOG_ATTRIBUTES_TABLE` | empty / `log_attributes3` | PostHog log attributes table; `CH_LOG_ATTRIBUTE_TABLE` is also accepted |
 
 `CH_TAGS_TABLE` and `CH_DATA_TABLE` remain accepted as fallbacks for
 `CH_SERIES_TABLE` and `CH_SAMPLES_TABLE`. `SNUFFLE_LOG_SCHEMA_LAYOUT` remains
@@ -423,8 +427,9 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `CH_ID_CHUNK_SIZE` | `20000` | Series ID batch size for selective reads |
 | `CH_AGGREGATE_MAX_THREADS` | `1` | ClickHouse `max_threads` for pushed-down aggregations; `0` leaves the ClickHouse default |
 | `REMOTE_WRITE_SAMPLE_INTERVAL` | `15s` | Timestamp bucket for float samples and histograms; `0` preserves timestamps |
-| `SNUFFLE_SAMPLE_ATTRIBUTES` | layout-dependent | Store sample label maps in `attributes_map_str`; false for `current`, true for `posthog` |
+| `SNUFFLE_SAMPLE_ATTRIBUTES` | layout-dependent | Store sample label maps on sample rows (`attributes_map_str` in `current`, `attributes` in `posthog`); false for `current`, true for `posthog` |
 | `SNUFFLE_LOG_RETENTION` | `720h` | Expiry assigned to log rows received through Loki push |
+| `SNUFFLE_METRICS_RETENTION` | `2160h` | Expiry assigned to PostHog metric rows received through remote write |
 | `SNUFFLE_LOG_QUERY_MAX_ROWS` | `100000` | Maximum raw log rows read by a LogQL query |
 
 ### Tenancy and self-observability
