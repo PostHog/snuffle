@@ -84,10 +84,13 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	if !cfg.SampleAttributes {
 		t.Fatalf("SampleAttributes = false, want true for posthog layout")
 	}
-	if cfg.SamplesTable != "metrics" || cfg.SeriesTable != "" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes" {
-		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable)
+	if cfg.SamplesTable != "metrics2" || cfg.SeriesTable != "metric_series2" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes2" || cfg.MetricsInputTable != "metrics2_input" {
+		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q input %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable, cfg.MetricsInputTable)
 	}
-	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes2" {
+	if cfg.MetricsRetention != 90*24*time.Hour {
+		t.Fatalf("MetricsRetention = %s, want 90 days", cfg.MetricsRetention)
+	}
+	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes3" {
 		t.Fatalf("posthog log defaults = layout %q logs %q attributes %q", cfg.LogSchemaLayout, cfg.LogsTable, cfg.LogAttributesTable)
 	}
 	if cfg.AggregateThreads != 1 {
@@ -143,7 +146,7 @@ func TestConfigFromEnvLogSettings(t *testing.T) {
 
 	t.Setenv("CH_LOG_SCHEMA_LAYOUT", "posthog")
 	cfg = ConfigFromEnv()
-	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes2" || cfg.LogStreamsTable != "" || cfg.LogStreamLabelsTable != "" || cfg.LogStreamStatsTable != "" {
+	if cfg.LogSchemaLayout != "posthog" || cfg.LogsTable != "logs34" || cfg.LogAttributesTable != "log_attributes3" || cfg.LogStreamsTable != "" || cfg.LogStreamLabelsTable != "" || cfg.LogStreamStatsTable != "" {
 		t.Fatalf("posthog log layout = layout %q logs %q streams %q stream labels %q attrs %q stats %q", cfg.LogSchemaLayout, cfg.LogsTable, cfg.LogStreamsTable, cfg.LogStreamLabelsTable, cfg.LogAttributesTable, cfg.LogStreamStatsTable)
 	}
 

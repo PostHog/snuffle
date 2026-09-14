@@ -342,7 +342,9 @@ func TestPostHogSeriesSamplesSQLUsesPostHogTablesAndAttributePredicates(t *testi
 	cfg := Config{
 		CHDatabase:   "posthog",
 		SchemaLayout: "posthog",
-		SamplesTable: "metrics1",
+		SeriesTable:  "metric_series2",
+		SamplesTable: "metrics2",
+		MaxSeries:    500,
 	}
 	matchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
@@ -352,46 +354,61 @@ func TestPostHogSeriesSamplesSQLUsesPostHogTablesAndAttributePredicates(t *testi
 
 	sql := postHogSeriesSamplesSQL(cfg, matchers, 1000, 2000, false)
 	for _, want := range []string{
-		"`posthog`.`metrics1`",
-		"xxHash64(metric_name, service_name, resource_fingerprint, mapSort(attributes_map_str)) AS series_id",
-		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
-		"time_bucket <= toStartOfDay(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"WITH selected_series AS (SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes FROM `posthog`.`metric_series2` WHERE",
+		"last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"if(mapContains(attributes, 'status'), attributes['status'], resource_attributes['status']) = '200'",
+		"LIMIT 1 BY series_id LIMIT 500",
+		"FROM `posthog`.`metrics2` WHERE",
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"service_name = 'checkout'",
 		"metric_name = 'http_requests_total'",
-		"if(mapContains(attributes_map_str, 'status__str'), attributes_map_str['status__str'], resource_attributes['status']) = '200'",
+		"series_fingerprint IN (SELECT series_id FROM selected_series)",
+		"INNER JOIN selected_series USING series_id",
+		"ORDER BY series_id, timestamp",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
-	for _, notWant := range []string{"metrics_series", "metrics_label_index", "id IN"} {
-		if strings.Contains(sql, notWant) {
+	for _, notWant := range []string{"metrics_series", "metrics_label_index", "id IN", "attributes_map_str", "resource_attributes['status']) = '200'"} {
+		if strings.Contains(sql, notWant) && notWant != "resource_attributes['status']) = '200'" {
 			t.Fatalf("posthog SQL should not use %q:\n%s", notWant, sql)
 		}
 	}
+	// the status matcher belongs to the series table, not the samples scan
+	_, samples, _ := strings.Cut(sql, "FROM `posthog`.`metrics2` WHERE")
+	if strings.Contains(samples, "'status'") {
+		t.Fatalf("samples scan must not filter map labels:\n%s", sql)
+	}
 }
 
-func TestPostHogLoadSamplesSQLFiltersByComputedSeriesID(t *testing.T) {
+func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 	cfg := Config{
 		CHDatabase:   "posthog",
 		SchemaLayout: "posthog",
-		SamplesTable: "metrics1",
+		SeriesTable:  "metric_series2",
+		SamplesTable: "metrics2",
 	}
 	matchers := []*labels.Matcher{
-		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
 	}
 
-	sql := postHogLoadSamplesSQL(cfg, []uint64{1, 2}, matchers, 1000, 2000, true)
+	sql := postHogLoadSamplesSQL(cfg, []uint64{1, 2}, []string{"http_requests_total"}, matchers, 1000, 2000, true)
 	for _, want := range []string{
-		"`posthog`.`metrics1`",
-		"time_bucket >= toStartOfDay(fromUnixTimestamp64Milli(1000, 'UTC'))",
-		"xxHash64(metric_name, service_name, resource_fingerprint, mapSort(attributes_map_str)) IN (1,2)",
+		"`posthog`.`metrics2`",
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"metric_name = 'http_requests_total'",
+		"series_fingerprint IN (1,2)",
 		"argMax(value, timestamp)",
 		nonStaleSampleSQL("value"),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
+	}
+	if strings.Contains(sql, "metric_series2") || strings.Contains(sql, "'status'") {
+		t.Fatalf("sample loading must not consult the series table: %s", sql)
 	}
 }
 

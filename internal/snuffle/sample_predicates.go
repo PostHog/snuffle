@@ -24,8 +24,8 @@ func sampleTimeFilters(cfg Config, mint, maxt int64) []string {
 	}
 	if cfg.postHogSchemaLayout() {
 		filters = append(filters,
-			"time_bucket >= toStartOfDay("+chTimeMillis(mint)+")",
-			"time_bucket <= toStartOfDay("+chTimeMillis(maxt)+")",
+			"time_bucket >= toStartOfHour("+chTimeMillis(mint)+")",
+			"time_bucket <= toStartOfHour("+chTimeMillis(maxt)+")",
 		)
 	} else {
 		filters = append(filters,

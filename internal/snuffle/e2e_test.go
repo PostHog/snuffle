@@ -61,10 +61,11 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
 	if cfg.postHogSchemaLayout() {
-		cfg.SeriesTable = ""
-		cfg.SamplesTable = "metrics1"
+		cfg.SeriesTable = "metric_series2"
+		cfg.SamplesTable = "metrics2"
+		cfg.MetricsInputTable = "metrics2_input"
 		cfg.LabelIndexTable = ""
-		cfg.AttributeTable = "metric_attributes"
+		cfg.AttributeTable = "metric_attributes2"
 		cfg.LabelPostingsTable = ""
 		cfg.ActivityTable = ""
 		cfg.MetricsTable = ""

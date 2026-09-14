@@ -86,7 +86,9 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 	cfg := Config{
 		CHDatabase:    "default",
 		SchemaLayout:  "posthog",
-		SamplesTable:  "metrics1",
+		SeriesTable:   "metric_series2",
+		SamplesTable:  "metrics2",
+		MaxSeries:     1000,
 		LookbackDelta: 5 * time.Minute,
 	}
 	s := &Server{cfg: cfg}
@@ -104,33 +106,38 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 
 	sql := postHogAggregateUnionSQL(cfg, plan, aggregate.Grouping, start, time.Minute.Milliseconds(), "sum(sample_value)")
 	for _, want := range []string{
+		"WITH selected_series AS (SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes, if(mapContains(attributes, 'hostname'), attributes['hostname'], resource_attributes['hostname']) AS `__group_0` FROM `default`.`metric_series2` WHERE",
 		"timeSeriesRateToGrid",
 		"IN ('host_0','host_1')",
 		"metric_name = 'usage_user'",
+		"series_fingerprint IN (SELECT series_id FROM selected_series)",
 		"GROUP BY series_id",
+		"INNER JOIN selected_series USING series_id",
 		"x / 5",
-		"`default`.`metrics1`",
+		"`default`.`metrics2`",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("union SQL does not contain %q:\n%s", want, sql)
 		}
 	}
-	// the varying hostname expression must be factored into one IN lookup, not
-	// one map lookup per branch
-	_, where, found := strings.Cut(sql, " WHERE ")
-	if !found {
-		t.Fatalf("union SQL has no WHERE clause:\n%s", sql)
+	// the varying hostname expression must be factored into one IN lookup on
+	// the series table, not one map lookup per branch
+	if got := strings.Count(sql, "mapContains(attributes, 'hostname')"); got != 2 {
+		t.Fatalf("hostname lookup count = %d, want 2 (group expression and IN filter):\n%s", got, sql)
 	}
-	if got := strings.Count(where, "mapContains(attributes_map_str, 'hostname__str')"); got != 1 {
-		t.Fatalf("hostname lookup count in WHERE = %d, want 1:\n%s", got, sql)
+	if strings.Contains(sql, "attributes_map_str") {
+		t.Fatalf("union SQL must not read the metrics1 attributes_map_str column:\n%s", sql)
 	}
-	if got := strings.Count(sql, "FROM `default`.`metrics1`"); got != 1 {
+	if got := strings.Count(sql, "FROM `default`.`metrics2`"); got != 1 {
 		t.Fatalf("samples table scan count = %d, want 1:\n%s", got, sql)
+	}
+	if got := strings.Count(sql, "FROM `default`.`metric_series2`"); got != 1 {
+		t.Fatalf("series table scan count = %d, want 1:\n%s", got, sql)
 	}
 }
 
 func TestPostHogAggregateUnionPlanRejectsMixedTransforms(t *testing.T) {
-	s := &Server{cfg: Config{SchemaLayout: "posthog", SamplesTable: "metrics1", LookbackDelta: 5 * time.Minute}}
+	s := &Server{cfg: Config{SchemaLayout: "posthog", SeriesTable: "metric_series2", SamplesTable: "metrics2", LookbackDelta: 5 * time.Minute}}
 	p := parser.NewParser(parser.Options{})
 	expr, err := p.ParseExpr(`sum by (hostname) (increase(usage_user{hostname="host_0"}[5m]) / 5 or increase(usage_user{hostname="host_1"}[5m]) / 6)`)
 	if err != nil {
@@ -143,7 +150,7 @@ func TestPostHogAggregateUnionPlanRejectsMixedTransforms(t *testing.T) {
 }
 
 func TestPostHogAggregateUnionPlanRejectsPlainSingleSelector(t *testing.T) {
-	s := &Server{cfg: Config{SchemaLayout: "posthog", SamplesTable: "metrics1", LookbackDelta: 5 * time.Minute}}
+	s := &Server{cfg: Config{SchemaLayout: "posthog", SeriesTable: "metric_series2", SamplesTable: "metrics2", LookbackDelta: 5 * time.Minute}}
 	p := parser.NewParser(parser.Options{})
 	expr, err := p.ParseExpr(`sum by (region) (usage_user{hostname="host_0"})`)
 	if err != nil {
@@ -166,7 +173,7 @@ func TestPostHogUnionMatcherConditionFallsBackToOr(t *testing.T) {
 		t.Fatalf("seriesExprBranches ok=%v len=%d, want 2 branches", ok, len(branches))
 	}
 	selectors := []*parser.VectorSelector{branches[0].selector, branches[1].selector}
-	condition, ok := postHogUnionMatcherCondition(selectors)
+	condition, ok := postHogUnionMatcherCondition(selectors, postHogSeriesLabelExpr)
 	if !ok {
 		t.Fatal("postHogUnionMatcherCondition returned ok=false")
 	}
@@ -1356,17 +1363,39 @@ func branchSelectors(t *testing.T, expr parser.Expr) []*parser.VectorSelector {
 	return selectors
 }
 
-func TestPostHogSampleGroupSQLSupportsMapLabels(t *testing.T) {
-	_, _, _, ok := postHogSampleGroupSQL([]string{"service_name", "__name__"})
-	if !ok {
-		t.Fatal("expected physical posthog grouping labels to be supported")
+func TestPostHogQueryPlanReadsSeriesTableOnlyForMapLabels(t *testing.T) {
+	cfg := Config{CHDatabase: "default", SchemaLayout: "posthog", SeriesTable: "metric_series2", SamplesTable: "metrics2", MaxSeries: 10}
+	nameMatchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up")}
+
+	plan := newPostHogQueryPlan(cfg, nameMatchers, []string{"service_name", "__name__"}, 1000, 2000, false)
+	if plan.useSeries {
+		t.Fatal("physical grouping labels must not read the series table")
 	}
-	_, _, perIDSelects, ok := postHogSampleGroupSQL([]string{"region"})
-	if !ok {
-		t.Fatal("expected ordinary posthog labels to be grouped from maps")
+	if got := strings.Join(plan.perSeriesGroupSelects(), ", "); got != "any(service_name) AS `__group_0`, any(metric_name) AS `__group_1`" {
+		t.Fatalf("per-series group selects = %s", got)
 	}
-	if got := strings.Join(perIDSelects, ", "); !strings.Contains(got, "attributes_map_str['region__str']") || !strings.Contains(got, "resource_attributes['region']") {
-		t.Fatalf("expected map-backed group expression, got %s", got)
+	if got := strings.Join(plan.sampleWhere(), " AND "); strings.Contains(got, "selected_series") {
+		t.Fatalf("samples filter must not reference selected_series: %s", got)
+	}
+
+	plan = newPostHogQueryPlan(cfg, nameMatchers, []string{"region"}, 1000, 2000, false)
+	if !plan.useSeries {
+		t.Fatal("map-backed grouping labels must read the series table")
+	}
+	if !strings.Contains(plan.seriesSQL, "if(mapContains(attributes, 'region'), attributes['region'], resource_attributes['region']) AS `__group_0`") {
+		t.Fatalf("expected map-backed group expression in series SQL, got %s", plan.seriesSQL)
+	}
+	if !strings.Contains(plan.seriesSQL, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") || !strings.Contains(plan.seriesSQL, "LIMIT 1 BY series_id LIMIT 10") {
+		t.Fatalf("series SQL must bound by last_seen and collapse duplicates: %s", plan.seriesSQL)
+	}
+	where := strings.Join(plan.sampleWhere(), " AND ")
+	if !strings.Contains(where, "series_fingerprint IN (SELECT series_id FROM selected_series)") || strings.Contains(where, "metric_name IN (SELECT") {
+		t.Fatalf("samples filter with an exact metric name = %s", where)
+	}
+
+	plan = newPostHogQueryPlan(cfg, []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "region", "eu")}, nil, 1000, 2000, false)
+	if where := strings.Join(plan.sampleWhere(), " AND "); !strings.Contains(where, "metric_name IN (SELECT metric_name FROM selected_series)") {
+		t.Fatalf("samples filter without a metric name must follow the selected metric names: %s", where)
 	}
 }
 

@@ -431,37 +431,37 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	if sampleMillis, ok := postHogExactInstantSampleMillis(s.cfg, selector, evalTime); ok {
 		return s.tryPostHogExactInstantAggregate(ctx, expr, selector, sampleMillis, evalTime, aggSQL)
 	}
-	groupSelect, groupBy, perIDGroupSelect, ok := postHogSampleGroupSQL(expr.Grouping)
-	if !ok {
+	if !postHogGroupingSupported(expr.Grouping) {
 		return queryData{}, false, nil
 	}
-
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, window.mint, window.maxt, false)
 
 	perIDSelect := []string{
-		postHogSeriesIDExpr() + " AS series_id",
+		"series_fingerprint AS series_id",
 		"argMax(value, timestamp) AS value",
 	}
-	perIDSelect = append(perIDSelect, perIDGroupSelect...)
+	perIDSelect = append(perIDSelect, plan.perSeriesGroupSelects()...)
 	perID := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
 		strings.Join(perIDSelect, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		postHogSamplesTable(s.cfg),
+		strings.Join(plan.sampleWhere(), " AND "),
 	)
+
 	perID = fmt.Sprintf("SELECT * FROM (%s) WHERE %s", perID, nonStaleSampleSQL("value"))
 
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
+	groupBy := plan.groupAliases()
+	selectParts := make([]string, 0, len(groupBy)+2)
+	selectParts = append(selectParts, groupBy...)
 	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
 	selectParts = append(selectParts, aggSQL+" AS value")
 
-	sql := fmt.Sprintf("SELECT %s FROM (%s)", strings.Join(selectParts, ", "), perID)
+	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), plan.joinSeries(perID))
 	if len(groupBy) > 0 {
 		sql += " GROUP BY " + strings.Join(groupBy, ", ")
 		sql += " ORDER BY " + strings.Join(groupBy, ", ")
 	}
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
 	if err != nil {
@@ -471,29 +471,26 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 }
 
 func (s *Server) tryPostHogExactInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, sampleMillis int64, evalTime time.Time, aggSQL string) (queryData, bool, error) {
-	groupSelect, groupBy, ok := postHogRangeGroupSQL(expr.Grouping)
-	if !ok {
+	if !postHogGroupingSupported(expr.Grouping) {
 		return queryData{}, false, nil
 	}
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, sampleMillis, sampleMillis)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, sampleMillis, sampleMillis, false)
+	where := plan.sampleWhere()
+	where = append(where, nonStaleSampleSQL("value"))
+	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"value"}, where)
 
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
+	groupBy := plan.groupAliases()
+	selectParts := make([]string, 0, len(groupBy)+2)
+	selectParts = append(selectParts, groupBy...)
 	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
 	selectParts = append(selectParts, aggSQL+" AS agg_value")
 
-	sql := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s",
-		strings.Join(selectParts, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
-	)
-	sql += " AND " + nonStaleSampleSQL("value")
+	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), plan.joinSeries(rows))
 	if len(groupBy) > 0 {
 		sql += " GROUP BY " + strings.Join(groupBy, ", ")
 		sql += " ORDER BY " + strings.Join(groupBy, ", ")
 	}
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
 	if err != nil {
@@ -514,32 +511,31 @@ func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *pa
 	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) || !exactBucketRangeSelector(s.cfg, selector, start, end, step) {
 		return queryData{}, false, nil
 	}
-	groupSelect, groupBy, ok := postHogRangeGroupSQL(expr.Grouping)
-	if !ok {
+	if !postHogGroupingSupported(expr.Grouping) {
 		return queryData{}, false, nil
 	}
-
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, start.UnixMilli(), end.UnixMilli(), false)
+	where := plan.sampleWhere()
 	where = append(where, nonStaleSampleSQL("value"))
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
+	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp", "value"}, where)
+
+	groupBy := plan.groupAliases()
+	selectParts := make([]string, 0, len(groupBy)+2)
+	selectParts = append(selectParts, groupBy...)
 	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
 	selectParts = append(selectParts, aggSQL+" AS agg_value")
 
 	groupByParts := append([]string{}, groupBy...)
 	groupByParts = append(groupByParts, "ts")
-	orderByParts := append([]string{}, groupBy...)
-	orderByParts = append(orderByParts, "ts")
 
 	sql := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY %s ORDER BY %s",
+		"SELECT %s FROM %s GROUP BY %s ORDER BY %s",
 		strings.Join(selectParts, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		plan.joinSeries(rows),
 		strings.Join(groupByParts, ", "),
-		strings.Join(orderByParts, ", "),
+		strings.Join(groupByParts, ", "),
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
 	if err != nil {
@@ -554,7 +550,7 @@ func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *pa
 type postHogAggregateUnionPlan struct {
 	gridVals string
 	where    []string
-	groupAny []string
+	plan     *postHogQueryPlan
 }
 
 func (s *Server) tryPostHogInstantAggregateUnionQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
@@ -628,23 +624,43 @@ func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, en
 		selectors = append(selectors, branch.selector)
 	}
 
-	matcherCondition, ok := postHogUnionMatcherCondition(selectors)
-	if !ok {
+	if !postHogGroupingSupported(expr.Grouping) {
 		return nil, false
 	}
-	groupAny := make([]string, 0, len(expr.Grouping))
-	for i, name := range expr.Grouping {
-		groupExpr, ok := postHogSampleGroupExpr(name)
-		if !ok {
-			return nil, false
+	useSeries := postHogNeedsSeriesLookup(nil, expr.Grouping)
+	for _, unionSelector := range selectors {
+		if postHogNeedsSeriesLookup(unionSelector.LabelMatchers, nil) {
+			useSeries = true
 		}
-		groupAny = append(groupAny, "any("+groupExpr+") AS "+quoteIdent(groupAlias(i)))
 	}
+	plan := &postHogQueryPlan{cfg: s.cfg, grouping: expr.Grouping, mint: mint, maxt: maxt, useSeries: useSeries}
 
 	where := []string{teamFilter(s.cfg)}
 	where = append(where, sampleTimeFilters(s.cfg, mint, maxt)...)
-	if matcherCondition != "" {
-		where = append(where, matcherCondition)
+	if useSeries {
+		// Every label is on the series table, so the union condition selects
+		// series there and the samples scan follows the selected fingerprints.
+		seriesCondition, ok := postHogUnionMatcherCondition(selectors, postHogSeriesLabelExpr)
+		if !ok {
+			return nil, false
+		}
+		seriesWhere := postHogSeriesFilters(s.cfg, nil, mint, maxt)
+		if seriesCondition != "" {
+			seriesWhere = append(seriesWhere, seriesCondition)
+		}
+		plan.seriesSQL = postHogSelectedSeriesWhereSQL(s.cfg, seriesWhere, s.cfg.MaxSeries, plan.seriesGroupSelects())
+		where = append(where,
+			"series_fingerprint IN (SELECT series_id FROM selected_series)",
+			"metric_name IN (SELECT metric_name FROM selected_series)",
+		)
+	} else {
+		sampleCondition, ok := postHogUnionMatcherCondition(selectors, postHogSampleLabelExpr)
+		if !ok {
+			return nil, false
+		}
+		if sampleCondition != "" {
+			where = append(where, sampleCondition)
+		}
 	}
 	if source.filterStaleSamples {
 		where = append(where, nonStaleSampleSQL("value"))
@@ -652,52 +668,54 @@ func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, en
 	return &postHogAggregateUnionPlan{
 		gridVals: transformGridValsSQL(source.gridExpr, first.transform),
 		where:    where,
-		groupAny: groupAny,
+		plan:     plan,
 	}, true
 }
 
 func postHogAggregateUnionSQL(cfg Config, plan *postHogAggregateUnionPlan, grouping []string, start time.Time, stepMillis int64, aggSQL string) string {
-	perSeriesSelects := make([]string, 0, len(plan.groupAny)+2)
-	perSeriesSelects = append(perSeriesSelects, postHogSeriesIDExpr()+" AS series_id")
-	perSeriesSelects = append(perSeriesSelects, plan.groupAny...)
+	groupAliases := plan.plan.groupAliases()
+	perSeriesSelects := make([]string, 0, len(groupAliases)+2)
+	perSeriesSelects = append(perSeriesSelects, "series_fingerprint AS series_id")
+	perSeriesSelects = append(perSeriesSelects, plan.plan.perSeriesGroupSelects()...)
 	perSeriesSelects = append(perSeriesSelects, plan.gridVals+" AS vals")
 	perSeries := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
 		strings.Join(perSeriesSelects, ", "),
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
+		postHogSamplesTable(cfg),
 		strings.Join(plan.where, " AND "),
 	)
+	perSeries = fmt.Sprintf(
+		"SELECT %s FROM %s",
+		strings.Join(append(append([]string{}, groupAliases...), "vals"), ", "),
+		plan.plan.joinSeries(perSeries),
+	)
 
-	groupAliases := make([]string, 0, len(grouping))
-	for i := range grouping {
-		groupAliases = append(groupAliases, quoteIdent(groupAlias(i)))
-	}
 	selectParts := append([]string{}, groupAliases...)
 	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
 	selectParts = append(selectParts, aggSQL+" AS value")
 	groupByParts := append(append([]string{}, groupAliases...), "idx")
 
 	sql := fmt.Sprintf(
-		"WITH per_series AS (%s) SELECT %s FROM per_series ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
-		perSeries,
+		"SELECT %s FROM (%s) AS per_series ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
 		strings.Join(selectParts, ", "),
+		perSeries,
 		nonStaleNullableSampleSQL("sample_value"),
 		strings.Join(groupByParts, ", "),
 		strings.Join(groupByParts, ", "),
 	)
-	return withMaxThreads(sql, cfg.AggregateThreads)
+	return withMaxThreads(plan.plan.withSelectedSeries(sql), cfg.AggregateThreads)
 }
 
 // postHogUnionMatcherCondition builds one WHERE condition matching rows
-// selected by any of the union's selectors. Returns "" when a branch matches
-// all rows.
-func postHogUnionMatcherCondition(selectors []*parser.VectorSelector) (string, bool) {
-	if condition, ok := postHogUnionInCondition(selectors); ok {
+// selected by any of the union's selectors, with labels resolved by labelExpr
+// for the target table. Returns "" when a branch matches all rows.
+func postHogUnionMatcherCondition(selectors []*parser.VectorSelector, labelExpr func(string) (string, bool)) (string, bool) {
+	if condition, ok := postHogUnionInCondition(selectors, labelExpr); ok {
 		return condition, true
 	}
 	branchConditions := make([]string, 0, len(selectors))
 	for _, selector := range selectors {
-		conditions, ok := postHogSelectorMatcherConditions(selector.LabelMatchers)
+		conditions, ok := postHogSelectorMatcherConditions(selector.LabelMatchers, labelExpr)
 		if !ok {
 			return "", false
 		}
@@ -712,13 +730,13 @@ func postHogUnionMatcherCondition(selectors []*parser.VectorSelector) (string, b
 	return "(" + strings.Join(branchConditions, " OR ") + ")", true
 }
 
-func postHogSelectorMatcherConditions(matchers []*labels.Matcher) ([]string, bool) {
+func postHogSelectorMatcherConditions(matchers []*labels.Matcher, labelExpr func(string) (string, bool)) ([]string, bool) {
 	conditions := make([]string, 0, len(matchers))
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
 			continue
 		}
-		condition, ok := postHogMatcherCondition(matcher)
+		condition, ok := postHogMatcherConditionWith(matcher, labelExpr)
 		if !ok {
 			return nil, false
 		}
@@ -730,7 +748,7 @@ func postHogSelectorMatcherConditions(matchers []*labels.Matcher) ([]string, boo
 // postHogUnionInCondition recognizes selectors that differ on exactly one
 // equality matcher and emits `common AND label_expr IN (...)` so the per-row
 // label lookup runs once instead of once per branch.
-func postHogUnionInCondition(selectors []*parser.VectorSelector) (string, bool) {
+func postHogUnionInCondition(selectors []*parser.VectorSelector, labelExpr func(string) (string, bool)) (string, bool) {
 	if len(selectors) < 2 {
 		return "", false
 	}
@@ -773,7 +791,7 @@ func postHogUnionInCondition(selectors []*parser.VectorSelector) (string, bool) 
 			}
 		}
 		if same {
-			condition, ok := postHogMatcherCondition(firstMatcher)
+			condition, ok := postHogMatcherConditionWith(firstMatcher, labelExpr)
 			if !ok {
 				return "", false
 			}
@@ -804,14 +822,9 @@ func postHogUnionInCondition(selectors []*parser.VectorSelector) (string, bool) 
 		seen[value] = struct{}{}
 		values = append(values, sqlString(value))
 	}
-	var column string
-	switch varying {
-	case labels.MetricName:
-		column = "metric_name"
-	case "service_name":
-		column = "service_name"
-	default:
-		column = postHogLabelValueExpr(varying)
+	column, ok := labelExpr(varying)
+	if !ok {
+		return "", false
 	}
 	conditions := append(common, column+" IN ("+strings.Join(values, ",")+")")
 	return "(" + strings.Join(conditions, " AND ") + ")", true
@@ -832,17 +845,21 @@ func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector 
 	shiftedEnd := end.Add(-offset)
 	mint := shiftedStart.Add(-s.cfg.LookbackDelta).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, mint, maxt)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, mint, maxt, true)
 	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
-	sql := fmt.Sprintf(
-		"SELECT %s AS series_id, any(metric_name) AS out_metric_name, any(service_name) AS out_service_name, any(resource_attributes) AS out_resource_attributes, any(attributes_map_str) AS out_attributes_map_str, %s AS vals FROM %s WHERE %s GROUP BY series_id ORDER BY series_id LIMIT %d",
-		postHogSeriesIDExpr(),
+	perSeries := fmt.Sprintf(
+		"SELECT series_fingerprint AS series_id, %s AS vals FROM %s WHERE %s GROUP BY series_id",
 		gridExpr,
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		postHogSamplesTable(s.cfg),
+		strings.Join(plan.sampleWhere(), " AND "),
+	)
+	sql := fmt.Sprintf(
+		"SELECT series_id, %s, vals FROM %s ORDER BY series_id LIMIT %d",
+		postHogSeriesLabelColumns,
+		plan.joinSeries(perSeries),
 		s.cfg.MaxSeries,
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results := make([]sampleResult, 0, 1024)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -886,14 +903,14 @@ func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector 
 }
 
 func (s *Server) tryPostHogExactSelectorRangeRows(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, stepMillis int64) (queryData, bool, error) {
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, start.UnixMilli(), end.UnixMilli(), true)
+	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp", "value"}, plan.sampleWhere())
 	sql := fmt.Sprintf(
-		"SELECT %s AS series_id, metric_name, service_name, resource_attributes, attributes_map_str, toUnixTimestamp64Milli(timestamp) AS ts, value FROM %s WHERE %s ORDER BY series_id, timestamp",
-		postHogSeriesIDExpr(),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		"SELECT series_id, %s, toUnixTimestamp64Milli(timestamp) AS ts, value FROM %s ORDER BY series_id, timestamp",
+		postHogSeriesLabelColumns,
+		plan.joinSeries(rows),
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results := make([]sampleResult, 0, 128)
 	seen := make(map[uint64]int, 128)
@@ -1422,19 +1439,19 @@ func (s *Server) tryPostHogNestedCountRangeQuery(ctx context.Context, expr *pars
 	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) || !exactBucketRangeSelector(s.cfg, selector, start, end, step) {
 		return queryData{}, false, nil
 	}
-	groupExprs, ok := postHogSampleGroupExprs(inner.Grouping)
-	if !ok || len(groupExprs) == 0 {
+	if !postHogGroupingSupported(inner.Grouping) || len(inner.Grouping) == 0 {
 		return queryData{}, false, nil
 	}
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, start.UnixMilli(), end.UnixMilli())
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, inner.Grouping, start.UnixMilli(), end.UnixMilli(), false)
+	where := plan.sampleWhere()
 	where = append(where, nonStaleSampleSQL("value"))
+	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp"}, where)
 	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s GROUP BY ts ORDER BY ts",
-		postHogUniqGroupExpr(groupExprs),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s GROUP BY ts ORDER BY ts",
+		postHogUniqGroupExpr(plan.groupAliases()),
+		plan.joinSeries(rows),
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 	data, err := s.queryNestedCountRangeValues(ctx, sql)
 	return data, true, err
 }
@@ -1448,35 +1465,29 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 	if !ok {
 		return queryData{}, false, nil
 	}
-	groupExprs, ok := postHogSampleGroupExprs(inner.Grouping)
-	if !ok || len(groupExprs) == 0 {
+	if !postHogGroupingSupported(inner.Grouping) || len(inner.Grouping) == 0 {
 		return queryData{}, false, nil
 	}
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, inner.Grouping, window.mint, window.maxt, false)
 	perSeriesSelects := []string{
-		postHogSeriesIDExpr() + " AS series_id",
+		"series_fingerprint AS series_id",
 		"argMax(value, timestamp) AS value",
 	}
-	uniqExprs := make([]string, 0, len(groupExprs))
-	for i, expr := range groupExprs {
-		alias := quoteIdent(groupAlias(i))
-		perSeriesSelects = append(perSeriesSelects, "argMax("+expr+", timestamp) AS "+alias)
-		uniqExprs = append(uniqExprs, alias)
-	}
+	perSeriesSelects = append(perSeriesSelects, plan.perSeriesGroupSelects()...)
 	perSeries := fmt.Sprintf(
 		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
 		strings.Join(perSeriesSelects, ", "),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		postHogSamplesTable(s.cfg),
+		strings.Join(plan.sampleWhere(), " AND "),
 	)
 	sql := fmt.Sprintf(
-		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM (%s) WHERE %s",
+		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s",
 		evalTime.UnixMilli(),
-		postHogUniqGroupExpr(uniqExprs),
-		perSeries,
+		postHogUniqGroupExpr(plan.groupAliases()),
+		plan.joinSeries(perSeries),
 		nonStaleSampleSQL("value"),
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 	data, err := s.queryNestedCountInstantValue(ctx, sql)
 	return data, true, err
 }
@@ -2268,22 +2279,27 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 	if sampleMillis, ok := postHogExactInstantSampleMillis(s.cfg, selector, evalTime); ok {
 		return s.tryPostHogExactTopK(ctx, selector, sampleMillis, evalTime, limit, direction)
 	}
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, window.mint, window.maxt)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, window.mint, window.maxt, true)
 	latest := fmt.Sprintf(
-		"SELECT %s AS series_id, argMax(metric_name, timestamp) AS out_metric_name, argMax(service_name, timestamp) AS out_service_name, argMax(resource_attributes, timestamp) AS out_resource_attributes, argMax(attributes_map_str, timestamp) AS out_attributes_map_str, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
-		postHogSeriesIDExpr(),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		"SELECT series_fingerprint AS series_id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
+		postHogSamplesTable(s.cfg),
+		strings.Join(plan.sampleWhere(), " AND "),
 	)
-	sql := fmt.Sprintf(
-		"SELECT out_metric_name, out_service_name, out_resource_attributes, out_attributes_map_str, toInt64(%d) AS ts, value FROM (%s) WHERE %s ORDER BY value %s LIMIT %d",
-		evalTime.UnixMilli(),
+	latest = fmt.Sprintf(
+		"SELECT series_id, value FROM (%s) WHERE %s ORDER BY value %s LIMIT %d",
 		latest,
 		nonStaleSampleSQL("value"),
 		direction,
 		limit,
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql := fmt.Sprintf(
+		"SELECT %s, toInt64(%d) AS ts, value FROM %s ORDER BY value %s",
+		postHogSeriesLabelColumns,
+		evalTime.UnixMilli(),
+		plan.joinSeries(latest),
+		direction,
+	)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results := make([]sampleResult, 0, limit)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -2313,17 +2329,19 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 }
 
 func (s *Server) tryPostHogExactTopK(ctx context.Context, selector *parser.VectorSelector, sampleMillis int64, evalTime time.Time, limit int, direction string) (queryData, bool, error) {
-	where := postHogSampleFilters(s.cfg, selector.LabelMatchers, sampleMillis, sampleMillis)
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, sampleMillis, sampleMillis, true)
+	where := plan.sampleWhere()
 	where = append(where, nonStaleSampleSQL("value"))
+	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"value"}, where)
+	rows = fmt.Sprintf("%s ORDER BY value %s LIMIT %d", rows, direction, limit)
 	sql := fmt.Sprintf(
-		"SELECT metric_name, service_name, resource_attributes, attributes_map_str, toInt64(%d) AS ts, value FROM %s WHERE %s ORDER BY value %s LIMIT %d",
+		"SELECT %s, toInt64(%d) AS ts, value FROM %s ORDER BY value %s",
+		postHogSeriesLabelColumns,
 		evalTime.UnixMilli(),
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
+		plan.joinSeries(rows),
 		direction,
-		limit,
 	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
+	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results := make([]sampleResult, 0, limit)
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -3433,48 +3451,15 @@ func exactMatcherGroupSQL(matchers []*labels.Matcher, grouping []string) ([]stri
 	return selects, true
 }
 
-func postHogSampleGroupSQL(grouping []string) ([]string, []string, []string, bool) {
-	selects := make([]string, 0, len(grouping))
-	groupBy := make([]string, 0, len(grouping))
-	perIDSelects := make([]string, 0, len(grouping))
-	for i, name := range grouping {
-		alias := quoteIdent(groupAlias(i))
-		expr, ok := postHogSampleGroupExpr(name)
-		if !ok {
-			return nil, nil, nil, false
-		}
-		perIDSelects = append(perIDSelects, "argMax("+expr+", timestamp) AS "+alias)
-		selects = append(selects, alias)
-		groupBy = append(groupBy, alias)
-	}
-	return selects, groupBy, perIDSelects, true
-}
-
-func postHogRangeGroupSQL(grouping []string) ([]string, []string, bool) {
-	selects := make([]string, 0, len(grouping))
-	groupBy := make([]string, 0, len(grouping))
-	for i, name := range grouping {
-		alias := quoteIdent(groupAlias(i))
-		expr, ok := postHogSampleGroupExpr(name)
-		if !ok {
-			return nil, nil, false
-		}
-		selects = append(selects, expr+" AS "+alias)
-		groupBy = append(groupBy, alias)
-	}
-	return selects, groupBy, true
-}
-
-func postHogSampleGroupExprs(grouping []string) ([]string, bool) {
-	exprs := make([]string, 0, len(grouping))
+// postHogGroupingSupported reports whether every grouping label can be
+// resolved on the PostHog series table.
+func postHogGroupingSupported(grouping []string) bool {
 	for _, name := range grouping {
-		expr, ok := postHogSampleGroupExpr(name)
-		if !ok {
-			return nil, false
+		if _, ok := postHogSeriesLabelExpr(name); !ok {
+			return false
 		}
-		exprs = append(exprs, expr)
 	}
-	return exprs, true
+	return true
 }
 
 func postHogUniqGroupExpr(exprs []string) string {
@@ -3482,19 +3467,6 @@ func postHogUniqGroupExpr(exprs []string) string {
 		return exprs[0]
 	}
 	return "tuple(" + strings.Join(exprs, ", ") + ")"
-}
-
-func postHogSampleGroupExpr(name string) (string, bool) {
-	switch name {
-	case labels.MetricName:
-		return "metric_name", true
-	case "service_name":
-		return "service_name", true
-	case "":
-		return "", false
-	default:
-		return postHogLabelValueExpr(name), true
-	}
 }
 
 func aggregateSourceSQL(base string, grouping []string, groupJoin string) string {
