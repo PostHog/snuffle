@@ -127,6 +127,8 @@ func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
 }
 
 func TestConfigFromEnvLogSettings(t *testing.T) {
+	t.Setenv("CH_SCHEMA_LAYOUT", "current")
+	t.Setenv("CH_LOG_SCHEMA_LAYOUT", "snuffle")
 	t.Setenv("SNUFFLE_LOG_RETENTION", "48h")
 	t.Setenv("SNUFFLE_LOG_QUERY_MAX_ROWS", "1234")
 

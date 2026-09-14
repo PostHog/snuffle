@@ -10,9 +10,14 @@ cd "$ROOT_DIR"
 
 started_docker=0
 cleanup() {
+  status=$?
+  if [[ "$status" != "0" && "$started_docker" == "1" ]]; then
+    docker compose logs clickhouse || true
+  fi
   if [[ "$started_docker" == "1" && "${SNUFFLE_E2E_KEEP_DOCKER:-}" != "1" ]]; then
     docker compose down
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -52,8 +57,6 @@ for attempt in {1..60}; do
   sleep 1
 done
 
-go test ./...
-
 SNUFFLE_E2E=1 \
 SNUFFLE_E2E_CH_ADDR="$CH_ADDR" \
-go test -count=1 -run '^TestEndToEndClickHouse$' ./internal/snuffle -timeout=3m
+go test -race -count=1 -timeout=5m ./...

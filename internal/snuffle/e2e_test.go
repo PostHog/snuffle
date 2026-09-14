@@ -88,6 +88,11 @@ func TestEndToEndClickHouse(t *testing.T) {
 
 	client := NewClickHouseClient(cfg)
 	createMetricsSchema(t, ctx, client)
+	logSchema := "create_logs_snuffle_schema.sql"
+	if cfg.postHogLogSchemaLayout() {
+		logSchema = "create_logs_posthog_schema.sql"
+	}
+	loadE2ESchema(t, ctx, client, filepath.Join(repoRoot(t), "scripts", logSchema))
 
 	mux := http.NewServeMux()
 	newServer(cfg).routes(mux)
@@ -95,6 +100,15 @@ func TestEndToEndClickHouse(t *testing.T) {
 	defer api.Close()
 
 	postRemoteWrite(t, api.URL, e2eWriteRequest())
+	t.Run("metrics tenant isolation", func(t *testing.T) {
+		assertMetricsTenantIsolation(t, api.URL)
+	})
+	t.Run("Loki round trip and tenant isolation", func(t *testing.T) {
+		assertLokiRoundTrip(t, api.URL, cfg)
+	})
+	t.Run("invalid ClickHouse credentials", func(t *testing.T) {
+		assertInvalidClickHouseCredentials(t, api.URL)
+	})
 
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
@@ -158,6 +172,11 @@ func createMetricsSchema(t *testing.T, ctx context.Context, client *ClickHouseCl
 	} else if !filepath.IsAbs(schemaPath) {
 		schemaPath = filepath.Join(repoRoot(t), schemaPath)
 	}
+	loadE2ESchema(t, ctx, client, schemaPath)
+}
+
+func loadE2ESchema(t *testing.T, ctx context.Context, client *ClickHouseClient, schemaPath string) {
+	t.Helper()
 	schema, err := os.ReadFile(schemaPath)
 	if err != nil {
 		t.Fatalf("read schema: %v", err)
@@ -251,11 +270,16 @@ func e2eWriteRequest() *prompb.WriteRequest {
 
 func postRemoteWrite(t *testing.T, baseURL string, req *prompb.WriteRequest) {
 	t.Helper()
+	postRemoteWriteForTeam(t, baseURL, e2eTeamID, req)
+}
+
+func postRemoteWriteForTeam(t *testing.T, baseURL string, teamID uint64, req *prompb.WriteRequest) {
+	t.Helper()
 	payload, err := req.Marshal()
 	if err != nil {
 		t.Fatalf("marshal remote write: %v", err)
 	}
-	resp, err := http.Post(baseURL+e2eAPIPath("/api/v1/write"), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
+	resp, err := http.Post(fmt.Sprintf("%s/t/%d/api/v1/write", baseURL, teamID), "application/x-protobuf", bytes.NewReader(snappy.Encode(nil, payload)))
 	if err != nil {
 		t.Fatalf("post remote write: %v", err)
 	}
@@ -556,7 +580,12 @@ type exemplarDTO struct {
 
 func apiGet[T any](t *testing.T, baseURL, path string, values url.Values) T {
 	t.Helper()
-	resp, err := http.Get(baseURL + e2eAPIPath(path) + "?" + values.Encode())
+	return apiGetForTeam[T](t, baseURL, e2eTeamID, path, values)
+}
+
+func apiGetForTeam[T any](t *testing.T, baseURL string, teamID uint64, path string, values url.Values) T {
+	t.Helper()
+	resp, err := http.Get(fmt.Sprintf("%s/t/%d%s?%s", baseURL, teamID, path, values.Encode()))
 	if err != nil {
 		t.Fatalf("GET %s: %v", path, err)
 	}

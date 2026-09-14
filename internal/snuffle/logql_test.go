@@ -487,7 +487,7 @@ func TestLogQLSelectSQLUsesSnuffleLogsSchema(t *testing.T) {
 	}
 	sql := logQLSelectSQL(cfg, *selector, 1000, 2000, 50, "backward")
 	for _, want := range []string{
-		"`snuffle`.`logs` AS logs ANY INNER JOIN `snuffle`.`log_streams` AS streams USING (team_id, stream_id) SETTINGS join_algorithm = 'full_sorting_merge', max_rows_in_set_to_optimize_join = 0",
+		"`snuffle`.`logs` AS logs ALL INNER JOIN (SELECT team_id, stream_id, labels, resource_attributes, service_name, severity_text FROM `snuffle`.`log_streams` FINAL) AS streams USING (team_id, stream_id) SETTINGS join_algorithm = 'full_sorting_merge', max_rows_in_set_to_optimize_join = 0",
 		"streams.service_name AS stream_service_name",
 		"streams.severity_text AS stream_severity_text",
 		"team_id = 0",
@@ -777,7 +777,7 @@ func TestLogQLMetricSnuffleStatsSQLSafe(t *testing.T) {
 		LogStreamStatsTable: "log_stream_stats",
 	})
 	for _, want := range []string{
-		"`snuffle`.`log_stream_stats` AS stats ANY INNER JOIN `snuffle`.`log_streams` AS streams USING (team_id, stream_id)",
+		"`snuffle`.`log_stream_stats` AS stats ALL INNER JOIN (SELECT team_id, stream_id, labels, resource_attributes, service_name, severity_text FROM `snuffle`.`log_streams` FINAL) AS streams USING (team_id, stream_id)",
 		"SETTINGS join_algorithm = 'full_sorting_merge', max_rows_in_set_to_optimize_join = 0",
 	} {
 		if !strings.Contains(statsSQL, want) {
