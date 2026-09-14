@@ -465,17 +465,31 @@ when Snuffle is exposed outside a trusted environment.
 
 ## Development and performance
 
-Run the unit and package tests:
+Run formatting checks, static analysis, and all unit tests with the race detector:
 
 ```bash
-go test ./...
+make lint
+make test
 ```
 
-Run the Docker-backed integration suite:
+The lint command disables the `stdmethods` check. The Prometheus iterator requires
+`Seek(int64)`, which does not match the unrelated `io.Seeker` signature.
+
+Run the Docker-backed integration suite for both metrics and logs layouts:
 
 ```bash
-./scripts/integration_test.sh
+make integration-test
+CH_SCHEMA_LAYOUT=posthog make integration-test
 ```
+
+CI runs these checks on pull requests. The release workflow uses the same checks
+before it builds release binaries. Integration tests use a fixed ClickHouse
+version from `docker-compose.yml`. Set `CLICKHOUSE_IMAGE` to test another version.
+
+The integration suite runs all package tests with the race detector. It also
+tests metrics and Loki requests against ClickHouse, including tenant isolation.
+Performance benchmarks remain separate because they need controlled hardware
+and datasets.
 
 Run repeatable metrics and logs regression benchmarks:
 

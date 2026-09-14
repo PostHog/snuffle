@@ -1,6 +1,6 @@
 services:
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: ${CLICKHOUSE_IMAGE:-clickhouse/clickhouse-server:26.8.3.105}
     container_name: snuffle-clickhouse
     cpus: 2.0
     environment:

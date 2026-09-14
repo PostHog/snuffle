@@ -1637,7 +1637,7 @@ func logQLLogsTableSQL(cfg Config) string {
 		return tableName(cfg.CHDatabase, cfg.LogsTable)
 	}
 	return fmt.Sprintf(
-		"(SELECT logs.team_id AS team_id, logs.timestamp AS timestamp, logs.time_bucket AS time_bucket, logs.observed_ns AS observed_ns, logs.body AS body, logs.stream_id AS stream_id, logs.fields AS fields, streams.resource_attributes AS resource_attributes, streams.labels AS labels, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS logs ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		"(SELECT logs.team_id AS team_id, logs.timestamp AS timestamp, logs.time_bucket AS time_bucket, logs.observed_ns AS observed_ns, logs.body AS body, logs.stream_id AS stream_id, logs.fields AS fields, streams.resource_attributes AS resource_attributes, streams.labels AS labels, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS logs ALL INNER JOIN (SELECT team_id, stream_id, labels, resource_attributes, service_name, severity_text FROM %s FINAL) AS streams USING (team_id, stream_id)%s)",
 		tableName(cfg.CHDatabase, cfg.LogsTable),
 		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
 		logQLSnuffleFullSortingMergeJoinSettings(cfg),

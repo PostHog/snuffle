@@ -936,7 +936,7 @@ func logQLSnuffleStatsIndexedTableSQL(cfg Config, plan *logQLMetricSQLPlan) stri
 	}
 	for i, matcher := range plan.rangeAgg.selector.matchers {
 		joins = append(joins, fmt.Sprintf(
-			"ANY INNER JOIN (SELECT team_id, stream_id FROM %s WHERE %s AND %s AND %s) AS filter_label_%d USING (team_id, stream_id)",
+			"ALL INNER JOIN (SELECT DISTINCT team_id, stream_id FROM %s WHERE %s AND %s AND %s) AS filter_label_%d USING (team_id, stream_id)",
 			tableName(cfg.CHDatabase, cfg.LogStreamLabelsTable),
 			teamFilter(cfg),
 			logQLSnuffleStreamLabelKeyCondition("label_name", matcher.name),
@@ -1080,8 +1080,8 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 		valueExpr = fmt.Sprintf("toFloat64(window_byte_count) / %s", formatDurationSeconds(plan.rangeAgg.window))
 	}
 	sql := fmt.Sprintf(
-		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, buckets AS (%s), groups AS (%s) SELECT %s, %s AS value FROM (SELECT %s, sum(ifNull(log_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_log_count, sum(ifNull(byte_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_byte_count FROM (SELECT %s FROM groups CROSS JOIN numbers(%d) AS n) AS grid LEFT JOIN buckets ON %s) WHERE window_log_count > 0 ORDER BY %s",
-		startNS,
+		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, buckets AS (%s), groups AS (%s) SELECT %s, %s AS value FROM (SELECT %s, sum(ifNull(log_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_log_count, sum(ifNull(byte_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_byte_count FROM (SELECT %s FROM groups CROSS JOIN numbers(%d) AS n) AS grid LEFT JOIN buckets ON %s) WHERE eval_ns >= %d AND window_log_count > 0 ORDER BY %s",
+		startNS-windowFrame*step.Nanoseconds(),
 		step.Nanoseconds(),
 		bucketSQL,
 		groupsSQL,
@@ -1093,8 +1093,9 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 		partitionBy,
 		windowFrame,
 		strings.Join(gridSelects, ", "),
-		points,
+		points+windowFrame,
 		strings.Join(joinConditions, " AND "),
+		startNS,
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
@@ -1103,7 +1104,7 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 
 func logQLSnuffleStatsTableSQL(cfg Config) string {
 	return fmt.Sprintf(
-		"(SELECT stats.team_id AS team_id, stats.bucket AS bucket, stats.stream_id AS stream_id, stats.log_count AS log_count, stats.byte_count AS byte_count, streams.labels AS labels, streams.resource_attributes AS resource_attributes, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS stats ANY INNER JOIN %s AS streams USING (team_id, stream_id)%s)",
+		"(SELECT stats.team_id AS team_id, stats.bucket AS bucket, stats.stream_id AS stream_id, stats.log_count AS log_count, stats.byte_count AS byte_count, streams.labels AS labels, streams.resource_attributes AS resource_attributes, streams.service_name AS stream_service_name, streams.severity_text AS stream_severity_text FROM %s AS stats ALL INNER JOIN (SELECT team_id, stream_id, labels, resource_attributes, service_name, severity_text FROM %s FINAL) AS streams USING (team_id, stream_id)%s)",
 		tableName(cfg.CHDatabase, cfg.LogStreamStatsTable),
 		tableName(cfg.CHDatabase, cfg.LogStreamsTable),
 		logQLSnuffleFullSortingMergeJoinSettings(cfg),

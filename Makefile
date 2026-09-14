@@ -1,4 +1,18 @@
-.PHONY: perf-test perf-test-posthog autoresearch-snuffle-metrics
+.PHONY: lint fmt-check test integration-test perf-test perf-test-posthog autoresearch-snuffle-metrics
+
+lint: fmt-check
+	go vet -stdmethods=false ./...
+
+fmt-check:
+	@files="$$(gofmt -l cmd internal)" || exit $$?; if [ -n "$$files" ]; then \
+		printf 'Run gofmt on these files:\n%s\n' "$$files"; exit 1; \
+	fi
+
+test:
+	go test -race -count=1 -timeout=5m ./...
+
+integration-test:
+	bash scripts/integration_test.sh
 
 AUTORESEARCH_METRIC_NAME ?= snuffle_metrics_score
 AUTORESEARCH_PERF_RESULTS_FILE ?= .perf/autoresearch-snuffle-metrics-baseline.json
