@@ -16,6 +16,9 @@ import (
 )
 
 func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime time.Time) (queryData, bool, error) {
+	if strings.Contains(query, "__snuffle_") {
+		return queryData{}, false, nil
+	}
 	expr, err := s.parser.ParseExpr(query)
 	if err != nil {
 		return queryData{}, false, nil
@@ -51,6 +54,9 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 }
 
 func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end time.Time, step time.Duration) (queryData, bool, error) {
+	if strings.Contains(query, "__snuffle_") {
+		return queryData{}, false, nil
+	}
 	if step <= 0 {
 		return queryData{}, false, nil
 	}

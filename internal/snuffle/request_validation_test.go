@@ -34,6 +34,12 @@ func TestRoutesRejectInvalidRequests(t *testing.T) {
 				body        []byte
 				wantStatus  int
 			}{
+				{name: "metrics syntax", method: http.MethodGet, path: "/api/v1/query?query=increase(", wantStatus: http.StatusBadRequest},
+				{name: "running sum instant query", method: http.MethodGet, path: "/api/v1/query?query=running_sum(m)", wantStatus: http.StatusBadRequest},
+				{name: "running sum unaligned range", method: http.MethodGet, path: "/api/v1/query_range?query=running_sum(m)&start=1700000401&end=1700000461&step=1m", wantStatus: http.StatusBadRequest},
+				{name: "metrics short step", method: http.MethodGet, path: "/api/v1/query?query=1&step=1us", wantStatus: http.StatusBadRequest},
+				{name: "metrics large duration", method: http.MethodGet, path: "/api/v1/query?query=increase(m[1000000000000s])", wantStatus: http.StatusBadRequest},
+				{name: "metrics internal function", method: http.MethodGet, path: "/api/v1/query?query=__snuffle_rate(m[1m],1,1,1,1)", wantStatus: http.StatusBadRequest},
 				{name: "write method", method: http.MethodGet, path: "/api/v1/write", wantStatus: http.StatusMethodNotAllowed},
 				{name: "read method", method: http.MethodGet, path: "/api/v1/read", wantStatus: http.StatusMethodNotAllowed},
 				{name: "push method", method: http.MethodGet, path: "/loki/api/v1/push", wantStatus: http.StatusMethodNotAllowed},

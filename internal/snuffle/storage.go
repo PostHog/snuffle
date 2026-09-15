@@ -19,8 +19,9 @@ import (
 )
 
 type CHQueryable struct {
-	client *ClickHouseClient
-	cfg    Config
+	preserveRollupStaleness bool
+	client                  *ClickHouseClient
+	cfg                     Config
 }
 
 func NewCHQueryable(client *ClickHouseClient, cfg Config) *CHQueryable {
@@ -58,6 +59,15 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 	q.selects[cacheKey] = future
 	go func() {
 		future.series, future.err = q.selectSeriesMeta(ctx, hints, matchers...)
+		if q.queryable.preserveRollupStaleness && hints != nil && hints.Func == "last_over_time" {
+			for _, series := range future.series {
+				for i, point := range series.samples {
+					if isStaleSampleValue(point.v) {
+						series.samples[i].v = math.NaN()
+					}
+				}
+			}
+		}
 		close(future.done)
 	}()
 	return &futureSeriesSet{future: future, sortSeries: sortResult}

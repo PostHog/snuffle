@@ -289,6 +289,7 @@ func (s *Server) handleHealthy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
+	s = s.metricsQLServer()
 	recordQueryLogMetadata(w, queryLogMetadata{language: "promql", queryType: "instant"})
 	if err := r.ParseForm(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
@@ -306,6 +307,20 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ts, err := parseAPITime(r.Form.Get("time"), time.Now())
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+
+	step := s.cfg.LookbackDelta
+	if raw := r.Form.Get("step"); raw != "" {
+		step, err = parseStep(raw)
+		if err != nil {
+			writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+			return
+		}
+	}
+	query, err = prepareMetricsQLQuery(query, step, s.cfg.LookbackDelta, ts, ts)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
@@ -348,10 +363,11 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(result.Value)
 	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccess(w, responseDataFromValue(result.Value))
+	writeAPISuccess(w, responseDataFromValue(metricsQLValue(result.Value)))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
+	s = s.metricsQLServer()
 	recordQueryLogMetadata(w, queryLogMetadata{language: "promql", queryType: "range"})
 	if err := r.ParseForm(); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
@@ -387,6 +403,12 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	if end.Before(start) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("end timestamp must not be before start time"))
+		return
+	}
+
+	query, err = prepareMetricsQLQuery(query, step, s.cfg.LookbackDelta, start, end)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
 
@@ -427,7 +449,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(result.Value)
 	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccess(w, responseDataFromValue(result.Value))
+	writeAPISuccess(w, responseDataFromValue(metricsQLValue(result.Value)))
 }
 
 func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {

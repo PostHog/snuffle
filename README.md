@@ -1,13 +1,13 @@
 # Snuffle
 
-**PromQL and LogQL APIs for telemetry stored in ClickHouse.**
+**Metric queries and LogQL APIs for telemetry stored in ClickHouse.**
 
 > Keep ClickHouse as your storage engine. Keep the Prometheus and Loki APIs
 > your tools already understand. Avoid operating a second telemetry database
 > just to bridge the two.
 
 Snuffle is a Go service that sits between observability clients and
-ClickHouse. It accepts Prometheus remote write and read, PromQL queries, Loki
+ClickHouse. It accepts Prometheus remote write and read, metric queries with MetricsQL behavior, Loki
 pushes, and LogQL queries, then translates that work into ClickHouse-native
 reads and writes.
 
@@ -30,7 +30,7 @@ Snuffle provides one focused compatibility layer instead.
 | What you need | What Snuffle provides |
 | --- | --- |
 | Standard observability clients | Prometheus-compatible query, metadata, remote write, and remote read endpoints, plus Loki-compatible push and query endpoints |
-| PromQL behavior users recognize | The upstream Prometheus parser and evaluation engine, including functions, aggregations, binary matching, subqueries, `@`, and `offset` |
+| MetricsQL query behavior | The upstream MetricsQL parser, automatic rollup windows, and counter calculations without extrapolation. Prometheus evaluates supported functions, aggregates, binary operations, and subqueries. |
 | ClickHouse-scale execution | SQL pruning and pushdowns for common selectors, range queries, and aggregations so less data crosses into Go |
 | One backend for metrics and logs | Purpose-built Snuffle schemas or compatibility with PostHog-style ClickHouse tables |
 | Tenant isolation | A tenant is resolved per request and included in every ClickHouse data query |
@@ -260,23 +260,46 @@ metadata, or logs includes the resolved tenant filter.
 | Remote storage | `POST /api/v1/write`, `POST /api/v1/read` |
 | Compatibility stubs | `GET\|POST /api/v1/rules`, `/api/v1/alerts` |
 
-PromQL compatibility comes from Prometheus's own parser and evaluation engine,
-not a local grammar clone. The storage layer supports float samples, native
-histograms, exemplars, and metric metadata.
+Snuffle uses the upstream MetricsQL parser and the Prometheus evaluation engine.
+Metric queries use MetricsQL rules for bare selectors, `increase`, `rate`, `delta`,
+`irate`, and `idelta`. This applies to both ClickHouse storage formats.
 
 `/api/v1/query` evaluates the expression once, at `time` (default: now).
-A bare metric selector returns an instant vector with one value per series.
-It uses the latest sample within the lookback window (default: five minutes).
+A bare selector returns an instant vector with one value per series.
+Numeric constants also return vectors. Results omit `NaN` values.
 For a time series, use `/api/v1/query_range` with `start`, `end`, and `step`.
-This endpoint returns a matrix with a value at each evaluation time.
-The query step does not change the sample interval or the range inside `[ ]`.
+This endpoint returns a matrix. Both endpoints accept `step`.
+For an instant query, `step` defaults to `PROMQL_LOOKBACK_DELTA` (five minutes).
 
-`increase(metric[1m])` needs at least two samples within each one-minute window.
-Prometheus excludes the sample at the window's start.
-With one sample per minute, this expression can return no data.
-Use a wider window, such as `[5m]`, or collect samples more often.
-`increase` handles counter resets and estimates the increase over the full window.
-Its result can differ from the last sample minus the first sample.
+A bare selector uses `default_rollup`. Its automatic window uses the query step
+and the sample interval, with a margin for timestamp variation.
+For an instant query, the window uses the step.
+Stale markers stop the series. `PROMQL_LOOKBACK_DELTA` limits the automatic
+selector window and the history read before counter windows.
+
+Rollup functions accept omitted windows, such as `increase(metric)` and
+`rate(metric)`. The default window is the query step. `rate` can widen an
+omitted window to cover the sample interval. Explicit windows keep their size.
+The parser also accepts `WITH` expressions, fractional durations, durations
+without a unit, and step units such as `[4i]`.
+
+`increase(metric[1m])` includes the sample before the one-minute window.
+It can return an increase when only one sample is inside the window.
+`increase` and `rate` handle counter resets without extrapolation to window edges.
+`rate` divides the counter change by the elapsed time between samples.
+A window with no samples returns no data.
+
+This is not a complete MetricsQL engine. Extra MetricsQL functions and operators
+must also be supported by the Prometheus engine or by Snuffle's query adapter.
+Unsupported expressions return a query error. Other functions retain Prometheus
+behavior, including metric-name removal and native histogram calculations.
+Scalar and vector operations also retain the Prometheus type rules.
+`running_sum` requires a range query with `start` aligned to `step`.
+
+Automatic selectors and counter rollups read raw samples through the evaluation
+engine. They bypass SQL optimizations that use PromQL calculations or fixed
+sample timestamps. These queries can read more samples than before. The existing
+query timeout, sample limit, and series limit still apply.
 
 ### Loki-compatible API
 
@@ -435,7 +458,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `PROMQL_QUERY_TIMEOUT_SECONDS` | `30` | PromQL and LogQL query timeout in seconds |
-| `PROMQL_LOOKBACK_DELTA` | `5m` | PromQL lookback delta |
+| `PROMQL_LOOKBACK_DELTA` | `5m` | Maximum automatic selector window, counter history, and default instant query step |
 | `PROMQL_MAX_SAMPLES` | `50000000` | Prometheus engine sample limit |
 | `CH_MAX_SERIES` | `1000000` | Maximum matching series selected from ClickHouse |
 | `CH_ID_CHUNK_SIZE` | `20000` | Series ID batch size for selective reads |

@@ -128,11 +128,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	if !cfg.postHogSchemaLayout() {
 		assertRemoteReadHistograms(t, api.URL)
 	}
-	if cfg.postHogSchemaLayout() {
-		t.Run("counter query intervals", func(t *testing.T) {
-			assertCounterQueryIntervals(t, cfg, api.URL)
-		})
-	}
+	t.Run("counter query intervals", func(t *testing.T) {
+		assertCounterQueryIntervals(t, cfg, api.URL)
+	})
 }
 
 func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
@@ -177,29 +175,52 @@ func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
 		},
 	}}})
 
+	postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{{Name: "__name__", Value: metric + "_stale"}},
+		Samples: []prompb.Sample{
+			{Timestamp: end.Add(-15 * time.Second).UnixMilli(), Value: 100},
+			{Timestamp: end.UnixMilli(), Value: math.Float64frombits(0x7ff0000000000002)},
+		},
+	}}})
+
+	// These counter results match VictoriaMetrics v1.152.0.
 	for _, tc := range []struct {
 		query string
 		value string
 	}{
+		{metric + "_stale", ""},
 		{metric + `{interval="1m0s"}`, "340"},
 		{`sum(` + metric + `{interval="1m0s"})`, "340"},
 		{`topk(1, ` + metric + `{interval="1m0s"})`, "340"},
 		{`count(count by (interval) (` + metric + `))`, "3"},
 		{`increase(` + metric + `{interval="15s"}[1m])`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[1m])`, ""},
-		{`increase(` + metric + `{interval="1m0s"}[5m])`, "300"},
-		{`sum(increase(` + metric + `{interval="1m0s"}[5m]))`, "300"},
-		{`increase(` + metric + `{interval="reset"}[5m])`, "237.5"},
-		{`sum(increase(` + metric + `{interval="reset"}[5m]))`, "237.5"},
+		{`increase(` + metric + `{interval="1m0s"}[1m])`, "60"},
+		{`increase(` + metric + `{interval="1m0s"}[5m])`, "340"},
+		{`sum(increase(` + metric + `{interval="1m0s"}[5m]))`, "340"},
+		{`increase(` + metric + `{interval="reset"}[5m])`, "290"},
+		{`sum(increase(` + metric + `{interval="reset"}[5m]))`, "290"},
+		{`increase(` + metric + `{interval="1m0s"})`, "60"},
+		{`rate(` + metric + `{interval="1m0s"})`, "1"},
+		{`rate(` + metric + `{interval="1m0s"}[1m])`, "1"},
+		{`irate(` + metric + `{interval="1m0s"}[1m])`, "1"},
+		{`delta(` + metric + `{interval="1m0s"}[1m])`, "60"},
+		{`idelta(` + metric + `{interval="1m0s"}[1m])`, "60"},
+		{`WITH (m = ` + metric + `{interval="1m0s"}) sum(rate(m))`, "1"},
+		{`increase(` + metric + `{interval="1m0s"}[60])`, "60"},
+		{`increase(` + metric + `{interval="1m0s"}[4i])`, "240"},
+		{`increase(` + metric + `{interval="1m0s"}[1m] offset 1m)`, "60"},
+		{`increase(` + metric + `{interval="1m0s"}[1m] offset 0m)`, "60"},
+		{`increase(` + metric + `{interval="1m0s"}[1m] offset -1m)`, ""},
+		{`increase(` + metric + `{interval="1m0s"}[1m] @ 1700000400)`, "60"},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			for _, path := range []string{"/api/v1/query", "/api/v1/query_range"} {
-				params := url.Values{"query": {tc.query}, "time": {"1700000400"}}
+				params := url.Values{"query": {tc.query}, "time": {"1700000400"}, "step": {"1m"}}
 				resultType := "vector"
 				if path == "/api/v1/query_range" {
 					params.Set("start", "1700000400")
-					params.Set("end", "1700000415")
-					params.Set("step", "15s")
+					params.Set("end", "1700000460")
+					params.Set("step", "1m")
 					resultType = "matrix"
 				}
 				data := apiGet[queryDataDTO](t, baseURL, path, params)
@@ -218,16 +239,24 @@ func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
 				}
 				point := data.Result[0].Value
 				if path == "/api/v1/query_range" {
-					if len(data.Result[0].Values) != 2 {
-						t.Errorf("%s returned %d points, want 2", path, len(data.Result[0].Values))
+					if len(data.Result[0].Values) == 0 {
+						t.Errorf("%s returned no points", path)
 						continue
 					}
+					if tc.query == metric+`{interval="1m0s"}` || tc.query == `increase(`+metric+`{interval="1m0s"}[1m])` {
+						if len(data.Result[0].Values) != 1 {
+							t.Errorf("%s retained a sample after its interval", path)
+						}
+					}
 					point = data.Result[0].Values[0]
-					// Adding zero makes Snuffle use the Prometheus engine.
+					if strings.Contains(tc.query, " @ ") && len(data.Result[0].Values) != 2 {
+						t.Error("the @ modifier did not keep the evaluation time fixed")
+					}
+					// Check the result when this expression is part of a binary operation.
 					params.Set("query", tc.query+" + 0")
 					engine := apiGet[queryDataDTO](t, baseURL, path, params)
 					if len(engine.Result) != 1 {
-						t.Fatalf("Prometheus returned %d series, want 1", len(engine.Result))
+						t.Fatalf("the binary expression returned %d series, want 1", len(engine.Result))
 					}
 					assertSameSampleValues(t, tc.query, data.Result[0].Values, engine.Result[0].Values)
 				}
