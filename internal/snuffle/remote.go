@@ -761,9 +761,11 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 		return nil, err
 	}
 	if s.knownSeries != nil {
+		s.knownSeries.mu.Lock()
 		for id := range known {
-			s.knownSeries.Store(remoteWriteSeriesKey{TeamID: s.cfg.TeamID, ID: id}, struct{}{})
+			s.knownSeries.ids[remoteWriteSeriesKey{TeamID: s.cfg.TeamID, ID: id}] = struct{}{}
 		}
+		s.knownSeries.mu.Unlock()
 	}
 	if len(known) == 0 {
 		return rows, nil
@@ -790,9 +792,11 @@ func (s *Server) filterCachedSeriesRows(rows []remoteWriteSeriesRow) []remoteWri
 	if s.knownSeries == nil {
 		return rows
 	}
+	s.knownSeries.mu.RLock()
+	defer s.knownSeries.mu.RUnlock()
 	uncached := rows[:0]
 	for _, row := range rows {
-		if _, ok := s.knownSeries.Load(remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}); !ok {
+		if _, ok := s.knownSeries.ids[remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}]; !ok {
 			uncached = append(uncached, row)
 		}
 	}
@@ -803,8 +807,10 @@ func (s *Server) cacheKnownSeriesRows(rows []remoteWriteSeriesRow) {
 	if s.knownSeries == nil {
 		return
 	}
+	s.knownSeries.mu.Lock()
+	defer s.knownSeries.mu.Unlock()
 	for _, row := range rows {
-		s.knownSeries.Store(remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}, struct{}{})
+		s.knownSeries.ids[remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}] = struct{}{}
 	}
 }
 

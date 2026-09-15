@@ -30,8 +30,13 @@ type Server struct {
 	parser    parser.Parser
 	seriesMu  *sync.Mutex
 	// ponytail: exact cache grows for the process lifetime; bound it if series churn makes memory material.
-	knownSeries *sync.Map
+	knownSeries *knownSeriesCache
 	metrics     *bridgeMetrics
+}
+
+type knownSeriesCache struct {
+	mu  sync.RWMutex
+	ids map[remoteWriteSeriesKey]struct{}
 }
 
 func Run(cfg Config) error {
@@ -91,7 +96,7 @@ func newServer(cfg Config) *Server {
 		engine:      engine,
 		parser:      parser.NewParser(parser.Options{}),
 		seriesMu:    &sync.Mutex{},
-		knownSeries: &sync.Map{},
+		knownSeries: &knownSeriesCache{ids: make(map[remoteWriteSeriesKey]struct{})},
 		metrics:     metrics,
 	}
 }
