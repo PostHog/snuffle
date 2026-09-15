@@ -61,11 +61,12 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
 	if cfg.postHogSchemaLayout() {
-		cfg.SeriesTable = "metric_series2"
+		cfg.SeriesTable = "metric_series3"
 		cfg.SamplesTable = "metrics2"
 		cfg.MetricsInputTable = "metrics2_input"
 		cfg.LabelIndexTable = ""
-		cfg.AttributeTable = "metric_attributes2"
+		cfg.AttributeTable = "metric_attributes3"
+		cfg.MetricNamesTable = "metric_names3"
 		cfg.LabelPostingsTable = ""
 		cfg.ActivityTable = ""
 		cfg.MetricsTable = ""
@@ -131,6 +132,11 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("counter query intervals", func(t *testing.T) {
 		assertCounterQueryIntervals(t, cfg, api.URL)
 	})
+	if cfg.postHogSchemaLayout() {
+		t.Run("filtered label discovery", func(t *testing.T) {
+			assertPostHogFilteredLabels(t, ctx, client, cfg)
+		})
+	}
 }
 
 func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
@@ -565,6 +571,84 @@ func assertMetricsQLSumOverTimeSubqueryQuery(t *testing.T, baseURL string) {
 	}
 }
 
+func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *ClickHouseClient, cfg Config) {
+	t.Helper()
+	const metric = "snuffle_e2e_discovery"
+	const service = "snuffle-discovery"
+	insert := fmt.Sprintf(`INSERT INTO %s
+		(team_id, metric_name, series_fingerprint, timestamp, observed_timestamp,
+		 original_expiry_timestamp, service_name, value, count, has_labels, resource_attributes, attributes)
+		SELECT %d, %s, 987654321, %s, now64(6), now64(6) + INTERVAL 1 DAY,
+		       %s, 1, 1, true, map('zone', 'resource-zone', 'host', 'host-1'),
+		       map('zone', 'metric-zone', 'status', '200')`,
+		tableName(cfg.CHDatabase, cfg.MetricsInputTable), e2eTeamID, sqlString(metric), chTimeMillis(e2eStartMS),
+		sqlString(service))
+	if err := client.Exec(ctx, insert); err != nil {
+		t.Fatalf("insert discovery fixture: %v", err)
+	}
+
+	for _, version := range []string{"3", "2"} {
+		t.Run("metadata"+version, func(t *testing.T) {
+			readCfg := cfg
+			readCfg.SeriesTable = "metric_series" + version
+			readCfg.AttributeTable = "metric_attributes" + version
+			if version == "2" {
+				readCfg.MetricNamesTable = ""
+				readCfg.AttributeTableHasMetricName = false
+			}
+			mux := http.NewServeMux()
+			newServer(readCfg).routes(mux)
+			api := httptest.NewServer(mux)
+			defer api.Close()
+
+			for _, selector := range []string{metric, metric + `{service_name="` + service + `"}`, `{service_name="` + service + `"}`, metric + `{status="200"}`} {
+				t.Run(selector, func(t *testing.T) {
+					params := url.Values{
+						"match[]": {selector},
+						"start":   {"1700000010"},
+						"end":     {"1700000070"},
+					}
+					names := apiGet[[]string](t, api.URL, "/api/v1/labels", params)
+					for _, name := range []string{"__name__", "service_name", "zone", "host", "status"} {
+						assertStringPresent(t, names, name)
+					}
+					for name, want := range map[string]string{"host": "host-1", "status": "200"} {
+						values := apiGet[[]string](t, api.URL, "/api/v1/label/"+name+"/values", params)
+						if len(values) != 1 || values[0] != want {
+							t.Errorf("label %q values = %q, want [%q]", name, values, want)
+						}
+					}
+					// A key in both maps lists the resource value; the rollup also lists the metric value.
+					zones := apiGet[[]string](t, api.URL, "/api/v1/label/zone/values", params)
+					assertStringPresent(t, zones, "resource-zone")
+
+					series := apiGet[[]map[string]string](t, api.URL, "/api/v1/series", params)
+					if len(series) != 1 || series[0]["zone"] != "resource-zone" {
+						t.Errorf("series for %q = %#v, want zone=resource-zone", selector, series)
+					}
+				})
+			}
+
+			if version == "2" {
+				// The old table can contain names that have not reached the new table.
+				const oldMetric = "snuffle_e2e_old_catalog_only"
+				insertOld := fmt.Sprintf(`INSERT INTO %s
+					(team_id, metric_name, series_fingerprint, last_seen, original_expiry_timestamp)
+					VALUES (%d, %s, 987654322, %s, now64(6) + INTERVAL 1 DAY)`,
+					tableName(cfg.CHDatabase, readCfg.SeriesTable), e2eTeamID, sqlString(oldMetric), chTimeMillis(e2eStartMS))
+				if err := client.Exec(ctx, insertOld); err != nil {
+					t.Fatalf("insert old catalog fixture: %v", err)
+				}
+				names := apiGet[[]string](t, api.URL, "/api/v1/label/__name__/values", url.Values{
+					"start": {"1700000010"},
+					"end":   {"1700000070"},
+				})
+				assertStringPresent(t, names, oldMetric)
+			}
+		})
+	}
+}
+
 func assertLabels(t *testing.T, baseURL string) {
 	t.Helper()
 	labels := apiGet[[]string](t, baseURL, "/api/v1/labels", url.Values{
@@ -574,6 +658,27 @@ func assertLabels(t *testing.T, baseURL string) {
 	assertStringPresent(t, labels, "__name__")
 	assertStringPresent(t, labels, "job")
 	assertStringPresent(t, labels, "instance")
+
+	metricLabels := apiGet[[]string](t, baseURL, "/api/v1/labels", url.Values{
+		"match[]": {e2eCounterMetric},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	})
+	assertStringPresent(t, metricLabels, "job")
+	assertStringPresent(t, metricLabels, "instance")
+
+	names := apiGet[[]string](t, baseURL, "/api/v1/label/__name__/values", url.Values{
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
+	})
+	assertStringPresent(t, names, e2eCounterMetric)
+
+	jobs := apiGet[[]string](t, baseURL, "/api/v1/label/job/values", url.Values{
+		"match[]": {e2eCounterMetric},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	})
+	assertStringPresent(t, jobs, "api")
 }
 
 func assertLabelValues(t *testing.T, baseURL string) {

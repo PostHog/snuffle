@@ -338,7 +338,7 @@ Metrics and logs choose their layouts independently.
 | Data | Layout | Best for | Schema |
 | --- | --- | --- | --- |
 | Metrics | `current` (default) | New Snuffle deployments optimized around Prometheus series, samples, labels, histograms, exemplars, and metadata | [`scripts/create_metrics_schema.sql`](scripts/create_metrics_schema.sql) |
-| Metrics | `posthog` | Existing PostHog-style `metrics2`, `metric_series2`, and `metric_attributes2` tables | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
+| Metrics | `posthog` | Existing PostHog-style `metrics2`, `metric_series3`, `metric_attributes3`, and `metric_names3` tables | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
 | Logs | `snuffle` (default with `current` metrics) | New deployments with a narrow log table, stream dictionary, label index, and minute rollups | [`scripts/create_logs_snuffle_schema.sql`](scripts/create_logs_snuffle_schema.sql) |
 | Logs | `posthog` (default with `posthog` metrics) | Existing PostHog-style `logs34` and `log_attributes3` tables | [`scripts/create_logs_posthog_schema.sql`](scripts/create_logs_posthog_schema.sql) |
 
@@ -372,11 +372,29 @@ the hot log table narrow while retaining selector and aggregation support.
 ### PostHog-compatible data
 
 In PostHog metrics mode, series identity is the `series_fingerprint` shared by
-`metric_series2` and `metrics2`. Snuffle selects series from `metric_series2`,
+`metric_series3` and `metrics2`. Snuffle selects series from `metric_series3`,
 builds Prometheus labels from `metric_name`, `service_name`,
 `resource_attributes`, and `attributes`, and reads samples from `metrics2` by
-fingerprint. Remote write inserts into `metrics2_input`; its materialized views
-fan each row out to the samples, series, and attribute tables.
+fingerprint. `metric_series3` keeps one row per series and expiry day, so
+series reads collapse duplicates by fingerprint. Label discovery reads the
+hourly rollups instead of the series table: `metric_names3` lists metric
+names, and `metric_attributes3` lists attribute keys and values, filtered by
+exact `__name__` and `service_name` matchers. Other matchers fall back to the
+series table. Remote write inserts into `metrics2_input`; its materialized
+views fan each row out to the samples, series, attribute, and name tables.
+
+The rollups set two limits on the Prometheus label surface:
+
+- Attribute keys and values must be shorter than 256 characters. The
+  attribute rollup drops longer pairs, so label discovery does not list them.
+- When a key exists in both `resource_attributes` and `attributes`, the
+  Prometheus label carries the resource attribute value. Label value
+  discovery for that key can also list the metric attribute value.
+
+Set `CH_SERIES_TABLE=metric_series2`, `CH_ATTRIBUTE_TABLE=metric_attributes2`,
+`CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME=false`, and an empty
+`CH_METRIC_NAMES_TABLE` to read the previous PostHog tables, for example
+before their backfill into the `3` tables is complete.
 
 In PostHog logs mode, Loki stream labels and structured metadata map onto the
 OpenTelemetry-shaped `logs34` columns. Service, severity, trace, span, resource,
@@ -440,11 +458,13 @@ Snuffle is configured with environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CH_SCHEMA_LAYOUT` | `current` | Metrics layout: `current` or `posthog`; `SNUFFLE_SCHEMA_LAYOUT` is accepted as a legacy fallback |
-| `CH_SERIES_TABLE` | `metrics_series` / `metric_series2` | Series table |
+| `CH_SERIES_TABLE` | `metrics_series` / `metric_series3` | Series table |
 | `CH_SAMPLES_TABLE` | `metrics_samples` / `metrics2` | Float sample table |
 | `CH_LABEL_INDEX_TABLE` | `metrics_label_index` / empty | Metrics label index |
-| `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metric_attributes2` | PostHog attribute discovery table |
-| `CH_METRICS_INPUT_TABLE` | empty / `metrics2_input` | PostHog remote write target; its materialized views feed the samples, series, and attribute tables |
+| `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metric_attributes3` | PostHog attribute discovery table |
+| `CH_METRIC_NAMES_TABLE` | empty / `metric_names3` | PostHog metric name discovery table; empty reads metric names from the series table |
+| `CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME` | `false` / `true` | Whether the PostHog attribute table has a `metric_name` column; set `false` with `metric_attributes2` |
+| `CH_METRICS_INPUT_TABLE` | empty / `metrics2_input` | PostHog remote write target; its materialized views feed the samples, series, attribute, and name tables |
 | `CH_LABEL_POSTINGS_TABLE` | empty | Optional optimized metrics postings table |
 | `CH_ACTIVITY_TABLE` | empty | Optional series-activity table |
 | `CH_METRICS_TABLE` | `metrics_metadata` / empty | Metric metadata table |

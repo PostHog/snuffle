@@ -84,8 +84,8 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	if !cfg.SampleAttributes {
 		t.Fatalf("SampleAttributes = false, want true for posthog layout")
 	}
-	if cfg.SamplesTable != "metrics2" || cfg.SeriesTable != "metric_series2" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes2" || cfg.MetricsInputTable != "metrics2_input" {
-		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q input %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable, cfg.MetricsInputTable)
+	if cfg.SamplesTable != "metrics2" || cfg.SeriesTable != "metric_series3" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes3" || cfg.MetricNamesTable != "metric_names3" || cfg.MetricsInputTable != "metrics2_input" {
+		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q names %q input %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable, cfg.MetricNamesTable, cfg.MetricsInputTable)
 	}
 	if cfg.MetricsRetention != 90*24*time.Hour {
 		t.Fatalf("MetricsRetention = %s, want 90 days", cfg.MetricsRetention)
@@ -101,6 +101,23 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	cfg = ConfigFromEnv()
 	if cfg.SampleAttributes {
 		t.Fatalf("SampleAttributes override = true, want false")
+	}
+}
+
+func TestConfigFromEnvMetricNamesTableOverride(t *testing.T) {
+	t.Setenv("CH_SCHEMA_LAYOUT", "posthog")
+	if !ConfigFromEnv().AttributeTableHasMetricName {
+		t.Fatalf("AttributeTableHasMetricName = false, want true for posthog layout")
+	}
+	t.Setenv("CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME", "false")
+	if ConfigFromEnv().AttributeTableHasMetricName {
+		t.Fatalf("AttributeTableHasMetricName = true, want false when disabled")
+	}
+	for _, table := range []string{"", "custom_metric_names"} {
+		t.Setenv("CH_METRIC_NAMES_TABLE", table)
+		if got := ConfigFromEnv().MetricNamesTable; got != table {
+			t.Fatalf("MetricNamesTable = %q, want %q", got, table)
+		}
 	}
 }
 

@@ -8,10 +8,13 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// PostHog metrics live in two tables: metric_series2 holds one row per series
-// (labels keyed by series_fingerprint) and metrics2 holds the samples keyed by
-// the same fingerprint. Queries select series from the series table, then
-// read samples by fingerprint and join the labels back in.
+// PostHog metrics live in two tables: metric_series3 holds the labels of each
+// series (keyed by series_fingerprint, one row per expiry day) and metrics2
+// holds the samples keyed by the same fingerprint. Queries select series from
+// the series table, then read samples by fingerprint and join the labels back
+// in. Two hourly rollups answer discovery without a series scan:
+// metric_attributes3 has one row per metric, service, attribute pair and hour,
+// and metric_names3 has one row per metric name and hour.
 
 const postHogSeriesLabelColumns = "metric_name, service_name, resource_attributes, attributes"
 
@@ -186,8 +189,9 @@ func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt 
 
 // postHogSelectedSeriesSQL returns one row per series matching the matchers,
 // with the label columns and any extra select expressions. The series table
-// is a ReplacingMergeTree keyed by fingerprint, so unmerged duplicates are
-// collapsed with LIMIT 1 BY.
+// is a ReplacingMergeTree keyed by fingerprint and partitioned by expiry day,
+// so unmerged duplicates and rows from other expiry days are collapsed with
+// LIMIT 1 BY.
 func postHogSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, limit int, extraSelects []string) string {
 	return postHogSelectedSeriesWhereSQL(cfg, postHogSeriesFilters(cfg, matchers, mint, maxt), limit, extraSelects)
 }
@@ -198,6 +202,14 @@ func postHogSeriesTable(cfg Config) string {
 
 func postHogSamplesTable(cfg Config) string {
 	return tableName(cfg.CHDatabase, cfg.SamplesTable)
+}
+
+func postHogAttributeTable(cfg Config) string {
+	return tableName(cfg.CHDatabase, cfg.AttributeTable)
+}
+
+func postHogMetricNamesTable(cfg Config) string {
+	return tableName(cfg.CHDatabase, cfg.MetricNamesTable)
 }
 
 // postHogSeriesFilters filters the series table. last_seen is the newest
@@ -293,9 +305,11 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 	}
 }
 
+// postHogLabelValueExpr reads a map label with the same precedence as
+// postHogLabelMap: a resource attribute wins over a metric attribute.
 func postHogLabelValueExpr(name string) string {
 	key := sqlString(name)
-	return "if(mapContains(attributes, " + key + "), attributes[" + key + "], resource_attributes[" + key + "])"
+	return "if(mapContains(resource_attributes, " + key + "), resource_attributes[" + key + "], attributes[" + key + "])"
 }
 
 func postHogMatchersPushdownSafe(matchers []*labels.Matcher) bool {
@@ -433,8 +447,14 @@ func (p *postHogQueryPlan) joinSeries(inner string) string {
 
 func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[string]string) map[string]string {
 	out := make(map[string]string, len(resourceAttrs)+len(attrs)+2)
+	for key, value := range attrs {
+		if key == "" || key == labels.MetricName {
+			continue
+		}
+		out[key] = value
+	}
 	for key, value := range resourceAttrs {
-		if key == "" {
+		if key == "" || key == labels.MetricName {
 			continue
 		}
 		out[key] = value
@@ -442,18 +462,13 @@ func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[st
 	if serviceName != "" {
 		out["service_name"] = serviceName
 	}
-	for key, value := range attrs {
-		if key == "" || key == labels.MetricName {
-			continue
-		}
-		out[key] = value
-	}
 	out[labels.MetricName] = metricName
 	return out
 }
 
 func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers ...*labels.Matcher) ([]string, error) {
-	if len(matchers) > 0 {
+	sql, ok := postHogLabelNamesSQL(q.queryable.cfg, q.mint, q.maxt, limit, matchers)
+	if !ok {
 		series, err := q.selectPostHogSeries(ctx, q.mint, q.maxt, matchers...)
 		if err != nil {
 			return nil, err
@@ -467,31 +482,41 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 		return sortedLimited(names, limit), nil
 	}
 	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}}
-	var sql string
-	if attrTable := q.queryable.cfg.AttributeTable; attrTable != "" {
-		sql = fmt.Sprintf(
-			"SELECT DISTINCT attribute_key FROM %s WHERE %s AND %s ORDER BY attribute_key%s",
-			tableName(q.queryable.cfg.CHDatabase, attrTable),
-			teamFilter(q.queryable.cfg),
-			strings.Join(postHogAttributeTimeFilters(q.mint, q.maxt), " AND "),
-			sqlLimit(limit),
-		)
-	} else {
-		sql = fmt.Sprintf(
-			"SELECT DISTINCT arrayJoin(arrayConcat(mapKeys(attributes), mapKeys(resource_attributes))) AS attribute_key FROM %s WHERE %s ORDER BY attribute_key%s",
-			postHogSeriesTable(q.queryable.cfg),
-			strings.Join(postHogSeriesFilters(q.queryable.cfg, nil, q.mint, q.maxt), " AND "),
-			sqlLimit(limit),
-		)
-	}
 	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, err
 	}
 	return sortedLimited(names, limit), nil
 }
 
+// postHogLabelNamesSQL lists attribute keys from the attribute rollup. It
+// reports false when the matchers need a series scan.
+func postHogLabelNamesSQL(cfg Config, mint, maxt int64, limit int, matchers []*labels.Matcher) (string, bool) {
+	if cfg.AttributeTable == "" {
+		if len(matchers) > 0 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT arrayJoin(arrayConcat(mapKeys(attributes), mapKeys(resource_attributes))) AS attribute_key FROM %s WHERE %s ORDER BY attribute_key%s",
+			postHogSeriesTable(cfg),
+			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
+			sqlLimit(limit),
+		), true
+	}
+	where, ok := postHogAttributeFilters(cfg, mint, maxt, matchers)
+	if !ok {
+		return "", false
+	}
+	return fmt.Sprintf(
+		"SELECT DISTINCT attribute_key FROM %s WHERE %s ORDER BY attribute_key%s",
+		postHogAttributeTable(cfg),
+		strings.Join(where, " AND "),
+		sqlLimit(limit),
+	), true
+}
+
 func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit int, matchers ...*labels.Matcher) ([]string, error) {
-	if len(matchers) > 0 {
+	sql, ok := postHogLabelValuesSQL(q.queryable.cfg, name, q.mint, q.maxt, limit, matchers)
+	if !ok {
 		series, err := q.selectPostHogSeries(ctx, q.mint, q.maxt, matchers...)
 		if err != nil {
 			return nil, err
@@ -505,43 +530,94 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 		return sortedLimited(values, limit), nil
 	}
 	values := make(map[string]struct{})
-	var sql string
-	switch {
-	case postHogSampleColumnLabel(name):
-		column, _ := postHogSeriesLabelExpr(name)
-		sql = fmt.Sprintf(
-			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s ORDER BY label_value%s",
-			column,
-			postHogSeriesTable(q.queryable.cfg),
-			strings.Join(postHogSeriesFilters(q.queryable.cfg, nil, q.mint, q.maxt), " AND "),
-			sqlLimit(limit),
-		)
-	case q.queryable.cfg.AttributeTable != "":
-		sql = fmt.Sprintf(
-			"SELECT DISTINCT attribute_value AS label_value FROM %s WHERE %s AND attribute_key = %s AND %s ORDER BY label_value%s",
-			tableName(q.queryable.cfg.CHDatabase, q.queryable.cfg.AttributeTable),
-			teamFilter(q.queryable.cfg),
-			sqlString(name),
-			strings.Join(postHogAttributeTimeFilters(q.mint, q.maxt), " AND "),
-			sqlLimit(limit),
-		)
-	default:
-		sql = fmt.Sprintf(
-			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s AND label_value != '' ORDER BY label_value%s",
-			postHogLabelValueExpr(name),
-			postHogSeriesTable(q.queryable.cfg),
-			strings.Join(postHogSeriesFilters(q.queryable.cfg, nil, q.mint, q.maxt), " AND "),
-			sqlLimit(limit),
-		)
-	}
 	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, err
 	}
 	return sortedLimited(values, limit), nil
 }
 
-// postHogAttributeTimeFilters bounds the attribute rollup, which buckets by
-// hour.
+// postHogLabelValuesSQL lists the values of one label. Metric names come from
+// the metric name rollup, other map labels from the attribute rollup, and the
+// rest from the series table. It reports false when the matchers need a
+// series scan.
+func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int, matchers []*labels.Matcher) (string, bool) {
+	switch {
+	case postHogSampleColumnLabel(name):
+		if len(matchers) > 0 {
+			return "", false
+		}
+		if name == labels.MetricName && cfg.MetricNamesTable != "" {
+			return fmt.Sprintf(
+				"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s AND %s ORDER BY label_value%s",
+				postHogMetricNamesTable(cfg),
+				teamFilter(cfg),
+				strings.Join(postHogAttributeTimeFilters(mint, maxt), " AND "),
+				sqlLimit(limit),
+			), true
+		}
+		column, _ := postHogSeriesLabelExpr(name)
+		return fmt.Sprintf(
+			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s ORDER BY label_value%s",
+			column,
+			postHogSeriesTable(cfg),
+			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
+			sqlLimit(limit),
+		), true
+	case cfg.AttributeTable != "":
+		where, ok := postHogAttributeFilters(cfg, mint, maxt, matchers)
+		if !ok {
+			return "", false
+		}
+		where = append(where, "attribute_key = "+sqlString(name))
+		return fmt.Sprintf(
+			"SELECT DISTINCT attribute_value AS label_value FROM %s WHERE %s ORDER BY label_value%s",
+			postHogAttributeTable(cfg),
+			strings.Join(where, " AND "),
+			sqlLimit(limit),
+		), true
+	default:
+		if len(matchers) > 0 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s AND label_value != '' ORDER BY label_value%s",
+			postHogLabelValueExpr(name),
+			postHogSeriesTable(cfg),
+			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
+			sqlLimit(limit),
+		), true
+	}
+}
+
+// postHogAttributeFilters filters the attribute rollup by team, time and the
+// matchers it can answer. The rollup keys on metric_name and service_name, so
+// only exact matchers on those labels are accepted; any other matcher reports
+// false and needs the series table. A metric_name filter also needs a table
+// that has the column.
+func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
+	filters := []string{teamFilter(cfg)}
+	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) {
+			continue
+		}
+		if matcher.Type != labels.MatchEqual || matcher.Value == "" {
+			return nil, false
+		}
+		if matcher.Name == labels.MetricName && !cfg.AttributeTableHasMetricName {
+			return nil, false
+		}
+		column, ok := postHogSampleLabelExpr(matcher.Name)
+		if !ok {
+			return nil, false
+		}
+		filters = append(filters, column+" = "+sqlString(matcher.Value))
+	}
+	return filters, true
+}
+
+// postHogAttributeTimeFilters bounds the attribute and metric name rollups,
+// which bucket by hour.
 func postHogAttributeTimeFilters(mint, maxt int64) []string {
 	return []string{
 		"time_bucket >= toStartOfHour(" + chTimeMillis(mint) + ")",

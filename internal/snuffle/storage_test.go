@@ -356,7 +356,7 @@ func TestPostHogSeriesSamplesSQLUsesPostHogTablesAndAttributePredicates(t *testi
 	for _, want := range []string{
 		"WITH selected_series AS (SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes FROM `posthog`.`metric_series2` WHERE",
 		"last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')",
-		"if(mapContains(attributes, 'status'), attributes['status'], resource_attributes['status']) = '200'",
+		"if(mapContains(resource_attributes, 'status'), resource_attributes['status'], attributes['status']) = '200'",
 		"LIMIT 1 BY series_id LIMIT 500",
 		"FROM `posthog`.`metrics2` WHERE",
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
@@ -409,6 +409,132 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 	}
 	if strings.Contains(sql, "metric_series2") || strings.Contains(sql, "'status'") {
 		t.Fatalf("sample loading must not consult the series table: %s", sql)
+	}
+}
+
+func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
+	cfg := Config{
+		CHDatabase:                  "posthog",
+		SchemaLayout:                "posthog",
+		SeriesTable:                 "metric_series3",
+		AttributeTable:              "metric_attributes3",
+		MetricNamesTable:            "metric_names3",
+		AttributeTableHasMetricName: true,
+		TeamID:                      7,
+	}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
+		labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status", ".*"),
+	}
+
+	sql, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers)
+	if !ok {
+		t.Fatalf("exact metric and service matchers should read the attribute rollup")
+	}
+	for _, want := range []string{
+		"SELECT DISTINCT attribute_key FROM `posthog`.`metric_attributes3` WHERE",
+		teamFilter(cfg),
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"metric_name = 'http_requests_total'",
+		"service_name = 'checkout'",
+		"ORDER BY attribute_key" + sqlLimit(100),
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "'status'") {
+		t.Fatalf("label names must not consult the series table: %s", sql)
+	}
+
+	for name, matchers := range map[string][]*labels.Matcher{
+		"map label":     {labels.MustNewMatcher(labels.MatchEqual, "status", "200")},
+		"regexp metric": {labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")},
+		"empty service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", "")},
+		"not equal":     {labels.MustNewMatcher(labels.MatchNotEqual, labels.MetricName, "up")},
+	} {
+		if _, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers); ok {
+			t.Fatalf("%s matcher should fall back to the series table", name)
+		}
+	}
+
+	// The legacy attribute table has no metric_name column.
+	cfg.AttributeTable = "metric_attributes2"
+	cfg.AttributeTableHasMetricName = false
+	if _, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers[:1]); ok {
+		t.Fatalf("metric matcher should fall back to the series table without a metric_name column")
+	}
+	sql, ok = postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers[1:2])
+	if !ok || !strings.Contains(sql, "`posthog`.`metric_attributes2`") || !strings.Contains(sql, "service_name = 'checkout'") {
+		t.Fatalf("service matcher should still read the legacy attribute table: %s", sql)
+	}
+}
+
+func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
+	cfg := Config{
+		CHDatabase:                  "posthog",
+		SchemaLayout:                "posthog",
+		SeriesTable:                 "metric_series3",
+		AttributeTable:              "metric_attributes3",
+		MetricNamesTable:            "metric_names3",
+		AttributeTableHasMetricName: true,
+		TeamID:                      7,
+	}
+	metric := labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total")
+
+	sql, ok := postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 0, nil)
+	if !ok {
+		t.Fatalf("metric names should read the metric name rollup")
+	}
+	for _, want := range []string{
+		"SELECT DISTINCT metric_name AS label_value FROM `posthog`.`metric_names3` WHERE",
+		teamFilter(cfg),
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"ORDER BY label_value",
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "last_seen") {
+		t.Fatalf("metric names must not consult the series table: %s", sql)
+	}
+
+	sql, ok = postHogLabelValuesSQL(cfg, "status", 1000, 2000, 50, []*labels.Matcher{metric})
+	if !ok {
+		t.Fatalf("map label values for an exact metric should read the attribute rollup")
+	}
+	for _, want := range []string{
+		"SELECT DISTINCT attribute_value AS label_value FROM `posthog`.`metric_attributes3` WHERE",
+		"metric_name = 'http_requests_total'",
+		"attribute_key = 'status'",
+		"ORDER BY label_value" + sqlLimit(50),
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+
+	if _, ok := postHogLabelValuesSQL(cfg, "status", 1000, 2000, 50, []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "region", "eu")}); ok {
+		t.Fatal("map label matchers should read the series table")
+	}
+
+	sql, ok = postHogLabelValuesSQL(cfg, "service_name", 1000, 2000, 0, nil)
+	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") || !strings.Contains(sql, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") {
+		t.Fatalf("service names should read the series table: %s", sql)
+	}
+
+	if _, ok := postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 0, []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout")}); ok {
+		t.Fatalf("metric names with a matcher should fall back to the series table")
+	}
+
+	cfg.MetricNamesTable = ""
+	sql, ok = postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 0, nil)
+	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") {
+		t.Fatalf("without a metric name rollup, metric names should read the series table: %s", sql)
 	}
 }
 
