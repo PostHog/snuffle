@@ -378,9 +378,9 @@ builds Prometheus labels from `metric_name`, `service_name`,
 fingerprint. `metric_series3` keeps one row per series and expiry day, so
 series reads collapse duplicates by fingerprint. Label discovery reads the
 hourly rollups instead of the series table: `metric_names3` lists metric
-names, and `metric_attributes3` lists attribute keys and values, filtered by
-exact `__name__` and `service_name` matchers. Other matchers fall back to the
-series table. Remote write inserts into `metrics2_input`; its materialized
+names, filtered by any `__name__` matcher, and `metric_attributes3` lists
+attribute keys and values, filtered by exact `__name__` and `service_name`
+matchers. Other matchers fall back to the series table. Remote write inserts into `metrics2_input`; its materialized
 views fan each row out to the samples, series, attribute, and name tables.
 
 The rollups set two limits on the Prometheus label surface:

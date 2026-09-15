@@ -527,8 +527,28 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 		t.Fatalf("service names should read the series table: %s", sql)
 	}
 
+	sql, ok = postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 1000, []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".*env.*"),
+		labels.MustNewMatcher(labels.MatchRegexp, "status", ".*"),
+	})
+	if !ok {
+		t.Fatalf("metric name search should read the metric name rollup")
+	}
+	for _, want := range []string{
+		"FROM `posthog`.`metric_names3` WHERE",
+		"match(metric_name, ",
+		"ORDER BY label_value" + sqlLimit(1000),
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "'status'") {
+		t.Fatalf("metric name search must not consult the series table: %s", sql)
+	}
+
 	if _, ok := postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 0, []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout")}); ok {
-		t.Fatalf("metric names with a matcher should fall back to the series table")
+		t.Fatalf("metric names with a matcher on another label should fall back to the series table")
 	}
 
 	cfg.MetricNamesTable = ""

@@ -542,18 +542,20 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 // series scan.
 func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int, matchers []*labels.Matcher) (string, bool) {
 	switch {
+	case name == labels.MetricName && cfg.MetricNamesTable != "":
+		where, ok := postHogMetricNameFilters(cfg, mint, maxt, matchers)
+		if !ok {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s ORDER BY label_value%s",
+			postHogMetricNamesTable(cfg),
+			strings.Join(where, " AND "),
+			sqlLimit(limit),
+		), true
 	case postHogSampleColumnLabel(name):
 		if len(matchers) > 0 {
 			return "", false
-		}
-		if name == labels.MetricName && cfg.MetricNamesTable != "" {
-			return fmt.Sprintf(
-				"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s AND %s ORDER BY label_value%s",
-				postHogMetricNamesTable(cfg),
-				teamFilter(cfg),
-				strings.Join(postHogAttributeTimeFilters(mint, maxt), " AND "),
-				sqlLimit(limit),
-			), true
 		}
 		column, _ := postHogSeriesLabelExpr(name)
 		return fmt.Sprintf(
@@ -587,6 +589,29 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			sqlLimit(limit),
 		), true
 	}
+}
+
+// postHogMetricNameFilters filters the metric name rollup by team, time and
+// the matchers it can answer: any matcher on __name__, including the regex
+// that a metric search sends. A matcher on another label needs the series
+// table and reports false.
+func postHogMetricNameFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
+	filters := []string{teamFilter(cfg)}
+	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
+			continue
+		}
+		if matcher.Name != labels.MetricName {
+			return nil, false
+		}
+		condition, ok := metricMatcherCondition(matcher)
+		if !ok {
+			return nil, false
+		}
+		filters = append(filters, condition)
+	}
+	return filters, true
 }
 
 // postHogAttributeFilters filters the attribute rollup by team, time and the
