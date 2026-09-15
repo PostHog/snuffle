@@ -575,16 +575,14 @@ func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *Clic
 	t.Helper()
 	const metric = "snuffle_e2e_discovery"
 	const service = "snuffle-discovery"
-	longValue := strings.Repeat("x", 256)
-	longKey := strings.Repeat("k", 256)
 	insert := fmt.Sprintf(`INSERT INTO %s
 		(team_id, metric_name, series_fingerprint, timestamp, observed_timestamp,
 		 original_expiry_timestamp, service_name, value, count, has_labels, resource_attributes, attributes)
 		SELECT %d, %s, 987654321, %s, now64(6), now64(6) + INTERVAL 1 DAY,
-		       %s, 1, 1, true, map('zone', 'resource-zone'),
-		       map('zone', 'metric-zone', 'long_label', %s, %s, 'long-key-value')`,
+		       %s, 1, 1, true, map('zone', 'resource-zone', 'host', 'host-1'),
+		       map('zone', 'metric-zone', 'status', '200')`,
 		tableName(cfg.CHDatabase, cfg.MetricsInputTable), e2eTeamID, sqlString(metric), chTimeMillis(e2eStartMS),
-		sqlString(service), sqlString(longValue), sqlString(longKey))
+		sqlString(service))
 	if err := client.Exec(ctx, insert); err != nil {
 		t.Fatalf("insert discovery fixture: %v", err)
 	}
@@ -595,15 +593,15 @@ func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *Clic
 			readCfg.SeriesTable = "metric_series" + version
 			readCfg.AttributeTable = "metric_attributes" + version
 			if version == "2" {
-				t.Setenv("CH_METRIC_NAMES_TABLE", "")
-				readCfg.MetricNamesTable = ConfigFromEnv().MetricNamesTable
+				readCfg.MetricNamesTable = ""
+				readCfg.AttributeTableHasMetricName = false
 			}
 			mux := http.NewServeMux()
 			newServer(readCfg).routes(mux)
 			api := httptest.NewServer(mux)
 			defer api.Close()
 
-			for _, selector := range []string{metric, metric + `{service_name="` + service + `"}`, `{service_name="` + service + `"}`} {
+			for _, selector := range []string{metric, metric + `{service_name="` + service + `"}`, `{service_name="` + service + `"}`, metric + `{status="200"}`} {
 				t.Run(selector, func(t *testing.T) {
 					params := url.Values{
 						"match[]": {selector},
@@ -611,14 +609,22 @@ func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *Clic
 						"end":     {"1700000070"},
 					}
 					names := apiGet[[]string](t, api.URL, "/api/v1/labels", params)
-					for _, name := range []string{"__name__", "service_name", "zone", "long_label", longKey} {
+					for _, name := range []string{"__name__", "service_name", "zone", "host", "status"} {
 						assertStringPresent(t, names, name)
 					}
-					for name, want := range map[string]string{"zone": "metric-zone", "long_label": longValue, longKey: "long-key-value"} {
+					for name, want := range map[string]string{"host": "host-1", "status": "200"} {
 						values := apiGet[[]string](t, api.URL, "/api/v1/label/"+name+"/values", params)
 						if len(values) != 1 || values[0] != want {
 							t.Errorf("label %q values = %q, want [%q]", name, values, want)
 						}
+					}
+					// A key in both maps lists the resource value; the rollup also lists the metric value.
+					zones := apiGet[[]string](t, api.URL, "/api/v1/label/zone/values", params)
+					assertStringPresent(t, zones, "resource-zone")
+
+					series := apiGet[[]map[string]string](t, api.URL, "/api/v1/series", params)
+					if len(series) != 1 || series[0]["zone"] != "resource-zone" {
+						t.Errorf("series for %q = %#v, want zone=resource-zone", selector, series)
 					}
 				})
 			}

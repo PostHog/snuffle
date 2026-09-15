@@ -74,7 +74,7 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 
 	sql := postHogAggregateUnionSQL(cfg, plan, aggregate.Grouping, start, time.Minute.Milliseconds(), "sum(sample_value)")
 	for _, want := range []string{
-		"WITH selected_series AS (SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes, if(mapContains(attributes, 'hostname'), attributes['hostname'], resource_attributes['hostname']) AS `__group_0` FROM `default`.`metric_series2` WHERE",
+		"WITH selected_series AS (SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes, if(mapContains(resource_attributes, 'hostname'), resource_attributes['hostname'], attributes['hostname']) AS `__group_0` FROM `default`.`metric_series2` WHERE",
 		"timeSeriesLastToGrid",
 		"IN ('host_0','host_1')",
 		"metric_name = 'usage_user'",
@@ -90,7 +90,7 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 	}
 	// the varying hostname expression must be factored into one IN lookup on
 	// the series table, not one map lookup per branch
-	if got := strings.Count(sql, "mapContains(attributes, 'hostname')"); got != 2 {
+	if got := strings.Count(sql, "mapContains(resource_attributes, 'hostname')"); got != 2 {
 		t.Fatalf("hostname lookup count = %d, want 2 (group expression and IN filter):\n%s", got, sql)
 	}
 	if strings.Contains(sql, "attributes_map_str") {
@@ -609,7 +609,7 @@ func TestPostHogQueryPlanReadsSeriesTableOnlyForMapLabels(t *testing.T) {
 	if !plan.useSeries {
 		t.Fatal("map-backed grouping labels must read the series table")
 	}
-	if !strings.Contains(plan.seriesSQL, "if(mapContains(attributes, 'region'), attributes['region'], resource_attributes['region']) AS `__group_0`") {
+	if !strings.Contains(plan.seriesSQL, "if(mapContains(resource_attributes, 'region'), resource_attributes['region'], attributes['region']) AS `__group_0`") {
 		t.Fatalf("expected map-backed group expression in series SQL, got %s", plan.seriesSQL)
 	}
 	if !strings.Contains(plan.seriesSQL, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") || !strings.Contains(plan.seriesSQL, "LIMIT 1 BY series_id LIMIT 10") {

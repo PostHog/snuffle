@@ -106,6 +106,13 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 
 func TestConfigFromEnvMetricNamesTableOverride(t *testing.T) {
 	t.Setenv("CH_SCHEMA_LAYOUT", "posthog")
+	if !ConfigFromEnv().AttributeTableHasMetricName {
+		t.Fatalf("AttributeTableHasMetricName = false, want true for posthog layout")
+	}
+	t.Setenv("CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME", "false")
+	if ConfigFromEnv().AttributeTableHasMetricName {
+		t.Fatalf("AttributeTableHasMetricName = true, want false when disabled")
+	}
 	for _, table := range []string{"", "custom_metric_names"} {
 		t.Setenv("CH_METRIC_NAMES_TABLE", table)
 		if got := ConfigFromEnv().MetricNamesTable; got != table {

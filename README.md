@@ -376,17 +376,25 @@ In PostHog metrics mode, series identity is the `series_fingerprint` shared by
 builds Prometheus labels from `metric_name`, `service_name`,
 `resource_attributes`, and `attributes`, and reads samples from `metrics2` by
 fingerprint. `metric_series3` keeps one row per series and expiry day, so
-series reads collapse duplicates by fingerprint. Without matchers, label
-discovery reads hourly rollups: `metric_names3` lists metric names, and
-`metric_attributes3` lists attribute keys and values. Requests with matchers
-read the series table. This preserves long metric attributes and gives
-metric attributes precedence over resource attributes with the same key.
-Remote write inserts into `metrics2_input`; its materialized views fan each
-row out to the samples, series, attribute, and name tables.
+series reads collapse duplicates by fingerprint. Label discovery reads the
+hourly rollups instead of the series table: `metric_names3` lists metric
+names, and `metric_attributes3` lists attribute keys and values, filtered by
+exact `__name__` and `service_name` matchers. Other matchers fall back to the
+series table. Remote write inserts into `metrics2_input`; its materialized
+views fan each row out to the samples, series, attribute, and name tables.
+
+The rollups set two limits on the Prometheus label surface:
+
+- Attribute keys and values must be shorter than 256 characters. The
+  attribute rollup drops longer pairs, so label discovery does not list them.
+- When a key exists in both `resource_attributes` and `attributes`, the
+  Prometheus label carries the resource attribute value. Label value
+  discovery for that key can also list the metric attribute value.
 
 Set `CH_SERIES_TABLE=metric_series2`, `CH_ATTRIBUTE_TABLE=metric_attributes2`,
-and an empty `CH_METRIC_NAMES_TABLE` to read the previous PostHog tables, for
-example before their backfill into the `3` tables is complete.
+`CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME=false`, and an empty
+`CH_METRIC_NAMES_TABLE` to read the previous PostHog tables, for example
+before their backfill into the `3` tables is complete.
 
 In PostHog logs mode, Loki stream labels and structured metadata map onto the
 OpenTelemetry-shaped `logs34` columns. Service, severity, trace, span, resource,
@@ -455,6 +463,7 @@ Snuffle is configured with environment variables.
 | `CH_LABEL_INDEX_TABLE` | `metrics_label_index` / empty | Metrics label index |
 | `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metric_attributes3` | PostHog attribute discovery table |
 | `CH_METRIC_NAMES_TABLE` | empty / `metric_names3` | PostHog metric name discovery table; empty reads metric names from the series table |
+| `CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME` | `false` / `true` | Whether the PostHog attribute table has a `metric_name` column; set `false` with `metric_attributes2` |
 | `CH_METRICS_INPUT_TABLE` | empty / `metrics2_input` | PostHog remote write target; its materialized views feed the samples, series, attribute, and name tables |
 | `CH_LABEL_POSTINGS_TABLE` | empty | Optional optimized metrics postings table |
 | `CH_ACTIVITY_TABLE` | empty | Optional series-activity table |

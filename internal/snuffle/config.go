@@ -19,45 +19,48 @@ type Config struct {
 	LabelIndexTable      string
 	AttributeTable       string
 	MetricNamesTable     string
-	LabelPostingsTable   string
-	ActivityTable        string
-	MetricsTable         string
-	MetricsInputTable    string
-	LogSchemaLayout      string
-	LogsTable            string
-	LogStreamsTable      string
-	LogStreamLabelsTable string
-	LogAttributesTable   string
-	LogStreamStatsTable  string
-	HistogramsTable      string
-	ExemplarsTable       string
-	HTTPHost             string
-	HTTPPort             string
-	TLSEnabled           bool
-	TLSCertFile          string
-	TLSKeyFile           string
-	CHTimeout            time.Duration
-	QueryTimeout         time.Duration
-	LookbackDelta        time.Duration
-	MaxSamples           int
-	MaxSeries            int
-	IDChunkSize          int
-	AggregateThreads     int
-	RemoteWriteInterval  time.Duration
-	SampleAttributes     bool
-	TeamID               uint64
-	DefaultTeamID        uint64
-	TeamHeader           string
-	TeamQueryParam       string
-	Pprof                bool
-	SelfScrapeEnabled    bool
-	SelfScrapeInterval   time.Duration
-	SelfScrapeTeamID     uint64
-	SelfScrapeJob        string
-	SelfScrapeInstance   string
-	LogRetention         time.Duration
-	LogQueryMaxRows      int
-	MetricsRetention     time.Duration
+	// AttributeTableHasMetricName allows filtered label discovery to read the
+	// attribute table. The legacy metric_attributes2 table has no metric_name.
+	AttributeTableHasMetricName bool
+	LabelPostingsTable          string
+	ActivityTable               string
+	MetricsTable                string
+	MetricsInputTable           string
+	LogSchemaLayout             string
+	LogsTable                   string
+	LogStreamsTable             string
+	LogStreamLabelsTable        string
+	LogAttributesTable          string
+	LogStreamStatsTable         string
+	HistogramsTable             string
+	ExemplarsTable              string
+	HTTPHost                    string
+	HTTPPort                    string
+	TLSEnabled                  bool
+	TLSCertFile                 string
+	TLSKeyFile                  string
+	CHTimeout                   time.Duration
+	QueryTimeout                time.Duration
+	LookbackDelta               time.Duration
+	MaxSamples                  int
+	MaxSeries                   int
+	IDChunkSize                 int
+	AggregateThreads            int
+	RemoteWriteInterval         time.Duration
+	SampleAttributes            bool
+	TeamID                      uint64
+	DefaultTeamID               uint64
+	TeamHeader                  string
+	TeamQueryParam              string
+	Pprof                       bool
+	SelfScrapeEnabled           bool
+	SelfScrapeInterval          time.Duration
+	SelfScrapeTeamID            uint64
+	SelfScrapeJob               string
+	SelfScrapeInstance          string
+	LogRetention                time.Duration
+	LogQueryMaxRows             int
+	MetricsRetention            time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -110,56 +113,57 @@ func ConfigFromEnv() Config {
 		metricNamesTable = metricNamesTableDefault
 	}
 	return Config{
-		CHAddr:               getenv("CH_ADDR", "localhost:9000"),
-		CHUser:               getenv("CH_USER", "default"),
-		CHPassword:           os.Getenv("CH_PASSWORD"),
-		AllowUnauthenticated: envBool("SNUFFLE_ALLOW_UNAUTHENTICATED", false),
-		CHDatabase:           getenv("CH_DATABASE", "default"),
-		SchemaLayout:         string(schemaLayout),
-		SeriesTable:          getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", seriesTableDefault)),
-		SamplesTable:         getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
-		LabelIndexTable:      getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
-		AttributeTable:       getenv("CH_ATTRIBUTE_TABLE", attributeTableDefault),
-		MetricNamesTable:     metricNamesTable,
-		LabelPostingsTable:   getenv("CH_LABEL_POSTINGS_TABLE", ""),
-		ActivityTable:        getenv("CH_ACTIVITY_TABLE", ""),
-		MetricsTable:         getenv("CH_METRICS_TABLE", metadataTableDefault),
-		MetricsInputTable:    getenv("CH_METRICS_INPUT_TABLE", metricsInputTableDefault),
-		LogSchemaLayout:      string(logSchemaLayout),
-		LogsTable:            getenv("CH_LOGS_TABLE", logsTableDefault),
-		LogStreamsTable:      getenv("CH_LOG_STREAMS_TABLE", logStreamsTableDefault),
-		LogStreamLabelsTable: getenv("CH_LOG_STREAM_LABELS_TABLE", logStreamLabelsTableDefault),
-		LogAttributesTable:   getenv("CH_LOG_ATTRIBUTES_TABLE", getenv("CH_LOG_ATTRIBUTE_TABLE", logAttributesTableDefault)),
-		LogStreamStatsTable:  getenv("CH_LOG_STREAM_STATS_TABLE", logStreamStatsTableDefault),
-		HistogramsTable:      getenv("CH_HISTOGRAMS_TABLE", histogramsTableDefault),
-		ExemplarsTable:       getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
-		HTTPHost:             getenv("SIDECAR_HOST", "0.0.0.0"),
-		HTTPPort:             httpPort,
-		TLSEnabled:           envBool("SNUFFLE_TLS_ENABLED", tlsCertFile != "" || tlsKeyFile != ""),
-		TLSCertFile:          tlsCertFile,
-		TLSKeyFile:           tlsKeyFile,
-		CHTimeout:            envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
-		QueryTimeout:         envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
-		LookbackDelta:        envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),
-		MaxSamples:           envInt("PROMQL_MAX_SAMPLES", 50_000_000, 1),
-		MaxSeries:            envInt("CH_MAX_SERIES", 1_000_000, 1),
-		IDChunkSize:          envInt("CH_ID_CHUNK_SIZE", 20000, 1),
-		AggregateThreads:     envInt("CH_AGGREGATE_MAX_THREADS", aggregateThreadsDefault, 0),
-		RemoteWriteInterval:  envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
-		SampleAttributes:     envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
-		TeamID:               defaultTeamID,
-		DefaultTeamID:        defaultTeamID,
-		TeamHeader:           getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
-		TeamQueryParam:       getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
-		Pprof:                envBool("SNUFFLE_PPROF", false),
-		SelfScrapeEnabled:    envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
-		SelfScrapeInterval:   envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
-		SelfScrapeTeamID:     envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),
-		SelfScrapeJob:        getenv("SNUFFLE_SELF_SCRAPE_JOB", "snuffle"),
-		SelfScrapeInstance:   getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
-		LogRetention:         envDuration("SNUFFLE_LOG_RETENTION", 30*24*time.Hour),
-		LogQueryMaxRows:      envInt("SNUFFLE_LOG_QUERY_MAX_ROWS", 100000, 1),
-		MetricsRetention:     envDuration("SNUFFLE_METRICS_RETENTION", 90*24*time.Hour),
+		CHAddr:                      getenv("CH_ADDR", "localhost:9000"),
+		CHUser:                      getenv("CH_USER", "default"),
+		CHPassword:                  os.Getenv("CH_PASSWORD"),
+		AllowUnauthenticated:        envBool("SNUFFLE_ALLOW_UNAUTHENTICATED", false),
+		CHDatabase:                  getenv("CH_DATABASE", "default"),
+		SchemaLayout:                string(schemaLayout),
+		SeriesTable:                 getenv("CH_SERIES_TABLE", getenv("CH_TAGS_TABLE", seriesTableDefault)),
+		SamplesTable:                getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
+		LabelIndexTable:             getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
+		AttributeTable:              getenv("CH_ATTRIBUTE_TABLE", attributeTableDefault),
+		MetricNamesTable:            metricNamesTable,
+		AttributeTableHasMetricName: envBool("CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME", schemaLayout == schemaLayoutPostHog),
+		LabelPostingsTable:          getenv("CH_LABEL_POSTINGS_TABLE", ""),
+		ActivityTable:               getenv("CH_ACTIVITY_TABLE", ""),
+		MetricsTable:                getenv("CH_METRICS_TABLE", metadataTableDefault),
+		MetricsInputTable:           getenv("CH_METRICS_INPUT_TABLE", metricsInputTableDefault),
+		LogSchemaLayout:             string(logSchemaLayout),
+		LogsTable:                   getenv("CH_LOGS_TABLE", logsTableDefault),
+		LogStreamsTable:             getenv("CH_LOG_STREAMS_TABLE", logStreamsTableDefault),
+		LogStreamLabelsTable:        getenv("CH_LOG_STREAM_LABELS_TABLE", logStreamLabelsTableDefault),
+		LogAttributesTable:          getenv("CH_LOG_ATTRIBUTES_TABLE", getenv("CH_LOG_ATTRIBUTE_TABLE", logAttributesTableDefault)),
+		LogStreamStatsTable:         getenv("CH_LOG_STREAM_STATS_TABLE", logStreamStatsTableDefault),
+		HistogramsTable:             getenv("CH_HISTOGRAMS_TABLE", histogramsTableDefault),
+		ExemplarsTable:              getenv("CH_EXEMPLARS_TABLE", exemplarsTableDefault),
+		HTTPHost:                    getenv("SIDECAR_HOST", "0.0.0.0"),
+		HTTPPort:                    httpPort,
+		TLSEnabled:                  envBool("SNUFFLE_TLS_ENABLED", tlsCertFile != "" || tlsKeyFile != ""),
+		TLSCertFile:                 tlsCertFile,
+		TLSKeyFile:                  tlsKeyFile,
+		CHTimeout:                   envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
+		QueryTimeout:                envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
+		LookbackDelta:               envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),
+		MaxSamples:                  envInt("PROMQL_MAX_SAMPLES", 50_000_000, 1),
+		MaxSeries:                   envInt("CH_MAX_SERIES", 1_000_000, 1),
+		IDChunkSize:                 envInt("CH_ID_CHUNK_SIZE", 20000, 1),
+		AggregateThreads:            envInt("CH_AGGREGATE_MAX_THREADS", aggregateThreadsDefault, 0),
+		RemoteWriteInterval:         envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
+		SampleAttributes:            envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
+		TeamID:                      defaultTeamID,
+		DefaultTeamID:               defaultTeamID,
+		TeamHeader:                  getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
+		TeamQueryParam:              getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
+		Pprof:                       envBool("SNUFFLE_PPROF", false),
+		SelfScrapeEnabled:           envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
+		SelfScrapeInterval:          envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
+		SelfScrapeTeamID:            envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),
+		SelfScrapeJob:               getenv("SNUFFLE_SELF_SCRAPE_JOB", "snuffle"),
+		SelfScrapeInstance:          getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
+		LogRetention:                envDuration("SNUFFLE_LOG_RETENTION", 30*24*time.Hour),
+		LogQueryMaxRows:             envInt("SNUFFLE_LOG_QUERY_MAX_ROWS", 100000, 1),
+		MetricsRetention:            envDuration("SNUFFLE_METRICS_RETENTION", 90*24*time.Hour),
 	}
 }
 

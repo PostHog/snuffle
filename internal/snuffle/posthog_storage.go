@@ -305,9 +305,11 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 	}
 }
 
+// postHogLabelValueExpr reads a map label with the same precedence as
+// postHogLabelMap: a resource attribute wins over a metric attribute.
 func postHogLabelValueExpr(name string) string {
 	key := sqlString(name)
-	return "if(mapContains(attributes, " + key + "), attributes[" + key + "], resource_attributes[" + key + "])"
+	return "if(mapContains(resource_attributes, " + key + "), resource_attributes[" + key + "], attributes[" + key + "])"
 }
 
 func postHogMatchersPushdownSafe(matchers []*labels.Matcher) bool {
@@ -445,20 +447,20 @@ func (p *postHogQueryPlan) joinSeries(inner string) string {
 
 func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[string]string) map[string]string {
 	out := make(map[string]string, len(resourceAttrs)+len(attrs)+2)
+	for key, value := range attrs {
+		if key == "" || key == labels.MetricName {
+			continue
+		}
+		out[key] = value
+	}
 	for key, value := range resourceAttrs {
-		if key == "" {
+		if key == "" || key == labels.MetricName {
 			continue
 		}
 		out[key] = value
 	}
 	if serviceName != "" {
 		out["service_name"] = serviceName
-	}
-	for key, value := range attrs {
-		if key == "" || key == labels.MetricName {
-			continue
-		}
-		out[key] = value
 	}
 	out[labels.MetricName] = metricName
 	return out
@@ -587,16 +589,30 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 	}
 }
 
-// postHogAttributeFilters bounds unfiltered attribute discovery. Filtered
-// discovery needs the series table: rollups omit long metric attributes and
-// cannot preserve metric attribute precedence over resource attributes. The
-// legacy attribute table also has no metric_name column.
+// postHogAttributeFilters filters the attribute rollup by team, time and the
+// matchers it can answer. The rollup keys on metric_name and service_name, so
+// only exact matchers on those labels are accepted; any other matcher reports
+// false and needs the series table. A metric_name filter also needs a table
+// that has the column.
 func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
-	if len(matchers) > 0 {
-		return nil, false
-	}
 	filters := []string{teamFilter(cfg)}
 	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) {
+			continue
+		}
+		if matcher.Type != labels.MatchEqual || matcher.Value == "" {
+			return nil, false
+		}
+		if matcher.Name == labels.MetricName && !cfg.AttributeTableHasMetricName {
+			return nil, false
+		}
+		column, ok := postHogSampleLabelExpr(matcher.Name)
+		if !ok {
+			return nil, false
+		}
+		filters = append(filters, column+" = "+sqlString(matcher.Value))
+	}
 	return filters, true
 }
 
