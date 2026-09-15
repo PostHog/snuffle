@@ -414,20 +414,6 @@ func (p *postHogQueryPlan) perSeriesGroupSelects() []string {
 	return selects
 }
 
-// rowGroupSelects returns the grouping labels a raw samples projection must
-// carry when no series lookup runs.
-func (p *postHogQueryPlan) rowGroupSelects() []string {
-	if p.useSeries {
-		return nil
-	}
-	selects := make([]string, 0, len(p.grouping))
-	for i, name := range p.grouping {
-		expr, _ := postHogSampleLabelExpr(name)
-		selects = append(selects, expr+" AS "+quoteIdent(groupAlias(i)))
-	}
-	return selects
-}
-
 func (p *postHogQueryPlan) groupAliases() []string {
 	aliases := make([]string, 0, len(p.grouping))
 	for i := range p.grouping {
@@ -574,20 +560,5 @@ func postHogSelectedSeriesWhereSQL(cfg Config, where []string, limit int, extraS
 		postHogSeriesTable(cfg),
 		strings.Join(where, " AND "),
 		sqlLimit(limit),
-	)
-}
-
-// postHogSampleRowsSQL projects raw sample rows with their fingerprint as
-// series_id, the requested columns, and grouping labels when the plan reads
-// them from the samples table.
-func postHogSampleRowsSQL(cfg Config, plan *postHogQueryPlan, columns []string, where []string) string {
-	selects := []string{"series_fingerprint AS series_id"}
-	selects = append(selects, columns...)
-	selects = append(selects, plan.rowGroupSelects()...)
-	return fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s",
-		strings.Join(selects, ", "),
-		postHogSamplesTable(cfg),
-		strings.Join(where, " AND "),
 	)
 }

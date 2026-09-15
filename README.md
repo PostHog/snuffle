@@ -272,15 +272,17 @@ For a time series, use `/api/v1/query_range` with `start`, `end`, and `step`.
 This endpoint returns a matrix. Both endpoints accept `step`.
 For an instant query, `step` defaults to `PROMQL_LOOKBACK_DELTA` (five minutes).
 
-A bare selector uses `default_rollup`. Its automatic window uses the query step
-and the sample interval, with a margin for timestamp variation.
-For an instant query, the window uses the step.
-Stale markers stop the series. `PROMQL_LOOKBACK_DELTA` limits the automatic
-selector window and the history read before counter windows.
+A bare selector uses `default_rollup`. In an instant query, it reads the latest
+sample in the lookback window, as Prometheus does. In a range query, its
+automatic window uses the query step and the sample interval, with a margin for
+timestamp variation. A series with one sample in the range is visible for one
+step only. Stale markers stop the series. `PROMQL_LOOKBACK_DELTA` limits the
+automatic selector window and the history read before counter windows.
 
 Rollup functions accept omitted windows, such as `increase(metric)` and
 `rate(metric)`. The default window is the query step. `rate` can widen an
 omitted window to cover the sample interval. Explicit windows keep their size.
+Inside a subquery, omitted windows and step units use the subquery step.
 The parser also accepts `WITH` expressions, fractional durations, durations
 without a unit, and step units such as `[4i]`.
 
@@ -291,13 +293,18 @@ It can return an increase when only one sample is inside the window.
 A window with no samples returns no data.
 
 Other functions retain Prometheus behavior, including metric-name removal and
-native histogram calculations. Scalar and vector operations also retain the
-Prometheus type rules. Unsupported extensions return a query error.
-`running_sum` requires a range query with `start` aligned to `step`.
+native histogram calculations. Functions that MetricsQL does not define, such
+as `histogram_count`, are still available. `timestamp` and `absent` read their
+selector with the Prometheus lookback. Scalar and vector operations also retain
+the Prometheus type rules. Unsupported extensions return a query error.
+`running_sum` must be the outermost function of a range query. It adds the
+values of each series from `start` to each step.
 
-Automatic selectors and counter rollups read raw samples through the evaluation
-engine. They bypass SQL optimizations that use PromQL calculations or fixed
-sample timestamps. These queries can read more samples than before. The existing
+Instant aggregates, `topk`, and nested counts over bare selectors keep their SQL
+fast paths. Range queries and counter rollups read raw samples through the
+evaluation engine: automatic selector windows depend on the samples of each
+series, and SQL cannot reproduce the MetricsQL counter calculations. These
+queries can read more samples than before. The existing
 query timeout, sample limit, and series limit still apply.
 
 ### Loki-compatible API

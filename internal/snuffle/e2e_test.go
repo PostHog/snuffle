@@ -187,31 +187,37 @@ func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
 	for _, tc := range []struct {
 		query string
 		value string
+		// rangePoints is the expected number of range points when not zero.
+		rangePoints int
 	}{
-		{metric + "_stale", ""},
-		{metric + `{interval="1m0s"}`, "340"},
-		{`sum(` + metric + `{interval="1m0s"})`, "340"},
-		{`topk(1, ` + metric + `{interval="1m0s"})`, "340"},
-		{`count(count by (interval) (` + metric + `))`, "3"},
-		{`increase(` + metric + `{interval="15s"}[1m])`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[1m])`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[5m])`, "340"},
-		{`sum(increase(` + metric + `{interval="1m0s"}[5m]))`, "340"},
-		{`increase(` + metric + `{interval="reset"}[5m])`, "290"},
-		{`sum(increase(` + metric + `{interval="reset"}[5m]))`, "290"},
-		{`increase(` + metric + `{interval="1m0s"})`, "60"},
-		{`rate(` + metric + `{interval="1m0s"})`, "1"},
-		{`rate(` + metric + `{interval="1m0s"}[1m])`, "1"},
-		{`irate(` + metric + `{interval="1m0s"}[1m])`, "1"},
-		{`delta(` + metric + `{interval="1m0s"}[1m])`, "60"},
-		{`idelta(` + metric + `{interval="1m0s"}[1m])`, "60"},
-		{`WITH (m = ` + metric + `{interval="1m0s"}) sum(rate(m))`, "1"},
-		{`increase(` + metric + `{interval="1m0s"}[60])`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[4i])`, "240"},
-		{`increase(` + metric + `{interval="1m0s"}[1m] offset 1m)`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[1m] offset 0m)`, "60"},
-		{`increase(` + metric + `{interval="1m0s"}[1m] offset -1m)`, ""},
-		{`increase(` + metric + `{interval="1m0s"}[1m] @ 1700000400)`, "60"},
+		{query: metric + "_stale"},
+		// The automatic window ends the series before the second step.
+		{query: metric + `{interval="1m0s"}`, value: "340", rangePoints: 1},
+		{query: `sum(` + metric + `{interval="1m0s"})`, value: "340"},
+		{query: `topk(1, ` + metric + `{interval="1m0s"})`, value: "340"},
+		{query: `count(count by (interval) (` + metric + `))`, value: "3"},
+		{query: `timestamp(` + metric + `{interval="1m0s"})`, value: "1700000345", rangePoints: 2},
+		{query: `absent(` + metric + `{interval="none"})`, value: "1", rangePoints: 2},
+		{query: `increase(` + metric + `{interval="15s"}[1m])`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m])`, value: "60", rangePoints: 1},
+		{query: `increase(` + metric + `{interval="1m0s"}[5m])`, value: "340"},
+		{query: `sum(increase(` + metric + `{interval="1m0s"}[5m]))`, value: "340"},
+		{query: `increase(` + metric + `{interval="reset"}[5m])`, value: "290"},
+		{query: `sum(increase(` + metric + `{interval="reset"}[5m]))`, value: "290"},
+		{query: `increase(` + metric + `{interval="1m0s"})`, value: "60"},
+		{query: `rate(` + metric + `{interval="1m0s"})`, value: "1"},
+		{query: `rate(` + metric + `{interval="1m0s"}[1m])`, value: "1"},
+		{query: `irate(` + metric + `{interval="1m0s"}[1m])`, value: "1"},
+		{query: `delta(` + metric + `{interval="1m0s"}[1m])`, value: "60"},
+		{query: `idelta(` + metric + `{interval="1m0s"}[1m])`, value: "60"},
+		{query: `WITH (m = ` + metric + `{interval="1m0s"}) sum(rate(m))`, value: "1"},
+		{query: `increase(` + metric + `{interval="1m0s"}[60])`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[4i])`, value: "240"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset 1m)`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset 0m)`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset -1m)`},
+		// The @ modifier keeps the evaluation time fixed at every step.
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] @ 1700000400)`, value: "60", rangePoints: 2},
 	} {
 		t.Run(tc.query, func(t *testing.T) {
 			for _, path := range []string{"/api/v1/query", "/api/v1/query_range"} {
@@ -243,15 +249,10 @@ func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
 						t.Errorf("%s returned no points", path)
 						continue
 					}
-					if tc.query == metric+`{interval="1m0s"}` || tc.query == `increase(`+metric+`{interval="1m0s"}[1m])` {
-						if len(data.Result[0].Values) != 1 {
-							t.Errorf("%s retained a sample after its interval", path)
-						}
+					if tc.rangePoints > 0 && len(data.Result[0].Values) != tc.rangePoints {
+						t.Errorf("%s returned %d points, want %d", path, len(data.Result[0].Values), tc.rangePoints)
 					}
 					point = data.Result[0].Values[0]
-					if strings.Contains(tc.query, " @ ") && len(data.Result[0].Values) != 2 {
-						t.Error("the @ modifier did not keep the evaluation time fixed")
-					}
 					// Check the result when this expression is part of a binary operation.
 					params.Set("query", tc.query+" + 0")
 					engine := apiGet[queryDataDTO](t, baseURL, path, params)

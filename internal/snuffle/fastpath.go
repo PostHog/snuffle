@@ -2,13 +2,11 @@ package snuffle
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -16,11 +14,12 @@ import (
 )
 
 func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime time.Time) (queryData, bool, error) {
-	if strings.Contains(query, "__snuffle_") {
-		return queryData{}, false, nil
-	}
 	expr, err := s.parser.ParseExpr(query)
 	if err != nil {
+		return queryData{}, false, nil
+	}
+	expr, ok := unwrapInstantDefaultRollups(expr)
+	if !ok {
 		return queryData{}, false, nil
 	}
 
@@ -47,338 +46,10 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 			return data, ok, err
 		}
 	}
-	if exprHasFunction(expr, "running_sum") {
-		return queryData{}, true, errors.New("MetricsQL running_sum is only supported for range queries")
-	}
 	return queryData{}, false, nil
 }
 
-func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end time.Time, step time.Duration) (queryData, bool, error) {
-	if strings.Contains(query, "__snuffle_") {
-		return queryData{}, false, nil
-	}
-	if step <= 0 {
-		return queryData{}, false, nil
-	}
-	stepMillis := step.Milliseconds()
-	if stepMillis <= 0 {
-		return queryData{}, false, nil
-	}
-	expr, hasMetricsQLRewrite, err := s.parseFastRangeExpr(query, step)
-	if err != nil {
-		return queryData{}, false, nil
-	}
-	if s.cfg.postHogSchemaLayout() {
-		if selector, ok := expr.(*parser.VectorSelector); ok {
-			return s.tryPostHogFastSelectorRangeQuery(ctx, selector, start, end, step, stepMillis)
-		}
-		if aggregate, ok := expr.(*parser.AggregateExpr); ok {
-			if data, ok, err := s.tryPostHogFastAggregateRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
-				return data, ok, err
-			}
-			if data, ok, err := s.tryPostHogAggregateRangeUnionQuery(ctx, aggregate, start, end, step); ok || err != nil {
-				return data, ok, err
-			}
-		}
-		if hasMetricsQLRewrite || exprHasFunction(expr, "running_sum") {
-			return queryData{}, true, errors.New("MetricsQL extensions are only supported in fast range queries when they wrap a selector or supported range function")
-		}
-		return queryData{}, false, nil
-	}
-	if selector, ok := expr.(*parser.VectorSelector); ok {
-		return s.tryFastSelectorRangeQuery(ctx, selector, start, end, step, stepMillis)
-	}
-	if aggregate, ok := expr.(*parser.AggregateExpr); ok {
-		if data, ok, err := s.tryFastNestedCountRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
-			return data, ok, err
-		}
-		if data, ok, err := s.tryFastAggregateRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
-			return data, ok, err
-		}
-	}
-	hasRunningSum := exprHasFunction(expr, "running_sum")
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr, start, end, step)
-	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		if hasRunningSum || hasMetricsQLRewrite {
-			return queryData{}, true, errors.New("MetricsQL extensions are only supported in fast range queries when they wrap a selector or supported range function")
-		}
-		return queryData{}, false, nil
-	}
-
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "metric_name", "labels_json"})
-	if !ok {
-		return queryData{}, false, nil
-	}
-	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
-	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
-
-	perSeries := rangeSourcePerSeriesSQL(source, sampleSource)
-
-	results, err := s.queryRangeGridResults(ctx, selectedSeries, perSeries, selector.LabelMatchers, start, end, stepMillis)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	if len(results) >= s.cfg.MaxSeries {
-		return queryData{}, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
-func (s *Server) parseFastRangeExpr(query string, step time.Duration) (parser.Expr, bool, error) {
-	expr, err := s.parser.ParseExpr(query)
-	if err == nil {
-		return expr, false, nil
-	}
-	rewritten := rewriteImplicitMetricsQLSubquerySteps(query, step)
-	if rewritten == query {
-		return nil, false, err
-	}
-	expr, err = s.parser.ParseExpr(rewritten)
-	if err != nil {
-		return nil, false, err
-	}
-	return expr, true, nil
-}
-
-func rewriteImplicitMetricsQLSubquerySteps(query string, step time.Duration) string {
-	stepText := promDuration(step)
-	if stepText == "" {
-		return query
-	}
-	var out strings.Builder
-	last := 0
-	changed := false
-	for i := 0; i < len(query); i++ {
-		switch query[i] {
-		case '"', '\'', '`':
-			i = skipQuoted(query, i)
-		case '[':
-			prev := previousNonSpace(query, i-1)
-			if prev < 0 || query[prev] != ')' {
-				continue
-			}
-			end := strings.IndexByte(query[i+1:], ']')
-			if end < 0 {
-				continue
-			}
-			end += i + 1
-			window := strings.TrimSpace(query[i+1 : end])
-			if strings.Contains(window, ":") || !looksLikeDuration(window) {
-				continue
-			}
-			out.WriteString(query[last:end])
-			out.WriteByte(':')
-			out.WriteString(stepText)
-			last = end
-			changed = true
-			i = end
-		}
-	}
-	if !changed {
-		return query
-	}
-	out.WriteString(query[last:])
-	return out.String()
-}
-
-func skipQuoted(query string, start int) int {
-	quote := query[start]
-	for i := start + 1; i < len(query); i++ {
-		if quote != '`' && query[i] == '\\' {
-			i++
-			continue
-		}
-		if query[i] == quote {
-			return i
-		}
-	}
-	return len(query) - 1
-}
-
-func previousNonSpace(query string, idx int) int {
-	for idx >= 0 {
-		switch query[idx] {
-		case ' ', '\t', '\n', '\r':
-			idx--
-		default:
-			return idx
-		}
-	}
-	return -1
-}
-
-func looksLikeDuration(value string) bool {
-	if value == "" {
-		return false
-	}
-	hasDigit := false
-	for _, r := range value {
-		if r >= '0' && r <= '9' {
-			hasDigit = true
-			continue
-		}
-		if r == '.' || r == 'y' || r == 'w' || r == 'd' || r == 'h' || r == 'm' || r == 's' {
-			continue
-		}
-		return false
-	}
-	return hasDigit
-}
-
-func promDuration(d time.Duration) string {
-	if d <= 0 {
-		return ""
-	}
-	return d.String()
-}
-
-func (s *Server) tryFastSelectorRangeQuery(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	if selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil || !matchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-	offset := selector.OriginalOffset
-	if offset == 0 {
-		offset = selector.Offset
-	}
-	shiftedStart := start.Add(-offset)
-	shiftedEnd := end.Add(-offset)
-	mint := shiftedStart.Add(-s.cfg.LookbackDelta).UnixMilli()
-	maxt := shiftedEnd.UnixMilli()
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "metric_name", "labels_json"})
-	if !ok {
-		return queryData{}, false, nil
-	}
-	selectedSeries += fmt.Sprintf(" LIMIT %d", s.cfg.MaxSeries)
-	sampleSource := samplesForSelectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt)
-	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
-		gridExpr,
-		sampleSource,
-	)
-	results, err := s.queryRangeGridResults(ctx, selectedSeries, perSeries, selector.LabelMatchers, start, end, stepMillis)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	if len(results) >= s.cfg.MaxSeries {
-		return queryData{}, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
-// queryRangeGridResults reads a selector's labels and its gridded samples as two
-// independent queries and joins them on series id in Go.
-//
-// Expressing that join in SQL instead makes ClickHouse run the two branches one
-// after the other, and each branch is dominated by fixed per-query cost rather
-// than by its data: measured separately they were ~9ms and ~11ms, joined ~19ms.
-// Issuing them concurrently pays the larger of the two instead of the sum.
-func (s *Server) queryRangeGridResults(ctx context.Context, selectedSeriesSQL, perSeriesSQL string, matchers []*labels.Matcher, start, end time.Time, stepMillis int64) ([]sampleResult, error) {
-	type gridRow struct {
-		id   uint64
-		vals []*float64
-	}
-
-	var (
-		seriesLabels map[uint64]map[string]string
-		grids        []gridRow
-		labelsErr    error
-		gridsErr     error
-		wait         sync.WaitGroup
-	)
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	wait.Add(2)
-	go func() {
-		defer wait.Done()
-		seriesLabels = make(map[uint64]map[string]string, 1024)
-		labelsErr = s.client.QueryRows(ctx, selectedSeriesSQL, func(row clickHouseRow) error {
-			var id uint64
-			var metricName string
-			var labelsJSON string
-			if err := row.Scan(&id, &metricName, &labelsJSON); err != nil {
-				return err
-			}
-			metric, ok, err := metricLabelMap(metricName, []byte(labelsJSON), matchers)
-			if err != nil || !ok {
-				return err
-			}
-			seriesLabels[id] = metric
-			return nil
-		})
-	}()
-	go func() {
-		defer wait.Done()
-		grids = make([]gridRow, 0, 1024)
-		gridsErr = s.client.QueryRows(ctx, perSeriesSQL, func(row clickHouseRow) error {
-			var out gridRow
-			if err := row.Scan(&out.id, &out.vals); err != nil {
-				return err
-			}
-			grids = append(grids, out)
-			return nil
-		})
-	}()
-	wait.Wait()
-	if labelsErr != nil {
-		return nil, labelsErr
-	}
-	if gridsErr != nil {
-		return nil, gridsErr
-	}
-
-	sort.Slice(grids, func(i, j int) bool { return grids[i].id < grids[j].id })
-	results := make([]sampleResult, 0, len(grids))
-	for _, grid := range grids {
-		// A series missing from the label side did not match the selector; that
-		// is the inner join this replaces.
-		metric, ok := seriesLabels[grid.id]
-		if !ok {
-			continue
-		}
-		values := make([][]any, 0, len(grid.vals))
-		for i, value := range grid.vals {
-			if value == nil || isStaleSampleValue(*value) {
-				continue
-			}
-			ts := start.UnixMilli() + int64(i)*stepMillis
-			if ts > end.UnixMilli() {
-				break
-			}
-			values = append(values, []any{float64(ts) / 1000, formatSample(*value)})
-		}
-		if len(values) > 0 {
-			results = append(results, sampleResult{Metric: metric, Values: values})
-		}
-	}
-	return results, nil
-}
-
-type rangeGridFunctionSpec struct {
-	name               string
-	increase           bool
-	usesPreviousSample bool
-}
-
 const maxAggregateUnionSelectors = 1024
-
-func rangeGridFunction(name string) (rangeGridFunctionSpec, bool) {
-	switch name {
-	case "rate":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid"}, true
-	case "irate":
-		return rangeGridFunctionSpec{name: "timeSeriesInstantRateToGrid"}, true
-	case "increase":
-		return rangeGridFunctionSpec{name: "timeSeriesRateToGrid", increase: true}, true
-	case "delta":
-		return rangeGridFunctionSpec{name: "timeSeriesDeltaToGrid", usesPreviousSample: true}, true
-	case "idelta":
-		return rangeGridFunctionSpec{name: "timeSeriesInstantDeltaToGrid", usesPreviousSample: true}, true
-	default:
-		return rangeGridFunctionSpec{}, false
-	}
-}
 
 func (s *Server) tryFastAggregate(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
 	if expr.Without {
@@ -470,42 +141,6 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
-func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	if expr.Without {
-		return queryData{}, false, nil
-	}
-	aggSQL, ok := aggregateSQL(expr, "sample_value")
-	if !ok {
-		return queryData{}, false, nil
-	}
-	selector, ok := expr.Expr.(*parser.VectorSelector)
-	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-	if !postHogGroupingSupported(expr.Grouping) {
-		return queryData{}, false, nil
-	}
-	grid, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, mint, maxt, false)
-	// Select the latest sample at each evaluation time before aggregation.
-	// The remote-write interval does not guarantee a sample at every step.
-	gridPlan := &postHogAggregateUnionPlan{
-		gridVals: lastGridExpr(grid.start, grid.end, step, s.cfg.LookbackDelta),
-		where:    plan.sampleWhere(),
-		plan:     plan,
-	}
-	sql := postHogAggregateUnionSQL(s.cfg, gridPlan, expr.Grouping, start, stepMillis, aggSQL)
-
-	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
 // postHogAggregateUnionPlan describes one ClickHouse query for an
 // `agg by (...) (branch or branch or ...)` expression over the PostHog layout,
 // where every branch is an equivalent selector or range-function expression.
@@ -535,26 +170,6 @@ func (s *Server) tryPostHogInstantAggregateUnionQuery(ctx context.Context, expr 
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
-func (s *Server) tryPostHogAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration) (queryData, bool, error) {
-	if expr.Without {
-		return queryData{}, false, nil
-	}
-	aggSQL, ok := aggregateSQL(expr, "sample_value")
-	if !ok {
-		return queryData{}, false, nil
-	}
-	plan, ok := s.postHogAggregateUnionPlan(expr, start, end, step)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	sql := postHogAggregateUnionSQL(s.cfg, plan, expr.Grouping, start, step.Milliseconds(), aggSQL)
-	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
 func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, end time.Time, step time.Duration) (*postHogAggregateUnionPlan, bool) {
 	branches, ok := seriesExprBranches(expr.Expr)
 	if !ok || len(branches) == 0 || len(branches) > maxAggregateUnionSelectors {
@@ -568,9 +183,6 @@ func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, en
 	first := branches[0]
 	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(first.node, start, end, step)
 	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
-		return nil, false
-	}
-	if source.sumOverTime != nil || source.runningSumWrap {
 		return nil, false
 	}
 	selectors := make([]*parser.VectorSelector, 0, len(branches))
@@ -623,9 +235,6 @@ func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, en
 		if sampleCondition != "" {
 			where = append(where, sampleCondition)
 		}
-	}
-	if source.filterStaleSamples {
-		where = append(where, nonStaleSampleSQL("value"))
 	}
 	return &postHogAggregateUnionPlan{
 		gridVals: transformGridValsSQL(source.gridExpr, first.transform),
@@ -792,75 +401,6 @@ func postHogUnionInCondition(selectors []*parser.VectorSelector, labelExpr func(
 	return "(" + strings.Join(conditions, " AND ") + ")", true
 }
 
-func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	if selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-	offset := selector.OriginalOffset
-	if offset == 0 {
-		offset = selector.Offset
-	}
-	shiftedStart := start.Add(-offset)
-	shiftedEnd := end.Add(-offset)
-	mint := shiftedStart.Add(-s.cfg.LookbackDelta).UnixMilli()
-	maxt := shiftedEnd.UnixMilli()
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, mint, maxt, true)
-	gridExpr := lastGridExpr(shiftedStart, shiftedEnd, step, s.cfg.LookbackDelta)
-	perSeries := fmt.Sprintf(
-		"SELECT series_fingerprint AS series_id, %s AS vals FROM %s WHERE %s GROUP BY series_id",
-		gridExpr,
-		postHogSamplesTable(s.cfg),
-		strings.Join(plan.sampleWhere(), " AND "),
-	)
-	sql := fmt.Sprintf(
-		"SELECT series_id, %s, vals FROM %s ORDER BY series_id LIMIT %d",
-		postHogSeriesLabelColumns,
-		plan.joinSeries(perSeries),
-		s.cfg.MaxSeries,
-	)
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
-
-	results := make([]sampleResult, 0, 1024)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var id uint64
-		var metricName string
-		var serviceName string
-		var resourceAttrs map[string]string
-		var attrs map[string]string
-		var vals []*float64
-		if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs, &vals); err != nil {
-			return err
-		}
-		_ = id
-		metric := postHogLabelMap(metricName, serviceName, resourceAttrs, attrs)
-		if !matchesAll(metric, selector.LabelMatchers) {
-			return nil
-		}
-		values := make([][]any, 0, len(vals))
-		for i, value := range vals {
-			if value == nil || isStaleSampleValue(*value) {
-				continue
-			}
-			ts := start.UnixMilli() + int64(i)*stepMillis
-			if ts > end.UnixMilli() {
-				break
-			}
-			values = append(values, []any{float64(ts) / 1000, formatSample(*value)})
-		}
-		if len(values) > 0 {
-			results = append(results, sampleResult{Metric: metric, Values: values})
-		}
-		return nil
-	})
-	if err != nil {
-		return queryData{}, true, err
-	}
-	if len(results) >= s.cfg.MaxSeries {
-		return queryData{}, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
 func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
 	selectedProjection := []string{"id"}
 	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
@@ -948,249 +488,6 @@ func (s *Server) queryInstantSeriesAggregate(ctx context.Context, expr *parser.A
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
-func (s *Server) tryFastAggregateRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	if expr.Without {
-		return queryData{}, false, nil
-	}
-	aggSQL, ok := aggregateSQL(expr, "sample_value")
-	if !ok {
-		return queryData{}, false, nil
-	}
-	if data, ok, err := s.tryFastAggregateRangeUnionQuery(ctx, expr, start, end, step, stepMillis, aggSQL); ok || err != nil {
-		return data, ok, err
-	}
-
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(expr.Expr, start, end, step)
-	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-
-	selectedProjection := []string{"id"}
-	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, selectedProjection)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	if vectorSelector, ok := expr.Expr.(*parser.VectorSelector); ok && exactBucketRangeSelector(s.cfg, vectorSelector, start, end, step) {
-		return s.queryFastExactAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, start, end, aggSQL)
-	}
-	return s.queryFastAggregateRange(ctx, expr, selectedSeries, selector.LabelMatchers, source, mint, maxt, start, stepMillis, aggSQL)
-}
-
-func (s *Server) tryFastAggregateRangeUnionQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64, aggSQL string) (queryData, bool, error) {
-	branches, ok := seriesExprBranches(expr.Expr)
-	if !ok || len(branches) == 0 || len(branches) > maxAggregateUnionSelectors {
-		return queryData{}, false, nil
-	}
-	if len(branches) == 1 && branches[0].transform.identity() {
-		// single selector or range function without scalar arithmetic: the dedicated paths handle it
-		return queryData{}, false, nil
-	}
-
-	first := branches[0]
-	source, mint, maxt, ok := s.rangeUnionBranchSource(first, start, end, step)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	selectors := make([]*parser.VectorSelector, 0, len(branches))
-	selectors = append(selectors, first.selector)
-	for _, branch := range branches[1:] {
-		if !first.equivalentTo(branch) {
-			return queryData{}, false, nil
-		}
-		branchSource, branchMint, branchMaxt, ok := s.rangeUnionBranchSource(branch, start, end, step)
-		if !ok || branchMint != mint || branchMaxt != maxt || branchSource.gridExpr != source.gridExpr {
-			return queryData{}, false, nil
-		}
-		selectors = append(selectors, branch.selector)
-	}
-	if source.sumOverTime == nil && !source.runningSumWrap {
-		if selectedSeries, groupValues, ok := selectedSeriesExactMatcherUnionBranchesSQL(s.cfg, selectors, expr.Grouping, mint, maxt); ok {
-			where := []string{teamFilter(s.cfg)}
-			where = append(where, sampleTimeFilters(s.cfg, mint, maxt)...)
-			if condition := metricNamesCondition(exactMetricNamesForSelectors(selectors)); condition != "" {
-				where = append(where, condition)
-			}
-			sampleSource := rawSamplesSourceSQL(s.cfg, strings.Join(where, " AND "))
-			sql := fastAggregateRangeExactUnionSQL(s.cfg, selectedSeries, groupValues, source, sampleSource, start, stepMillis, aggSQL)
-			results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
-			if err != nil {
-				return queryData{}, true, err
-			}
-			return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-		}
-	}
-
-	selectedProjection := []string{"id"}
-	selectedProjection = append(selectedProjection, metricGroupProjection(expr.Grouping)...)
-	windows := make([]selectorWindow, len(selectors))
-	for i := range windows {
-		windows[i] = selectorWindow{mint: mint, maxt: maxt}
-	}
-	selectedSeries, ok := selectedSeriesUnionSQL(s.cfg, selectors, windows, selectedProjection)
-	if !ok {
-		return queryData{}, false, nil
-	}
-
-	groupMatchers := first.selector.LabelMatchers
-	sampleSource := samplesForSelectedSeriesSQL(s.cfg, groupMatchers, mint, maxt)
-	if len(branches) > 1 {
-		groupMatchers = commonExactMetricMatchers(selectors)
-		sampleSource = samplesForSelectedSeriesUnionSQL(s.cfg, exactMetricNamesForSelectors(selectors), mint, maxt)
-	}
-	return s.queryFastAggregateRangeFromSamples(ctx, expr, selectedSeries, groupMatchers, source, sampleSource, start, stepMillis, aggSQL)
-}
-
-func (s *Server) rangeUnionBranchSource(branch seriesExprBranch, start, end time.Time, step time.Duration) (aggregateRangeSource, int64, int64, bool) {
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(branch.node, start, end, step)
-	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		return aggregateRangeSource{}, 0, 0, false
-	}
-	source.gridExpr = transformGridValsSQL(source.gridExpr, branch.transform)
-	return source, mint, maxt, true
-}
-
-func (s *Server) queryFastAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, source aggregateRangeSource, mint, maxt int64, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
-	sampleSource := samplesForSelectedSeriesSQL(s.cfg, groupMatchers, mint, maxt)
-	return s.queryFastAggregateRangeFromSamples(ctx, expr, selectedSeries, groupMatchers, source, sampleSource, start, stepMillis, aggSQL)
-}
-
-func (s *Server) queryFastAggregateRangeFromSamples(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, source aggregateRangeSource, sampleSource string, start time.Time, stepMillis int64, aggSQL string) (queryData, bool, error) {
-	sql := fastAggregateRangeSQL(s.cfg, expr, selectedSeries, groupMatchers, source, sampleSource, start, stepMillis, aggSQL)
-	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
-func fastAggregateRangeSQL(cfg Config, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, source aggregateRangeSource, sampleSource string, start time.Time, stepMillis int64, aggSQL string) string {
-	perSeries := rangeSourcePerSeriesSQL(source, sampleSource)
-
-	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQL(cfg, groupMatchers, expr.Grouping)
-	if exactGroups, ok := exactMatcherGroupSQL(groupMatchers, expr.Grouping); ok {
-		groupSelect = exactGroups
-		groupLabels = ""
-		groupJoin = ""
-	}
-	withParts := []string{
-		"selected_series AS (" + selectedSeries + ")",
-		"per_series AS (" + perSeries + ")",
-	}
-	if groupLabels != "" {
-		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
-	}
-
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
-	selectParts = append(selectParts, aggSQL+" AS value")
-
-	groupByParts := append([]string{}, groupBy...)
-	groupByParts = append(groupByParts, "idx")
-	orderByParts := append([]string{}, groupBy...)
-	orderByParts = append(orderByParts, "idx")
-
-	rangeSource := aggregateSourceSQL("per_series", expr.Grouping, groupJoin)
-	sql := fmt.Sprintf(
-		"WITH %s SELECT %s FROM %s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
-		strings.Join(withParts, ", "),
-		strings.Join(selectParts, ", "),
-		rangeSource,
-		nonStaleNullableSampleSQL("sample_value"),
-		strings.Join(groupByParts, ", "),
-		strings.Join(orderByParts, ", "),
-	)
-	return withMaxThreads(sql, cfg.AggregateThreads)
-}
-
-func fastAggregateRangeExactUnionSQL(cfg Config, selectedSeries string, groupValues [][]string, source aggregateRangeSource, sampleSource string, start time.Time, stepMillis int64, aggSQL string) string {
-	if source.filterStaleSamples {
-		sampleSource = "SELECT * FROM (" + sampleSource + ") WHERE " + nonStaleSampleSQL("value")
-	}
-	perSeries := fmt.Sprintf(
-		"SELECT samples.id AS id, any(selected_series.branch) AS branch, %s AS vals FROM (%s) AS samples ALL INNER JOIN selected_series USING id GROUP BY samples.id",
-		source.gridExpr,
-		sampleSource,
-	)
-
-	groupSelect := make([]string, 0, len(groupValues))
-	groupBy := make([]string, 0, len(groupValues)+1)
-	for i, values := range groupValues {
-		quoted := make([]string, 0, len(values))
-		for _, value := range values {
-			quoted = append(quoted, sqlString(value))
-		}
-		alias := quoteIdent(groupAlias(i))
-		groupSelect = append(groupSelect, "arrayElement(["+strings.Join(quoted, ",")+"], toUInt64(branch) + 1) AS "+alias)
-		groupBy = append(groupBy, alias)
-	}
-	groupBy = append(groupBy, "idx")
-
-	selectParts := append([]string{}, groupSelect...)
-	selectParts = append(selectParts, fmt.Sprintf("toInt64(%d) + (toInt64(idx) - 1) * %d AS ts", start.UnixMilli(), stepMillis))
-	selectParts = append(selectParts, aggSQL+" AS value")
-	sql := fmt.Sprintf(
-		"WITH selected_series AS (%s), per_series AS (%s) SELECT %s FROM per_series ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY %s ORDER BY %s",
-		selectedSeries,
-		perSeries,
-		strings.Join(selectParts, ", "),
-		nonStaleNullableSampleSQL("sample_value"),
-		strings.Join(groupBy, ", "),
-		strings.Join(groupBy, ", "),
-	)
-	return withMaxThreads(sql, cfg.AggregateThreads)
-}
-
-func (s *Server) queryFastExactAggregateRange(ctx context.Context, expr *parser.AggregateExpr, selectedSeries string, groupMatchers []*labels.Matcher, start, end time.Time, aggSQL string) (queryData, bool, error) {
-	where := sampleBaseFilters(s.cfg, groupMatchers, start.UnixMilli(), end.UnixMilli())
-	where = append(where, sampleSelectedSeriesFilters(s.cfg)...)
-	where = append(where, nonStaleSampleSQL("value"))
-	samples := fmt.Sprintf(
-		"SELECT id, timestamp, value AS sample_value FROM %s WHERE %s",
-		tableName(s.cfg.CHDatabase, s.cfg.SamplesTable),
-		strings.Join(where, " AND "),
-	)
-
-	groupSelect, groupBy := labelIndexGroupSQL(expr.Grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQL(s.cfg, groupMatchers, expr.Grouping)
-	withParts := []string{
-		"selected_series AS (" + selectedSeries + ")",
-		"samples AS (" + samples + ")",
-	}
-	if groupLabels != "" {
-		withParts = append(withParts, "group_labels AS ("+groupLabels+")")
-	}
-
-	selectParts := make([]string, 0, len(groupSelect)+2)
-	selectParts = append(selectParts, groupSelect...)
-	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
-	selectParts = append(selectParts, aggSQL+" AS value")
-
-	groupByParts := append([]string{}, groupBy...)
-	groupByParts = append(groupByParts, "ts")
-	orderByParts := append([]string{}, groupBy...)
-	orderByParts = append(orderByParts, "ts")
-
-	source := aggregateSourceSQL("samples", expr.Grouping, groupJoin)
-	sql := fmt.Sprintf(
-		"WITH %s SELECT %s FROM %s GROUP BY %s ORDER BY %s",
-		strings.Join(withParts, ", "),
-		strings.Join(selectParts, ", "),
-		source,
-		strings.Join(groupByParts, ", "),
-		strings.Join(orderByParts, ", "),
-	)
-	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-
-	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
 func (s *Server) trySampleLabelIndexInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
 	if s.cfg.postHogSchemaLayout() || groupingHasMetricName(expr.Grouping) {
 		return queryData{}, false, nil
@@ -1242,78 +539,6 @@ func (s *Server) trySampleLabelIndexInstantAggregate(ctx context.Context, expr *
 		return queryData{}, true, err
 	}
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
-}
-
-func (s *Server) queryAggregateRangeRows(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
-	results := make([]sampleResult, 0, 128)
-	seen := make(map[string]int, 128)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		groupValues := make([]string, len(grouping))
-		var ts int64
-		var value float64
-		dest := make([]any, 0, len(groupValues)+2)
-		for i := range groupValues {
-			dest = append(dest, &groupValues[i])
-		}
-		dest = append(dest, &ts, &value)
-		if err := row.Scan(dest...); err != nil {
-			return err
-		}
-		metric, key := groupingMetricAndKeyValues(groupValues, grouping)
-		idx, ok := seen[key]
-		if !ok {
-			idx = len(results)
-			seen[key] = idx
-			results = append(results, sampleResult{Metric: metric})
-		}
-		results[idx].Values = append(results[idx].Values, []any{float64(ts) / 1000, formatSample(value)})
-		return nil
-	})
-	return results, err
-}
-
-func (s *Server) tryFastNestedCountRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
-	inner, selector, ok := nestedCountSelector(expr)
-	if !ok || !matchersPushdownSafe(selector.LabelMatchers) {
-		return queryData{}, false, nil
-	}
-	source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
-	if !ok {
-		return queryData{}, false, nil
-	}
-	steps := ((end.UnixMilli() - start.UnixMilli()) / stepMillis) + 1
-	if steps <= 0 {
-		return queryData{}, false, nil
-	}
-	if sql, ok := nestedCountTimestampSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
-		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-		data, err := s.queryNestedCountRangeValues(ctx, sql)
-		if err != nil {
-			return queryData{}, true, err
-		}
-		return data, true, nil
-	}
-	if sql, ok := nestedCountSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
-		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-		data, err := s.queryNestedCountRangeValues(ctx, sql)
-		if err != nil {
-			return queryData{}, true, err
-		}
-		return data, true, nil
-	}
-	selectedSeries, ok := selectedSeriesSQL(s.cfg, selector.LabelMatchers, mint, maxt, []string{"id", "min_time", "max_time"})
-	if !ok {
-		return queryData{}, false, nil
-	}
-	if sql, ok := nestedCountSelectedSamplesRangeSQL(s.cfg, selector.LabelMatchers, inner.Grouping, selectedSeries, source.start, start, stepMillis, steps, s.cfg.LookbackDelta); ok {
-		sql = withMaxThreads(sql, s.cfg.AggregateThreads)
-		data, err := s.queryNestedCountRangeValues(ctx, sql)
-		if err != nil {
-			return queryData{}, true, err
-		}
-		return data, true, nil
-	}
-	return queryData{}, false, nil
 }
 
 func (s *Server) tryFastNestedCountInstantQuery(ctx context.Context, expr *parser.AggregateExpr, evalTime time.Time) (queryData, bool, error) {
@@ -1386,160 +611,6 @@ func nestedCountSelector(expr *parser.AggregateExpr) (*parser.AggregateExpr, *pa
 		return nil, nil, false
 	}
 	return inner, selector, true
-}
-
-func nestedCountTimestampSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
-	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) != 1 || grouping[0] == labels.MetricName || steps <= 0 {
-		return "", false
-	}
-	intervalMillis := cfg.RemoteWriteInterval.Milliseconds()
-	evalStartMillis := evalStart.UnixMilli()
-	if intervalMillis <= 0 || intervalMillis > lookback.Milliseconds() {
-		return "", false
-	}
-	metric := exactMetricName(matchers)
-	if metric == "" {
-		return "", false
-	}
-	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers)
-	if !ok {
-		return "", false
-	}
-
-	evalEndMillis := evalStartMillis + (steps-1)*stepMillis
-	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
-	if stepMillis >= intervalMillis && stepMillis%intervalMillis == 0 && bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval) == evalStartMillis {
-		return nestedCountAlignedTimestampSamplesRangeSQL(cfg, metric, groupColumn, groupLabels, idFilters, evalStartMillis, outputStart.UnixMilli(), stepMillis, steps)
-	}
-
-	bucketStartMillis := bucketTimestampMS(evalStartMillis, cfg.RemoteWriteInterval)
-	bucketEndMillis := bucketTimestampMS(evalEndMillis, cfg.RemoteWriteInterval)
-	sampleWhere := sampleBaseFilters(cfg, matchers, bucketStartMillis, bucketEndMillis)
-	sampleWhere = append(sampleWhere, sampleStepBucketFilters(cfg, evalStartMillis, stepMillis, steps)...)
-	sampleWhere = append(sampleWhere, idFilters...)
-	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
-
-	return fmt.Sprintf(
-		"WITH group_labels AS (%s), step_map AS (SELECT toInt64(%d) + toInt64(number) * %d AS ts, intDiv(toInt64(%d) + toInt64(number) * %d, %d) * %d AS bucket_ms FROM numbers(toUInt64(%d))) SELECT step_map.ts AS ts, %s AS value FROM step_map INNER JOIN (SELECT timestamp, id FROM %s WHERE %s) AS active_samples ON active_samples.timestamp = %s ANY LEFT JOIN group_labels USING id GROUP BY ts ORDER BY ts",
-		groupLabels,
-		outputStart.UnixMilli(),
-		stepMillis,
-		evalStartMillis,
-		stepMillis,
-		intervalMillis,
-		intervalMillis,
-		steps,
-		nestedCountDistinctGroupSQL(groupColumn),
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		strings.Join(sampleWhere, " AND "),
-		chTimeMillisExpr("step_map.bucket_ms"),
-	), true
-}
-
-func nestedCountAlignedTimestampSamplesRangeSQL(cfg Config, metric, groupColumn, groupLabels string, idFilters []string, evalStartMillis, outputStartMillis, stepMillis, steps int64) (string, bool) {
-	evalEndMillis := evalStartMillis + (steps-1)*stepMillis
-	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric)}
-	sampleWhere := sampleBaseFilters(cfg, matchers, evalStartMillis, evalEndMillis)
-	if stepMillis != cfg.RemoteWriteInterval.Milliseconds() {
-		sampleWhere = append(sampleWhere, fmt.Sprintf("modulo(toUnixTimestamp64Milli(timestamp) - %d, %d) = 0", evalStartMillis, stepMillis))
-	}
-	sampleWhere = append(sampleWhere, sampleStepBucketFilters(cfg, evalStartMillis, stepMillis, steps)...)
-	sampleWhere = append(sampleWhere, idFilters...)
-	sampleWhere = append(sampleWhere, nonStaleSampleSQL("value"))
-
-	return fmt.Sprintf(
-		"WITH group_labels AS (%s), active_samples AS (SELECT timestamp, id FROM %s WHERE %s) SELECT toInt64(%d) + intDiv(toUnixTimestamp64Milli(timestamp) - %d, %d) * %d AS ts, %s AS value FROM active_samples ANY LEFT JOIN group_labels USING id GROUP BY ts ORDER BY ts",
-		groupLabels,
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		strings.Join(sampleWhere, " AND "),
-		outputStartMillis,
-		evalStartMillis,
-		stepMillis,
-		stepMillis,
-		nestedCountDistinctGroupSQL(groupColumn),
-	), true
-}
-
-func nestedCountSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
-	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || len(grouping) == 0 || groupingHasMetricName(grouping) || steps <= 0 {
-		return "", false
-	}
-	metric := exactMetricName(matchers)
-	if metric == "" {
-		return "", false
-	}
-	idFilters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers)
-	if !ok {
-		return "", false
-	}
-
-	sampleStart := evalStart.Add(-lookback)
-	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
-	sampleWhere := sampleBaseFilters(cfg, matchers, sampleStart.UnixMilli(), sampleEnd.UnixMilli())
-	sampleWhere = append(sampleWhere, idFilters...)
-
-	groupSelect, groupBy := labelIndexGroupSQL(grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, false)
-	if groupLabels == "" || len(groupBy) == 0 {
-		return "", false
-	}
-	gridEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
-	gridExpr := lastGridExpr(evalStart, gridEnd, time.Duration(stepMillis)*time.Millisecond, lookback)
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (SELECT id, timestamp, value FROM %s WHERE %s) GROUP BY id",
-		gridExpr,
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		strings.Join(sampleWhere, " AND "),
-	)
-
-	return fmt.Sprintf(
-		"WITH group_labels AS (%s), per_series AS (%s), active_groups AS (SELECT idx, %s FROM per_series%s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY idx, %s) SELECT toInt64(%d) + (toInt64(idx) - 1) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY idx ORDER BY idx",
-		groupLabels,
-		perSeries,
-		strings.Join(groupSelect, ", "),
-		groupJoin,
-		nonStaleNullableSampleSQL("sample_value"),
-		strings.Join(groupBy, ", "),
-		outputStart.UnixMilli(),
-		stepMillis,
-	), true
-}
-
-func nestedCountSelectedSamplesRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, selectedSeries string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
-	if cfg.SamplesTable == "" || cfg.LabelIndexTable == "" || steps <= 0 {
-		return "", false
-	}
-	groupSelect, groupBy := labelIndexGroupSQL(grouping)
-	groupLabels, groupJoin := labelIndexGroupLabelsSQLWithSelectedFilter(cfg, matchers, grouping, true)
-	if groupLabels == "" || len(groupBy) == 0 {
-		return "", false
-	}
-
-	sampleStart := evalStart.Add(-lookback)
-	sampleEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
-	sampleWhere := sampleBaseFilters(cfg, matchers, sampleStart.UnixMilli(), sampleEnd.UnixMilli())
-	sampleWhere = append(sampleWhere, sampleSelectedSeriesFilters(cfg)...)
-	gridEnd := evalStart.Add(time.Duration(steps-1) * time.Duration(stepMillis) * time.Millisecond)
-	gridExpr := lastGridExpr(evalStart, gridEnd, time.Duration(stepMillis)*time.Millisecond, lookback)
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (SELECT id, timestamp, value FROM %s WHERE %s) GROUP BY id",
-		gridExpr,
-		tableName(cfg.CHDatabase, cfg.SamplesTable),
-		strings.Join(sampleWhere, " AND "),
-	)
-
-	return fmt.Sprintf(
-		"WITH selected_series AS (%s), group_labels AS (%s), per_series AS (%s), active_groups AS (SELECT idx, %s FROM per_series%s ARRAY JOIN arrayEnumerate(vals) AS idx, vals AS sample_value WHERE %s GROUP BY idx, %s) SELECT toInt64(%d) + (toInt64(idx) - 1) * %d AS ts, toFloat64(count()) AS value FROM active_groups GROUP BY idx ORDER BY idx",
-		selectedSeries,
-		groupLabels,
-		perSeries,
-		strings.Join(groupSelect, ", "),
-		groupJoin,
-		nonStaleNullableSampleSQL("sample_value"),
-		strings.Join(groupBy, ", "),
-		outputStart.UnixMilli(),
-		stepMillis,
-	), true
 }
 
 func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, grouping []string, mint, maxt, evalMillis int64) (string, bool) {
@@ -1627,24 +698,6 @@ func (s *Server) queryNestedCountInstantValue(ctx context.Context, sql string) (
 		return queryData{}, err
 	}
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: result}, nil
-}
-
-func (s *Server) queryNestedCountRangeValues(ctx context.Context, sql string) (queryData, error) {
-	values := make([][]any, 0, 128)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var ts int64
-		var value float64
-		if err := row.Scan(&ts, &value); err != nil {
-			return err
-		}
-		values = append(values, []any{float64(ts) / 1000, formatSample(value)})
-		return nil
-	})
-	if err != nil {
-		return queryData{}, err
-	}
-	result := []sampleResult{{Metric: map[string]string{}, Values: values}}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: result}, nil
 }
 
 func nestedCountRangeSQL(cfg Config, matchers []*labels.Matcher, grouping []string, selectedSeries string, evalStart, outputStart time.Time, stepMillis, steps int64, lookback time.Duration) (string, bool) {
@@ -1800,215 +853,19 @@ type selectorGridSource struct {
 }
 
 type aggregateRangeSource struct {
-	gridExpr           string
-	gridStart          time.Time
-	gridEnd            time.Time
-	gridStep           time.Duration
-	avgOverTime        time.Duration
-	filterStaleSamples bool
-	runningSumWrap     bool
-	sumOverTime        *rangeSourceSumOverTime
-}
-
-type rangeSourceSumOverTime struct {
-	outputStart time.Time
-	outputEnd   time.Time
-	outputStep  time.Duration
-	window      time.Duration
+	gridExpr string
 }
 
 func (s *Server) aggregateRangeSourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
-	if selector, ok := expr.(*parser.VectorSelector); ok {
-		source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
-		if !ok {
-			return aggregateRangeSource{}, nil, 0, 0, false
-		}
-		return aggregateRangeSource{gridExpr: lastGridExpr(source.start, source.end, step, s.cfg.LookbackDelta), gridStart: source.start, gridEnd: source.end, gridStep: step}, selector, mint, maxt, true
-	}
-
-	call, ok := expr.(*parser.Call)
-	if !ok || len(call.Args) != 1 {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
-	if call.Func.Name == "running_sum" {
-		source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(call.Args[0], start, end, step)
-		if !ok {
-			return aggregateRangeSource{}, nil, 0, 0, false
-		}
-		source.runningSumWrap = true
-		return source, selector, mint, maxt, true
-	}
-	if call.Func.Name == "sum_over_time" {
-		return s.sumOverTimeSubquerySourceSQL(call.Args[0], start, end, step)
-	}
-	matrix, ok := call.Args[0].(*parser.MatrixSelector)
-	if !ok || matrix.Range <= 0 {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
-	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
-	if !ok || selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
-	offset := selector.OriginalOffset
-	if offset == 0 {
-		offset = selector.Offset
-	}
-	shiftedStart := start.Add(-offset)
-	shiftedEnd := end.Add(-offset)
-	if call.Func.Name == "avg_over_time" {
-		return aggregateRangeSource{
-			gridStart:          shiftedStart,
-			gridEnd:            shiftedEnd,
-			gridStep:           step,
-			avgOverTime:        matrix.Range,
-			filterStaleSamples: true,
-		}, selector, shiftedStart.Add(-matrix.Range).UnixMilli() + 1, shiftedEnd.UnixMilli(), true
-	}
-	fn, ok := rangeGridFunction(call.Func.Name)
+	selector, ok := expr.(*parser.VectorSelector)
 	if !ok {
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
-	gridRange := matrix.Range + previousSampleLookback(s.cfg, fn)
-	mint := shiftedStart.Add(-gridRange).UnixMilli()
-	maxt := shiftedEnd.UnixMilli()
-	gridRangeSeconds := formatDurationSeconds(gridRange)
-	gridExpr := fmt.Sprintf(
-		"%s(%s, %s, %s, %s)(timestamp, value)",
-		fn.name,
-		chTimeMillis(shiftedStart.UnixMilli()),
-		chTimeMillis(shiftedEnd.UnixMilli()),
-		formatDurationSeconds(step),
-		gridRangeSeconds,
-	)
-	if fn.increase {
-		gridExpr = fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, x * %s), %s)", formatDurationSeconds(matrix.Range), gridExpr)
-	}
-	return aggregateRangeSource{gridExpr: gridExpr, gridStart: shiftedStart, gridEnd: shiftedEnd, gridStep: step, filterStaleSamples: true}, selector, mint, maxt, true
-}
-
-func previousSampleLookback(cfg Config, fn rangeGridFunctionSpec) time.Duration {
-	if !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
-		return 0
-	}
-	return cfg.RemoteWriteInterval
-}
-
-func (s *Server) sumOverTimeSubquerySourceSQL(expr parser.Expr, start, end time.Time, step time.Duration) (aggregateRangeSource, *parser.VectorSelector, int64, int64, bool) {
-	subquery, ok := expr.(*parser.SubqueryExpr)
-	if !ok || subquery.Range <= 0 || subquery.OriginalOffset != 0 || subquery.Offset != 0 || subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
-	subqueryStep := subquery.Step
-	if subqueryStep <= 0 {
-		subqueryStep = step
-	}
-	if subqueryStep <= 0 {
-		return aggregateRangeSource{}, nil, 0, 0, false
-	}
-	innerStart := start.Add(-subquery.Range)
-	source, selector, mint, maxt, ok := s.aggregateRangeSourceSQL(subquery.Expr, innerStart, end, subqueryStep)
+	source, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
 	if !ok {
 		return aggregateRangeSource{}, nil, 0, 0, false
 	}
-	source.sumOverTime = &rangeSourceSumOverTime{
-		outputStart: start,
-		outputEnd:   end,
-		outputStep:  step,
-		window:      subquery.Range,
-	}
-	return source, selector, mint, maxt, true
-}
-
-func rangeSourcePerSeriesSQL(source aggregateRangeSource, sampleSource string) string {
-	if source.filterStaleSamples {
-		sampleSource = "SELECT * FROM (" + sampleSource + ") WHERE " + nonStaleSampleSQL("value")
-	}
-	if source.avgOverTime > 0 {
-		return fmt.Sprintf(
-			"SELECT id, arrayMap(eval_ms -> arrayReduce('avgOrNull', arrayFilter((v, ts_ms) -> ts_ms > eval_ms - %d AND ts_ms <= eval_ms, vals, ts)), range(toInt64(%d), toInt64(%d), toInt64(%d))) AS vals FROM (%s)",
-			source.avgOverTime.Milliseconds(),
-			source.gridStart.UnixMilli(),
-			source.gridEnd.UnixMilli()+source.gridStep.Milliseconds(),
-			source.gridStep.Milliseconds(),
-			sampleArraySourceFromSamplesSQL(sampleSource),
-		)
-	}
-	perSeries := fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (%s) GROUP BY id",
-		source.gridExpr,
-		sampleSource,
-	)
-	if source.sumOverTime != nil {
-		perSeries = fmt.Sprintf(
-			"SELECT id, %s AS vals FROM (%s)",
-			sumOverTimeArraySQL("vals", source.gridStart, source.gridStep, *source.sumOverTime),
-			perSeries,
-		)
-	}
-	if !source.runningSumWrap {
-		return perSeries
-	}
-	return fmt.Sprintf(
-		"SELECT id, %s AS vals FROM (%s)",
-		runningSumArraySQL("vals"),
-		perSeries,
-	)
-}
-
-func runningSumArraySQL(valuesExpr string) string {
-	return fmt.Sprintf(
-		"arrayMap((running_sum, seen) -> if(seen = 0, NULL, running_sum), arrayCumSum(arrayMap(x -> %s, %s)), arrayCumSum(arrayMap(x -> %s, %s)))",
-		nullableValueOrZeroSQL("x"),
-		valuesExpr,
-		nullableIsFiniteSQL("x"),
-		valuesExpr,
-	)
-}
-
-func sumOverTimeArraySQL(valuesExpr string, inputStart time.Time, inputStep time.Duration, rollup rangeSourceSumOverTime) string {
-	inputStepMillis := inputStep.Milliseconds()
-	outputStepMillis := rollup.outputStep.Milliseconds()
-	if inputStepMillis <= 0 || outputStepMillis <= 0 {
-		return "[]"
-	}
-	outputSteps := ((rollup.outputEnd.UnixMilli() - rollup.outputStart.UnixMilli()) / outputStepMillis) + 1
-	if outputSteps <= 0 {
-		return "[]"
-	}
-	sliceExpr := func(i string) string {
-		startIdx := sumOverTimeStartIndexSQL(i, inputStart.UnixMilli(), inputStepMillis, rollup.outputStart.UnixMilli(), outputStepMillis, rollup.window.Milliseconds())
-		count := sumOverTimeCountSQL(i, valuesExpr, inputStart.UnixMilli(), inputStepMillis, rollup.outputStart.UnixMilli(), outputStepMillis, rollup.window.Milliseconds())
-		return fmt.Sprintf("arraySlice(%s, %s, %s)", valuesExpr, startIdx, count)
-	}
-	return fmt.Sprintf(
-		"arrayMap(i -> if(arraySum(arrayMap(x -> %s, %s)) = 0, NULL, arraySum(arrayMap(x -> %s, %s))), range(toUInt64(%d)))",
-		nullableIsFiniteSQL("x"),
-		sliceExpr("i"),
-		nullableValueOrZeroSQL("x"),
-		sliceExpr("i"),
-		outputSteps,
-	)
-}
-
-func sumOverTimeStartIndexSQL(i string, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis int64) string {
-	evalMillis := fmt.Sprintf("(%d + toInt64(%s) * %d)", outputStartMillis, i, outputStepMillis)
-	windowStartMillis := fmt.Sprintf("(%s - %d)", evalMillis, windowMillis)
-	return fmt.Sprintf("greatest(toInt64(1), intDiv(greatest(%s - %d, 0) + %d - 1, %d) + 1)", windowStartMillis, inputStartMillis, inputStepMillis, inputStepMillis)
-}
-
-func sumOverTimeCountSQL(i, valuesExpr string, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis int64) string {
-	evalMillis := fmt.Sprintf("(%d + toInt64(%s) * %d)", outputStartMillis, i, outputStepMillis)
-	startIdx := sumOverTimeStartIndexSQL(i, inputStartMillis, inputStepMillis, outputStartMillis, outputStepMillis, windowMillis)
-	lastIdx := fmt.Sprintf("least(toInt64(length(%s)), intDiv(greatest(%s - %d, 0), %d) + 1)", valuesExpr, evalMillis, inputStartMillis, inputStepMillis)
-	return fmt.Sprintf("greatest(toInt64(0), %s - %s + 1)", lastIdx, startIdx)
-}
-
-func nullableValueOrZeroSQL(value string) string {
-	return fmt.Sprintf("if(isNull(%s), 0.0, if(isNaN(assumeNotNull(%s)), 0.0, assumeNotNull(%s)))", value, value, value)
-}
-
-func nullableIsFiniteSQL(value string) string {
-	return fmt.Sprintf("if(isNull(%s), 0, if(isNaN(assumeNotNull(%s)), 0, 1))", value, value)
+	return aggregateRangeSource{gridExpr: lastGridExpr(source.start, source.end, step, s.cfg.LookbackDelta)}, selector, mint, maxt, true
 }
 
 func selectorRangeGridSource(cfg Config, selector *parser.VectorSelector, start, end time.Time, step time.Duration) (selectorGridSource, int64, int64, bool) {
@@ -2024,23 +881,6 @@ func selectorRangeGridSource(cfg Config, selector *parser.VectorSelector, start,
 	mint := shiftedStart.Add(-cfg.LookbackDelta).UnixMilli()
 	maxt := shiftedEnd.UnixMilli()
 	return selectorGridSource{start: shiftedStart, end: shiftedEnd}, mint, maxt, true
-}
-
-func exactBucketRangeSelector(cfg Config, selector *parser.VectorSelector, start, end time.Time, step time.Duration) bool {
-	if cfg.RemoteWriteInterval <= 0 || step != cfg.RemoteWriteInterval {
-		return false
-	}
-	if selector.OriginalOffset != 0 || selector.Offset != 0 {
-		return false
-	}
-	intervalMillis := cfg.RemoteWriteInterval.Milliseconds()
-	if intervalMillis <= 0 {
-		return false
-	}
-	startMillis := start.UnixMilli()
-	endMillis := end.UnixMilli()
-	return bucketTimestampMS(startMillis, cfg.RemoteWriteInterval) == startMillis &&
-		bucketTimestampMS(endMillis, cfg.RemoteWriteInterval) == endMillis
 }
 
 func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
@@ -2255,23 +1095,18 @@ type instantSeriesExprKind int
 
 const (
 	instantSeriesSelector instantSeriesExprKind = iota
-	instantSeriesRangeFunction
 )
 
 type instantSeriesExprBranch struct {
-	kind        instantSeriesExprKind
-	selector    *parser.VectorSelector
-	window      selectorWindow
-	matrixRange time.Duration
-	fn          rangeFunction
-	transform   scalarTransform
+	kind      instantSeriesExprKind
+	selector  *parser.VectorSelector
+	window    selectorWindow
+	transform scalarTransform
 }
 
 func (b instantSeriesExprBranch) equivalentTo(other instantSeriesExprBranch) bool {
 	return b.kind == other.kind &&
 		b.window == other.window &&
-		b.matrixRange == other.matrixRange &&
-		b.fn == other.fn &&
 		b.transform.signature() == other.transform.signature()
 }
 
@@ -2349,26 +1184,20 @@ type seriesExprKind int
 
 const (
 	seriesExprSelector seriesExprKind = iota
-	seriesExprRangeFunction
 )
 
 // seriesExprBranch is one operand of a chain of plain `or` operators: a vector
-// selector or a single-argument range function over one, with any scalar
-// arithmetic folded into transform. node keeps the selector/call expression
-// with the scalar arithmetic stripped.
+// selector with any scalar arithmetic folded into transform. node keeps the
+// selector expression with the scalar arithmetic stripped.
 type seriesExprBranch struct {
-	node        parser.Expr
-	kind        seriesExprKind
-	selector    *parser.VectorSelector
-	matrixRange time.Duration
-	funcName    string
-	transform   scalarTransform
+	node      parser.Expr
+	kind      seriesExprKind
+	selector  *parser.VectorSelector
+	transform scalarTransform
 }
 
 func (b seriesExprBranch) equivalentTo(other seriesExprBranch) bool {
 	return b.kind == other.kind &&
-		b.funcName == other.funcName &&
-		b.matrixRange == other.matrixRange &&
 		b.transform.signature() == other.transform.signature()
 }
 
@@ -2410,19 +1239,6 @@ func seriesExprBranchFor(expr parser.Expr) (seriesExprBranch, bool) {
 			return seriesExprBranch{}, false
 		}
 		return seriesExprBranch{node: e, kind: seriesExprSelector, selector: e}, true
-	case *parser.Call:
-		if e.Func == nil || len(e.Args) != 1 {
-			return seriesExprBranch{}, false
-		}
-		matrix, ok := e.Args[0].(*parser.MatrixSelector)
-		if !ok || matrix.Range <= 0 {
-			return seriesExprBranch{}, false
-		}
-		selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
-		if !ok || selector.Anchored || selector.Smoothed {
-			return seriesExprBranch{}, false
-		}
-		return seriesExprBranch{node: e, kind: seriesExprRangeFunction, selector: selector, matrixRange: matrix.Range, funcName: e.Func.Name}, true
 	case *parser.BinaryExpr:
 		if !scalarArithmeticOperator(e.Op) {
 			return seriesExprBranch{}, false
@@ -2471,16 +1287,6 @@ func (s *Server) instantSeriesExprBranchFor(branch seriesExprBranch, evalTime ti
 			return instantSeriesExprBranch{}, false
 		}
 		return instantSeriesExprBranch{kind: instantSeriesSelector, selector: branch.selector, window: window, transform: branch.transform}, true
-	case seriesExprRangeFunction:
-		fn, ok := rangeFunctionMode(branch.funcName)
-		if !ok {
-			return instantSeriesExprBranch{}, false
-		}
-		window, ok := selectorWindowFor(branch.selector, evalTime, branch.matrixRange+rangeFunctionPreviousSampleLookback(s.cfg, fn))
-		if !ok {
-			return instantSeriesExprBranch{}, false
-		}
-		return instantSeriesExprBranch{kind: instantSeriesRangeFunction, selector: branch.selector, window: window, matrixRange: branch.matrixRange, fn: fn, transform: branch.transform}, true
 	default:
 		return instantSeriesExprBranch{}, false
 	}
@@ -2497,17 +1303,6 @@ func (s *Server) instantSeriesExprSourceSQL(branch instantSeriesExprBranch, sele
 			latest = latestSamplesForSelectedSeriesSQL(s.cfg, branch.selector.LabelMatchers, branch.window.mint, branch.window.maxt)
 		}
 		return transformValueSQL(latest, branch.transform), "latest"
-	case instantSeriesRangeFunction:
-		var perSeries string
-		if union {
-			perSeries = rangeFunctionPerSeriesUnionSQL(s.cfg, branch.window, exactMetricNamesForSelectors(selectors), branch.fn)
-		} else {
-			perSeries = rangeFunctionPerSeriesSQL(s.cfg, branch.window, branch.selector.LabelMatchers, branch.fn)
-		}
-		if branch.fn.increase {
-			perSeries = fmt.Sprintf("SELECT id, value * %s AS value FROM (%s)", formatDurationSeconds(branch.matrixRange), perSeries)
-		}
-		return transformValueSQL(perSeries, branch.transform), "per_series"
 	default:
 		return "", ""
 	}
@@ -2525,102 +1320,6 @@ func transformGridValsSQL(gridExpr string, transform scalarTransform) string {
 		return gridExpr
 	}
 	return fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, %s), %s)", transform.apply("x"), gridExpr)
-}
-
-type rangeFunction struct {
-	counter            bool
-	rate               bool
-	instant            bool
-	increase           bool
-	usesPreviousSample bool
-}
-
-func rangeFunctionMode(name string) (rangeFunction, bool) {
-	switch name {
-	case "rate":
-		return rangeFunction{counter: true, rate: true}, true
-	case "irate":
-		return rangeFunction{counter: true, rate: true, instant: true}, true
-	case "increase":
-		return rangeFunction{counter: true, rate: true, increase: true}, true
-	case "delta":
-		return rangeFunction{counter: false, rate: false, usesPreviousSample: true}, true
-	case "idelta":
-		return rangeFunction{counter: false, rate: false, instant: true, usesPreviousSample: true}, true
-	default:
-		return rangeFunction{}, false
-	}
-}
-
-func rangeFunctionPreviousSampleLookback(cfg Config, fn rangeFunction) time.Duration {
-	if !fn.usesPreviousSample || cfg.RemoteWriteInterval <= 0 {
-		return 0
-	}
-	return cfg.RemoteWriteInterval
-}
-
-func rangeFunctionSampleSourceSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher) string {
-	source := samplesForSelectedSeriesSQL(cfg, matchers, window.mint, window.maxt)
-	return rangeFunctionSampleSourceFromSamplesSQL(source)
-}
-
-func rangeFunctionSampleSourceFromSamplesSQL(source string) string {
-	return "SELECT * FROM (" + sampleArraySourceFromSamplesSQL(source) + ") WHERE length(vals) > 1"
-}
-
-func sampleArraySourceFromSamplesSQL(source string) string {
-	return fmt.Sprintf(
-		"SELECT id, arrayMap(x -> x.1, pts) AS ts, arrayMap(x -> x.2, pts) AS vals FROM (SELECT id, arraySort(x -> x.1, groupArray((toUnixTimestamp64Milli(timestamp), value))) AS pts FROM (%s) GROUP BY id)",
-		source,
-	)
-}
-
-func rangeFunctionPerSeriesSQL(cfg Config, window selectorWindow, matchers []*labels.Matcher, fn rangeFunction) string {
-	source := rangeFunctionSampleSourceSQL(cfg, window, matchers)
-	return rangeFunctionPerSeriesFromSourceSQL(window, source, fn)
-}
-
-func rangeFunctionPerSeriesUnionSQL(cfg Config, window selectorWindow, metricNames []string, fn rangeFunction) string {
-	source := samplesForSelectedSeriesUnionSQL(cfg, metricNames, window.mint, window.maxt)
-	return rangeFunctionPerSeriesFromSourceSQL(window, rangeFunctionSampleSourceFromSamplesSQL(source), fn)
-}
-
-func rangeFunctionPerSeriesFromSourceSQL(window selectorWindow, source string, fn rangeFunction) string {
-	if fn.instant {
-		result := "if(last_v < prev_v, last_v, last_v - prev_v)"
-		if !fn.counter {
-			result = "last_v - prev_v"
-		}
-		if fn.rate {
-			result = "(" + result + ") / ((last_t - prev_t) / 1000.0)"
-		}
-		return fmt.Sprintf(
-			"SELECT id, %s AS value FROM (SELECT id, vals[-2] AS prev_v, vals[-1] AS last_v, ts[-2] AS prev_t, ts[-1] AS last_t FROM (%s) WHERE length(vals) >= 2 AND last_t > prev_t)",
-			result,
-			source,
-		)
-	}
-	rangeSeconds := float64(window.maxt-window.mint) / 1000.0
-	resetCorrection := "0.0"
-	durationToStart := "duration_to_start1"
-	if fn.counter {
-		resetCorrection = "arraySum(arrayMap((prev, curr) -> if(curr < prev, prev, 0.0), arrayPopBack(vals), arrayPopFront(vals)))"
-		durationToStart = "duration_to_start2"
-	}
-	result := "raw_delta + reset_correction"
-	factor := "(sampled_interval + " + durationToStart + " + duration_to_end2) / sampled_interval"
-	if fn.rate {
-		factor += " / " + strconv.FormatFloat(rangeSeconds, 'f', -1, 64)
-	}
-	return fmt.Sprintf(
-		"SELECT id, ((%s) * (%s)) AS value FROM (SELECT id, vals[1] AS first_v, vals[-1] AS last_v, ts[1] AS first_t, ts[-1] AS last_t, length(vals)-1 AS num_minus_one, (last_v - first_v) AS raw_delta, %s AS reset_correction, (last_t - first_t) / 1000.0 AS sampled_interval, (first_t - %d) / 1000.0 AS duration_to_start0, (%d - last_t) / 1000.0 AS duration_to_end0, sampled_interval / num_minus_one AS avg_between, avg_between * 1.1 AS threshold, if(duration_to_start0 >= threshold, avg_between / 2, duration_to_start0) AS duration_to_start1, if(raw_delta + reset_correction > 0 AND first_v >= 0, sampled_interval * (first_v / (raw_delta + reset_correction)), duration_to_start1) AS duration_to_zero, if(duration_to_zero < duration_to_start1, duration_to_zero, duration_to_start1) AS duration_to_start2, if(duration_to_end0 >= threshold, avg_between / 2, duration_to_end0) AS duration_to_end2 FROM (%s))",
-		result,
-		factor,
-		resetCorrection,
-		window.mint,
-		window.maxt,
-		source,
-	)
 }
 
 func aggregateSQL(expr *parser.AggregateExpr, valueColumn string) (string, bool) {
@@ -2686,22 +1385,6 @@ func aggregateLimit(expr parser.Expr) (int, bool) {
 		return 0, false
 	}
 	return int(value), true
-}
-
-func exprHasFunction(expr parser.Expr, name string) bool {
-	found := false
-	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
-		if found {
-			return errors.New("done")
-		}
-		call, ok := node.(*parser.Call)
-		if ok && call.Func != nil && call.Func.Name == name {
-			found = true
-			return errors.New("done")
-		}
-		return nil
-	})
-	return found
 }
 
 func matchersPushdownSafe(matchers []*labels.Matcher) bool {
@@ -2889,45 +1572,6 @@ func selectedSeriesExactMatcherUnionSQL(cfg Config, selectors []*parser.VectorSe
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		strings.Join(where, " AND "),
 	), true
-}
-
-func selectedSeriesExactMatcherUnionBranchesSQL(cfg Config, selectors []*parser.VectorSelector, grouping []string, mint, maxt int64) (string, [][]string, bool) {
-	if len(selectors) < 2 || len(grouping) == 0 {
-		return "", nil, false
-	}
-	sets := make([]exactSelectorMatcherSet, 0, len(selectors))
-	metricNames := make([]string, 0, len(selectors))
-	seenMetrics := make(map[string]struct{}, len(selectors))
-	groupValues := make([][]string, len(grouping))
-	for _, selector := range selectors {
-		set, ok := exactSelectorMatcherSetFor(selector.LabelMatchers)
-		if !ok || len(set.labels) < 2 {
-			return "", nil, false
-		}
-		sets = append(sets, set)
-		if _, ok := seenMetrics[set.metric]; !ok {
-			seenMetrics[set.metric] = struct{}{}
-			metricNames = append(metricNames, set.metric)
-		}
-		for i, name := range grouping {
-			value := set.metric
-			found := name == labels.MetricName
-			if !found {
-				for _, matcher := range set.labels {
-					if matcher.name == name {
-						value = matcher.value
-						found = true
-						break
-					}
-				}
-			}
-			if !found {
-				return "", nil, false
-			}
-			groupValues[i] = append(groupValues[i], value)
-		}
-	}
-	return "SELECT id, min(branch) AS branch FROM (" + exactMatcherUnionBranchIDsSQL(cfg, sets, mint, maxt) + ") GROUP BY id", groupValues, true
 }
 
 func selectPartsIDOnly(selectParts []string) bool {
@@ -3237,32 +1881,6 @@ func labelIndexGroupSQL(grouping []string) ([]string, []string) {
 		groupBy = append(groupBy, quoteIdent(alias))
 	}
 	return selects, groupBy
-}
-
-func exactMatcherGroupSQL(matchers []*labels.Matcher, grouping []string) ([]string, bool) {
-	set, ok := exactSelectorMatcherSetFor(matchers)
-	if !ok {
-		return nil, false
-	}
-	selects := make([]string, 0, len(grouping))
-	for i, name := range grouping {
-		value := set.metric
-		found := name == labels.MetricName
-		if !found {
-			for _, matcher := range set.labels {
-				if matcher.name == name {
-					value = matcher.value
-					found = true
-					break
-				}
-			}
-		}
-		if !found {
-			return nil, false
-		}
-		selects = append(selects, sqlString(value)+" AS "+quoteIdent(groupAlias(i)))
-	}
-	return selects, true
 }
 
 // postHogGroupingSupported reports whether every grouping label can be

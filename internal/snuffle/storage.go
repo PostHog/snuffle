@@ -19,9 +19,8 @@ import (
 )
 
 type CHQueryable struct {
-	preserveRollupStaleness bool
-	client                  *ClickHouseClient
-	cfg                     Config
+	client *ClickHouseClient
+	cfg    Config
 }
 
 func NewCHQueryable(client *ClickHouseClient, cfg Config) *CHQueryable {
@@ -59,7 +58,9 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 	q.selects[cacheKey] = future
 	go func() {
 		future.series, future.err = q.selectSeriesMeta(ctx, hints, matchers...)
-		if q.queryable.preserveRollupStaleness && hints != nil && hints.Func == "last_over_time" {
+		// The engine drops stale markers before a range function sees them.
+		// default_rollup needs them to end a series, so they become plain NaN.
+		if hints != nil && hints.Func == metricsQLDefaultRollupName {
 			for _, series := range future.series {
 				for i, point := range series.samples {
 					if isStaleSampleValue(point.v) {
@@ -1092,12 +1093,6 @@ func rawSamplesSourceSQL(cfg Config, where string) string {
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		where,
 	)
-}
-
-func samplesForSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64) string {
-	where := sampleBaseFilters(cfg, matchers, mint, maxt)
-	where = append(where, sampleSelectedSeriesFiltersFromMatchers(cfg, matchers)...)
-	return rawSamplesSourceSQL(cfg, strings.Join(where, " AND "))
 }
 
 func sampleIDFiltersFromMatchers(cfg Config, matchers []*labels.Matcher, mint, maxt int64) ([]string, bool) {

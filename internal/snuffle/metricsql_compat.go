@@ -3,6 +3,7 @@ package snuffle
 import (
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -13,189 +14,334 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
+// metricsQLInternalPrefix marks functions that only prepareMetricsQLQuery emits.
+const metricsQLInternalPrefix = "__snuffle_"
+
+// metricsQLCarrierPrefix marks a Prometheus function name that the MetricsQL
+// parser rejects. The name travels through the parser as a string argument.
+const metricsQLCarrierPrefix = metricsQLInternalPrefix + "fn:"
+
+// metricsQLDefaultRollupName is the engine name of the internal default_rollup.
+// The engine keeps metric names only for last_over_time and first_over_time.
+const metricsQLDefaultRollupName = "last_over_time"
+
+var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "idelta"}
+
+// metricsQLSelectorFunctions inspect their selector argument in the engine.
+// Their selector arguments keep the Prometheus lookback.
+var metricsQLSelectorFunctions = map[string]bool{"absent": true, "timestamp": true}
+
 func init() {
-	parser.Functions["__snuffle_running_sum"] = &parser.Function{
-		Name: "__snuffle_running_sum", ArgTypes: []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar}, ReturnType: parser.ValueTypeVector,
+	rollupArgTypes := []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar}
+	for _, name := range metricsQLCounterFunctions {
+		internalName := metricsQLInternalPrefix + name
+		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
+		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
 	}
-	promql.FunctionCalls["__snuffle_running_sum"] = func(v []promql.Vector, m promql.Matrix, _ parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
-		var sum float64
-		seen := false
-		for _, p := range m[0].Floats {
-			if p.T >= int64(v[0][0].F) && !math.IsNaN(p.F) {
-				sum += p.F
-				seen = true
-			}
+	parser.Functions[metricsQLInternalPrefix+"default_rollup"] = &parser.Function{Name: metricsQLDefaultRollupName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
+	original := promql.FunctionCalls[metricsQLDefaultRollupName]
+	rollup := metricsQLRollup("default_rollup", original)
+	promql.FunctionCalls[metricsQLDefaultRollupName] = func(v []promql.Vector, m promql.Matrix, args parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+		if len(args) > 1 {
+			return rollup(v, m, args, enh)
 		}
-		if !seen {
+		// The storage adapter keeps stale markers as NaN for this engine name.
+		// Public last_over_time ignores those markers.
+		series := seriesWithoutNaN(m[0])
+		if len(series.Floats)+len(series.Histograms) == 0 {
 			return enh.Out, nil
 		}
-		return append(enh.Out, promql.Sample{F: sum}), nil
+		return original(v, promql.Matrix{series}, args, enh)
 	}
-	parser.Functions["running_sum"] = &parser.Function{
-		Name: "running_sum", ArgTypes: []parser.ValueType{parser.ValueTypeVector}, ReturnType: parser.ValueTypeVector,
-	}
-	for _, name := range []string{"increase", "rate", "delta", "irate", "idelta", "default_rollup"} {
-		internalName := "__snuffle_" + name
-		parser.Functions[internalName] = &parser.Function{
-			Name:       internalName,
-			ArgTypes:   []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar},
-			ReturnType: parser.ValueTypeVector,
-		}
-		if name == "default_rollup" {
-			// The engine keeps metric names for last_over_time. Use its name
-			// for this internal signature, while retaining the public function.
-			parser.Functions[internalName].Name = "last_over_time"
-			original := promql.FunctionCalls["last_over_time"]
-			rollup := metricsQLRollup(name, original)
-			promql.FunctionCalls["last_over_time"] = func(v []promql.Vector, m promql.Matrix, args parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
-				if len(args) > 1 {
-					return rollup(v, m, args, enh)
-				}
-				// The storage adapter preserves stale markers for default_rollup.
-				// Public last_over_time ignores those markers.
-				series := m[0]
-				series.Floats = make([]promql.FPoint, 0, len(m[0].Floats))
-				for _, p := range m[0].Floats {
-					if !math.IsNaN(p.F) {
-						series.Floats = append(series.Floats, p)
-					}
-				}
-				if len(series.Floats)+len(series.Histograms) == 0 {
-					return enh.Out, nil
-				}
-				return original(v, promql.Matrix{series}, args, enh)
-			}
-		} else {
-			promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
-		}
-	}
+}
+
+// metricsQLQuery is a request expression prepared for the Prometheus engine.
+type metricsQLQuery struct {
+	query string
+	// runningSum applies a running sum to the range result.
+	runningSum bool
 }
 
 // prepareMetricsQLQuery expands MetricsQL syntax before either execution path.
 // Counter functions use separate names so Prometheus SQL optimizations cannot
 // replace their calculations with extrapolated PromQL results.
-func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, end time.Time) (string, error) {
-	expr, err := metricsql.Parse(query)
+func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, end time.Time) (metricsQLQuery, error) {
+	expr, err := metricsql.Parse(carryUnsupportedFunctions(query))
 	if err != nil {
-		return "", err
+		return metricsQLQuery{}, err
 	}
 	if step <= 0 {
 		step = 5 * time.Minute
 	}
 	if step < time.Millisecond {
-		return "", fmt.Errorf("step must be at least 1ms")
+		return metricsQLQuery{}, fmt.Errorf("step must be at least 1ms")
 	}
 	if lookback <= 0 {
 		lookback = 5 * time.Minute
 	}
+	restoreCarriedFunctions(expr)
+
+	var prepared metricsQLQuery
+	if fe, ok := expr.(*metricsql.FuncExpr); ok && fe.Name == "running_sum" {
+		if len(fe.Args) != 1 || fe.KeepMetricNames {
+			return metricsQLQuery{}, fmt.Errorf("running_sum requires one series argument; keep_metric_names is not supported")
+		}
+		if start.Equal(end) {
+			return metricsQLQuery{}, fmt.Errorf("running_sum requires a range query")
+		}
+		prepared.runningSum = true
+		expr = fe.Args[0]
+	}
 	expr = metricsQLDefaultSelectors(expr)
-	var rewriteErr error
+	rewriter := metricsQLRewriter{lookback: lookback}
+	if err := rewriter.rewrite(expr, step, start.Equal(end)); err != nil {
+		return metricsQLQuery{}, err
+	}
+	prepared.query = string(expr.AppendString(nil))
+	return prepared, nil
+}
+
+// carryUnsupportedFunctions renames Prometheus functions that the MetricsQL
+// parser rejects into the variadic union function. The original name becomes
+// the first argument. restoreCarriedFunctions reverses the change.
+func carryUnsupportedFunctions(query string) string {
+	var out strings.Builder
+	for i := 0; i < len(query); {
+		c := query[i]
+		if c == '"' || c == '\'' || c == '`' {
+			end := skipQuotedString(query, i)
+			out.WriteString(query[i:end])
+			i = end
+			continue
+		}
+		if !isIdentStart(c) {
+			out.WriteByte(c)
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(query) && isIdentPart(query[j]) {
+			j++
+		}
+		ident := query[i:j]
+		k := skipSpaces(query, j)
+		if k >= len(query) || query[k] != '(' || parser.Functions[ident] == nil || metricsql.IsSupportedFunction(ident) {
+			out.WriteString(ident)
+			i = j
+			continue
+		}
+		out.WriteString(`union("` + metricsQLCarrierPrefix + ident + `"`)
+		k = skipSpaces(query, k+1)
+		if k < len(query) && query[k] == ')' {
+			out.WriteByte(')')
+			i = k + 1
+			continue
+		}
+		out.WriteString(", ")
+		i = k
+	}
+	return out.String()
+}
+
+func restoreCarriedFunctions(expr metricsql.Expr) {
 	metricsql.VisitAll(expr, func(e metricsql.Expr) {
-		if rewriteErr != nil {
+		fe, ok := e.(*metricsql.FuncExpr)
+		if !ok || !strings.EqualFold(fe.Name, "union") || len(fe.Args) == 0 {
 			return
 		}
-		switch e := e.(type) {
-		case *metricsql.DurationExpr:
-			millis := e.Duration(step.Milliseconds())
-			if millis > math.MaxInt64/int64(time.Millisecond) || millis < math.MinInt64/int64(time.Millisecond) {
-				rewriteErr = fmt.Errorf("the query duration is too large")
+		name, ok := fe.Args[0].(*metricsql.StringExpr)
+		if !ok || !strings.HasPrefix(name.S, metricsQLCarrierPrefix) {
+			return
+		}
+		fe.Name = strings.TrimPrefix(name.S, metricsQLCarrierPrefix)
+		fe.Args = fe.Args[1:]
+	})
+}
+
+func skipQuotedString(query string, start int) int {
+	quote := query[start]
+	for i := start + 1; i < len(query); i++ {
+		switch query[i] {
+		case '\\':
+			if quote != '`' {
+				i++
 			}
-		case *metricsql.RollupExpr:
-			// Prometheus requires an explicit subquery step after expressions.
-			if _, ok := e.Expr.(*metricsql.MetricExpr); !ok && e.Window != nil && e.Step == nil {
-				e.Step = metricsQLDuration(step)
-			}
-			e.Window = resolveMetricsQLDuration(e.Window, step)
-			e.Step = resolveMetricsQLDuration(e.Step, step)
-			e.Offset = resolveMetricsQLDuration(e.Offset, step)
-		case *metricsql.FuncExpr:
-			if strings.HasPrefix(e.Name, "__snuffle_") {
-				rewriteErr = fmt.Errorf("function %q is reserved for query execution", e.Name)
-				return
-			}
-			if e.Name == "running_sum" && len(e.Args) == 1 {
-				if start.Equal(end) || start.UnixMilli()%step.Milliseconds() != 0 {
-					rewriteErr = fmt.Errorf("running_sum requires a range query with start aligned to step")
-					return
-				}
-				if end.Sub(start) > time.Duration(math.MaxInt64)-step {
-					rewriteErr = fmt.Errorf("the running_sum range is too large")
-					return
-				}
-				e.Name = "__snuffle_running_sum"
-				e.Args = []metricsql.Expr{&metricsql.RollupExpr{
-					Expr: e.Args[0], Window: metricsQLDuration(end.Sub(start) + step), Step: metricsQLDuration(step),
-				}, &metricsql.NumberExpr{N: float64(start.UnixMilli())}}
-				return
-			}
-			if !metricsql.IsRollupFunc(e.Name) {
-				if fn := parser.Functions[e.Name]; fn != nil {
-					for i, arg := range e.Args {
-						if i < len(fn.ArgTypes) && fn.ArgTypes[i] == parser.ValueTypeVector {
-							if _, numeric := arg.(*metricsql.NumberExpr); numeric {
-								e.Args[i] = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{arg}}
-							}
-						}
+		case quote:
+			return i + 1
+		}
+	}
+	return len(query)
+}
+
+func skipSpaces(query string, i int) int {
+	for i < len(query) && (query[i] == ' ' || query[i] == '\t' || query[i] == '\n' || query[i] == '\r') {
+		i++
+	}
+	return i
+}
+
+func isIdentStart(c byte) bool {
+	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+func isIdentPart(c byte) bool {
+	return isIdentStart(c) || c == ':' || (c >= '0' && c <= '9')
+}
+
+// metricsQLRewriter resolves step-relative durations and rewrites rollup
+// functions. The step changes inside a subquery, so the rewriter carries it.
+type metricsQLRewriter struct {
+	lookback time.Duration
+}
+
+func (r metricsQLRewriter) rewrite(expr metricsql.Expr, step time.Duration, instant bool) error {
+	switch e := expr.(type) {
+	case *metricsql.DurationExpr:
+		_, err := resolveMetricsQLDuration(e, step)
+		return err
+	case *metricsql.RollupExpr:
+		// Prometheus requires an explicit subquery step after expressions.
+		if _, raw := e.Expr.(*metricsql.MetricExpr); !raw && e.Window != nil && e.Step == nil {
+			e.Step = metricsQLDuration(step)
+		}
+		childStep, err := r.resolveRollupDurations(e, step)
+		if err != nil {
+			return err
+		}
+		return r.rewrite(e.Expr, childStep, instant && e.Step == nil)
+	case *metricsql.FuncExpr:
+		return r.rewriteFunc(e, step, instant)
+	case *metricsql.AggrFuncExpr:
+		return r.rewriteArgs(e.Args, step, instant)
+	case *metricsql.BinaryOpExpr:
+		if err := r.rewrite(e.Left, step, instant); err != nil {
+			return err
+		}
+		return r.rewrite(e.Right, step, instant)
+	}
+	return nil
+}
+
+func (r metricsQLRewriter) rewriteArgs(args []metricsql.Expr, step time.Duration, instant bool) error {
+	for _, arg := range args {
+		if err := r.rewrite(arg, step, instant); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration, instant bool) error {
+	if strings.HasPrefix(e.Name, metricsQLInternalPrefix) {
+		return fmt.Errorf("function %q is reserved for query execution", e.Name)
+	}
+	if e.Name == "running_sum" {
+		return fmt.Errorf("running_sum must be the outermost function of a range query")
+	}
+	if metricsQLSelectorFunctions[e.Name] || !metricsql.IsRollupFunc(e.Name) {
+		if fn := parser.Functions[e.Name]; fn != nil {
+			for i, arg := range e.Args {
+				if i < len(fn.ArgTypes) && fn.ArgTypes[i] == parser.ValueTypeVector {
+					if _, numeric := arg.(*metricsql.NumberExpr); numeric {
+						e.Args[i] = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{arg}}
 					}
 				}
-				return
-			}
-			// Most rollups take the series first. Quantile rollups take it last.
-			argIndex := 0
-			if e.Name == "quantile_over_time" {
-				argIndex = 1
-			}
-			if len(e.Args) <= argIndex {
-				return
-			}
-			r, ok := e.Args[argIndex].(*metricsql.RollupExpr)
-			if !ok {
-				r = &metricsql.RollupExpr{Expr: e.Args[argIndex]}
-				e.Args[argIndex] = r
-			}
-			implicit := r.Window == nil
-			window := step
-			if !implicit {
-				window = time.Duration(r.Window.Duration(step.Milliseconds())) * time.Millisecond
-			}
-			if window <= 0 {
-				rewriteErr = fmt.Errorf("the query window must be at least 1ms")
-				return
-			}
-			r.Window = metricsQLDuration(window)
-			if _, ok := r.Expr.(*metricsql.MetricExpr); !ok && r.Step == nil {
-				r.Step = metricsQLDuration(step)
-			}
-			switch e.Name {
-			case "increase", "rate", "delta", "irate", "idelta", "default_rollup":
-				if len(e.Args) != 1 || e.KeepMetricNames {
-					rewriteErr = fmt.Errorf("%s requires one series argument; keep_metric_names is not supported", e.Name)
-					return
-				}
-				if window > time.Duration(math.MaxInt64)-lookback {
-					rewriteErr = fmt.Errorf("the query window is too large")
-					return
-				}
-				// Fetch history before the window for the previous sample and
-				// the sample interval. Explicit windows keep their original size.
-				r.Window = metricsQLDuration(window + lookback)
-				windowArg := window.Milliseconds()
-				if implicit && (e.Name == "rate" || e.Name == "default_rollup") {
-					windowArg = 0
-				}
-				e.Name = "__snuffle_" + e.Name
-				instant := 0.0
-				if start.Equal(end) {
-					instant = 1
-				}
-				e.Args = append(e.Args, &metricsql.NumberExpr{N: float64(windowArg)}, &metricsql.NumberExpr{N: float64(step.Milliseconds())}, &metricsql.NumberExpr{N: float64(lookback.Milliseconds())}, &metricsql.NumberExpr{N: instant})
 			}
 		}
-	})
-	if rewriteErr != nil {
-		return "", rewriteErr
+		return r.rewriteArgs(e.Args, step, instant)
 	}
-	return string(expr.AppendString(nil)), nil
+	argIndex := metricsql.GetRollupArgIdx(e)
+	if argIndex < 0 || argIndex >= len(e.Args) {
+		return r.rewriteArgs(e.Args, step, instant)
+	}
+	for i, arg := range e.Args {
+		if i == argIndex {
+			continue
+		}
+		if err := r.rewrite(arg, step, instant); err != nil {
+			return err
+		}
+	}
+	roll, ok := e.Args[argIndex].(*metricsql.RollupExpr)
+	if !ok {
+		roll = &metricsql.RollupExpr{Expr: e.Args[argIndex]}
+		e.Args[argIndex] = roll
+	}
+	implicit := roll.Window == nil
+	if implicit {
+		roll.Window = metricsQLDuration(step)
+	}
+	if _, raw := roll.Expr.(*metricsql.MetricExpr); !raw && roll.Step == nil {
+		roll.Step = metricsQLDuration(step)
+	}
+	childStep, err := r.resolveRollupDurations(roll, step)
+	if err != nil {
+		return err
+	}
+	window := time.Duration(roll.Window.Duration(step.Milliseconds())) * time.Millisecond
+	if window <= 0 {
+		return fmt.Errorf("the query window must be at least 1ms")
+	}
+	if err := r.rewrite(roll.Expr, childStep, false); err != nil {
+		return err
+	}
+	if e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
+		return nil
+	}
+	if len(e.Args) != 1 || e.KeepMetricNames {
+		return fmt.Errorf("%s requires one series argument; keep_metric_names is not supported", e.Name)
+	}
+	if window > time.Duration(math.MaxInt64)-r.lookback {
+		return fmt.Errorf("the query window is too large")
+	}
+	switch {
+	case e.Name == "default_rollup" && instant && implicit:
+		// A bare selector in an instant query reads only the lookback window.
+		roll.Window = metricsQLDuration(r.lookback)
+	default:
+		// Fetch history before the window for the previous sample and
+		// the sample interval. Explicit windows keep their original size.
+		roll.Window = metricsQLDuration(window + r.lookback)
+	}
+	windowArg := window.Milliseconds()
+	if implicit && (e.Name == "rate" || e.Name == "default_rollup") {
+		windowArg = 0
+	}
+	instantArg := 0.0
+	if instant {
+		instantArg = 1
+	}
+	e.Name = metricsQLInternalPrefix + e.Name
+	e.Args = append(e.Args,
+		&metricsql.NumberExpr{N: float64(windowArg)},
+		&metricsql.NumberExpr{N: float64(step.Milliseconds())},
+		&metricsql.NumberExpr{N: float64(r.lookback.Milliseconds())},
+		&metricsql.NumberExpr{N: instantArg},
+	)
+	return nil
+}
+
+// resolveRollupDurations replaces step-relative durations with milliseconds
+// and returns the step for the expression inside the rollup.
+func (r metricsQLRewriter) resolveRollupDurations(e *metricsql.RollupExpr, step time.Duration) (time.Duration, error) {
+	var err error
+	if e.Window, err = resolveMetricsQLDuration(e.Window, step); err != nil {
+		return 0, err
+	}
+	if e.Step, err = resolveMetricsQLDuration(e.Step, step); err != nil {
+		return 0, err
+	}
+	if e.Offset, err = resolveMetricsQLDuration(e.Offset, step); err != nil {
+		return 0, err
+	}
+	if e.Step == nil {
+		return step, nil
+	}
+	childStep := time.Duration(e.Step.Duration(step.Milliseconds())) * time.Millisecond
+	if childStep < time.Millisecond {
+		return 0, fmt.Errorf("the subquery step must be at least 1ms")
+	}
+	return childStep, nil
 }
 
 func metricsQLDuration(d time.Duration) *metricsql.DurationExpr {
@@ -207,11 +353,15 @@ func metricsQLDuration(d time.Duration) *metricsql.DurationExpr {
 	return e.(*metricsql.RollupExpr).Offset
 }
 
-func resolveMetricsQLDuration(d *metricsql.DurationExpr, step time.Duration) *metricsql.DurationExpr {
+func resolveMetricsQLDuration(d *metricsql.DurationExpr, step time.Duration) (*metricsql.DurationExpr, error) {
 	if d == nil {
-		return nil
+		return nil, nil
 	}
-	return metricsQLDuration(time.Duration(d.Duration(step.Milliseconds())) * time.Millisecond)
+	millis := d.Duration(step.Milliseconds())
+	if millis > math.MaxInt64/int64(time.Millisecond) || millis < math.MinInt64/int64(time.Millisecond) {
+		return nil, fmt.Errorf("the query duration is too large")
+	}
+	return metricsQLDuration(time.Duration(millis) * time.Millisecond), nil
 }
 
 func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.FunctionCall {
@@ -221,16 +371,22 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 		window := int64(vectors[0][0].F)
 		step := int64(vectors[1][0].F)
 		lookback := int64(vectors[2][0].F)
+		instant := vectors[3][0].F != 0
 		points := matrix[0].Floats
 		maxPrev := step
-		if vectors[3][0].F == 0 {
+		if !instant {
 			maxPrev = metricsQLSampleInterval(points, step)
 		}
 		maxPrev = min(maxPrev, lookback)
 		if window == 0 {
-			window = max(step, maxPrev)
-			if name == "default_rollup" {
-				window = min(window, lookback)
+			switch {
+			case name != "default_rollup":
+				window = max(step, maxPrev)
+			case instant:
+				// A bare selector in an instant query keeps the Prometheus lookback.
+				window = lookback
+			default:
+				window = min(max(step, maxPrev), lookback)
 			}
 		}
 		end := enh.Ts - vs.Offset.Milliseconds()
@@ -238,38 +394,66 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 			end = *vs.Timestamp - vs.OriginalOffset.Milliseconds()
 		}
 		start := end - window
-		first := sort.Search(len(points), func(i int) bool { return points[i].T > start })
+		series := seriesAfter(matrix[0], start)
 		if name == "default_rollup" {
-			series := matrix[0]
-			series.Floats = points[first:]
-			h := series.Histograms
-			series.Histograms = h[sort.Search(len(h), func(i int) bool { return h[i].T > start }):]
-			if len(series.Floats)+len(series.Histograms) == 0 {
+			if len(series.Floats)+len(series.Histograms) == 0 || endsWithStaleMarker(series) {
 				return enh.Out, nil
-			}
-			if len(series.Floats) > 0 && math.IsNaN(series.Floats[len(series.Floats)-1].F) {
-				if len(series.Histograms) == 0 || series.Histograms[len(series.Histograms)-1].T < series.Floats[len(series.Floats)-1].T {
-					return enh.Out, nil
-				}
 			}
 			return histogramFallback(nil, promql.Matrix{series}, args[:1], enh)
 		}
-		if len(matrix[0].Histograms) > 0 {
+		if len(series.Histograms) > 0 {
 			// Native histograms retain the existing Prometheus calculations.
 			copySelector := *ms
 			copySelector.Range = time.Duration(window) * time.Millisecond
-			copySeries := matrix[0]
-			copySeries.Floats = points[first:]
-			h := copySeries.Histograms
-			copySeries.Histograms = h[sort.Search(len(h), func(i int) bool { return h[i].T > start }):]
-			return histogramFallback(nil, promql.Matrix{copySeries}, parser.Expressions{&copySelector}, enh)
+			return histogramFallback(nil, promql.Matrix{series}, parser.Expressions{&copySelector}, enh)
 		}
+		first := len(points) - len(series.Floats)
 		value := metricsQLCounterValue(name, points, first, start, maxPrev, lookback)
 		if math.IsNaN(value) {
 			return enh.Out, nil
 		}
 		return append(enh.Out, promql.Sample{F: value}), nil
 	}
+}
+
+// seriesAfter keeps the points after start. Range windows are left-open.
+func seriesAfter(series promql.Series, start int64) promql.Series {
+	floats := series.Floats
+	series.Floats = floats[sort.Search(len(floats), func(i int) bool { return floats[i].T > start }):]
+	histograms := series.Histograms
+	series.Histograms = histograms[sort.Search(len(histograms), func(i int) bool { return histograms[i].T > start }):]
+	return series
+}
+
+// endsWithStaleMarker reports whether the latest point is a stale marker,
+// which the storage adapter delivers as NaN.
+func endsWithStaleMarker(series promql.Series) bool {
+	if len(series.Floats) == 0 {
+		return false
+	}
+	last := series.Floats[len(series.Floats)-1]
+	if !math.IsNaN(last.F) {
+		return false
+	}
+	return len(series.Histograms) == 0 || series.Histograms[len(series.Histograms)-1].T < last.T
+}
+
+// seriesWithoutNaN removes NaN points. It copies the points only when needed
+// because the input can alias an engine buffer.
+func seriesWithoutNaN(series promql.Series) promql.Series {
+	first := slices.IndexFunc(series.Floats, func(p promql.FPoint) bool { return math.IsNaN(p.F) })
+	if first < 0 {
+		return series
+	}
+	points := make([]promql.FPoint, 0, len(series.Floats)-1)
+	points = append(points, series.Floats[:first]...)
+	for _, p := range series.Floats[first+1:] {
+		if !math.IsNaN(p.F) {
+			points = append(points, p)
+		}
+	}
+	series.Floats = points
+	return series
 }
 
 // VictoriaMetrics estimates the sample interval with the 0.6 quantile of the
@@ -279,11 +463,12 @@ func metricsQLSampleInterval(points []promql.FPoint, fallback int64) int64 {
 	if len(points) < 2 {
 		return fallback
 	}
-	intervals := make([]int64, 0, 20)
+	var buf [20]int64
+	intervals := buf[:0]
 	for i := max(1, len(points)-20); i < len(points); i++ {
 		intervals = append(intervals, points[i].T-points[i-1].T)
 	}
-	sort.Slice(intervals, func(i, j int) bool { return intervals[i] < intervals[j] })
+	slices.Sort(intervals)
 	position := 0.6 * float64(len(intervals)-1)
 	index := int(position)
 	interval := intervals[index]
@@ -359,12 +544,18 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 		}
 	}
 	if isRate {
-		value /= float64(points[len(points)-1].T-points[begin].T) / 1000
+		seconds := float64(points[len(points)-1].T-points[begin].T) / 1000
+		if seconds <= 0 {
+			return math.NaN()
+		}
+		value /= seconds
 	}
 	return value
 }
 
 // MetricsQL returns numeric constants as vectors and removes NaN output points.
+// The result never aliases the input slices: the engine returns the input
+// matrix to its buffer pools when the query closes.
 func metricsQLValue(value parser.Value) parser.Value {
 	switch v := value.(type) {
 	case promql.Scalar:
@@ -373,7 +564,7 @@ func metricsQLValue(value parser.Value) parser.Value {
 		}
 		return promql.Vector{{T: v.T, F: v.V}}
 	case promql.Vector:
-		out := v[:0]
+		out := make(promql.Vector, 0, len(v))
 		for _, p := range v {
 			if p.H != nil || !math.IsNaN(p.F) {
 				out = append(out, p)
@@ -381,16 +572,10 @@ func metricsQLValue(value parser.Value) parser.Value {
 		}
 		return out
 	case promql.Matrix:
-		out := v[:0]
+		out := make(promql.Matrix, 0, len(v))
 		for _, series := range v {
-			points := series.Floats[:0]
-			for _, p := range series.Floats {
-				if !math.IsNaN(p.F) {
-					points = append(points, p)
-				}
-			}
-			series.Floats = points
-			if len(points)+len(series.Histograms) > 0 {
+			series = seriesWithoutNaN(series)
+			if len(series.Floats)+len(series.Histograms) > 0 {
 				out = append(out, series)
 			}
 		}
@@ -400,14 +585,27 @@ func metricsQLValue(value parser.Value) parser.Value {
 	}
 }
 
-// The write interval cannot guarantee sample times for external writers.
-// Disable query optimizations that require samples at exact interval boundaries.
-func (s *Server) metricsQLServer() *Server {
-	copy := *s
-	copy.cfg.RemoteWriteInterval = 0
-	copy.queryable = NewCHQueryable(s.client, copy.cfg)
-	copy.queryable.preserveRollupStaleness = true
-	return &copy
+// metricsQLRunningSum replaces each float point with the sum of the points
+// at or before it. Histogram points are not summed and are dropped.
+func metricsQLRunningSum(value parser.Value) parser.Value {
+	matrix, ok := value.(promql.Matrix)
+	if !ok {
+		return value
+	}
+	out := make(promql.Matrix, 0, len(matrix))
+	for _, series := range matrix {
+		if len(series.Floats) == 0 {
+			continue
+		}
+		points := make([]promql.FPoint, len(series.Floats))
+		var sum float64
+		for i, p := range series.Floats {
+			sum += p.F
+			points[i] = promql.FPoint{T: p.T, F: sum}
+		}
+		out = append(out, promql.Series{Metric: series.Metric, Floats: points, DropName: series.DropName})
+	}
+	return out
 }
 
 // Raw selectors are rollup inputs. Selectors in vector expressions use
@@ -425,18 +623,20 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 			e.Expr = metricsQLDefaultSelectors(e.Expr)
 		}
 	case *metricsql.FuncExpr:
-		if metricsql.IsRollupFunc(e.Name) {
+		if !metricsql.IsRollupFunc(e.Name) && !metricsQLSelectorFunctions[e.Name] {
 			for i, arg := range e.Args {
-				if r, ok := arg.(*metricsql.RollupExpr); ok {
-					if _, raw := r.Expr.(*metricsql.MetricExpr); !raw {
-						r.Expr = metricsQLDefaultSelectors(r.Expr)
-					}
-				} else if _, raw := arg.(*metricsql.MetricExpr); !raw {
-					e.Args[i] = metricsQLDefaultSelectors(arg)
-				}
+				e.Args[i] = metricsQLDefaultSelectors(arg)
 			}
-		} else if e.Name != "timestamp" {
-			for i, arg := range e.Args {
+			return expr
+		}
+		for i, arg := range e.Args {
+			switch a := arg.(type) {
+			case *metricsql.MetricExpr:
+			case *metricsql.RollupExpr:
+				if _, raw := a.Expr.(*metricsql.MetricExpr); !raw {
+					a.Expr = metricsQLDefaultSelectors(a.Expr)
+				}
+			default:
 				e.Args[i] = metricsQLDefaultSelectors(arg)
 			}
 		}
@@ -449,4 +649,84 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 		e.Right = metricsQLDefaultSelectors(e.Right)
 	}
 	return expr
+}
+
+// unwrapInstantDefaultRollups replaces the internal default_rollup calls of an
+// instant query with their selectors. Both read the latest non-stale sample in
+// the lookback window, so the SQL fast paths stay exact. Other internal
+// functions need the evaluation engine, so the expression is rejected.
+func unwrapInstantDefaultRollups(expr parser.Expr) (parser.Expr, bool) {
+	switch e := expr.(type) {
+	case *parser.Call:
+		if e.Func != nil && e.Func.Name == metricsQLDefaultRollupName && len(e.Args) == 5 {
+			matrix, ok := e.Args[0].(*parser.MatrixSelector)
+			if !ok {
+				return nil, false
+			}
+			selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
+			instant, isNumber := e.Args[4].(*parser.NumberLiteral)
+			if !ok || !isNumber || instant.Val != 1 {
+				return nil, false
+			}
+			return selector, true
+		}
+		if e.Func != nil && strings.HasPrefix(e.Func.Name, metricsQLInternalPrefix) {
+			return nil, false
+		}
+		for i, arg := range e.Args {
+			unwrapped, ok := unwrapInstantDefaultRollups(arg)
+			if !ok {
+				return nil, false
+			}
+			e.Args[i] = unwrapped
+		}
+	case *parser.AggregateExpr:
+		inner, ok := unwrapInstantDefaultRollups(e.Expr)
+		if !ok {
+			return nil, false
+		}
+		e.Expr = inner
+		if e.Param != nil {
+			param, ok := unwrapInstantDefaultRollups(e.Param)
+			if !ok {
+				return nil, false
+			}
+			e.Param = param
+		}
+	case *parser.BinaryExpr:
+		lhs, ok := unwrapInstantDefaultRollups(e.LHS)
+		if !ok {
+			return nil, false
+		}
+		rhs, ok := unwrapInstantDefaultRollups(e.RHS)
+		if !ok {
+			return nil, false
+		}
+		e.LHS, e.RHS = lhs, rhs
+	case *parser.ParenExpr:
+		inner, ok := unwrapInstantDefaultRollups(e.Expr)
+		if !ok {
+			return nil, false
+		}
+		e.Expr = inner
+	case *parser.UnaryExpr:
+		inner, ok := unwrapInstantDefaultRollups(e.Expr)
+		if !ok {
+			return nil, false
+		}
+		e.Expr = inner
+	case *parser.SubqueryExpr:
+		inner, ok := unwrapInstantDefaultRollups(e.Expr)
+		if !ok {
+			return nil, false
+		}
+		e.Expr = inner
+	case *parser.StepInvariantExpr:
+		inner, ok := unwrapInstantDefaultRollups(e.Expr)
+		if !ok {
+			return nil, false
+		}
+		e.Expr = inner
+	}
+	return expr, true
 }

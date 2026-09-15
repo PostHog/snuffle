@@ -578,10 +578,6 @@ func serviceNameFromRemoteWriteLabels(input []remoteWriteLabel) string {
 	return ""
 }
 
-func bucketTimestampMS(timestamp int64, interval time.Duration) int64 {
-	return bucketTimestampForStepMS(timestamp, interval.Milliseconds())
-}
-
 func bucketTimestampForStepMS(timestamp, step int64) int64 {
 	if step <= 0 {
 		return timestamp
