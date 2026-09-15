@@ -128,6 +128,145 @@ func TestEndToEndClickHouse(t *testing.T) {
 	if !cfg.postHogSchemaLayout() {
 		assertRemoteReadHistograms(t, api.URL)
 	}
+	t.Run("counter query intervals", func(t *testing.T) {
+		assertCounterQueryIntervals(t, cfg, api.URL)
+	})
+}
+
+func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
+	t.Helper()
+	// External writers do not use Snuffle's timestamp buckets.
+	cfg.RemoteWriteInterval = 0
+	mux := http.NewServeMux()
+	newServer(cfg).routes(mux)
+	writer := httptest.NewServer(mux)
+	defer writer.Close()
+
+	const metric = "snuffle_e2e_interval_total"
+	end := time.Unix(1700000400, 0)
+	for _, interval := range []time.Duration{15 * time.Second, time.Minute} {
+		var samples []prompb.Sample
+		for ts := end.Add(-5*time.Minute + 5*time.Second); ts.Before(end); ts = ts.Add(interval) {
+			samples = append(samples, prompb.Sample{
+				Timestamp: ts.UnixMilli(),
+				Value:     100 + ts.Sub(end.Add(-5*time.Minute+5*time.Second)).Seconds(),
+			})
+		}
+		postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+			Labels: []prompb.Label{
+				{Name: "__name__", Value: metric},
+				{Name: "interval", Value: interval.String()},
+			},
+			Samples: samples,
+		}}})
+	}
+	postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: metric},
+			{Name: "interval", Value: "reset"},
+		},
+		Samples: []prompb.Sample{
+			{Timestamp: end.Add(-5 * time.Minute).UnixMilli(), Value: 900},
+			{Timestamp: end.Add(-4 * time.Minute).UnixMilli(), Value: 100},
+			{Timestamp: end.Add(-3 * time.Minute).UnixMilli(), Value: 160},
+			{Timestamp: end.Add(-2 * time.Minute).UnixMilli(), Value: 10},
+			{Timestamp: end.Add(-time.Minute).UnixMilli(), Value: 70},
+			{Timestamp: end.UnixMilli(), Value: 130},
+		},
+	}}})
+
+	postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{{Name: "__name__", Value: metric + "_stale"}},
+		Samples: []prompb.Sample{
+			{Timestamp: end.Add(-15 * time.Second).UnixMilli(), Value: 100},
+			{Timestamp: end.UnixMilli(), Value: math.Float64frombits(0x7ff0000000000002)},
+		},
+	}}})
+
+	// These counter results match VictoriaMetrics v1.152.0.
+	for _, tc := range []struct {
+		query string
+		value string
+		// rangePoints is the expected number of range points when not zero.
+		rangePoints int
+	}{
+		{query: metric + "_stale"},
+		// The automatic window ends the series before the second step.
+		{query: metric + `{interval="1m0s"}`, value: "340", rangePoints: 1},
+		{query: `sum(` + metric + `{interval="1m0s"})`, value: "340"},
+		{query: `topk(1, ` + metric + `{interval="1m0s"})`, value: "340"},
+		{query: `count(count by (interval) (` + metric + `))`, value: "3"},
+		{query: `timestamp(` + metric + `{interval="1m0s"})`, value: "1700000345", rangePoints: 2},
+		{query: `absent(` + metric + `{interval="none"})`, value: "1", rangePoints: 2},
+		{query: `increase(` + metric + `{interval="15s"}[1m])`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m])`, value: "60", rangePoints: 1},
+		{query: `increase(` + metric + `{interval="1m0s"}[5m])`, value: "340"},
+		{query: `sum(increase(` + metric + `{interval="1m0s"}[5m]))`, value: "340"},
+		{query: `increase(` + metric + `{interval="reset"}[5m])`, value: "290"},
+		{query: `sum(increase(` + metric + `{interval="reset"}[5m]))`, value: "290"},
+		{query: `increase(` + metric + `{interval="1m0s"})`, value: "60"},
+		{query: `rate(` + metric + `{interval="1m0s"})`, value: "1"},
+		{query: `rate(` + metric + `{interval="1m0s"}[1m])`, value: "1"},
+		{query: `irate(` + metric + `{interval="1m0s"}[1m])`, value: "1"},
+		{query: `delta(` + metric + `{interval="1m0s"}[1m])`, value: "60"},
+		{query: `idelta(` + metric + `{interval="1m0s"}[1m])`, value: "60"},
+		{query: `WITH (m = ` + metric + `{interval="1m0s"}) sum(rate(m))`, value: "1"},
+		{query: `increase(` + metric + `{interval="1m0s"}[60])`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[4i])`, value: "240"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset 1m)`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset 0m)`, value: "60"},
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] offset -1m)`},
+		// The @ modifier keeps the evaluation time fixed at every step.
+		{query: `increase(` + metric + `{interval="1m0s"}[1m] @ 1700000400)`, value: "60", rangePoints: 2},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			for _, path := range []string{"/api/v1/query", "/api/v1/query_range"} {
+				params := url.Values{"query": {tc.query}, "time": {"1700000400"}, "step": {"1m"}}
+				resultType := "vector"
+				if path == "/api/v1/query_range" {
+					params.Set("start", "1700000400")
+					params.Set("end", "1700000460")
+					params.Set("step", "1m")
+					resultType = "matrix"
+				}
+				data := apiGet[queryDataDTO](t, baseURL, path, params)
+				if data.ResultType != resultType {
+					t.Fatalf("%s result type = %s, want %s", path, data.ResultType, resultType)
+				}
+				if tc.value == "" {
+					if len(data.Result) != 0 {
+						t.Errorf("%s returned %v with fewer than two samples", path, data.Result)
+					}
+					continue
+				}
+				if len(data.Result) != 1 {
+					t.Errorf("%s returned %d series, want 1", path, len(data.Result))
+					continue
+				}
+				point := data.Result[0].Value
+				if path == "/api/v1/query_range" {
+					if len(data.Result[0].Values) == 0 {
+						t.Errorf("%s returned no points", path)
+						continue
+					}
+					if tc.rangePoints > 0 && len(data.Result[0].Values) != tc.rangePoints {
+						t.Errorf("%s returned %d points, want %d", path, len(data.Result[0].Values), tc.rangePoints)
+					}
+					point = data.Result[0].Values[0]
+					// Check the result when this expression is part of a binary operation.
+					params.Set("query", tc.query+" + 0")
+					engine := apiGet[queryDataDTO](t, baseURL, path, params)
+					if len(engine.Result) != 1 {
+						t.Fatalf("the binary expression returned %d series, want 1", len(engine.Result))
+					}
+					assertSameSampleValues(t, tc.query, data.Result[0].Values, engine.Result[0].Values)
+				}
+				if got := sampleString(point); got != tc.value {
+					t.Errorf("%s value = %s, want %s", path, got, tc.value)
+				}
+			}
+		})
+	}
 }
 
 func waitForClickHouse(t *testing.T, ctx context.Context, client *ClickHouseClient) {

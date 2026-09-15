@@ -311,6 +311,18 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	step, err := parseStepDefault(r.Form.Get("step"), s.cfg.LookbackDelta)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+	prepared, err := prepareMetricsQLQuery(query, step, s.cfg.LookbackDelta, ts, ts)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+	query = prepared.query
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
@@ -346,9 +358,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
-	series, samples, histograms := valueStats(result.Value)
+	value := metricsQLValue(result.Value)
+	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccess(w, responseDataFromValue(result.Value))
+	writeAPISuccess(w, responseDataFromValue(value))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -390,26 +403,20 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	prepared, err := prepareMetricsQLQuery(query, step, s.cfg.LookbackDelta, start, end)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+	query = prepared.query
+
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
+	// Range queries use the evaluation engine. Automatic selector windows depend
+	// on the sample interval of each series, and counter rollups use MetricsQL
+	// calculations. SQL grids cannot reproduce either.
 	queryStarted := time.Now()
-	recordQueryLogBackend(w, "fastpath")
-	if data, ok, err := s.tryFastRangeQuery(ctx, query, start, end, step); ok {
-		status := "ok"
-		if err != nil {
-			status = "error"
-			s.metrics.observePromQLQuery("range", "fastpath", status, time.Since(queryStarted), 0, 0, 0)
-			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
-			return
-		}
-		series, samples, histograms := queryDataStats(data)
-		s.metrics.observePromQLQuery("range", "fastpath", status, time.Since(queryStarted), series, samples, histograms)
-		writeAPISuccess(w, data)
-		return
-	}
-
-	queryStarted = time.Now()
 	recordQueryLogBackend(w, "prometheus")
 	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {
@@ -425,9 +432,13 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
-	series, samples, histograms := valueStats(result.Value)
+	value := metricsQLValue(result.Value)
+	if prepared.runningSum {
+		value = metricsQLRunningSum(value)
+	}
+	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccess(w, responseDataFromValue(result.Value))
+	writeAPISuccess(w, responseDataFromValue(value))
 }
 
 func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {

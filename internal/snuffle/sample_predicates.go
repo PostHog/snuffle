@@ -1,13 +1,10 @@
 package snuffle
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
-
-const sampleTimestampBucketMillis = int64(10 * 60 * 1000)
 
 func sampleBaseFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
 	filters := []string{teamFilter(cfg)}
@@ -34,18 +31,6 @@ func sampleTimeFilters(cfg Config, mint, maxt int64) []string {
 		)
 	}
 	return filters
-}
-
-func sampleStepBucketFilters(cfg Config, startMillis, stepMillis, steps int64) []string {
-	if cfg.postHogSchemaLayout() || steps <= 0 || stepMillis < sampleTimestampBucketMillis {
-		return nil
-	}
-	return []string{fmt.Sprintf(
-		"toStartOfTenMinutes(timestamp) IN (SELECT toStartOfTenMinutes(fromUnixTimestamp64Milli(toInt64(%d) + toInt64(number) * %d, 'UTC')) FROM numbers(toUInt64(%d)))",
-		startMillis,
-		stepMillis,
-		steps,
-	)}
 }
 
 func postHogServiceNameFilters(cfg Config, matchers []*labels.Matcher) []string {
@@ -106,20 +91,6 @@ func stringColumnMatcherCondition(column string, matcher *labels.Matcher) (strin
 
 func sampleSelectedSeriesFilters(cfg Config) []string {
 	return sampleIDMembershipFilters(cfg, "IN", "SELECT id FROM selected_series")
-}
-
-// sampleSelectedSeriesFiltersFromMatchers prunes a sample scan to the selected
-// series without naming the selected_series CTE. ClickHouse inlines CTEs rather
-// than materialising them, so referencing it from the sample scan runs the whole
-// series lookup a second time -- which costs more than the scan it saves. The
-// label index answers the same question on its own, off a single key prefix.
-func sampleSelectedSeriesFiltersFromMatchers(cfg Config, matchers []*labels.Matcher) []string {
-	if metric := exactMetricName(matchers); metric != "" && cfg.LabelIndexTable != "" {
-		if filters, ok := nonMetricSampleIDFiltersFromMatchers(cfg, metric, matchers); ok {
-			return filters
-		}
-	}
-	return sampleSelectedSeriesFilters(cfg)
 }
 
 func sampleExplicitIDFilters(cfg Config, ids []uint64) []string {

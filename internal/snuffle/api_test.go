@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"compress/gzip"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -187,5 +188,37 @@ func TestSortedSeriesJSONRowsOrdersByPrometheusLabels(t *testing.T) {
 	got := sortedSeriesJSONRows(seen)
 	if len(got) != 2 || got[0].labels != `{"__name__":"up","job":"api"}` || got[1].labels != `{"__name__":"up","job":"worker"}` {
 		t.Fatalf("sortedSeriesJSONRows = %#v", got)
+	}
+}
+
+func TestMetricsQLNumericResponses(t *testing.T) {
+	mux := http.NewServeMux()
+	newServer(ConfigFromEnv()).routes(mux)
+	for _, tc := range []struct {
+		path, resultType, value string
+		count                   int
+	}{
+		{path: "/api/v1/query?query=1%2B2&time=1700000400", resultType: "vector", value: "3", count: 1},
+		{path: "/api/v1/query?query=sqrt(-1)&time=1700000400", resultType: "vector"},
+		{path: "/api/v1/query_range?query=sqrt(-1)&start=1700000400&end=1700000460&step=1m", resultType: "matrix"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
+			}
+			var response apiResponseDTO[queryDataDTO]
+			if err := json.Unmarshal(rec.Body.Bytes(), &response); err != nil {
+				t.Fatal(err)
+			}
+			data := response.Data
+			if data.ResultType != tc.resultType || len(data.Result) != tc.count {
+				t.Fatalf("unexpected data: %#v", data)
+			}
+			if tc.count > 0 && sampleString(data.Result[0].Value) != tc.value {
+				t.Fatalf("unexpected value: %#v", data)
+			}
+		})
 	}
 }

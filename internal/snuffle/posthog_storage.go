@@ -161,9 +161,6 @@ func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, match
 
 func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
 	plan := newPostHogQueryPlan(cfg, matchers, nil, mint, maxt, true)
-	if latestOnly && postHogExactSampleTimestamp(cfg, maxt) {
-		plan.mint = maxt
-	}
 	var perSeries string
 	if latestOnly {
 		perSeries = fmt.Sprintf(
@@ -234,10 +231,6 @@ func postHogSampleFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int
 		}
 	}
 	return filters
-}
-
-func postHogExactSampleTimestamp(cfg Config, ts int64) bool {
-	return cfg.RemoteWriteInterval > 0 && bucketTimestampMS(ts, cfg.RemoteWriteInterval) == ts
 }
 
 func postHogMatcherCanSkip(matcher *labels.Matcher) bool {
@@ -421,20 +414,6 @@ func (p *postHogQueryPlan) perSeriesGroupSelects() []string {
 	return selects
 }
 
-// rowGroupSelects returns the grouping labels a raw samples projection must
-// carry when no series lookup runs.
-func (p *postHogQueryPlan) rowGroupSelects() []string {
-	if p.useSeries {
-		return nil
-	}
-	selects := make([]string, 0, len(p.grouping))
-	for i, name := range p.grouping {
-		expr, _ := postHogSampleLabelExpr(name)
-		selects = append(selects, expr+" AS "+quoteIdent(groupAlias(i)))
-	}
-	return selects
-}
-
 func (p *postHogQueryPlan) groupAliases() []string {
 	aliases := make([]string, 0, len(p.grouping))
 	for i := range p.grouping {
@@ -581,20 +560,5 @@ func postHogSelectedSeriesWhereSQL(cfg Config, where []string, limit int, extraS
 		postHogSeriesTable(cfg),
 		strings.Join(where, " AND "),
 		sqlLimit(limit),
-	)
-}
-
-// postHogSampleRowsSQL projects raw sample rows with their fingerprint as
-// series_id, the requested columns, and grouping labels when the plan reads
-// them from the samples table.
-func postHogSampleRowsSQL(cfg Config, plan *postHogQueryPlan, columns []string, where []string) string {
-	selects := []string{"series_fingerprint AS series_id"}
-	selects = append(selects, columns...)
-	selects = append(selects, plan.rowGroupSelects()...)
-	return fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s",
-		strings.Join(selects, ", "),
-		postHogSamplesTable(cfg),
-		strings.Join(where, " AND "),
 	)
 }

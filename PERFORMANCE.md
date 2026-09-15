@@ -425,10 +425,12 @@ Implemented storage optimizations:
   bitmap intersections
 - exact Prometheus matcher semantics are preserved by a final Go-side matcher
   filter
-- instant aggregate/topk paths read the exact remote-write bucket when
-  `REMOTE_WRITE_SAMPLE_INTERVAL` is configured, avoiding a full lookback scan
-- exact-step range aggregates over raw selectors aggregate directly from
-  samples when the query range is aligned to `REMOTE_WRITE_SAMPLE_INTERVAL`
+- instant aggregates, topk, and nested counts over bare selectors read the
+  lookback window in SQL; samples can arrive outside Snuffle's remote-write
+  timestamp buckets, so no read path depends on `REMOTE_WRITE_SAMPLE_INTERVAL`
+- range queries and counter rollups use the Prometheus engine: automatic
+  selector windows depend on the sample interval of each series, and counter
+  rollups use MetricsQL calculations
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
