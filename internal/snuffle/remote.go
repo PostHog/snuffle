@@ -694,6 +694,7 @@ func (s *Server) insertMissingRemoteSeriesRows(ctx context.Context, batch remote
 	if err := s.insertRemoteSeriesRows(ctx, newRows); err != nil {
 		return 0, remoteWritePhaseError("insert series", s.cfg.SeriesTable, len(newRows), s.cfg.CHTimeout, batchSummary, started, err)
 	}
+	s.cacheKnownSeriesRows(newRows)
 	return len(newRows), nil
 }
 
@@ -739,6 +740,7 @@ func populateSeriesLabelsJSON(rows []remoteWriteSeriesRow) error {
 }
 
 func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeriesRow) ([]remoteWriteSeriesRow, error) {
+	rows = s.filterCachedSeriesRows(rows)
 	if len(rows) == 0 {
 		return nil, nil
 	}
@@ -758,6 +760,11 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 	}); err != nil {
 		return nil, err
 	}
+	if s.knownSeries != nil {
+		for id := range known {
+			s.knownSeries.Store(remoteWriteSeriesKey{TeamID: s.cfg.TeamID, ID: id}, struct{}{})
+		}
+	}
 	if len(known) == 0 {
 		return rows, nil
 	}
@@ -774,6 +781,33 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 	return newRows, nil
 }
 
+type remoteWriteSeriesKey struct {
+	TeamID uint64
+	ID     uint64
+}
+
+func (s *Server) filterCachedSeriesRows(rows []remoteWriteSeriesRow) []remoteWriteSeriesRow {
+	if s.knownSeries == nil {
+		return rows
+	}
+	uncached := rows[:0]
+	for _, row := range rows {
+		if _, ok := s.knownSeries.Load(remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}); !ok {
+			uncached = append(uncached, row)
+		}
+	}
+	return uncached
+}
+
+func (s *Server) cacheKnownSeriesRows(rows []remoteWriteSeriesRow) {
+	if s.knownSeries == nil {
+		return
+	}
+	for _, row := range rows {
+		s.knownSeries.Store(remoteWriteSeriesKey{TeamID: row.TeamID, ID: row.ID}, struct{}{})
+	}
+}
+
 // knownSeriesIDsSQL reports which of this batch's series already exist.
 //
 // Asking the inverse -- which batch ids are NOT IN (SELECT id FROM series) --
@@ -784,7 +818,7 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 // result, which costs one map lookup per row.
 func knownSeriesIDsSQL(cfg Config, lookupTable string) string {
 	return fmt.Sprintf(
-		"SELECT id FROM %s WHERE team_id = %d AND id IN (SELECT id FROM %s) SETTINGS optimize_use_projections = 1",
+		"SELECT id FROM %s WHERE team_id = %d AND id IN (SELECT id FROM %s)",
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		cfg.TeamID,
 		quoteIdent(lookupTable),

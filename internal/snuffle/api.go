@@ -29,7 +29,9 @@ type Server struct {
 	engine    *promql.Engine
 	parser    parser.Parser
 	seriesMu  *sync.Mutex
-	metrics   *bridgeMetrics
+	// ponytail: exact cache grows for the process lifetime; bound it if series churn makes memory material.
+	knownSeries *sync.Map
+	metrics     *bridgeMetrics
 }
 
 func Run(cfg Config) error {
@@ -83,13 +85,14 @@ func newServer(cfg Config) *Server {
 	})
 
 	return &Server{
-		cfg:       cfg,
-		client:    client,
-		queryable: queryable,
-		engine:    engine,
-		parser:    parser.NewParser(parser.Options{}),
-		seriesMu:  &sync.Mutex{},
-		metrics:   metrics,
+		cfg:         cfg,
+		client:      client,
+		queryable:   queryable,
+		engine:      engine,
+		parser:      parser.NewParser(parser.Options{}),
+		seriesMu:    &sync.Mutex{},
+		knownSeries: &sync.Map{},
+		metrics:     metrics,
 	}
 }
 
@@ -258,13 +261,14 @@ func (s *Server) withTeamID(teamID uint64) *Server {
 	cfg := s.cfg
 	cfg.TeamID = teamID
 	return &Server{
-		cfg:       cfg,
-		client:    s.client,
-		queryable: NewCHQueryable(s.client, cfg),
-		engine:    s.engine,
-		parser:    s.parser,
-		seriesMu:  s.seriesMu,
-		metrics:   s.metrics,
+		cfg:         cfg,
+		client:      s.client,
+		queryable:   NewCHQueryable(s.client, cfg),
+		engine:      s.engine,
+		parser:      s.parser,
+		seriesMu:    s.seriesMu,
+		knownSeries: s.knownSeries,
+		metrics:     s.metrics,
 	}
 }
 

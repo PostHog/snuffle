@@ -305,7 +305,6 @@ func TestKnownSeriesIDsSQLDrivesLookupFromTheBatch(t *testing.T) {
 		"`default`.`series`",
 		"team_id = 42",
 		"id IN (SELECT id FROM `remote_write_series_ids`)",
-		"SETTINGS optimize_use_projections = 1",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
@@ -315,6 +314,24 @@ func TestKnownSeriesIDsSQLDrivesLookupFromTheBatch(t *testing.T) {
 	// batch is what made this cost 2.9s per remote-write request.
 	if strings.Contains(sql, "NOT IN") {
 		t.Fatalf("SQL still scans the full series set: %q", sql)
+	}
+	if strings.Contains(sql, "optimize_use_projections") {
+		t.Fatalf("SQL still overrides projection selection: %q", sql)
+	}
+}
+
+func TestKnownSeriesCacheIsTenantScoped(t *testing.T) {
+	server := newServer(Config{})
+	server.cacheKnownSeriesRows([]remoteWriteSeriesRow{{TeamID: 7, ID: 11}})
+
+	rows := []remoteWriteSeriesRow{
+		{TeamID: 7, ID: 11},
+		{TeamID: 8, ID: 11},
+		{TeamID: 7, ID: 12},
+	}
+	got := server.withTeamID(7).filterCachedSeriesRows(rows)
+	if len(got) != 2 || got[0].TeamID != 8 || got[0].ID != 11 || got[1].TeamID != 7 || got[1].ID != 12 {
+		t.Fatalf("uncached rows = %#v, want team 8/id 11 and team 7/id 12", got)
 	}
 }
 
