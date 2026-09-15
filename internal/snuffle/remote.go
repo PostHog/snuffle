@@ -784,7 +784,7 @@ func (s *Server) filterNewSeriesRows(ctx context.Context, rows []remoteWriteSeri
 // result, which costs one map lookup per row.
 func knownSeriesIDsSQL(cfg Config, lookupTable string) string {
 	return fmt.Sprintf(
-		"SELECT id FROM %s WHERE team_id = %d AND id IN (SELECT id FROM %s)",
+		"SELECT id FROM %s WHERE team_id = %d AND id IN (SELECT id FROM %s) SETTINGS optimize_use_projections = 1",
 		tableName(cfg.CHDatabase, cfg.SeriesTable),
 		cfg.TeamID,
 		quoteIdent(lookupTable),

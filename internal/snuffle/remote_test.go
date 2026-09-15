@@ -305,6 +305,7 @@ func TestKnownSeriesIDsSQLDrivesLookupFromTheBatch(t *testing.T) {
 		"`default`.`series`",
 		"team_id = 42",
 		"id IN (SELECT id FROM `remote_write_series_ids`)",
+		"SETTINGS optimize_use_projections = 1",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
