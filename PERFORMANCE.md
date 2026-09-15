@@ -425,9 +425,11 @@ Implemented storage optimizations:
   bitmap intersections
 - exact Prometheus matcher semantics are preserved by a final Go-side matcher
   filter
-- instant aggregate/topk paths read the exact remote-write bucket when
-  `REMOTE_WRITE_SAMPLE_INTERVAL` is configured, avoiding a full lookback scan
-- exact-step range aggregates over raw selectors aggregate directly from
+- PostHog instant selectors, aggregates, and topk read the lookback window;
+  samples can arrive outside Snuffle's remote-write timestamp buckets
+- PostHog range selectors and aggregates select the latest sample at each
+  evaluation time; nested range counts use the Prometheus engine
+- current-layout exact-step range aggregates over raw selectors aggregate directly from
   samples when the query range is aligned to `REMOTE_WRITE_SAMPLE_INTERVAL`
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity

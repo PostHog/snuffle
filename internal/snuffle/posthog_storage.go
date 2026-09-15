@@ -161,9 +161,6 @@ func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, match
 
 func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
 	plan := newPostHogQueryPlan(cfg, matchers, nil, mint, maxt, true)
-	if latestOnly && postHogExactSampleTimestamp(cfg, maxt) {
-		plan.mint = maxt
-	}
 	var perSeries string
 	if latestOnly {
 		perSeries = fmt.Sprintf(
@@ -234,10 +231,6 @@ func postHogSampleFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int
 		}
 	}
 	return filters
-}
-
-func postHogExactSampleTimestamp(cfg Config, ts int64) bool {
-	return cfg.RemoteWriteInterval > 0 && bucketTimestampMS(ts, cfg.RemoteWriteInterval) == ts
 }
 
 func postHogMatcherCanSkip(matcher *labels.Matcher) bool {

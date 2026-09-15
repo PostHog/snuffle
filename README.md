@@ -264,6 +264,20 @@ PromQL compatibility comes from Prometheus's own parser and evaluation engine,
 not a local grammar clone. The storage layer supports float samples, native
 histograms, exemplars, and metric metadata.
 
+`/api/v1/query` evaluates the expression once, at `time` (default: now).
+A bare metric selector returns an instant vector with one value per series.
+It uses the latest sample within the lookback window (default: five minutes).
+For a time series, use `/api/v1/query_range` with `start`, `end`, and `step`.
+This endpoint returns a matrix with a value at each evaluation time.
+The query step does not change the sample interval or the range inside `[ ]`.
+
+`increase(metric[1m])` needs at least two samples within each one-minute window.
+Prometheus excludes the sample at the window's start.
+With one sample per minute, this expression can return no data.
+Use a wider window, such as `[5m]`, or collect samples more often.
+`increase` handles counter resets and estimates the increase over the full window.
+Its result can differ from the last sample minus the first sample.
+
 ### Loki-compatible API
 
 | Capability | Endpoints |

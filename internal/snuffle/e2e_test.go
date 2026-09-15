@@ -128,6 +128,115 @@ func TestEndToEndClickHouse(t *testing.T) {
 	if !cfg.postHogSchemaLayout() {
 		assertRemoteReadHistograms(t, api.URL)
 	}
+	if cfg.postHogSchemaLayout() {
+		t.Run("counter query intervals", func(t *testing.T) {
+			assertCounterQueryIntervals(t, cfg, api.URL)
+		})
+	}
+}
+
+func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
+	t.Helper()
+	// External writers do not use Snuffle's timestamp buckets.
+	cfg.RemoteWriteInterval = 0
+	mux := http.NewServeMux()
+	newServer(cfg).routes(mux)
+	writer := httptest.NewServer(mux)
+	defer writer.Close()
+
+	const metric = "snuffle_e2e_interval_total"
+	end := time.Unix(1700000400, 0)
+	for _, interval := range []time.Duration{15 * time.Second, time.Minute} {
+		var samples []prompb.Sample
+		for ts := end.Add(-5*time.Minute + 5*time.Second); ts.Before(end); ts = ts.Add(interval) {
+			samples = append(samples, prompb.Sample{
+				Timestamp: ts.UnixMilli(),
+				Value:     100 + ts.Sub(end.Add(-5*time.Minute+5*time.Second)).Seconds(),
+			})
+		}
+		postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+			Labels: []prompb.Label{
+				{Name: "__name__", Value: metric},
+				{Name: "interval", Value: interval.String()},
+			},
+			Samples: samples,
+		}}})
+	}
+	postRemoteWrite(t, writer.URL, &prompb.WriteRequest{Timeseries: []prompb.TimeSeries{{
+		Labels: []prompb.Label{
+			{Name: "__name__", Value: metric},
+			{Name: "interval", Value: "reset"},
+		},
+		Samples: []prompb.Sample{
+			{Timestamp: end.Add(-5 * time.Minute).UnixMilli(), Value: 900},
+			{Timestamp: end.Add(-4 * time.Minute).UnixMilli(), Value: 100},
+			{Timestamp: end.Add(-3 * time.Minute).UnixMilli(), Value: 160},
+			{Timestamp: end.Add(-2 * time.Minute).UnixMilli(), Value: 10},
+			{Timestamp: end.Add(-time.Minute).UnixMilli(), Value: 70},
+			{Timestamp: end.UnixMilli(), Value: 130},
+		},
+	}}})
+
+	for _, tc := range []struct {
+		query string
+		value string
+	}{
+		{metric + `{interval="1m0s"}`, "340"},
+		{`sum(` + metric + `{interval="1m0s"})`, "340"},
+		{`topk(1, ` + metric + `{interval="1m0s"})`, "340"},
+		{`count(count by (interval) (` + metric + `))`, "3"},
+		{`increase(` + metric + `{interval="15s"}[1m])`, "60"},
+		{`increase(` + metric + `{interval="1m0s"}[1m])`, ""},
+		{`increase(` + metric + `{interval="1m0s"}[5m])`, "300"},
+		{`sum(increase(` + metric + `{interval="1m0s"}[5m]))`, "300"},
+		{`increase(` + metric + `{interval="reset"}[5m])`, "237.5"},
+		{`sum(increase(` + metric + `{interval="reset"}[5m]))`, "237.5"},
+	} {
+		t.Run(tc.query, func(t *testing.T) {
+			for _, path := range []string{"/api/v1/query", "/api/v1/query_range"} {
+				params := url.Values{"query": {tc.query}, "time": {"1700000400"}}
+				resultType := "vector"
+				if path == "/api/v1/query_range" {
+					params.Set("start", "1700000400")
+					params.Set("end", "1700000415")
+					params.Set("step", "15s")
+					resultType = "matrix"
+				}
+				data := apiGet[queryDataDTO](t, baseURL, path, params)
+				if data.ResultType != resultType {
+					t.Fatalf("%s result type = %s, want %s", path, data.ResultType, resultType)
+				}
+				if tc.value == "" {
+					if len(data.Result) != 0 {
+						t.Errorf("%s returned %v with fewer than two samples", path, data.Result)
+					}
+					continue
+				}
+				if len(data.Result) != 1 {
+					t.Errorf("%s returned %d series, want 1", path, len(data.Result))
+					continue
+				}
+				point := data.Result[0].Value
+				if path == "/api/v1/query_range" {
+					if len(data.Result[0].Values) != 2 {
+						t.Errorf("%s returned %d points, want 2", path, len(data.Result[0].Values))
+						continue
+					}
+					point = data.Result[0].Values[0]
+					// Adding zero makes Snuffle use the Prometheus engine.
+					params.Set("query", tc.query+" + 0")
+					engine := apiGet[queryDataDTO](t, baseURL, path, params)
+					if len(engine.Result) != 1 {
+						t.Fatalf("Prometheus returned %d series, want 1", len(engine.Result))
+					}
+					assertSameSampleValues(t, tc.query, data.Result[0].Values, engine.Result[0].Values)
+				}
+				if got := sampleString(point); got != tc.value {
+					t.Errorf("%s value = %s, want %s", path, got, tc.value)
+				}
+			}
+		})
+	}
 }
 
 func waitForClickHouse(t *testing.T, ctx context.Context, client *ClickHouseClient) {

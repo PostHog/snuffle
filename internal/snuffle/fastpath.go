@@ -67,9 +67,6 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 			return s.tryPostHogFastSelectorRangeQuery(ctx, selector, start, end, step, stepMillis)
 		}
 		if aggregate, ok := expr.(*parser.AggregateExpr); ok {
-			if data, ok, err := s.tryPostHogNestedCountRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
-				return data, ok, err
-			}
 			if data, ok, err := s.tryPostHogFastAggregateRangeQuery(ctx, aggregate, start, end, step, stepMillis); ok || err != nil {
 				return data, ok, err
 			}
@@ -428,9 +425,6 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	if !s.cfg.postHogSchemaLayout() {
 		return queryData{}, false, nil
 	}
-	if sampleMillis, ok := postHogExactInstantSampleMillis(s.cfg, selector, evalTime); ok {
-		return s.tryPostHogExactInstantAggregate(ctx, expr, selector, sampleMillis, evalTime, aggSQL)
-	}
 	if !postHogGroupingSupported(expr.Grouping) {
 		return queryData{}, false, nil
 	}
@@ -470,72 +464,34 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
 }
 
-func (s *Server) tryPostHogExactInstantAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, sampleMillis int64, evalTime time.Time, aggSQL string) (queryData, bool, error) {
-	if !postHogGroupingSupported(expr.Grouping) {
-		return queryData{}, false, nil
-	}
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, sampleMillis, sampleMillis, false)
-	where := plan.sampleWhere()
-	where = append(where, nonStaleSampleSQL("value"))
-	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"value"}, where)
-
-	groupBy := plan.groupAliases()
-	selectParts := make([]string, 0, len(groupBy)+2)
-	selectParts = append(selectParts, groupBy...)
-	selectParts = append(selectParts, "toInt64("+strconv.FormatInt(evalTime.UnixMilli(), 10)+") AS ts")
-	selectParts = append(selectParts, aggSQL+" AS agg_value")
-
-	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), plan.joinSeries(rows))
-	if len(groupBy) > 0 {
-		sql += " GROUP BY " + strings.Join(groupBy, ", ")
-		sql += " ORDER BY " + strings.Join(groupBy, ", ")
-	}
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
-
-	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
-}
-
-func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, _ int64) (queryData, bool, error) {
+func (s *Server) tryPostHogFastAggregateRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, stepMillis int64) (queryData, bool, error) {
 	if expr.Without {
 		return queryData{}, false, nil
 	}
-	aggSQL, ok := aggregateSQL(expr, "value")
+	aggSQL, ok := aggregateSQL(expr, "sample_value")
 	if !ok {
 		return queryData{}, false, nil
 	}
 	selector, ok := expr.Expr.(*parser.VectorSelector)
-	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) || !exactBucketRangeSelector(s.cfg, selector, start, end, step) {
+	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
 		return queryData{}, false, nil
 	}
 	if !postHogGroupingSupported(expr.Grouping) {
 		return queryData{}, false, nil
 	}
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, start.UnixMilli(), end.UnixMilli(), false)
-	where := plan.sampleWhere()
-	where = append(where, nonStaleSampleSQL("value"))
-	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp", "value"}, where)
-
-	groupBy := plan.groupAliases()
-	selectParts := make([]string, 0, len(groupBy)+2)
-	selectParts = append(selectParts, groupBy...)
-	selectParts = append(selectParts, "toUnixTimestamp64Milli(timestamp) AS ts")
-	selectParts = append(selectParts, aggSQL+" AS agg_value")
-
-	groupByParts := append([]string{}, groupBy...)
-	groupByParts = append(groupByParts, "ts")
-
-	sql := fmt.Sprintf(
-		"SELECT %s FROM %s GROUP BY %s ORDER BY %s",
-		strings.Join(selectParts, ", "),
-		plan.joinSeries(rows),
-		strings.Join(groupByParts, ", "),
-		strings.Join(groupByParts, ", "),
-	)
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
+	grid, mint, maxt, ok := selectorRangeGridSource(s.cfg, selector, start, end, step)
+	if !ok {
+		return queryData{}, false, nil
+	}
+	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, expr.Grouping, mint, maxt, false)
+	// Select the latest sample at each evaluation time before aggregation.
+	// The remote-write interval does not guarantee a sample at every step.
+	gridPlan := &postHogAggregateUnionPlan{
+		gridVals: lastGridExpr(grid.start, grid.end, step, s.cfg.LookbackDelta),
+		where:    plan.sampleWhere(),
+		plan:     plan,
+	}
+	sql := postHogAggregateUnionSQL(s.cfg, gridPlan, expr.Grouping, start, stepMillis, aggSQL)
 
 	results, err := s.queryAggregateRangeRows(ctx, sql, expr.Grouping)
 	if err != nil {
@@ -834,9 +790,6 @@ func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector 
 	if selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 || selector.Timestamp != nil || !postHogMatchersPushdownSafe(selector.LabelMatchers) {
 		return queryData{}, false, nil
 	}
-	if exactBucketRangeSelector(s.cfg, selector, start, end, step) && postHogSelectorHasNonMetricMatcher(selector.LabelMatchers) {
-		return s.tryPostHogExactSelectorRangeRows(ctx, selector, start, end, stepMillis)
-	}
 	offset := selector.OriginalOffset
 	if offset == 0 {
 		offset = selector.Offset
@@ -900,65 +853,6 @@ func (s *Server) tryPostHogFastSelectorRangeQuery(ctx context.Context, selector 
 		return queryData{}, true, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
 	}
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
-func (s *Server) tryPostHogExactSelectorRangeRows(ctx context.Context, selector *parser.VectorSelector, start, end time.Time, stepMillis int64) (queryData, bool, error) {
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, start.UnixMilli(), end.UnixMilli(), true)
-	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp", "value"}, plan.sampleWhere())
-	sql := fmt.Sprintf(
-		"SELECT series_id, %s, toUnixTimestamp64Milli(timestamp) AS ts, value FROM %s ORDER BY series_id, timestamp",
-		postHogSeriesLabelColumns,
-		plan.joinSeries(rows),
-	)
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
-
-	results := make([]sampleResult, 0, 128)
-	seen := make(map[uint64]int, 128)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var id uint64
-		var metricName string
-		var serviceName string
-		var resourceAttrs map[string]string
-		var attrs map[string]string
-		var ts int64
-		var value float64
-		if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs, &ts, &value); err != nil {
-			return err
-		}
-		if isStaleSampleValue(value) {
-			return nil
-		}
-		idx, ok := seen[id]
-		if !ok {
-			metric := postHogLabelMap(metricName, serviceName, resourceAttrs, attrs)
-			if !matchesAll(metric, selector.LabelMatchers) {
-				return nil
-			}
-			if len(results) >= s.cfg.MaxSeries {
-				return fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", s.cfg.MaxSeries)
-			}
-			idx = len(results)
-			seen[id] = idx
-			results = append(results, sampleResult{Metric: metric})
-		}
-		if ts >= start.UnixMilli() && ts <= end.UnixMilli() && (ts-start.UnixMilli())%stepMillis == 0 {
-			results[idx].Values = append(results[idx].Values, []any{float64(ts) / 1000, formatSample(value)})
-		}
-		return nil
-	})
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
-}
-
-func postHogSelectorHasNonMetricMatcher(matchers []*labels.Matcher) bool {
-	for _, matcher := range matchers {
-		if matcher.Name != "" && matcher.Name != labels.MetricName && !matcherIsNoop(matcher) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) tryLabelIndexAggregate(ctx context.Context, expr *parser.AggregateExpr, selector *parser.VectorSelector, window selectorWindow, evalTime time.Time, aggSQL string) (queryData, bool, error) {
@@ -1431,28 +1325,6 @@ func (s *Server) tryFastNestedCountInstantQuery(ctx context.Context, expr *parse
 	}
 	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 	data, err := s.queryNestedCountInstantValue(ctx, sql)
-	return data, true, err
-}
-
-func (s *Server) tryPostHogNestedCountRangeQuery(ctx context.Context, expr *parser.AggregateExpr, start, end time.Time, step time.Duration, _ int64) (queryData, bool, error) {
-	inner, selector, ok := nestedCountSelector(expr)
-	if !ok || !postHogMatchersPushdownSafe(selector.LabelMatchers) || !exactBucketRangeSelector(s.cfg, selector, start, end, step) {
-		return queryData{}, false, nil
-	}
-	if !postHogGroupingSupported(inner.Grouping) || len(inner.Grouping) == 0 {
-		return queryData{}, false, nil
-	}
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, inner.Grouping, start.UnixMilli(), end.UnixMilli(), false)
-	where := plan.sampleWhere()
-	where = append(where, nonStaleSampleSQL("value"))
-	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"timestamp"}, where)
-	sql := fmt.Sprintf(
-		"SELECT toUnixTimestamp64Milli(timestamp) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s GROUP BY ts ORDER BY ts",
-		postHogUniqGroupExpr(plan.groupAliases()),
-		plan.joinSeries(rows),
-	)
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
-	data, err := s.queryNestedCountRangeValues(ctx, sql)
 	return data, true, err
 }
 
@@ -2165,25 +2037,6 @@ func exactBucketRangeSelector(cfg Config, selector *parser.VectorSelector, start
 		bucketTimestampMS(endMillis, cfg.RemoteWriteInterval) == endMillis
 }
 
-func postHogExactInstantSampleMillis(cfg Config, selector *parser.VectorSelector, evalTime time.Time) (int64, bool) {
-	if cfg.RemoteWriteInterval <= 0 || selector.Anchored || selector.Smoothed || selector.StartOrEnd != 0 {
-		return 0, false
-	}
-	ref := evalTime.UnixMilli()
-	if selector.Timestamp != nil {
-		ref = *selector.Timestamp
-	}
-	offset := selector.OriginalOffset
-	if offset == 0 {
-		offset = selector.Offset
-	}
-	sampleMillis := ref - offset.Milliseconds()
-	if !postHogExactSampleTimestamp(cfg, sampleMillis) {
-		return 0, false
-	}
-	return sampleMillis, true
-}
-
 func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
 	grid := fmt.Sprintf(
 		"timeSeriesLastToGrid(%s, %s, %s, %s)(timestamp, value)",
@@ -2276,9 +2129,6 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 	if op == parser.BOTTOMK {
 		direction = "ASC"
 	}
-	if sampleMillis, ok := postHogExactInstantSampleMillis(s.cfg, selector, evalTime); ok {
-		return s.tryPostHogExactTopK(ctx, selector, sampleMillis, evalTime, limit, direction)
-	}
 	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, window.mint, window.maxt, true)
 	latest := fmt.Sprintf(
 		"SELECT series_fingerprint AS series_id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
@@ -2297,48 +2147,6 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 		postHogSeriesLabelColumns,
 		evalTime.UnixMilli(),
 		plan.joinSeries(latest),
-		direction,
-	)
-	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
-
-	results := make([]sampleResult, 0, limit)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var metricName string
-		var serviceName string
-		var resourceAttrs map[string]string
-		var attrs map[string]string
-		var ts int64
-		var value float64
-		if err := row.Scan(&metricName, &serviceName, &resourceAttrs, &attrs, &ts, &value); err != nil {
-			return err
-		}
-		metric := postHogLabelMap(metricName, serviceName, resourceAttrs, attrs)
-		if !matchesAll(metric, selector.LabelMatchers) {
-			return nil
-		}
-		results = append(results, sampleResult{
-			Metric: metric,
-			Value:  []any{float64(ts) / 1000, formatSample(value)},
-		})
-		return nil
-	})
-	if err != nil {
-		return queryData{}, true, err
-	}
-	return queryData{ResultType: string(parser.ValueTypeVector), Result: results}, true, nil
-}
-
-func (s *Server) tryPostHogExactTopK(ctx context.Context, selector *parser.VectorSelector, sampleMillis int64, evalTime time.Time, limit int, direction string) (queryData, bool, error) {
-	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, sampleMillis, sampleMillis, true)
-	where := plan.sampleWhere()
-	where = append(where, nonStaleSampleSQL("value"))
-	rows := postHogSampleRowsSQL(s.cfg, plan, []string{"value"}, where)
-	rows = fmt.Sprintf("%s ORDER BY value %s LIMIT %d", rows, direction, limit)
-	sql := fmt.Sprintf(
-		"SELECT %s, toInt64(%d) AS ts, value FROM %s ORDER BY value %s",
-		postHogSeriesLabelColumns,
-		evalTime.UnixMilli(),
-		plan.joinSeries(rows),
 		direction,
 	)
 	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
