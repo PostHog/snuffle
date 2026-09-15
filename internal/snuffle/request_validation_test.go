@@ -36,7 +36,7 @@ func TestRoutesRejectInvalidRequests(t *testing.T) {
 			}{
 				{name: "metrics syntax", method: http.MethodGet, path: "/api/v1/query?query=increase(", wantStatus: http.StatusBadRequest},
 				{name: "running sum instant query", method: http.MethodGet, path: "/api/v1/query?query=running_sum(m)", wantStatus: http.StatusBadRequest},
-				{name: "running sum nested", method: http.MethodGet, path: "/api/v1/query_range?query=sum(running_sum(m))&start=1700000401&end=1700000461&step=1m", wantStatus: http.StatusBadRequest},
+				{name: "running sum nested unaligned range", method: http.MethodGet, path: "/api/v1/query_range?query=sum(running_sum(m))&start=1700000401&end=1700000461&step=1m", wantStatus: http.StatusBadRequest},
 				{name: "metrics carrier function", method: http.MethodGet, path: "/api/v1/query?query=union(%22__snuffle_fn:no_such_function%22,m)", wantStatus: http.StatusBadRequest},
 				{name: "metrics short step", method: http.MethodGet, path: "/api/v1/query?query=1&step=1us", wantStatus: http.StatusBadRequest},
 				{name: "metrics large duration", method: http.MethodGet, path: "/api/v1/query?query=increase(m[1000000000000s])", wantStatus: http.StatusBadRequest},

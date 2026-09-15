@@ -297,8 +297,10 @@ native histogram calculations. Functions that MetricsQL does not define, such
 as `histogram_count`, are still available. `timestamp` and `absent` read their
 selector with the Prometheus lookback. Scalar and vector operations also retain
 the Prometheus type rules. Unsupported extensions return a query error.
-`running_sum` must be the outermost function of a range query. It adds the
-values of each series from `start` to each step.
+`running_sum` requires a range query. It adds the values of each series from
+`start` to each step. As the outermost function, it runs on the query result.
+Inside another expression, it runs as a subquery over the range and requires
+`start` aligned to `step`.
 
 Instant aggregates, `topk`, and nested counts over bare selectors keep their SQL
 fast paths. Range queries and counter rollups read raw samples through the

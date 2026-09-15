@@ -71,8 +71,9 @@ func TestPrepareMetricsQLQueryRunningSum(t *testing.T) {
 		t.Fatalf("unexpected result: %#v", prepared)
 	}
 	for _, tc := range []struct{ query, wantErr string }{
-		{query: "sum(running_sum(m))", wantErr: "outermost"},
+		{query: "sum(running_sum(m))", wantErr: "aligned"},
 		{query: "__snuffle_rate(m[1m], 1, 1, 1, 1)", wantErr: "reserved"},
+		{query: "__snuffle_running_sum(m[1m:1m], 1)", wantErr: "reserved"},
 	} {
 		if _, err := prepareMetricsQLQuery(tc.query, 15*time.Second, 5*time.Minute, start, end); err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 			t.Errorf("%s: err = %v, want %q", tc.query, err, tc.wantErr)
@@ -80,6 +81,20 @@ func TestPrepareMetricsQLQueryRunningSum(t *testing.T) {
 	}
 	if _, err := prepareMetricsQLQuery("running_sum(m)", 15*time.Second, 5*time.Minute, start, start); err == nil || !strings.Contains(err.Error(), "range query") {
 		t.Errorf("instant running_sum err = %v", err)
+	}
+
+	// A nested running_sum spans the range from the aligned start as a subquery.
+	aligned := time.Unix(1700000010, 0)
+	prepared, err = prepareMetricsQLQuery("quantile(1, running_sum(delta(m[60s])))", 10*time.Second, 5*time.Minute, aligned, aligned.Add(10*time.Second))
+	if err != nil {
+		t.Fatalf("nested prepare: %v", err)
+	}
+	want := "quantile(1, __snuffle_running_sum(__snuffle_delta(m[360000ms], 60000, 10000, 300000, 0)[20000ms:10000ms], 1.70000001e+12))"
+	if prepared.runningSum || prepared.query != want {
+		t.Fatalf("nested query = %#v, want %s", prepared, want)
+	}
+	if _, err := parser.NewParser(parser.Options{}).ParseExpr(prepared.query); err != nil {
+		t.Fatalf("prometheus parse: %v", err)
 	}
 }
 

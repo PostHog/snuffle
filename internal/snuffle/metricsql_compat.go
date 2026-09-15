@@ -38,6 +38,24 @@ func init() {
 		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
 	}
+	runningSum := metricsQLInternalPrefix + "running_sum"
+	parser.Functions[runningSum] = &parser.Function{Name: runningSum, ArgTypes: []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar}, ReturnType: parser.ValueTypeVector}
+	promql.FunctionCalls[runningSum] = func(v []promql.Vector, m promql.Matrix, _ parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+		// The subquery holds every step since the range start. Sum the points
+		// from the start to the evaluation time.
+		var sum float64
+		seen := false
+		for _, p := range m[0].Floats {
+			if p.T >= int64(v[0][0].F) && !math.IsNaN(p.F) {
+				sum += p.F
+				seen = true
+			}
+		}
+		if !seen {
+			return enh.Out, nil
+		}
+		return append(enh.Out, promql.Sample{F: sum}), nil
+	}
 	parser.Functions[metricsQLInternalPrefix+"default_rollup"] = &parser.Function{Name: metricsQLDefaultRollupName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 	original := promql.FunctionCalls[metricsQLDefaultRollupName]
 	rollup := metricsQLRollup("default_rollup", original)
@@ -93,7 +111,7 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 		expr = fe.Args[0]
 	}
 	expr = metricsQLDefaultSelectors(expr)
-	rewriter := metricsQLRewriter{lookback: lookback}
+	rewriter := metricsQLRewriter{lookback: lookback, start: start, end: end}
 	if err := rewriter.rewrite(expr, step, start.Equal(end)); err != nil {
 		return metricsQLQuery{}, err
 	}
@@ -192,6 +210,8 @@ func isIdentPart(c byte) bool {
 // functions. The step changes inside a subquery, so the rewriter carries it.
 type metricsQLRewriter struct {
 	lookback time.Duration
+	start    time.Time
+	end      time.Time
 }
 
 func (r metricsQLRewriter) rewrite(expr metricsql.Expr, step time.Duration, instant bool) error {
@@ -236,7 +256,7 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 		return fmt.Errorf("function %q is reserved for query execution", e.Name)
 	}
 	if e.Name == "running_sum" {
-		return fmt.Errorf("running_sum must be the outermost function of a range query")
+		return r.rewriteNestedRunningSum(e, step, instant)
 	}
 	if metricsQLSelectorFunctions[e.Name] || !metricsql.IsRollupFunc(e.Name) {
 		if fn := parser.Functions[e.Name]; fn != nil {
@@ -318,6 +338,37 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 		&metricsql.NumberExpr{N: float64(r.lookback.Milliseconds())},
 		&metricsql.NumberExpr{N: instantArg},
 	)
+	return nil
+}
+
+// rewriteNestedRunningSum evaluates a running_sum inside another expression as
+// a subquery that spans the range from start to each step. Prometheus aligns
+// subquery steps to multiples of the step, so start must be aligned. The
+// outermost running_sum of a request avoids this cost: prepareMetricsQLQuery
+// removes it and metricsQLRunningSum sums the range result.
+func (r metricsQLRewriter) rewriteNestedRunningSum(e *metricsql.FuncExpr, step time.Duration, instant bool) error {
+	if len(e.Args) != 1 || e.KeepMetricNames {
+		return fmt.Errorf("running_sum requires one series argument; keep_metric_names is not supported")
+	}
+	if instant {
+		return fmt.Errorf("running_sum requires a range query")
+	}
+	if r.start.UnixMilli()%step.Milliseconds() != 0 {
+		return fmt.Errorf("a nested running_sum requires start aligned to step")
+	}
+	span := r.end.Sub(r.start)
+	if span > time.Duration(math.MaxInt64)-step {
+		return fmt.Errorf("the running_sum range is too large")
+	}
+	inner := e.Args[0]
+	if err := r.rewrite(inner, step, false); err != nil {
+		return err
+	}
+	e.Name = metricsQLInternalPrefix + "running_sum"
+	e.Args = []metricsql.Expr{
+		&metricsql.RollupExpr{Expr: inner, Window: metricsQLDuration(span + step), Step: metricsQLDuration(step)},
+		&metricsql.NumberExpr{N: float64(r.start.UnixMilli())},
+	}
 	return nil
 }
 
