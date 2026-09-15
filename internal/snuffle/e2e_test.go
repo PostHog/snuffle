@@ -61,11 +61,12 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
 	if cfg.postHogSchemaLayout() {
-		cfg.SeriesTable = "metric_series2"
+		cfg.SeriesTable = "metric_series3"
 		cfg.SamplesTable = "metrics2"
 		cfg.MetricsInputTable = "metrics2_input"
 		cfg.LabelIndexTable = ""
-		cfg.AttributeTable = "metric_attributes2"
+		cfg.AttributeTable = "metric_attributes3"
+		cfg.MetricNamesTable = "metric_names3"
 		cfg.LabelPostingsTable = ""
 		cfg.ActivityTable = ""
 		cfg.MetricsTable = ""
@@ -574,6 +575,27 @@ func assertLabels(t *testing.T, baseURL string) {
 	assertStringPresent(t, labels, "__name__")
 	assertStringPresent(t, labels, "job")
 	assertStringPresent(t, labels, "instance")
+
+	metricLabels := apiGet[[]string](t, baseURL, "/api/v1/labels", url.Values{
+		"match[]": {e2eCounterMetric},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	})
+	assertStringPresent(t, metricLabels, "job")
+	assertStringPresent(t, metricLabels, "instance")
+
+	names := apiGet[[]string](t, baseURL, "/api/v1/label/__name__/values", url.Values{
+		"start": {"1700000010"},
+		"end":   {"1700000070"},
+	})
+	assertStringPresent(t, names, e2eCounterMetric)
+
+	jobs := apiGet[[]string](t, baseURL, "/api/v1/label/job/values", url.Values{
+		"match[]": {e2eCounterMetric},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	})
+	assertStringPresent(t, jobs, "api")
 }
 
 func assertLabelValues(t *testing.T, baseURL string) {

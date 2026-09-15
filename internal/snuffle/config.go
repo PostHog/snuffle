@@ -18,6 +18,7 @@ type Config struct {
 	SamplesTable         string
 	LabelIndexTable      string
 	AttributeTable       string
+	MetricNamesTable     string
 	LabelPostingsTable   string
 	ActivityTable        string
 	MetricsTable         string
@@ -78,6 +79,7 @@ func ConfigFromEnv() Config {
 	exemplarsTableDefault := "metrics_exemplars"
 	metadataTableDefault := "metrics_metadata"
 	attributeTableDefault := "metric_attributes"
+	metricNamesTableDefault := ""
 	metricsInputTableDefault := ""
 	logsTableDefault := "logs"
 	logStreamsTableDefault := "log_streams"
@@ -86,10 +88,11 @@ func ConfigFromEnv() Config {
 	logStreamStatsTableDefault := "log_stream_stats"
 	aggregateThreadsDefault := 1
 	if schemaLayout == schemaLayoutPostHog {
-		seriesTableDefault = "metric_series2"
+		seriesTableDefault = "metric_series3"
 		samplesTableDefault = "metrics2"
 		labelIndexTableDefault = ""
-		attributeTableDefault = "metric_attributes2"
+		attributeTableDefault = "metric_attributes3"
+		metricNamesTableDefault = "metric_names3"
 		metricsInputTableDefault = "metrics2_input"
 		histogramsTableDefault = ""
 		exemplarsTableDefault = ""
@@ -113,6 +116,7 @@ func ConfigFromEnv() Config {
 		SamplesTable:         getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
 		LabelIndexTable:      getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
 		AttributeTable:       getenv("CH_ATTRIBUTE_TABLE", attributeTableDefault),
+		MetricNamesTable:     getenv("CH_METRIC_NAMES_TABLE", metricNamesTableDefault),
 		LabelPostingsTable:   getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:        getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:         getenv("CH_METRICS_TABLE", metadataTableDefault),

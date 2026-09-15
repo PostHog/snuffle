@@ -59,7 +59,7 @@ func Run(cfg Config) error {
 		ReadHeaderTimeout: 5 * time.Second,
 		TLSConfig:         tlsConfig,
 	}
-	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "tls", tlsConfig != nil, "schema_layout", cfg.SchemaLayout, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
+	slog.Info("starting PromQL ClickHouse sidecar", "addr", addr, "tls", tlsConfig != nil, "schema_layout", cfg.SchemaLayout, "series_table", cfg.SeriesTable, "samples_table", cfg.SamplesTable, "label_index_table", cfg.LabelIndexTable, "attribute_table", cfg.AttributeTable, "metric_names_table", cfg.MetricNamesTable, "lookback_delta", cfg.LookbackDelta.String(), "max_samples", cfg.MaxSamples)
 	if tlsConfig != nil {
 		return srv.ListenAndServeTLS("", "")
 	}
