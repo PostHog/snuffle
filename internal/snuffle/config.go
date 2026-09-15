@@ -105,6 +105,10 @@ func ConfigFromEnv() Config {
 		logAttributesTableDefault = "log_attributes3"
 		logStreamStatsTableDefault = ""
 	}
+	metricNamesTable, metricNamesTableSet := os.LookupEnv("CH_METRIC_NAMES_TABLE")
+	if !metricNamesTableSet {
+		metricNamesTable = metricNamesTableDefault
+	}
 	return Config{
 		CHAddr:               getenv("CH_ADDR", "localhost:9000"),
 		CHUser:               getenv("CH_USER", "default"),
@@ -116,7 +120,7 @@ func ConfigFromEnv() Config {
 		SamplesTable:         getenv("CH_SAMPLES_TABLE", getenv("CH_DATA_TABLE", samplesTableDefault)),
 		LabelIndexTable:      getenv("CH_LABEL_INDEX_TABLE", labelIndexTableDefault),
 		AttributeTable:       getenv("CH_ATTRIBUTE_TABLE", attributeTableDefault),
-		MetricNamesTable:     getenv("CH_METRIC_NAMES_TABLE", metricNamesTableDefault),
+		MetricNamesTable:     metricNamesTable,
 		LabelPostingsTable:   getenv("CH_LABEL_POSTINGS_TABLE", ""),
 		ActivityTable:        getenv("CH_ACTIVITY_TABLE", ""),
 		MetricsTable:         getenv("CH_METRICS_TABLE", metadataTableDefault),

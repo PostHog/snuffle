@@ -412,7 +412,7 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 	}
 }
 
-func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
+func TestPostHogLabelNamesSQLReadsAttributeRollupWithoutMatchers(t *testing.T) {
 	cfg := Config{
 		CHDatabase:       "posthog",
 		SchemaLayout:     "posthog",
@@ -421,23 +421,15 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		MetricNamesTable: "metric_names3",
 		TeamID:           7,
 	}
-	matchers := []*labels.Matcher{
-		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total"),
-		labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout"),
-		labels.MustNewMatcher(labels.MatchRegexp, "status", ".*"),
-	}
-
-	sql, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers)
+	sql, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, nil)
 	if !ok {
-		t.Fatalf("exact metric and service matchers should read the attribute rollup")
+		t.Fatalf("unfiltered label names should read the attribute rollup")
 	}
 	for _, want := range []string{
 		"SELECT DISTINCT attribute_key FROM `posthog`.`metric_attributes3` WHERE",
 		teamFilter(cfg),
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
-		"metric_name = 'http_requests_total'",
-		"service_name = 'checkout'",
 		"ORDER BY attribute_key" + sqlLimit(100),
 	} {
 		if !strings.Contains(sql, want) {
@@ -449,6 +441,9 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 	}
 
 	for name, matchers := range map[string][]*labels.Matcher{
+		"exact metric":  {labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "http_requests_total")},
+		"exact service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", "checkout")},
+		"noop":          {labels.MustNewMatcher(labels.MatchRegexp, "status", ".*")},
 		"map label":     {labels.MustNewMatcher(labels.MatchEqual, "status", "200")},
 		"regexp metric": {labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")},
 		"empty service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", "")},
@@ -490,19 +485,22 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 		t.Fatalf("metric names must not consult the series table: %s", sql)
 	}
 
-	sql, ok = postHogLabelValuesSQL(cfg, "status", 1000, 2000, 50, []*labels.Matcher{metric})
+	sql, ok = postHogLabelValuesSQL(cfg, "status", 1000, 2000, 50, nil)
 	if !ok {
-		t.Fatalf("map label values for an exact metric should read the attribute rollup")
+		t.Fatalf("unfiltered map label values should read the attribute rollup")
 	}
 	for _, want := range []string{
 		"SELECT DISTINCT attribute_value AS label_value FROM `posthog`.`metric_attributes3` WHERE",
-		"metric_name = 'http_requests_total'",
 		"attribute_key = 'status'",
 		"ORDER BY label_value" + sqlLimit(50),
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
+	}
+
+	if _, ok := postHogLabelValuesSQL(cfg, "status", 1000, 2000, 50, []*labels.Matcher{metric}); ok {
+		t.Fatal("filtered map label values should read the series table")
 	}
 
 	sql, ok = postHogLabelValuesSQL(cfg, "service_name", 1000, 2000, 0, nil)

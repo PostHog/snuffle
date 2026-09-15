@@ -376,12 +376,13 @@ In PostHog metrics mode, series identity is the `series_fingerprint` shared by
 builds Prometheus labels from `metric_name`, `service_name`,
 `resource_attributes`, and `attributes`, and reads samples from `metrics2` by
 fingerprint. `metric_series3` keeps one row per series and expiry day, so
-series reads collapse duplicates by fingerprint. Label discovery reads the
-hourly rollups instead of the series table: `metric_names3` lists metric
-names, and `metric_attributes3` lists attribute keys and values, filtered by
-exact `__name__` and `service_name` matchers. Other matchers fall back to the
-series table. Remote write inserts into `metrics2_input`; its materialized
-views fan each row out to the samples, series, attribute, and name tables.
+series reads collapse duplicates by fingerprint. Without matchers, label
+discovery reads hourly rollups: `metric_names3` lists metric names, and
+`metric_attributes3` lists attribute keys and values. Requests with matchers
+read the series table. This preserves long metric attributes and gives
+metric attributes precedence over resource attributes with the same key.
+Remote write inserts into `metrics2_input`; its materialized views fan each
+row out to the samples, series, attribute, and name tables.
 
 Set `CH_SERIES_TABLE=metric_series2`, `CH_ATTRIBUTE_TABLE=metric_attributes2`,
 and an empty `CH_METRIC_NAMES_TABLE` to read the previous PostHog tables, for

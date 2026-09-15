@@ -132,6 +132,11 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("counter query intervals", func(t *testing.T) {
 		assertCounterQueryIntervals(t, cfg, api.URL)
 	})
+	if cfg.postHogSchemaLayout() {
+		t.Run("filtered label discovery", func(t *testing.T) {
+			assertPostHogFilteredLabels(t, ctx, client, cfg)
+		})
+	}
 }
 
 func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {
@@ -563,6 +568,78 @@ func assertMetricsQLSumOverTimeSubqueryQuery(t *testing.T, baseURL string) {
 	})
 	if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) == 0 {
 		t.Fatalf("sum_over_time subquery result = %#v", data)
+	}
+}
+
+func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *ClickHouseClient, cfg Config) {
+	t.Helper()
+	const metric = "snuffle_e2e_discovery"
+	const service = "snuffle-discovery"
+	longValue := strings.Repeat("x", 256)
+	longKey := strings.Repeat("k", 256)
+	insert := fmt.Sprintf(`INSERT INTO %s
+		(team_id, metric_name, series_fingerprint, timestamp, observed_timestamp,
+		 original_expiry_timestamp, service_name, value, count, has_labels, resource_attributes, attributes)
+		SELECT %d, %s, 987654321, %s, now64(6), now64(6) + INTERVAL 1 DAY,
+		       %s, 1, 1, true, map('zone', 'resource-zone'),
+		       map('zone', 'metric-zone', 'long_label', %s, %s, 'long-key-value')`,
+		tableName(cfg.CHDatabase, cfg.MetricsInputTable), e2eTeamID, sqlString(metric), chTimeMillis(e2eStartMS),
+		sqlString(service), sqlString(longValue), sqlString(longKey))
+	if err := client.Exec(ctx, insert); err != nil {
+		t.Fatalf("insert discovery fixture: %v", err)
+	}
+
+	for _, version := range []string{"3", "2"} {
+		t.Run("metadata"+version, func(t *testing.T) {
+			readCfg := cfg
+			readCfg.SeriesTable = "metric_series" + version
+			readCfg.AttributeTable = "metric_attributes" + version
+			if version == "2" {
+				t.Setenv("CH_METRIC_NAMES_TABLE", "")
+				readCfg.MetricNamesTable = ConfigFromEnv().MetricNamesTable
+			}
+			mux := http.NewServeMux()
+			newServer(readCfg).routes(mux)
+			api := httptest.NewServer(mux)
+			defer api.Close()
+
+			for _, selector := range []string{metric, metric + `{service_name="` + service + `"}`, `{service_name="` + service + `"}`} {
+				t.Run(selector, func(t *testing.T) {
+					params := url.Values{
+						"match[]": {selector},
+						"start":   {"1700000010"},
+						"end":     {"1700000070"},
+					}
+					names := apiGet[[]string](t, api.URL, "/api/v1/labels", params)
+					for _, name := range []string{"__name__", "service_name", "zone", "long_label", longKey} {
+						assertStringPresent(t, names, name)
+					}
+					for name, want := range map[string]string{"zone": "metric-zone", "long_label": longValue, longKey: "long-key-value"} {
+						values := apiGet[[]string](t, api.URL, "/api/v1/label/"+name+"/values", params)
+						if len(values) != 1 || values[0] != want {
+							t.Errorf("label %q values = %q, want [%q]", name, values, want)
+						}
+					}
+				})
+			}
+
+			if version == "2" {
+				// The old table can contain names that have not reached the new table.
+				const oldMetric = "snuffle_e2e_old_catalog_only"
+				insertOld := fmt.Sprintf(`INSERT INTO %s
+					(team_id, metric_name, series_fingerprint, last_seen, original_expiry_timestamp)
+					VALUES (%d, %s, 987654322, %s, now64(6) + INTERVAL 1 DAY)`,
+					tableName(cfg.CHDatabase, readCfg.SeriesTable), e2eTeamID, sqlString(oldMetric), chTimeMillis(e2eStartMS))
+				if err := client.Exec(ctx, insertOld); err != nil {
+					t.Fatalf("insert old catalog fixture: %v", err)
+				}
+				names := apiGet[[]string](t, api.URL, "/api/v1/label/__name__/values", url.Values{
+					"start": {"1700000010"},
+					"end":   {"1700000070"},
+				})
+				assertStringPresent(t, names, oldMetric)
+			}
+		})
 	}
 }
 

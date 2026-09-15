@@ -104,6 +104,16 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	}
 }
 
+func TestConfigFromEnvMetricNamesTableOverride(t *testing.T) {
+	t.Setenv("CH_SCHEMA_LAYOUT", "posthog")
+	for _, table := range []string{"", "custom_metric_names"} {
+		t.Setenv("CH_METRIC_NAMES_TABLE", table)
+		if got := ConfigFromEnv().MetricNamesTable; got != table {
+			t.Fatalf("MetricNamesTable = %q, want %q", got, table)
+		}
+	}
+}
+
 func TestConfigFromEnvSelfScrapeSettings(t *testing.T) {
 	t.Setenv("SNUFFLE_DEFAULT_TEAM_ID", "42")
 	t.Setenv("SNUFFLE_SELF_SCRAPE_INTERVAL", "30s")
