@@ -184,6 +184,7 @@ curl --user reader:password \
 
 Every incoming HTTP request that accesses ClickHouse gets a request-scoped
 native connection pool using that request's HTTP Basic username and password.
+Native connections use LZ4 compression to reduce network traffic.
 ClickHouse performs authentication and authorization; Snuffle does not
 maintain a user database or make authentication decisions.
 

@@ -51,6 +51,9 @@ func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, err
 	return clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
 		Addr:     clickHouseAddrs(cfg),
+		Compression: &clickhouse.Compression{
+			Method: clickhouse.CompressionLZ4,
+		},
 		Auth: clickhouse.Auth{
 			Database: cfg.CHDatabase,
 			Username: username,
