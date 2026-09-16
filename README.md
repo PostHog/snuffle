@@ -302,6 +302,28 @@ the Prometheus type rules. Unsupported extensions return a query error.
 Inside another expression, it runs as a subquery over the range and requires
 `start` aligned to `step`.
 
+`histogram_quantiles("phi", 0.5, 0.9, buckets)` calculates several histogram
+quantiles in one call. The first argument names the output label, the middle
+arguments are constant numeric quantiles, and the last argument is the histogram
+vector. It supports classic `le` buckets and Prometheus native histograms. The
+output label replaces an existing label with the same name and uses MetricsQL
+number formatting, such as `"0"`, `"0.5"`, and `"1"`. Dynamic quantile expressions
+and `keep_metric_names` are not supported. Histogram calculations otherwise use
+the same behavior as `histogram_quantile`.
+
+`median(values)` calculates the median across input series at each evaluation
+step. It supports `by (...)`, `without (...)`, and multiple arguments. `limit`
+is supported only for instant queries outside subqueries, not for range queries.
+Multiple arguments contribute all their values, including repeated inputs.
+NaN values are ignored. For an even number of values, the result is the average
+of the two middle values. This is not a histogram median: use
+`histogram_quantile(0.5, buckets)` for that.
+
+```promql
+histogram_quantiles("phi", 0.5, 0.9, 0.99, sum by (le) (rate(request_duration_seconds_bucket[5m])))
+median(cpu_usage) by (service_name)
+```
+
 Instant aggregates, `topk`, and nested counts over bare selectors keep their SQL
 fast paths. Range queries and counter rollups read raw samples through the
 evaluation engine: automatic selector windows depend on the samples of each

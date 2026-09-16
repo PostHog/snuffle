@@ -101,6 +101,17 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		assertValue(test, "sum("+metric+"_count)", 30)
 		assertValue(test, `sum({__name__=~"test_duration_seconds_(count|sum)"})`, 66)
 		assertValue(test, "histogram_quantile(0.5, sum by (le) (rate("+metric+"_bucket[1m])))", 1)
+		assertValue(test, "median("+metric+"_count, "+metric+"_sum)", 33)
+		quantiles := query(test, `histogram_quantiles("phi", 0.2, 0.5, 0.9, sum by (le) (rate(`+metric+`_bucket[1m])))`)
+		if len(quantiles.Result) != 3 {
+			test.Fatalf("multiple quantiles = %v", quantiles)
+		}
+		for _, result := range quantiles.Result {
+			want := map[string]string{"0.2": "0.5", "0.5": "1", "0.9": "1"}
+			if expected, exists := want[result.Metric["phi"]]; !exists || sampleString(result.Value) != expected {
+				test.Fatalf("unexpected quantile = %v", result)
+			}
+		}
 		result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {metric + `_bucket{le="1"}`}, "start": {"1700000010"}, "end": {"1700000070"}, "step": {"30"}})
 		if len(result.Result) != 1 || len(result.Result[0].Values) != 3 {
 			test.Fatalf("range samples: %+v", result)
