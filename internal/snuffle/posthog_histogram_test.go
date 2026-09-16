@@ -3,6 +3,7 @@ package snuffle
 import (
 	"math"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -104,9 +105,16 @@ func TestPostHogHistogramMatchers(test *testing.T) {
 		if err := builder.add(sample, []string{"_bucket"}); err != nil {
 			test.Fatal(err)
 		}
+		sample.timestamp += 1000
+		if err := builder.add(sample, []string{"_bucket"}); err != nil {
+			test.Fatal(err)
+		}
 		for _, meta := range builder.series {
 			if !matcher.Matches(meta.labelMap["le"]) || meta.labelMap["le"] == "original" {
 				test.Fatalf("incorrect bucket matcher: %v", meta.labelMap)
+			}
+			if len(meta.samples) != 2 {
+				test.Fatalf("matched bucket lost a sample: %v", meta.samples)
 			}
 		}
 	}
@@ -188,5 +196,189 @@ func TestPostHogHistogramSQL(test *testing.T) {
 	}
 	if postHogMaySelectHistogram([]*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "requests_total")}) {
 		test.Fatal("ordinary exact metric must keep its existing query path")
+	}
+}
+
+func TestPostHogHistogramRepeatedSamples(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	sample := histogramTestSample()
+	if err := builder.add(sample, postHogHistogramSuffixes); err != nil {
+		test.Fatal(err)
+	}
+	initial := append([]*seriesMeta(nil), builder.series...)
+	sample.timestamp = 2000
+	sample.sum = 3
+	sample.count = 4
+	sample.counts = []uint64{1, 1, 2}
+	if err := builder.add(sample, postHogHistogramSuffixes); err != nil {
+		test.Fatal(err)
+	}
+	if !reflect.DeepEqual(initial, builder.series) || builder.samples != 10 {
+		test.Fatalf("series changed or samples missing: %d series, %d samples", len(builder.series), builder.samples)
+	}
+	for _, meta := range builder.series {
+		want := float64(3)
+		if strings.HasSuffix(meta.metricName, "_count") {
+			want = 4
+		} else if strings.HasSuffix(meta.metricName, "_bucket") {
+			want = map[string]float64{"0.5": 1, "1": 2, "+Inf": 4}[meta.labelMap["le"]]
+		}
+		if len(meta.samples) != 2 || meta.samples[1] != (samplePoint{t: 2000, v: want}) {
+			test.Fatalf("incorrect repeated sample for %s: %v", meta.labels, meta.samples)
+		}
+		if meta.labelMap["region"] != "resource" || meta.labelMap["service_name"] != "api" {
+			test.Fatalf("labels changed: %v", meta.labelMap)
+		}
+	}
+}
+
+func TestPostHogHistogramSourceIdentity(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	for index := 0; index < 3; index++ {
+		sample := histogramTestSample()
+		sample.id = uint64(index + 1)
+		sample.timestamp += int64(index) * 1000
+		if index == 1 {
+			sample.resource["region"] = "other"
+		}
+		if err := builder.add(sample, []string{"_bucket"}); err != nil {
+			test.Fatal(err)
+		}
+	}
+	if len(builder.series) != 6 {
+		test.Fatalf("got %d series, want 6", len(builder.series))
+	}
+	for _, meta := range builder.series {
+		if meta.labelMap["region"] == "other" {
+			if len(meta.samples) != 1 || meta.samples[0].t != 2000 {
+				test.Fatalf("source labels mixed: %v", meta.samples)
+			}
+		} else if len(meta.samples) != 2 || meta.samples[0].t != 1000 || meta.samples[1].t != 3000 {
+			test.Fatalf("identical labels did not merge: %v", meta.samples)
+		}
+	}
+}
+
+func TestPostHogHistogramBucketReappears(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	for index := 0; index < 4; index++ {
+		sample := histogramTestSample()
+		sample.timestamp += int64(index) * 1000
+		if index == 1 || index == 2 {
+			sample.bounds = []float64{1}
+			sample.counts = []uint64{5, 5}
+		}
+		if err := builder.add(sample, []string{"_bucket"}); err != nil {
+			test.Fatal(err)
+		}
+	}
+	if len(builder.series) != 3 {
+		test.Fatalf("got %d series, want 3", len(builder.series))
+	}
+	for _, meta := range builder.series {
+		if meta.labelMap["le"] == "0.5" {
+			if len(meta.samples) != 3 || meta.samples[0] != (samplePoint{t: 1000, v: 2}) || meta.samples[1].t != 2000 || !isStaleSampleValue(meta.samples[1].v) || meta.samples[2] != (samplePoint{t: 4000, v: 2}) {
+				test.Fatalf("incorrect bucket removal or return: %v", meta.samples)
+			}
+		} else if len(meta.samples) != 4 {
+			test.Fatalf("unchanged bucket lost samples: %v", meta.samples)
+		}
+	}
+}
+
+func TestPostHogHistogramRepeatedSampleChecks(test *testing.T) {
+	for _, testcase := range []struct {
+		name   string
+		change func(*postHogHistogramSample)
+	}{
+		{"temporality", func(sample *postHogHistogramSample) { sample.temporality = "delta" }},
+		{"count", func(sample *postHogHistogramSample) { sample.count++ }},
+		{"bounds", func(sample *postHogHistogramSample) { sample.bounds = []float64{1, 0.5} }},
+	} {
+		test.Run(testcase.name, func(test *testing.T) {
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+			sample := histogramTestSample()
+			if err := builder.add(sample, []string{"_bucket"}); err != nil {
+				test.Fatal(err)
+			}
+			testcase.change(&sample)
+			if err := builder.add(sample, []string{"_bucket"}); err == nil {
+				test.Fatal("invalid repeated sample accepted")
+			}
+		})
+	}
+	config := histogramTestConfig()
+	config.MaxSamples = 4
+	builder := newPostHogHistogramSeriesBuilder(config, nil, true)
+	if err := builder.add(histogramTestSample(), []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	if err := builder.add(histogramTestSample(), []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "sample limit") {
+		test.Fatalf("repeated samples bypassed limit: %v", err)
+	}
+	config = histogramTestConfig()
+	config.MaxSeries = 3
+	builder = newPostHogHistogramSeriesBuilder(config, nil, true)
+	sample := histogramTestSample()
+	if err := builder.add(sample, []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	sample.bounds = []float64{2}
+	sample.counts = []uint64{1, 9}
+	if err := builder.add(sample, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "series limit") {
+		test.Fatalf("new bucket bypassed series limit: %v", err)
+	}
+}
+
+func TestPostHogHistogramSignedZeroBounds(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	sample := histogramTestSample()
+	sample.bounds = []float64{math.Copysign(0, -1)}
+	sample.counts = []uint64{1, 9}
+	if err := builder.add(sample, []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	sample.timestamp = 2000
+	sample.bounds = []float64{0}
+	if err := builder.add(sample, []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	if len(builder.series) != 3 {
+		test.Fatalf("signed zero boundaries merged: %d series", len(builder.series))
+	}
+	for _, meta := range builder.series {
+		if meta.labelMap["le"] == "-0" && (len(meta.samples) != 2 || !isStaleSampleValue(meta.samples[1].v)) {
+			test.Fatalf("old signed zero bucket did not become stale: %v", meta.samples)
+		}
+	}
+}
+
+func BenchmarkPostHogHistogramSeriesBuilder(benchmark *testing.B) {
+	for _, suffixes := range [][]string{{"_bucket"}, {"_count", "_sum"}, postHogHistogramSuffixes} {
+		benchmark.Run(strings.Join(suffixes, ""), func(benchmark *testing.B) {
+			config := histogramTestConfig()
+			config.MaxSeries = 1000
+			config.MaxSamples = 0
+			var samples []postHogHistogramSample
+			for source := 0; source < 32; source++ {
+				for step := 0; step < 128; step++ {
+					sample := histogramTestSample()
+					sample.id = uint64(source)
+					sample.attributes["instance"] = strconv.Itoa(source)
+					sample.timestamp += int64(step) * 1000
+					samples = append(samples, sample)
+				}
+			}
+			benchmark.ReportAllocs()
+			benchmark.ResetTimer()
+			for iteration := 0; iteration < benchmark.N; iteration++ {
+				builder := newPostHogHistogramSeriesBuilder(config, nil, true)
+				for _, sample := range samples {
+					if err := builder.add(sample, suffixes); err != nil {
+						benchmark.Fatal(err)
+					}
+				}
+			}
+		})
 	}
 }

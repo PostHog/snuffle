@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
 )
 
@@ -92,6 +93,73 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			test.Fatalf("%s = %v (%v), want %v", expression, got, err, want)
 		}
 	}
+	test.Run("combined metadata matches general path", func(test *testing.T) {
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		querier := &CHQuerier{queryable: NewCHQueryable(client, teamCfg)}
+		for _, suffix := range postHogHistogramSuffixes {
+			for _, withSamples := range []bool{false, true} {
+				matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric+suffix)}
+				stats := &promRequestStats{}
+				var got []*seriesMeta
+				var err error
+				if withSamples {
+					got, err = querier.selectPostHogSeriesSamples(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, false, matchers...)
+				} else {
+					got, err = querier.selectPostHogSeries(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, matchers...)
+				}
+				if err != nil {
+					test.Fatal(err)
+				}
+				if count := stats.clickHouseQueries.Load(); count != 2 {
+					test.Fatalf("%s samples=%v used %d queries, want metadata + samples", suffix, withSamples, count)
+				}
+				want, err := querier.appendPostHogHistogramSeries(ctx, nil, e2eStartMS, e2eEndMS, matchers, withSamples)
+				if err != nil {
+					test.Fatal(err)
+				}
+				snapshot := func(series []*seriesMeta) map[string][]samplePoint {
+					result := make(map[string][]samplePoint, len(series))
+					for _, meta := range series {
+						result[meta.labels.String()] = meta.samples
+					}
+					return result
+				}
+				if !reflect.DeepEqual(snapshot(got), snapshot(want)) {
+					test.Fatalf("%s samples=%v: combined metadata differs from general path", suffix, withSamples)
+				}
+			}
+		}
+	})
+	test.Run("combined metadata limits", func(test *testing.T) {
+		for _, limit := range []string{"source", "series", "samples"} {
+			limited := cfg
+			limited.TeamID = e2eTeamID
+			switch limit {
+			case "source":
+				limited.MaxSeries = 1
+			case "series":
+				limited.MaxSeries = 2
+			case "samples":
+				limited.MaxSamples = 1
+			}
+			querier := &CHQuerier{queryable: NewCHQueryable(client, limited)}
+			_, err := querier.selectPostHogSeriesSamples(ctx, e2eStartMS, e2eEndMS, false, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric+"_bucket"))
+			if err == nil || !strings.Contains(err.Error(), "limit exceeded") {
+				test.Fatalf("%s limit: %v", limit, err)
+			}
+		}
+	})
+	test.Run("missing histogram needs only metadata", func(test *testing.T) {
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		querier := &CHQuerier{queryable: NewCHQueryable(client, teamCfg)}
+		stats := &promRequestStats{}
+		series, err := querier.selectPostHogSeriesSamples(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, false, labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "missing_duration_bucket"))
+		if err != nil || len(series) != 0 || stats.clickHouseQueries.Load() != 1 {
+			test.Fatalf("missing histogram: series=%d queries=%d error=%v", len(series), stats.clickHouseQueries.Load(), err)
+		}
+	})
 	test.Run("queries", func(test *testing.T) {
 		assertValue(test, metric+`_bucket{le="0.5"}`, 6)
 		assertValue(test, metric+`_bucket{le="1",region="resource"}`, 15)
@@ -174,6 +242,28 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 	})
 	test.Run("real names take priority", func(test *testing.T) {
 		insertReal(metric+"_bucket", e2eTeamID, e2eEndMS)
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		querier := &CHQuerier{queryable: NewCHQueryable(client, teamCfg)}
+		for _, withSamples := range []bool{false, true} {
+			stats := &promRequestStats{}
+			matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric+"_bucket"), labels.MustNewMatcher(labels.MatchEqual, "le", "0.5")}
+			var series []*seriesMeta
+			var err error
+			wantQueries := int64(1)
+			if withSamples {
+				series, err = querier.selectPostHogSeriesSamples(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, true, matchers...)
+				wantQueries = 2
+			} else {
+				series, err = querier.selectPostHogSeries(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, matchers...)
+			}
+			if err != nil || len(series) != 1 || stats.clickHouseQueries.Load() != wantQueries {
+				test.Fatalf("real metric samples=%v: series=%d queries=%d error=%v", withSamples, len(series), stats.clickHouseQueries.Load(), err)
+			}
+			if series[0].labelMap["service_name"] != "other" || (withSamples && (len(series[0].samples) != 1 || series[0].samples[0].v != 777)) {
+				test.Fatalf("real metric samples=%v: %+v", withSamples, series[0])
+			}
+		}
 		assertValue(test, metric+"_bucket", 777)
 		assertValue(test, "sum("+metric+"_bucket)", 777)
 		if result := query(test, metric+`_bucket{service_name="api"}`); len(result.Result) != 0 {
@@ -181,6 +271,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		}
 		assertValue(test, metric+"_count", 30)
 		assertValue(test, metric+"_sum", 36)
+		assertValue(test, `sum({__name__=~"test_duration_seconds_(bucket|count)"})`, 807)
 		insertReal(metric+"_sum", e2eTeamID, e2eStartMS-3600000)
 		if result := query(test, metric+"_sum"); len(result.Result) != 0 {
 			test.Fatalf("real name outside the query window must still take priority: %v", result)

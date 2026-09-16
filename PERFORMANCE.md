@@ -437,6 +437,13 @@ Implemented storage optimizations:
   then read `(series_fingerprint, timestamp, value)` by fingerprint; joining
   the series table onto the samples scan shipped both label maps on every
   sample row and made Go map decoding the dominant cost of range queries
+- virtual histogram series reuse their resolved labels within each request,
+  keyed by source fingerprint, suffix, and bucket boundary; later samples
+  append values without repeating label sorting and string formatting
+- exact histogram suffix selectors resolve real metric labels or virtual
+  source labels in one metadata query; a team-wide name check keeps real
+  metrics first, independent of label filters and the query time window.
+  Regex selectors retain the general alias lookup path.
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU

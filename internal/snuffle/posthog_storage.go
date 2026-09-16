@@ -20,6 +20,9 @@ import (
 const postHogSeriesLabelColumns = "metric_name, service_name, resource_attributes, attributes"
 
 func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if alias, ok := postHogExactHistogramAlias(matchers); ok {
+		return q.selectPostHogExactHistogramSeries(ctx, mint, maxt, alias, matchers, false, false)
+	}
 	series, err := q.selectPostHogFloatSeries(ctx, mint, maxt, matchers...)
 	if err != nil {
 		return nil, err
@@ -32,6 +35,9 @@ func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, m
 // both label maps on every sample row, and decoding those maps in Go
 // dominated range queries over many series.
 func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt int64, latestOnly bool, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if alias, ok := postHogExactHistogramAlias(matchers); ok {
+		return q.selectPostHogExactHistogramSeries(ctx, mint, maxt, alias, matchers, true, latestOnly)
+	}
 	series, err := q.selectPostHogFloatSeries(ctx, mint, maxt, matchers...)
 	if err != nil {
 		return nil, err

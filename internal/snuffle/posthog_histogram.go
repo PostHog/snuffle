@@ -6,6 +6,7 @@ import (
 	"maps"
 	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,86 @@ var postHogHistogramSuffixes = []string{"_bucket", "_count", "_sum"}
 type postHogHistogramAlias struct {
 	baseName string
 	suffix   string
+}
+
+func postHogExactHistogramAlias(matchers []*labels.Matcher) (postHogHistogramAlias, bool) {
+	name := exactMetricName(matchers)
+	for _, suffix := range postHogHistogramSuffixes {
+		if strings.HasSuffix(name, suffix) && len(name) > len(suffix) {
+			return postHogHistogramAlias{baseName: strings.TrimSuffix(name, suffix), suffix: suffix}, true
+		}
+	}
+	return postHogHistogramAlias{}, false
+}
+
+func postHogExactHistogramMetadataSQL(cfg Config, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher) string {
+	name := alias.baseName + alias.suffix
+	realWhere := postHogSeriesFilters(cfg, matchers, mint, maxt)
+	virtualWhere := postHogSeriesFilters(cfg, postHogHistogramBaseMatchers(matchers), mint, maxt)
+	virtualWhere = append(virtualWhere, "metric_name = "+sqlString(alias.baseName))
+	if alias.suffix == "_bucket" {
+		virtualWhere = append(virtualWhere, "metric_type = 'histogram'")
+	} else {
+		virtualWhere = append(virtualWhere, postHogHistogramTypeFilter)
+	}
+	virtualWhere = append(virtualWhere, fmt.Sprintf("%s NOT IN (SELECT metric_name FROM %s WHERE %s AND metric_name = %s)", sqlString(name), postHogSeriesTable(cfg), teamFilter(cfg), sqlString(name)))
+	where := []string{
+		teamFilter(cfg),
+		"metric_name IN (" + sqlString(name) + ", " + sqlString(alias.baseName) + ")",
+		"((" + strings.Join(realWhere, " AND ") + ") OR (" + strings.Join(virtualWhere, " AND ") + "))",
+	}
+	return postHogSelectedSeriesWhereSQL(cfg, where, cfg.MaxSeries, nil)
+}
+
+func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher, withSamples, latestOnly bool) ([]*seriesMeta, error) {
+	for _, matcher := range matchers {
+		if matcher.Name == labels.MetricName && !matcher.Matches(alias.baseName+alias.suffix) {
+			return nil, nil
+		}
+	}
+	series := make([]*seriesMeta, 0, 64)
+	sources := make(map[uint64]postHogHistogramSource, 64)
+	ids := make([]uint64, 0, 64)
+	err := q.queryable.client.QueryRows(ctx, postHogExactHistogramMetadataSQL(q.queryable.cfg, mint, maxt, alias, matchers), func(row clickHouseRow) error {
+		var id uint64
+		var source postHogHistogramSource
+		if err := row.Scan(&id, &source.metricName, &source.serviceName, &source.resource, &source.attributes); err != nil {
+			return err
+		}
+		if source.metricName == alias.baseName {
+			sources[id] = source
+			ids = append(ids, id)
+			return nil
+		}
+		labelMap := postHogLabelMap(source.metricName, source.serviceName, source.resource, source.attributes)
+		if matchesAll(labelMap, matchers) {
+			series = append(series, &seriesMeta{id: id, metricName: source.metricName, labelMap: labelMap, labels: labels.FromMap(labelMap)})
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(ids) >= q.queryable.cfg.MaxSeries {
+		return nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	if len(series) >= q.queryable.cfg.MaxSeries {
+		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	if withSamples {
+		if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
+			return nil, err
+		}
+		series = slices.DeleteFunc(series, func(meta *seriesMeta) bool { return len(meta.samples) == 0 })
+	}
+	virtual, err := q.readPostHogHistogramSamples(ctx, mint, maxt, []postHogHistogramAlias{alias}, matchers, sources, ids, withSamples)
+	if err != nil {
+		return nil, err
+	}
+	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
+		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	return append(series, virtual...), nil
 }
 
 func postHogMaySelectHistogram(matchers []*labels.Matcher) bool {
@@ -150,12 +231,23 @@ type postHogHistogramSeriesBuilder struct {
 	withSamples    bool
 	series         []*seriesMeta
 	byLabels       map[string]*seriesMeta
+	bySource       map[uint64]*postHogHistogramSourceSeries
 	previousBucket map[uint64]map[string]*seriesMeta
 	samples        int
 }
 
+type postHogHistogramSeriesKey struct {
+	suffix string
+	bound  string
+}
+
+type postHogHistogramSourceSeries struct {
+	labels map[string]string
+	series map[postHogHistogramSeriesKey]*seriesMeta
+}
+
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, byLabels: make(map[string]*seriesMeta), previousBucket: make(map[uint64]map[string]*seriesMeta)}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta)}
 }
 
 func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
@@ -186,19 +278,15 @@ func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64,
 }
 
 func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample, suffixes []string) error {
-	addPoint := func(labelMap map[string]string, value float64) (*seriesMeta, error) {
-		if !matchesAll(labelMap, builder.matchers) {
-			return nil, nil
+	source := builder.bySource[sample.id]
+	if source == nil {
+		source = &postHogHistogramSourceSeries{
+			labels: postHogLabelMap(sample.metricName, sample.serviceName, sample.resource, sample.attributes),
+			series: make(map[postHogHistogramSeriesKey]*seriesMeta),
 		}
-		if builder.withSamples && sample.temporality != "cumulative" {
-			return nil, fmt.Errorf("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
-		}
-		return builder.addPoint(labelMap, sample.timestamp, value)
+		builder.bySource[sample.id] = source
 	}
-	baseLabels := postHogLabelMap(sample.metricName, sample.serviceName, sample.resource, sample.attributes)
 	for _, suffix := range suffixes {
-		labelMap := maps.Clone(baseLabels)
-		labelMap[labels.MetricName] = sample.metricName + suffix
 		switch suffix {
 		case "_bucket":
 			buckets, err := postHogHistogramBuckets(sample)
@@ -207,9 +295,7 @@ func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample,
 			}
 			current := make(map[string]*seriesMeta, len(buckets))
 			for bound, count := range buckets {
-				bucketLabels := maps.Clone(labelMap)
-				bucketLabels["le"] = bound
-				meta, err := addPoint(bucketLabels, count)
+				meta, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix, bound: bound}, count)
 				if err != nil {
 					return err
 				}
@@ -228,11 +314,11 @@ func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample,
 				builder.previousBucket[sample.id] = current
 			}
 		case "_count":
-			if _, err := addPoint(labelMap, float64(sample.count)); err != nil {
+			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, float64(sample.count)); err != nil {
 				return err
 			}
 		case "_sum":
-			if _, err := addPoint(labelMap, sample.sum); err != nil {
+			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, sample.sum); err != nil {
 				return err
 			}
 		}
@@ -240,23 +326,38 @@ func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample,
 	return nil
 }
 
-func (builder *postHogHistogramSeriesBuilder) addPoint(labelMap map[string]string, timestamp int64, value float64) (*seriesMeta, error) {
-	if !matchesAll(labelMap, builder.matchers) {
-		return nil, nil
-	}
-	labelSet := labels.FromMap(labelMap)
-	key := labelSet.String()
-	meta := builder.byLabels[key]
+func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramSourceSeries, sample postHogHistogramSample, seriesKey postHogHistogramSeriesKey, value float64) (*seriesMeta, error) {
+	meta := source.series[seriesKey]
+	var labelMap map[string]string
 	if meta == nil {
-		if len(builder.series) >= builder.cfg.MaxSeries {
-			return nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", builder.cfg.MaxSeries)
+		labelMap = maps.Clone(source.labels)
+		labelMap[labels.MetricName] = sample.metricName + seriesKey.suffix
+		if seriesKey.suffix == "_bucket" {
+			labelMap["le"] = seriesKey.bound
 		}
-		meta = &seriesMeta{id: labelSet.Hash(), metricName: labelMap[labels.MetricName], labelMap: labelMap, labels: labelSet}
-		builder.byLabels[key] = meta
-		builder.series = append(builder.series, meta)
+		if !matchesAll(labelMap, builder.matchers) {
+			return nil, nil
+		}
+	}
+	if builder.withSamples && sample.temporality != "cumulative" {
+		return nil, fmt.Errorf("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
+	}
+	if meta == nil {
+		labelSet := labels.FromMap(labelMap)
+		key := labelSet.String()
+		meta = builder.byLabels[key]
+		if meta == nil {
+			if len(builder.series) >= builder.cfg.MaxSeries {
+				return nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", builder.cfg.MaxSeries)
+			}
+			meta = &seriesMeta{id: labelSet.Hash(), metricName: labelMap[labels.MetricName], labelMap: labelMap, labels: labelSet}
+			builder.byLabels[key] = meta
+			builder.series = append(builder.series, meta)
+		}
+		source.series[seriesKey] = meta
 	}
 	if builder.withSamples {
-		if err := builder.appendSample(meta, timestamp, value); err != nil {
+		if err := builder.appendSample(meta, sample.timestamp, value); err != nil {
 			return nil, err
 		}
 	}
@@ -298,13 +399,17 @@ func (q *CHQuerier) readPostHogHistogramSeries(ctx context.Context, mint, maxt i
 	if len(aliases) == 0 {
 		return nil, nil
 	}
-	suffixes := make(map[string][]string, len(aliases))
-	for _, alias := range aliases {
-		suffixes[alias.baseName] = append(suffixes[alias.baseName], alias.suffix)
-	}
 	sources, ids, err := q.selectPostHogHistogramSources(ctx, mint, maxt, aliases, matchers)
 	if err != nil {
 		return nil, err
+	}
+	return q.readPostHogHistogramSamples(ctx, mint, maxt, aliases, matchers, sources, ids, withSamples)
+}
+
+func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt int64, aliases []postHogHistogramAlias, matchers []*labels.Matcher, sources map[uint64]postHogHistogramSource, ids []uint64, withSamples bool) ([]*seriesMeta, error) {
+	suffixes := make(map[string][]string, len(aliases))
+	for _, alias := range aliases {
+		suffixes[alias.baseName] = append(suffixes[alias.baseName], alias.suffix)
 	}
 	builder := newPostHogHistogramSeriesBuilder(q.queryable.cfg, matchers, withSamples)
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
