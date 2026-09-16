@@ -161,10 +161,24 @@ func TestPostHogHistogramSQL(test *testing.T) {
 		test.Fatalf("virtual le must not filter source attributes: %s", sql)
 	}
 	aliases := []postHogHistogramAlias{{baseName: "test_duration_seconds", suffix: "_bucket"}}
-	sql = postHogHistogramSamplesSQL(cfg, 1000, 2000, aliases, matchers)
-	for _, want := range []string{"histogram_bounds", "histogram_counts", "aggregation_temporality", "team_id = 42", "fromUnixTimestamp64Milli(1000", "fromUnixTimestamp64Milli(2000", "INNER JOIN selected_series", "ORDER BY series_id, timestamp"} {
+	sql = postHogHistogramSeriesSQL(cfg, 1000, 2000, aliases, matchers)
+	for _, want := range []string{"`test`.`metric_series3`", "resource_attributes, attributes", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "test_duration_seconds", "last_seen >= fromUnixTimestamp64Milli(1000", "LIMIT 1 BY series_id"} {
+		if !strings.Contains(sql, want) {
+			test.Fatalf("series SQL missing %q: %s", want, sql)
+		}
+	}
+	if strings.Contains(sql, "'le'") {
+		test.Fatalf("virtual le must not filter source attributes: %s", sql)
+	}
+	sql = postHogHistogramSamplesSQL(cfg, 1000, 2000, []uint64{7}, aliases, matchers)
+	for _, want := range []string{"histogram_bounds", "histogram_counts", "aggregation_temporality", "team_id = 42", "fromUnixTimestamp64Milli(1000", "fromUnixTimestamp64Milli(2000", "series_fingerprint IN (7)", "ORDER BY series_id, timestamp"} {
 		if !strings.Contains(sql, want) {
 			test.Fatalf("samples SQL missing %q: %s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"resource_attributes", "JOIN", "selected_series", "metric_series3"} {
+		if strings.Contains(sql, notWant) {
+			test.Fatalf("samples SQL must not carry labels via %q: %s", notWant, sql)
 		}
 	}
 	for _, name := range []string{"test_duration_seconds_bucket", "test_duration_seconds_count", "test_duration_seconds_sum"} {

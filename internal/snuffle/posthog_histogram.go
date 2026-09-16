@@ -87,7 +87,11 @@ func (q *CHQuerier) postHogHistogramAliases(ctx context.Context, mint, maxt int6
 	return aliases, err
 }
 
-func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
+const postHogHistogramTypeFilter = "metric_type IN ('histogram', 'exponential_histogram')"
+
+// postHogHistogramSampleMatchers replaces the virtual metric name and le
+// matchers with a matcher on the stored base metric names.
+func postHogHistogramSampleMatchers(aliases []postHogHistogramAlias, matchers []*labels.Matcher) []*labels.Matcher {
 	names := make(map[string]struct{}, len(aliases))
 	for _, alias := range aliases {
 		names[alias.baseName] = struct{}{}
@@ -97,11 +101,33 @@ func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, aliases []postHogH
 		patterns[index] = regexp.QuoteMeta(name)
 	}
 	baseMatchers := postHogHistogramBaseMatchers(matchers)
-	baseMatchers = append(baseMatchers, labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, strings.Join(patterns, "|")))
-	plan := newPostHogQueryPlan(cfg, baseMatchers, nil, mint, maxt, true)
-	where := append(plan.sampleWhere(), "metric_type IN ('histogram', 'exponential_histogram')")
-	samples := fmt.Sprintf("SELECT series_fingerprint AS series_id, timestamp, value, count, histogram_bounds, histogram_counts, aggregation_temporality FROM %s WHERE %s", postHogSamplesTable(cfg), strings.Join(where, " AND "))
-	return plan.withSelectedSeries(fmt.Sprintf("SELECT series_id, %s, toUnixTimestamp64Milli(timestamp) AS ts, value, count, histogram_bounds, histogram_counts, samples.aggregation_temporality FROM %s ORDER BY series_id, timestamp", postHogSeriesLabelColumns, plan.joinSeries(samples)))
+	return append(baseMatchers, labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, strings.Join(patterns, "|")))
+}
+
+// postHogHistogramSeriesSQL selects the stored histogram series behind the
+// aliases, with their labels, from the series table.
+func postHogHistogramSeriesSQL(cfg Config, mint, maxt int64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
+	where := postHogSeriesFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
+	where = append(where, postHogHistogramTypeFilter)
+	return postHogSelectedSeriesWhereSQL(cfg, where, cfg.MaxSeries, nil)
+}
+
+// postHogHistogramSamplesSQL reads histogram samples for the selected
+// fingerprints. Labels come from postHogHistogramSeriesSQL, once per series,
+// not once per sample row.
+func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, ids []uint64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
+	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
+	where = append(where, postHogHistogramTypeFilter, "series_fingerprint IN ("+joinUint64(ids)+")")
+	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, histogram_bounds, histogram_counts, aggregation_temporality FROM %s WHERE %s ORDER BY series_id, timestamp", postHogSamplesTable(cfg), strings.Join(where, " AND "))
+}
+
+// postHogHistogramSource is the stored series a virtual histogram series
+// derives from.
+type postHogHistogramSource struct {
+	metricName  string
+	serviceName string
+	resource    map[string]string
+	attributes  map[string]string
 }
 
 type postHogHistogramSample struct {
@@ -246,6 +272,28 @@ func (builder *postHogHistogramSeriesBuilder) appendSample(meta *seriesMeta, tim
 	return nil
 }
 
+func (q *CHQuerier) selectPostHogHistogramSources(ctx context.Context, mint, maxt int64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) (map[uint64]postHogHistogramSource, []uint64, error) {
+	sources := make(map[uint64]postHogHistogramSource, 64)
+	ids := make([]uint64, 0, 64)
+	err := q.queryable.client.QueryRows(ctx, postHogHistogramSeriesSQL(q.queryable.cfg, mint, maxt, aliases, matchers), func(row clickHouseRow) error {
+		var id uint64
+		var source postHogHistogramSource
+		if err := row.Scan(&id, &source.metricName, &source.serviceName, &source.resource, &source.attributes); err != nil {
+			return err
+		}
+		sources[id] = source
+		ids = append(ids, id)
+		return nil
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(ids) >= q.queryable.cfg.MaxSeries {
+		return nil, nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	return sources, ids, nil
+}
+
 func (q *CHQuerier) readPostHogHistogramSeries(ctx context.Context, mint, maxt int64, aliases []postHogHistogramAlias, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {
 	if len(aliases) == 0 {
 		return nil, nil
@@ -254,15 +302,32 @@ func (q *CHQuerier) readPostHogHistogramSeries(ctx context.Context, mint, maxt i
 	for _, alias := range aliases {
 		suffixes[alias.baseName] = append(suffixes[alias.baseName], alias.suffix)
 	}
+	sources, ids, err := q.selectPostHogHistogramSources(ctx, mint, maxt, aliases, matchers)
+	if err != nil {
+		return nil, err
+	}
 	builder := newPostHogHistogramSeriesBuilder(q.queryable.cfg, matchers, withSamples)
-	err := q.queryable.client.QueryRows(ctx, postHogHistogramSamplesSQL(q.queryable.cfg, mint, maxt, aliases, matchers), func(row clickHouseRow) error {
-		var sample postHogHistogramSample
-		if err := row.Scan(&sample.id, &sample.metricName, &sample.serviceName, &sample.resource, &sample.attributes, &sample.timestamp, &sample.sum, &sample.count, &sample.bounds, &sample.counts, &sample.temporality); err != nil {
-			return err
+	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
+		err := q.queryable.client.QueryRows(ctx, postHogHistogramSamplesSQL(q.queryable.cfg, mint, maxt, batch, aliases, matchers), func(row clickHouseRow) error {
+			var sample postHogHistogramSample
+			if err := row.Scan(&sample.id, &sample.timestamp, &sample.sum, &sample.count, &sample.bounds, &sample.counts, &sample.temporality); err != nil {
+				return err
+			}
+			source, ok := sources[sample.id]
+			if !ok {
+				return nil
+			}
+			sample.metricName = source.metricName
+			sample.serviceName = source.serviceName
+			sample.resource = source.resource
+			sample.attributes = source.attributes
+			return builder.add(sample, suffixes[sample.metricName])
+		})
+		if err != nil {
+			return nil, err
 		}
-		return builder.add(sample, suffixes[sample.metricName])
-	})
-	return builder.series, err
+	}
+	return builder.series, nil
 }
 
 func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*seriesMeta, mint, maxt int64, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {

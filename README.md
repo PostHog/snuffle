@@ -402,7 +402,8 @@ In PostHog metrics mode, series identity is the `series_fingerprint` shared by
 `metric_series3` and `metrics2`. Snuffle selects series from `metric_series3`,
 builds Prometheus labels from `metric_name`, `service_name`,
 `resource_attributes`, and `attributes`, and reads samples from `metrics2` by
-fingerprint. `metric_series3` keeps one row per series and expiry day, so
+fingerprint. A sample row carries only the fingerprint, timestamp, and value;
+labels are read once per series, never per sample row. `metric_series3` keeps one row per series and expiry day, so
 series reads collapse duplicates by fingerprint. Label discovery reads the
 hourly rollups instead of the series table: `metric_names3` lists metric
 names, filtered by any `__name__` matcher, and `metric_attributes3` lists

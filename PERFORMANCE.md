@@ -433,6 +433,10 @@ Implemented storage optimizations:
   rollups use MetricsQL calculations
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
+- PostHog-layout sample reads (float and histogram) select series first and
+  then read `(series_fingerprint, timestamp, value)` by fingerprint; joining
+  the series table onto the samples scan shipped both label maps on every
+  sample row and made Go map decoding the dominant cost of range queries
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU
