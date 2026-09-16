@@ -43,7 +43,7 @@ func postHogExactHistogramMetadataSQL(cfg Config, mint, maxt int64, alias postHo
 	} else {
 		virtualWhere = append(virtualWhere, postHogHistogramTypeFilter)
 	}
-	virtualWhere = append(virtualWhere, fmt.Sprintf("%s NOT IN (SELECT metric_name FROM %s WHERE %s AND metric_name = %s)", sqlString(name), postHogSeriesTable(cfg), teamFilter(cfg), sqlString(name)))
+	virtualWhere = append(virtualWhere, fmt.Sprintf("%s NOT IN (SELECT metric_name FROM %s WHERE %s AND metric_name = %s LIMIT 1)", sqlString(name), postHogSeriesTable(cfg), teamFilter(cfg), sqlString(name)))
 	where := []string{
 		teamFilter(cfg),
 		"metric_name IN (" + sqlString(name) + ", " + sqlString(alias.baseName) + ")",

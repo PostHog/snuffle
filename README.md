@@ -523,7 +523,7 @@ Snuffle is configured with environment variables.
 | `SNUFFLE_TLS_CERT_FILE` | empty | PEM server certificate; omit with the key to generate a self-signed certificate |
 | `SNUFFLE_TLS_KEY_FILE` | empty | PEM private key; required with the certificate |
 | `SNUFFLE_PPROF` | `false` | Expose Go pprof handlers under `/debug/pprof/` |
-| `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS` | `true` | Evaluate supported exact histogram `irate` quantile range queries without expanding bucket series; set to `false` to use the general engine |
+| `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS` | `false` | Evaluate supported exact histogram `irate` quantile range queries without expanding bucket series; off by default so a deployment can enable this path after it compares results with the general engine |
 
 ### ClickHouse connection
 

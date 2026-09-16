@@ -446,8 +446,9 @@ Implemented storage optimizations:
   keyed by source fingerprint, suffix, and bucket boundary; later samples
   append values without repeating label sorting and string formatting
 - exact histogram suffix selectors resolve real metric labels or virtual
-  source labels in one metadata query; a team-wide name check keeps real
-  metrics first, independent of label filters and the query time window.
+  source labels in one metadata query; a team-wide name check with `LIMIT 1`
+  keeps real metrics first, independent of label filters and the query time
+  window, and stops at the first matching series row.
   Regex selectors retain the general alias lookup path.
 - histogram array reads use a RowBinary payload with checked, reusable typed
   decoding instead of reflective per-element array scanning
@@ -456,7 +457,9 @@ Implemented storage optimizations:
   timestamps and two cumulative bucket vectors per source. They use the existing
   MetricsQL counter and Prometheus quantile calculations. Real metrics, changing
   bounds, overlapping source labels, and unsupported query shapes use the general
-  engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=false` disables this path.
+  engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=true` enables this path; it is
+  off by default so a deployment can compare its results with the general
+  engine before it enables it.
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU
