@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -396,6 +397,64 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		body, _ := io.ReadAll(response.Body)
 		if response.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(body), "require cumulative") {
 			test.Fatalf("delta query: status %d: %s", response.StatusCode, body)
+		}
+	})
+	test.Run("invalid histograms fail only exact selectors", func(test *testing.T) {
+		result := query(test, `{__name__=~"test_.*_seconds_count"}`)
+		names := make([]string, 0, len(result.Result))
+		for _, series := range result.Result {
+			names = append(names, series.Metric[labels.MetricName])
+		}
+		sort.Strings(names)
+		if want := []string{"test_duration_seconds_count", "test_exponential_seconds_count"}; !reflect.DeepEqual(names, want) {
+			test.Fatalf("broad selector over a delta histogram = %v, want %v", names, want)
+		}
+	})
+	test.Run("large fingerprint sets use an external table", func(test *testing.T) {
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		chunkedCfg := teamCfg
+		chunkedCfg.IDChunkSize = 1
+		matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "test_.*_seconds_(count|sum)")}
+		want, err := (&CHQuerier{queryable: NewCHQueryable(client, teamCfg)}).selectPostHogSeriesSamples(ctx, e2eStartMS, e2eEndMS, false, matchers...)
+		if err != nil || len(want) < 2 {
+			test.Fatalf("series = %d, %v", len(want), err)
+		}
+		stats := &promRequestStats{}
+		got, err := (&CHQuerier{queryable: NewCHQueryable(client, chunkedCfg)}).selectPostHogSeriesSamples(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, false, matchers...)
+		if err != nil {
+			test.Fatal(err)
+		}
+		snapshot := func(series []*seriesMeta) map[string][]samplePoint {
+			result := make(map[string][]samplePoint, len(series))
+			for _, meta := range series {
+				result[meta.labels.String()] = meta.samples
+			}
+			return result
+		}
+		if !reflect.DeepEqual(snapshot(got), snapshot(want)) {
+			test.Fatalf("external table read differs from chunked read")
+		}
+		if count := stats.clickHouseQueries.Load(); count != 4 {
+			test.Fatalf("used %d queries, want series, aliases, histogram series and one external sample read", count)
+		}
+	})
+	test.Run("fast path checks for stored histograms", func(test *testing.T) {
+		teamServer := server.withTeamID(e2eTeamID)
+		for _, testcase := range []struct {
+			matcher *labels.Matcher
+			virtual bool
+		}{
+			{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "requests_total_count"), false},
+			{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric+"_count"), true},
+			{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_exponential_seconds_bucket"), false},
+			{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_exponential_seconds_sum"), true},
+			{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "requests_.*"), true},
+		} {
+			virtual, err := teamServer.postHogSelectsHistogram(ctx, []*labels.Matcher{testcase.matcher})
+			if err != nil || virtual != testcase.virtual {
+				test.Fatalf("%s selects histogram = %v (%v), want %v", testcase.matcher, virtual, err, testcase.virtual)
+			}
 		}
 	})
 }

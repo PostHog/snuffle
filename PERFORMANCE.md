@@ -436,7 +436,12 @@ Implemented storage optimizations:
 - PostHog-layout sample reads (float and histogram) select series first and
   then read `(series_fingerprint, timestamp, value)` by fingerprint; joining
   the series table onto the samples scan shipped both label maps on every
-  sample row and made Go map decoding the dominant cost of range queries
+  sample row and made Go map decoding the dominant cost of range queries.
+  Fingerprint sets larger than `CH_ID_CHUNK_SIZE` are sent as a ClickHouse
+  external table and read with one subquery, because a literal `IN (...)` list
+  of that size can exceed the server `max_query_size`
+- virtual histogram discovery reads `DISTINCT (series_fingerprint,
+  histogram_bounds)` instead of every sample row
 - virtual histogram series reuse their resolved labels within each request,
   keyed by source fingerprint, suffix, and bucket boundary; later samples
   append values without repeating label sorting and string formatting

@@ -17,7 +17,11 @@ import (
 )
 
 func init() {
-	histogramQuantiles := *parser.Functions["histogram_quantiles"]
+	upstream, ok := parser.Functions["histogram_quantiles"]
+	if !ok {
+		panic("metricsql: the Prometheus dependency has no histogram_quantiles function")
+	}
+	histogramQuantiles := *upstream
 	histogramQuantiles.Name = metricsQLInternalPrefix + "histogram_quantiles"
 	histogramQuantiles.Experimental = false
 	histogramQuantiles.Variadic = -1

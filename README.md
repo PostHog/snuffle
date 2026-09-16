@@ -441,7 +441,8 @@ histogram_quantile(0.95, sum by (le) (rate(request_duration_seconds_bucket[5m]))
 Virtual names and labels are available through metric search, label discovery,
 and the series API. Real name searches still use the name rollup; virtual name
 discovery also reads histogram names and types from the series table. Bucket
-label discovery reads the stored bounds within the requested time range.
+label discovery reads the distinct stored bound sets within the requested time
+range, not the samples.
 
 Only cumulative histogram samples can be read as virtual counters. Delta or
 unspecified temporality returns an error rather than an incorrect counter or
@@ -449,7 +450,16 @@ rate. Convert delta histograms to cumulative before ingestion. Exponential
 histograms expose `_count` and `_sum` only: the stored flattened arrays do not
 preserve enough information to reconstruct their bucket boundaries. Use explicit
 histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
+These errors apply to selectors that name the metric exactly. A selector that
+can reach every histogram of a team, such as a regex on `__name__` or a label
+filter alone, skips an invalid histogram and logs a warning, so one bad
+histogram does not fail discovery or broad queries for the team.
 Removed bucket boundaries produce stale markers.
+
+Instant query fast paths stay available for exact `_bucket`, `_count`, and
+`_sum` names when the team stores no histogram with the base name, so real
+classic histograms keep their pushdown. Selectors without an exact name use the
+general engine because any virtual name can match.
 `CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
 
 The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native

@@ -19,15 +19,21 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 		return queryData{}, false, nil
 	}
 	if s.cfg.postHogSchemaLayout() {
-		virtual := false
+		var selectors []*parser.VectorSelector
 		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
-			if selector, ok := node.(*parser.VectorSelector); ok && postHogMaySelectHistogram(selector.LabelMatchers) {
-				virtual = true
+			if selector, ok := node.(*parser.VectorSelector); ok {
+				selectors = append(selectors, selector)
 			}
 			return nil
 		})
-		if virtual {
-			return queryData{}, false, nil
+		for _, selector := range selectors {
+			virtual, err := s.postHogSelectsHistogram(ctx, selector.LabelMatchers)
+			if err != nil {
+				return queryData{}, false, err
+			}
+			if virtual {
+				return queryData{}, false, nil
+			}
 		}
 	}
 	expr, ok := unwrapInstantDefaultRollups(expr)

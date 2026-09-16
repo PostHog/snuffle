@@ -100,26 +100,30 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 		return nil
 	}
 	byID, ids := seriesIndex(series)
-	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
+	return queryPostHogSeriesIDs(ctx, q.queryable.client, q.queryable.cfg.IDChunkSize, ids, func(batch []uint64, idCondition string) string {
 		metricNames := make(map[string]struct{}, 8)
 		for _, id := range batch {
 			if s := byID[id]; s != nil {
 				metricNames[s.metricName] = struct{}{}
 			}
 		}
-		sql := postHogLoadSamplesSQL(q.queryable.cfg, batch, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
-		if err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-			var id uint64
-			var ts int64
-			var value float64
-			if err := row.Scan(&id, &ts, &value); err != nil {
-				return err
-			}
-			if s := byID[id]; s != nil {
-				s.samples = append(s.samples, samplePoint{t: ts, v: value})
-			}
-			return nil
-		}); err != nil {
+		return postHogLoadSamplesWhereSQL(q.queryable.cfg, idCondition, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
+	}, sampleRowHandler(byID))
+}
+
+const postHogSeriesIDsTable = "series_ids"
+
+// queryPostHogSeriesIDs runs the SQL from sqlFor over the fingerprints in ids.
+// Small sets go as literal IN lists in chunks. A literal list of more than
+// chunkSize fingerprints can exceed the ClickHouse max_query_size, so larger
+// sets are sent once as an external table that the SQL reads with a subquery.
+func queryPostHogSeriesIDs(ctx context.Context, client *ClickHouseClient, chunkSize int, ids []uint64, sqlFor func(batch []uint64, idCondition string) string, handle func(clickHouseRow) error) error {
+	if len(ids) > chunkSize {
+		sql := sqlFor(ids, "series_fingerprint IN (SELECT id FROM "+postHogSeriesIDsTable+")")
+		return client.QueryRowsWithExternalUInt64s(ctx, postHogSeriesIDsTable, "id", ids, sql, handle)
+	}
+	for _, batch := range idBatches(ids, chunkSize) {
+		if err := client.QueryRows(ctx, sqlFor(batch, "series_fingerprint IN ("+joinUint64(batch)+")"), handle); err != nil {
 			return err
 		}
 	}
@@ -127,13 +131,17 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 }
 
 func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
+	return postHogLoadSamplesWhereSQL(cfg, "series_fingerprint IN ("+joinUint64(ids)+")", metricNames, matchers, mint, maxt, latestOnly)
+}
+
+func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []string, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
 	where := postHogSampleFilters(cfg, matchers, mint, maxt)
 	if exactMetricName(matchers) == "" {
 		if condition := metricNamesCondition(metricNames); condition != "" {
 			where = append(where, condition)
 		}
 	}
-	where = append(where, "series_fingerprint IN ("+joinUint64(ids)+")")
+	where = append(where, idCondition)
 	source := fmt.Sprintf(
 		"SELECT series_fingerprint AS series_id, timestamp, value FROM %s WHERE %s",
 		postHogSamplesTable(cfg),

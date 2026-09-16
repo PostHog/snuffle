@@ -126,10 +126,11 @@ func TestPostHogHistogramMatchers(test *testing.T) {
 }
 
 func TestPostHogHistogramTemporalityAndLimits(test *testing.T) {
+	exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_count")}
 	for _, temporality := range []string{"delta", "unspecified", ""} {
 		sample := histogramTestSample()
 		sample.temporality = temporality
-		builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+		builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
 		if err := builder.add(sample, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "require cumulative") {
 			test.Fatalf("unsupported temporality %q: %v", temporality, err)
 		}
@@ -296,7 +297,8 @@ func TestPostHogHistogramRepeatedSampleChecks(test *testing.T) {
 		{"bounds", func(sample *postHogHistogramSample) { sample.bounds = []float64{1, 0.5} }},
 	} {
 		test.Run(testcase.name, func(test *testing.T) {
-			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_bucket")}
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
 			sample := histogramTestSample()
 			if err := builder.add(sample, []string{"_bucket"}); err != nil {
 				test.Fatal(err)
@@ -380,5 +382,61 @@ func BenchmarkPostHogHistogramSeriesBuilder(benchmark *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func TestPostHogHistogramInvalidSourcesSkippedForBroadSelectors(test *testing.T) {
+	invalid := histogramTestSample()
+	invalid.id = 2
+	invalid.metricName = "test_broken_seconds"
+	invalid.count = 11
+	delta := histogramTestSample()
+	delta.id = 3
+	delta.metricName = "test_delta_seconds"
+	delta.temporality = "delta"
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "test_.*")}, true)
+	for _, sample := range []postHogHistogramSample{invalid, delta, invalid, histogramTestSample()} {
+		if err := builder.add(sample, []string{"_bucket", "_count"}); err != nil {
+			test.Fatalf("broad selector must skip invalid histogram %q: %v", sample.metricName, err)
+		}
+	}
+	if len(builder.skipped) != 2 {
+		test.Fatalf("skipped sources = %d, want the invalid and the delta histogram", len(builder.skipped))
+	}
+	for _, meta := range builder.series {
+		if name := meta.labelMap[labels.MetricName]; !strings.HasPrefix(name, "test_duration_seconds") {
+			test.Fatalf("invalid histogram produced series %q", name)
+		}
+	}
+	if len(builder.series) != 4 {
+		test.Fatalf("valid histogram produced %d series, want three buckets and a count", len(builder.series))
+	}
+	strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_broken_seconds_bucket")}, true)
+	if err := strict.add(invalid, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "observation count") {
+		test.Fatalf("exact selector must report the invalid histogram: %v", err)
+	}
+}
+
+func TestPostHogHistogramDiscoveryAndExistenceSQL(test *testing.T) {
+	cfg := histogramTestConfig()
+	aliases := []postHogHistogramAlias{{baseName: "test_duration_seconds", suffix: "_bucket"}}
+	sql := postHogHistogramBoundsSQL(cfg, 1000, 2000, "series_fingerprint IN (SELECT id FROM series_ids)", aliases, nil)
+	for _, want := range []string{"SELECT DISTINCT series_fingerprint", "arrayWithConstant(length(histogram_bounds) + 1, toUInt64(0))", "series_fingerprint IN (SELECT id FROM series_ids)", "team_id = 42", "ORDER BY series_id"} {
+		if !strings.Contains(sql, want) {
+			test.Fatalf("bounds SQL missing %q: %s", want, sql)
+		}
+	}
+	for _, notWant := range []string{"histogram_counts", "toUnixTimestamp64Milli", "ORDER BY series_id, timestamp"} {
+		if strings.Contains(sql, notWant) {
+			test.Fatalf("bounds SQL must not read samples via %q: %s", notWant, sql)
+		}
+	}
+	sql = postHogHistogramSourceExistsSQL(cfg, aliases[0])
+	if want := "SELECT 1 FROM `test`.`metric_series3` WHERE team_id = 42 AND metric_name = 'test_duration_seconds' AND metric_type = 'histogram' LIMIT 1"; sql != want {
+		test.Fatalf("bucket existence SQL = %s, want %s", sql, want)
+	}
+	sql = postHogHistogramSourceExistsSQL(cfg, postHogHistogramAlias{baseName: "test_duration_seconds", suffix: "_count"})
+	if !strings.Contains(sql, "metric_type IN ('histogram', 'exponential_histogram')") {
+		test.Fatalf("count existence SQL must accept exponential histograms: %s", sql)
 	}
 }

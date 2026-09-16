@@ -2,7 +2,9 @@ package snuffle
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"math"
 	"regexp"
@@ -124,6 +126,38 @@ func postHogMaySelectHistogram(matchers []*labels.Matcher) bool {
 	return true
 }
 
+// postHogHistogramSourceExistsSQL finds one stored histogram series that can
+// back virtual series for the alias. The series table is keyed by team and
+// metric name, so this is a primary key lookup.
+func postHogHistogramSourceExistsSQL(cfg Config, alias postHogHistogramAlias) string {
+	typeFilter := postHogHistogramTypeFilter
+	if alias.suffix == "_bucket" {
+		typeFilter = "metric_type = 'histogram'"
+	}
+	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s AND metric_name = %s AND %s LIMIT 1", postHogSeriesTable(cfg), teamFilter(cfg), sqlString(alias.baseName), typeFilter)
+}
+
+// postHogSelectsHistogram reports whether the selector can return virtual
+// histogram series. Without an exact metric name, any virtual name can match.
+// An exact name with a histogram suffix, such as a real classic histogram's
+// _bucket series, only does when the team stores a histogram with the base
+// name.
+func (s *Server) postHogSelectsHistogram(ctx context.Context, matchers []*labels.Matcher) (bool, error) {
+	if !postHogMaySelectHistogram(matchers) {
+		return false, nil
+	}
+	alias, ok := postHogExactHistogramAlias(matchers)
+	if !ok {
+		return true, nil
+	}
+	found := false
+	err := s.client.QueryRows(ctx, postHogHistogramSourceExistsSQL(s.cfg, alias), func(clickHouseRow) error {
+		found = true
+		return nil
+	})
+	return found, err
+}
+
 func postHogHistogramBaseMatchers(matchers []*labels.Matcher) []*labels.Matcher {
 	base := make([]*labels.Matcher, 0, len(matchers))
 	for _, matcher := range matchers {
@@ -143,10 +177,12 @@ func postHogHistogramAliasesSQL(cfg Config, mint, maxt int64, matchers []*labels
 		if matcher.Name != labels.MetricName {
 			continue
 		}
-		condition, _ := stringColumnMatcherCondition("concat(metric_name, suffix)", matcher)
-		where = append(where, condition)
-		condition, _ = metricMatcherCondition(matcher)
-		realWhere = append(realWhere, condition)
+		if condition, ok := stringColumnMatcherCondition("concat(metric_name, suffix)", matcher); ok {
+			where = append(where, condition)
+		}
+		if condition, ok := metricMatcherCondition(matcher); ok {
+			realWhere = append(realWhere, condition)
+		}
 	}
 	if name := exactMetricName(matchers); name != "" {
 		for _, suffix := range postHogHistogramSuffixes {
@@ -208,9 +244,23 @@ func postHogHistogramSeriesSQL(cfg Config, mint, maxt int64, aliases []postHogHi
 // fingerprints. Labels come from postHogHistogramSeriesSQL, once per series,
 // not once per sample row.
 func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, ids []uint64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
+	return postHogHistogramSamplesWhereSQL(cfg, mint, maxt, "series_fingerprint IN ("+joinUint64(ids)+")", aliases, matchers)
+}
+
+func postHogHistogramSamplesWhereSQL(cfg Config, mint, maxt int64, idCondition string, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
 	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
-	where = append(where, postHogHistogramTypeFilter, "series_fingerprint IN ("+joinUint64(ids)+")")
+	where = append(where, postHogHistogramTypeFilter, idCondition)
 	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id, timestamp", postHogSamplesTable(cfg), strings.Join(where, " AND "))
+}
+
+// postHogHistogramBoundsSQL reads the distinct bound sets of the selected
+// fingerprints for discovery. It returns rows in the shape of
+// postHogHistogramSamplesWhereSQL with zero counts, so the series builder
+// creates the same virtual series without reading every sample row.
+func postHogHistogramBoundsSQL(cfg Config, mint, maxt int64, idCondition string, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
+	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
+	where = append(where, postHogHistogramTypeFilter, idCondition)
+	return fmt.Sprintf("SELECT DISTINCT series_fingerprint AS series_id, toInt64(0) AS ts, toFloat64(0) AS value, toUInt64(0) AS count, formatRow('RowBinary', histogram_bounds, arrayWithConstant(length(histogram_bounds) + 1, toUInt64(0))) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id", postHogSamplesTable(cfg), strings.Join(where, " AND "))
 }
 
 // postHogHistogramSource is the stored series a virtual histogram series
@@ -240,11 +290,27 @@ type postHogHistogramSeriesBuilder struct {
 	cfg            Config
 	matchers       []*labels.Matcher
 	withSamples    bool
+	strict         bool
 	series         []*seriesMeta
 	byLabels       map[string]*seriesMeta
 	bySource       map[uint64]*postHogHistogramSourceSeries
 	previousBucket map[uint64]map[string]*seriesMeta
+	skipped        map[uint64]struct{}
 	samples        int
+}
+
+// invalidPostHogHistogramError reports a stored histogram sample that cannot
+// become Prometheus series. Limit errors are not of this type.
+type invalidPostHogHistogramError struct {
+	message string
+}
+
+func (err invalidPostHogHistogramError) Error() string {
+	return err.message
+}
+
+func invalidPostHogHistogram(format string, args ...any) error {
+	return invalidPostHogHistogramError{message: fmt.Sprintf(format, args...)}
 }
 
 type postHogHistogramSeriesKey struct {
@@ -257,38 +323,56 @@ type postHogHistogramSourceSeries struct {
 	series map[postHogHistogramSeriesKey]*seriesMeta
 }
 
+// newPostHogHistogramSeriesBuilder builds virtual series from stored
+// histogram samples. A selector that names the metric exactly is strict: an
+// invalid sample fails the query. A broader selector reaches every histogram
+// of the team, so one invalid histogram must not fail it; the builder skips
+// that source and logs it once.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta)}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{})}
 }
 
 func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
 	if len(sample.counts) != len(sample.bounds)+1 {
-		return nil, fmt.Errorf("histogram %q has %d bounds but %d bucket counts", sample.metricName, len(sample.bounds), len(sample.counts))
+		return nil, invalidPostHogHistogram("histogram %q has %d bounds but %d bucket counts", sample.metricName, len(sample.bounds), len(sample.counts))
 	}
 	buckets := make(map[string]float64, len(sample.counts))
 	var cumulative uint64
 	for index, count := range sample.counts {
 		if count > math.MaxUint64-cumulative {
-			return nil, fmt.Errorf("histogram %q bucket count overflows uint64", sample.metricName)
+			return nil, invalidPostHogHistogram("histogram %q bucket count overflows uint64", sample.metricName)
 		}
 		cumulative += count
 		bound := "+Inf"
 		if index < len(sample.bounds) {
 			upper := sample.bounds[index]
 			if math.IsNaN(upper) || math.IsInf(upper, 0) || (index > 0 && upper <= sample.bounds[index-1]) {
-				return nil, fmt.Errorf("histogram %q bounds must be finite and strictly increasing", sample.metricName)
+				return nil, invalidPostHogHistogram("histogram %q bounds must be finite and strictly increasing", sample.metricName)
 			}
 			bound = strconv.FormatFloat(upper, 'g', -1, 64)
 		}
 		buckets[bound] = float64(cumulative)
 	}
 	if cumulative != sample.count {
-		return nil, fmt.Errorf("histogram %q bucket counts do not match its observation count", sample.metricName)
+		return nil, invalidPostHogHistogram("histogram %q bucket counts do not match its observation count", sample.metricName)
 	}
 	return buckets, nil
 }
 
 func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample, suffixes []string) error {
+	err := builder.addSample(sample, suffixes)
+	var invalid invalidPostHogHistogramError
+	if err == nil || builder.strict || !errors.As(err, &invalid) {
+		return err
+	}
+	if _, seen := builder.skipped[sample.id]; !seen {
+		builder.skipped[sample.id] = struct{}{}
+		slog.Warn("skipping invalid histogram series", "metric", sample.metricName, "service_name", sample.serviceName, "error", err)
+	}
+	return nil
+}
+
+func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramSample, suffixes []string) error {
 	source := builder.bySource[sample.id]
 	if source == nil {
 		source = &postHogHistogramSourceSeries{
@@ -351,7 +435,7 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 		}
 	}
 	if builder.withSamples && sample.temporality != "cumulative" {
-		return nil, fmt.Errorf("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
+		return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
 	}
 	if meta == nil {
 		labelSet := labels.FromMap(labelMap)
@@ -423,25 +507,29 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 		suffixes[alias.baseName] = append(suffixes[alias.baseName], alias.suffix)
 	}
 	builder := newPostHogHistogramSeriesBuilder(q.queryable.cfg, matchers, withSamples)
-	var sample postHogHistogramSample
-	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
-		err := q.queryable.client.QueryRows(ctx, postHogHistogramSamplesSQL(q.queryable.cfg, mint, maxt, batch, aliases, matchers), func(row clickHouseRow) error {
-			if err := sample.scanPacked(row); err != nil {
-				return err
-			}
-			source, ok := sources[sample.id]
-			if !ok {
-				return nil
-			}
-			sample.metricName = source.metricName
-			sample.serviceName = source.serviceName
-			sample.resource = source.resource
-			sample.attributes = source.attributes
-			return builder.add(sample, suffixes[sample.metricName])
-		})
-		if err != nil {
-			return nil, err
+	sqlFor := func(_ []uint64, idCondition string) string {
+		if withSamples {
+			return postHogHistogramSamplesWhereSQL(q.queryable.cfg, mint, maxt, idCondition, aliases, matchers)
 		}
+		return postHogHistogramBoundsSQL(q.queryable.cfg, mint, maxt, idCondition, aliases, matchers)
+	}
+	var sample postHogHistogramSample
+	err := queryPostHogSeriesIDs(ctx, q.queryable.client, q.queryable.cfg.IDChunkSize, ids, sqlFor, func(row clickHouseRow) error {
+		if err := sample.scanPacked(row); err != nil {
+			return err
+		}
+		source, ok := sources[sample.id]
+		if !ok {
+			return nil
+		}
+		sample.metricName = source.metricName
+		sample.serviceName = source.serviceName
+		sample.resource = source.resource
+		sample.attributes = source.attributes
+		return builder.add(sample, suffixes[sample.metricName])
+	})
+	if err != nil {
+		return nil, err
 	}
 	return builder.series, nil
 }

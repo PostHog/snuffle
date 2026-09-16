@@ -365,17 +365,14 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 	}
 	evaluator := newCompactHistogramEvaluator(plan, server.cfg)
 	var sample postHogHistogramSample
-	for _, batch := range idBatches(selected, server.cfg.IDChunkSize) {
-		err = server.client.QueryRows(ctx, postHogHistogramSamplesSQL(server.cfg, mint, plan.end, batch, []postHogHistogramAlias{plan.alias}, plan.selector.LabelMatchers), func(row clickHouseRow) error {
-			if err := sample.scanPacked(row); err != nil {
-				return err
-			}
-			return evaluator.add(ctx, sample)
-		})
-		if err != nil {
-			break
+	err = queryPostHogSeriesIDs(ctx, server.client, server.cfg.IDChunkSize, selected, func(_ []uint64, idCondition string) string {
+		return postHogHistogramSamplesWhereSQL(server.cfg, mint, plan.end, idCondition, []postHogHistogramAlias{plan.alias}, plan.selector.LabelMatchers)
+	}, func(row clickHouseRow) error {
+		if err := sample.scanPacked(row); err != nil {
+			return err
 		}
-	}
+		return evaluator.add(ctx, sample)
+	})
 	var result promql.Matrix
 	if err == nil {
 		result, err = evaluator.result(ctx)

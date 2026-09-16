@@ -595,3 +595,14 @@ func TestTopKSelectedSeriesCarriesLabelsAndMetricConstraint(t *testing.T) {
 		}
 	}
 }
+
+func TestPostHogLoadSamplesSQLReadsExternalSeriesIDs(t *testing.T) {
+	cfg := Config{SchemaLayout: "posthog", CHDatabase: "posthog", SamplesTable: "metrics2", TeamID: 7}
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")}
+	sql := postHogLoadSamplesWhereSQL(cfg, "series_fingerprint IN (SELECT id FROM series_ids)", []string{"http_requests_total"}, matchers, 1000, 2000, false)
+	for _, want := range []string{"series_fingerprint IN (SELECT id FROM series_ids)", "metric_name = 'http_requests_total'", "ORDER BY series_id, timestamp"} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
