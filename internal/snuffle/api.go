@@ -413,10 +413,21 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
-	// Range queries use the evaluation engine. Automatic selector windows depend
-	// on the sample interval of each series, and counter rollups use MetricsQL
-	// calculations. SQL grids cannot reproduce either.
 	queryStarted := time.Now()
+	if !prepared.runningSum {
+		if value, handled, err := s.tryCompactHistogramRange(ctx, query, start, end, step); handled {
+			recordQueryLogBackend(w, "compact_histogram")
+			if err != nil {
+				s.metrics.observePromQLQuery("range", "compact_histogram", "error", time.Since(queryStarted), 0, 0, 0)
+				writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+				return
+			}
+			series, samples, histograms := valueStats(value)
+			s.metrics.observePromQLQuery("range", "compact_histogram", "ok", time.Since(queryStarted), series, samples, histograms)
+			writeAPISuccess(w, responseDataFromValue(value))
+			return
+		}
+	}
 	recordQueryLogBackend(w, "prometheus")
 	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {

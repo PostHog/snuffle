@@ -444,6 +444,14 @@ Implemented storage optimizations:
   source labels in one metadata query; a team-wide name check keeps real
   metrics first, independent of label filters and the query time window.
   Regex selectors retain the general alias lookup path.
+- histogram array reads use a RowBinary payload with checked, reusable typed
+  decoding instead of reflective per-element array scanning
+- exact virtual histogram quantile range queries over `sum by (le) (irate(...))`
+  share timestamp and window work across buckets and retain only the last 21
+  timestamps and two cumulative bucket vectors per source. They use the existing
+  MetricsQL counter and Prometheus quantile calculations. Real metrics, changing
+  bounds, overlapping source labels, and unsupported query shapes use the general
+  engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=false` disables this path.
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU

@@ -50,10 +50,10 @@ func postHogExactHistogramMetadataSQL(cfg Config, mint, maxt int64, alias postHo
 	return postHogSelectedSeriesWhereSQL(cfg, where, cfg.MaxSeries, nil)
 }
 
-func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher, withSamples, latestOnly bool) ([]*seriesMeta, error) {
+func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher) ([]*seriesMeta, map[uint64]postHogHistogramSource, []uint64, error) {
 	for _, matcher := range matchers {
 		if matcher.Name == labels.MetricName && !matcher.Matches(alias.baseName+alias.suffix) {
-			return nil, nil
+			return nil, nil, nil, nil
 		}
 	}
 	series := make([]*seriesMeta, 0, 64)
@@ -77,13 +77,24 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, nil, err
 	}
 	if len(ids) >= q.queryable.cfg.MaxSeries {
-		return nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+		return nil, nil, nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
 	if len(series) >= q.queryable.cfg.MaxSeries {
-		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+		return nil, nil, nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	}
+	return series, sources, ids, nil
+}
+
+func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher, withSamples, latestOnly bool) ([]*seriesMeta, error) {
+	series, sources, ids, err := q.selectPostHogExactHistogramMetadata(ctx, mint, maxt, alias, matchers)
+	if err != nil {
+		return nil, err
+	}
+	if len(series) == 0 && len(ids) == 0 {
+		return nil, nil
 	}
 	if withSamples {
 		if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
@@ -199,7 +210,7 @@ func postHogHistogramSeriesSQL(cfg Config, mint, maxt int64, aliases []postHogHi
 func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, ids []uint64, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
 	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
 	where = append(where, postHogHistogramTypeFilter, "series_fingerprint IN ("+joinUint64(ids)+")")
-	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, histogram_bounds, histogram_counts, aggregation_temporality FROM %s WHERE %s ORDER BY series_id, timestamp", postHogSamplesTable(cfg), strings.Join(where, " AND "))
+	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id, timestamp", postHogSamplesTable(cfg), strings.Join(where, " AND "))
 }
 
 // postHogHistogramSource is the stored series a virtual histogram series
@@ -412,10 +423,10 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 		suffixes[alias.baseName] = append(suffixes[alias.baseName], alias.suffix)
 	}
 	builder := newPostHogHistogramSeriesBuilder(q.queryable.cfg, matchers, withSamples)
+	var sample postHogHistogramSample
 	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
 		err := q.queryable.client.QueryRows(ctx, postHogHistogramSamplesSQL(q.queryable.cfg, mint, maxt, batch, aliases, matchers), func(row clickHouseRow) error {
-			var sample postHogHistogramSample
-			if err := row.Scan(&sample.id, &sample.timestamp, &sample.sum, &sample.count, &sample.bounds, &sample.counts, &sample.temporality); err != nil {
+			if err := sample.scanPacked(row); err != nil {
 				return err
 			}
 			source, ok := sources[sample.id]

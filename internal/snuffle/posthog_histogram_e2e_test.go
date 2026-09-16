@@ -18,6 +18,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/prompb"
+	"github.com/prometheus/prometheus/promql"
 )
 
 func TestPostHogHistogramEndToEnd(test *testing.T) {
@@ -128,6 +129,94 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 				if !reflect.DeepEqual(snapshot(got), snapshot(want)) {
 					test.Fatalf("%s samples=%v: combined metadata differs from general path", suffix, withSamples)
 				}
+			}
+		}
+	})
+	test.Run("compact range matches engine", func(test *testing.T) {
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		teamCfg.PostHogCompactHistograms = true
+		compactServer := newServer(teamCfg)
+		start, end, step := time.UnixMilli(e2eStartMS), time.UnixMilli(e2eEndMS), 30*time.Second
+		for _, expression := range []string{
+			`histogram_quantiles("p", 0.5, 0.9, sum by(le)(irate(` + metric + `_bucket)))`,
+			`histogram_quantile(0.5, sum by(le)(irate(` + metric + `_bucket[1m])))`,
+		} {
+			prepared, err := prepareMetricsQLQuery(expression, step, teamCfg.LookbackDelta, start, end)
+			if err != nil {
+				test.Fatal(err)
+			}
+			stats := &promRequestStats{}
+			actual, handled, err := compactServer.tryCompactHistogramRange(withPromRequestStats(ctx, stats), prepared.query, start, end, step)
+			if err != nil || !handled || stats.clickHouseQueries.Load() != 2 {
+				test.Fatalf("compact query: handled=%v queries=%d error=%v", handled, stats.clickHouseQueries.Load(), err)
+			}
+			engineQuery, err := compactServer.engine.NewRangeQuery(ctx, compactServer.queryable, promql.NewPrometheusQueryOpts(false, teamCfg.LookbackDelta), prepared.query, start, end, step)
+			if err != nil {
+				test.Fatal(err)
+			}
+			response := engineQuery.Exec(ctx)
+			if response.Err != nil {
+				test.Fatal(response.Err)
+			}
+			expected := responseDataFromValue(metricsQLValue(response.Value))
+			if !reflect.DeepEqual(responseDataFromValue(actual), expected) {
+				test.Fatalf("compact output differs from engine: %v != %v", responseDataFromValue(actual), expected)
+			}
+			engineQuery.Close()
+		}
+		teamCfg.PostHogCompactHistograms = false
+		disabled := newServer(teamCfg)
+		if _, handled, err := disabled.tryCompactHistogramRange(ctx, "", start, end, step); handled || err != nil {
+			test.Fatal("disabled path did not fall back")
+		}
+	})
+	test.Run("packed binary trailing byte", func(test *testing.T) {
+		const count uint64 = 0x0a00000000000000
+		err := client.QueryRows(ctx, fmt.Sprintf("SELECT toUInt64(1), toInt64(1000), toFloat64(0), toUInt64(%d), formatRow('RowBinary', [toFloat64(1)], [toUInt64(0), toUInt64(%d)]), 'cumulative'", count, count), func(row clickHouseRow) error {
+			var sample postHogHistogramSample
+			if err := sample.scanPacked(row); err != nil {
+				return err
+			}
+			if len(sample.counts) != 2 || sample.counts[1] != count {
+				return fmt.Errorf("packed data lost its final byte: %v", sample.counts)
+			}
+			return nil
+		})
+		if err != nil {
+			test.Fatal(err)
+		}
+	})
+	test.Run("compact data guards", func(test *testing.T) {
+		teamCfg := cfg
+		teamCfg.TeamID = e2eTeamID
+		teamCfg.PostHogCompactHistograms = true
+		compactServer := newServer(teamCfg)
+		start, end, step := time.UnixMilli(e2eStartMS), time.UnixMilli(e2eEndMS+30000), 30*time.Second
+		for _, guard := range []string{"changing", "overlap"} {
+			name := "guard_" + guard + "_duration"
+			insertHistogram(name, "cumulative", "histogram", e2eTeamID)
+			fingerprint := sqlString(name)
+			bounds := "[0.25,1.0]"
+			if guard == "overlap" {
+				fingerprint = sqlString(name + "_copy")
+				bounds = "[0.5,1.0]"
+			}
+			sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes) SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6)+INTERVAL 1 DAY, 'api', 'histogram', 'cumulative', 48, 40, %s, [8,12,20], true, map('region','resource'), map('region','metric','status','200')", tableName(database, cfg.MetricsInputTable), e2eTeamID, sqlString(name), fingerprint, chTimeMillis(e2eEndMS+30000), bounds)
+			if err := client.Exec(ctx, sql); err != nil {
+				test.Fatal(err)
+			}
+			expression := `histogram_quantile(0.5,sum by(le)(irate(` + name + `_bucket)))`
+			prepared, err := prepareMetricsQLQuery(expression, step, teamCfg.LookbackDelta, start, end)
+			if err != nil {
+				test.Fatal(err)
+			}
+			if _, handled, err := compactServer.tryCompactHistogramRange(ctx, prepared.query, start, end, step); handled || err != nil {
+				test.Fatalf("%s guard: handled=%v error=%v", guard, handled, err)
+			}
+			result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {expression}, "start": {"1700000010"}, "end": {"1700000100"}, "step": {"30"}})
+			if len(result.Result) != 1 || len(result.Result[0].Values) == 0 {
+				test.Fatalf("%s fallback returned no data: %v", guard, result)
 			}
 		}
 	})
@@ -242,6 +331,18 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 	})
 	test.Run("real names take priority", func(test *testing.T) {
 		insertReal(metric+"_bucket", e2eTeamID, e2eEndMS)
+		compactCfg := cfg
+		compactCfg.TeamID = e2eTeamID
+		compactCfg.PostHogCompactHistograms = true
+		compactServer := newServer(compactCfg)
+		start, end, step := time.UnixMilli(e2eStartMS), time.UnixMilli(e2eEndMS), 30*time.Second
+		prepared, err := prepareMetricsQLQuery(`histogram_quantile(0.5,sum by(le)(irate(`+metric+`_bucket)))`, step, compactCfg.LookbackDelta, start, end)
+		if err != nil {
+			test.Fatal(err)
+		}
+		if _, handled, err := compactServer.tryCompactHistogramRange(ctx, prepared.query, start, end, step); handled || err != nil {
+			test.Fatalf("real metric did not fall back: %v %v", handled, err)
+		}
 		teamCfg := cfg
 		teamCfg.TeamID = e2eTeamID
 		querier := &CHQuerier{queryable: NewCHQueryable(client, teamCfg)}
