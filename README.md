@@ -286,6 +286,10 @@ Inside a subquery, omitted windows and step units use the subquery step.
 The parser also accepts `WITH` expressions, fractional durations, durations
 without a unit, and step units such as `[4i]`.
 
+An `offset` can follow an aggregate or another expression, for example
+`sum(increase(requests_total[5m])) offset 24h`. Snuffle evaluates the expression
+as a subquery at the query step and returns samples at the original query times.
+
 `increase(metric[1m])` includes the sample before the one-minute window.
 It can return an increase when only one sample is inside the window.
 `increase` and `rate` handle counter resets without extrapolation to window edges.

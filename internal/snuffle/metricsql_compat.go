@@ -677,12 +677,11 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 	case *metricsql.MetricExpr:
 		return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
 	case *metricsql.RollupExpr:
-		if _, ok := e.Expr.(*metricsql.MetricExpr); ok {
-			if e.Window == nil && !e.ForSubquery() {
-				return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
-			}
-		} else {
+		if _, raw := e.Expr.(*metricsql.MetricExpr); !raw {
 			e.Expr = metricsQLDefaultSelectors(e.Expr)
+		}
+		if e.Window == nil && !e.ForSubquery() {
+			return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
 		}
 	case *metricsql.FuncExpr:
 		if !metricsql.IsRollupFunc(e.Name) && !metricsQLSelectorFunctions[e.Name] {
@@ -696,7 +695,11 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 			case *metricsql.MetricExpr:
 			case *metricsql.RollupExpr:
 				if _, raw := a.Expr.(*metricsql.MetricExpr); !raw {
-					a.Expr = metricsQLDefaultSelectors(a.Expr)
+					if metricsQLSelectorFunctions[e.Name] {
+						e.Args[i] = metricsQLDefaultSelectors(a)
+					} else {
+						a.Expr = metricsQLDefaultSelectors(a.Expr)
+					}
 				}
 			default:
 				e.Args[i] = metricsQLDefaultSelectors(arg)
