@@ -53,6 +53,7 @@ type Config struct {
 	TeamHeader                  string
 	TeamQueryParam              string
 	Pprof                       bool
+	PostHogCompactHistograms    bool
 	SelfScrapeEnabled           bool
 	SelfScrapeInterval          time.Duration
 	SelfScrapeTeamID            uint64
@@ -156,6 +157,7 @@ func ConfigFromEnv() Config {
 		TeamHeader:                  getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:              getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
 		Pprof:                       envBool("SNUFFLE_PPROF", false),
+		PostHogCompactHistograms:    envBool("SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS", false),
 		SelfScrapeEnabled:           envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
 		SelfScrapeInterval:          envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
 		SelfScrapeTeamID:            envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),

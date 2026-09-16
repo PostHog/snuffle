@@ -673,6 +673,15 @@ func assertLabels(t *testing.T, baseURL string) {
 	})
 	assertStringPresent(t, names, e2eCounterMetric)
 
+	searched := apiGet[[]string](t, baseURL, "/api/v1/label/__name__/values", url.Values{
+		"match[]": {`{__name__=~".*e2e_requests.*"}`},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	})
+	if len(searched) != 1 || searched[0] != e2eCounterMetric {
+		t.Fatalf("metric name search = %q, want [%q]", searched, e2eCounterMetric)
+	}
+
 	jobs := apiGet[[]string](t, baseURL, "/api/v1/label/job/values", url.Values{
 		"match[]": {e2eCounterMetric},
 		"start":   {"1700000010"},

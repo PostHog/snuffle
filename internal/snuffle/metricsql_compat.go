@@ -112,7 +112,7 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 	}
 	expr = metricsQLDefaultSelectors(expr)
 	rewriter := metricsQLRewriter{lookback: lookback, start: start, end: end}
-	if err := rewriter.rewrite(expr, step, start.Equal(end)); err != nil {
+	if err := rewriter.rewrite(&expr, step, start.Equal(end)); err != nil {
 		return metricsQLQuery{}, err
 	}
 	prepared.query = string(expr.AppendString(nil))
@@ -214,8 +214,8 @@ type metricsQLRewriter struct {
 	end      time.Time
 }
 
-func (r metricsQLRewriter) rewrite(expr metricsql.Expr, step time.Duration, instant bool) error {
-	switch e := expr.(type) {
+func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, instant bool) error {
+	switch e := (*expr).(type) {
 	case *metricsql.DurationExpr:
 		_, err := resolveMetricsQLDuration(e, step)
 		return err
@@ -228,23 +228,31 @@ func (r metricsQLRewriter) rewrite(expr metricsql.Expr, step time.Duration, inst
 		if err != nil {
 			return err
 		}
-		return r.rewrite(e.Expr, childStep, instant && e.Step == nil)
+		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
 	case *metricsql.FuncExpr:
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
+		if e.Name == "median" {
+			replacement, err := r.rewriteMedian(e, step, instant)
+			if err != nil {
+				return err
+			}
+			*expr = replacement
+			return nil
+		}
 		return r.rewriteArgs(e.Args, step, instant)
 	case *metricsql.BinaryOpExpr:
-		if err := r.rewrite(e.Left, step, instant); err != nil {
+		if err := r.rewrite(&e.Left, step, instant); err != nil {
 			return err
 		}
-		return r.rewrite(e.Right, step, instant)
+		return r.rewrite(&e.Right, step, instant)
 	}
 	return nil
 }
 
 func (r metricsQLRewriter) rewriteArgs(args []metricsql.Expr, step time.Duration, instant bool) error {
-	for _, arg := range args {
-		if err := r.rewrite(arg, step, instant); err != nil {
+	for index := range args {
+		if err := r.rewrite(&args[index], step, instant); err != nil {
 			return err
 		}
 	}
@@ -254,6 +262,9 @@ func (r metricsQLRewriter) rewriteArgs(args []metricsql.Expr, step time.Duration
 func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration, instant bool) error {
 	if strings.HasPrefix(e.Name, metricsQLInternalPrefix) {
 		return fmt.Errorf("function %q is reserved for query execution", e.Name)
+	}
+	if e.Name == "histogram_quantiles" {
+		return r.rewriteHistogramQuantiles(e, step, instant)
 	}
 	if e.Name == "running_sum" {
 		return r.rewriteNestedRunningSum(e, step, instant)
@@ -274,11 +285,11 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if argIndex < 0 || argIndex >= len(e.Args) {
 		return r.rewriteArgs(e.Args, step, instant)
 	}
-	for i, arg := range e.Args {
+	for i := range e.Args {
 		if i == argIndex {
 			continue
 		}
-		if err := r.rewrite(arg, step, instant); err != nil {
+		if err := r.rewrite(&e.Args[i], step, instant); err != nil {
 			return err
 		}
 	}
@@ -302,7 +313,7 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if window <= 0 {
 		return fmt.Errorf("the query window must be at least 1ms")
 	}
-	if err := r.rewrite(roll.Expr, childStep, false); err != nil {
+	if err := r.rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
 	if e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
@@ -361,7 +372,7 @@ func (r metricsQLRewriter) rewriteNestedRunningSum(e *metricsql.FuncExpr, step t
 		return fmt.Errorf("the running_sum range is too large")
 	}
 	inner := e.Args[0]
-	if err := r.rewrite(inner, step, false); err != nil {
+	if err := r.rewrite(&inner, step, false); err != nil {
 		return err
 	}
 	e.Name = metricsQLInternalPrefix + "running_sum"
@@ -666,12 +677,11 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 	case *metricsql.MetricExpr:
 		return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
 	case *metricsql.RollupExpr:
-		if _, ok := e.Expr.(*metricsql.MetricExpr); ok {
-			if e.Window == nil && !e.ForSubquery() {
-				return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
-			}
-		} else {
+		if _, raw := e.Expr.(*metricsql.MetricExpr); !raw {
 			e.Expr = metricsQLDefaultSelectors(e.Expr)
+		}
+		if e.Window == nil && !e.ForSubquery() {
+			return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
 		}
 	case *metricsql.FuncExpr:
 		if !metricsql.IsRollupFunc(e.Name) && !metricsQLSelectorFunctions[e.Name] {
@@ -685,7 +695,11 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 			case *metricsql.MetricExpr:
 			case *metricsql.RollupExpr:
 				if _, raw := a.Expr.(*metricsql.MetricExpr); !raw {
-					a.Expr = metricsQLDefaultSelectors(a.Expr)
+					if metricsQLSelectorFunctions[e.Name] {
+						e.Args[i] = metricsQLDefaultSelectors(a)
+					} else {
+						a.Expr = metricsQLDefaultSelectors(a.Expr)
+					}
 				}
 			default:
 				e.Args[i] = metricsQLDefaultSelectors(arg)

@@ -184,6 +184,7 @@ curl --user reader:password \
 
 Every incoming HTTP request that accesses ClickHouse gets a request-scoped
 native connection pool using that request's HTTP Basic username and password.
+Native connections use LZ4 compression to reduce network traffic.
 ClickHouse performs authentication and authorization; Snuffle does not
 maintain a user database or make authentication decisions.
 
@@ -286,6 +287,10 @@ Inside a subquery, omitted windows and step units use the subquery step.
 The parser also accepts `WITH` expressions, fractional durations, durations
 without a unit, and step units such as `[4i]`.
 
+An `offset` can follow an aggregate or another expression, for example
+`sum(increase(requests_total[5m])) offset 24h`. Snuffle evaluates the expression
+as a subquery at the query step and returns samples at the original query times.
+
 `increase(metric[1m])` includes the sample before the one-minute window.
 It can return an increase when only one sample is inside the window.
 `increase` and `rate` handle counter resets without extrapolation to window edges.
@@ -301,6 +306,28 @@ the Prometheus type rules. Unsupported extensions return a query error.
 `start` to each step. As the outermost function, it runs on the query result.
 Inside another expression, it runs as a subquery over the range and requires
 `start` aligned to `step`.
+
+`histogram_quantiles("phi", 0.5, 0.9, buckets)` calculates several histogram
+quantiles in one call. The first argument names the output label, the middle
+arguments are constant numeric quantiles, and the last argument is the histogram
+vector. It supports classic `le` buckets and Prometheus native histograms. The
+output label replaces an existing label with the same name and uses MetricsQL
+number formatting, such as `"0"`, `"0.5"`, and `"1"`. Dynamic quantile expressions
+and `keep_metric_names` are not supported. Histogram calculations otherwise use
+the same behavior as `histogram_quantile`.
+
+`median(values)` calculates the median across input series at each evaluation
+step. It supports `by (...)`, `without (...)`, and multiple arguments. `limit`
+is supported only for instant queries outside subqueries, not for range queries.
+Multiple arguments contribute all their values, including repeated inputs.
+NaN values are ignored. For an even number of values, the result is the average
+of the two middle values. This is not a histogram median: use
+`histogram_quantile(0.5, buckets)` for that.
+
+```promql
+histogram_quantiles("phi", 0.5, 0.9, 0.99, sum by (le) (rate(request_duration_seconds_bucket[5m])))
+median(cpu_usage) by (service_name)
+```
 
 Instant aggregates, `topk`, and nested counts over bare selectors keep their SQL
 fast paths. Range queries and counter rollups read raw samples through the
@@ -375,13 +402,68 @@ In PostHog metrics mode, series identity is the `series_fingerprint` shared by
 `metric_series3` and `metrics2`. Snuffle selects series from `metric_series3`,
 builds Prometheus labels from `metric_name`, `service_name`,
 `resource_attributes`, and `attributes`, and reads samples from `metrics2` by
-fingerprint. `metric_series3` keeps one row per series and expiry day, so
+fingerprint. A sample row carries only the fingerprint, timestamp, and value;
+labels are read once per series, never per sample row. `metric_series3` keeps one row per series and expiry day, so
 series reads collapse duplicates by fingerprint. Label discovery reads the
 hourly rollups instead of the series table: `metric_names3` lists metric
-names, and `metric_attributes3` lists attribute keys and values, filtered by
-exact `__name__` and `service_name` matchers. Other matchers fall back to the
-series table. Remote write inserts into `metrics2_input`; its materialized
+names, filtered by any `__name__` matcher, and `metric_attributes3` lists
+attribute keys and values, filtered by exact `__name__` and `service_name`
+matchers. Other matchers fall back to the series table. Remote write inserts into `metrics2_input`; its materialized
 views fan each row out to the samples, series, attribute, and name tables.
+
+#### OpenTelemetry histogram queries
+
+Snuffle exposes three virtual metrics for each stored PostHog explicit histogram:
+
+- `<name>_bucket{le="..."}` contains cumulative counts across bucket boundaries,
+  including the final `le="+Inf"` bucket.
+- `<name>_count` contains the observation count.
+- `<name>_sum` contains the observation sum, stored in the `value` column.
+
+These are read-time conversions of `histogram_bounds`, `histogram_counts`,
+`count`, and `value`. They do not write new series or change the stored base
+metric. Resource and metric labels are preserved. For buckets, the generated
+`le` label replaces any input attribute with that name. Units are not converted.
+
+A real metric with the exact generated name takes priority for the whole team,
+even if that real metric has different labels or no samples in the query window.
+This rule applies separately to `_bucket`, `_count`, and `_sum`. A real name in
+another team does not suppress a virtual metric. Priority lasts while the real
+name remains in the configured series table.
+
+For example, a histogram named `request_duration_seconds` supports:
+
+```promql
+sum by (le) (rate(request_duration_seconds_bucket[5m]))
+histogram_quantile(0.95, sum by (le) (rate(request_duration_seconds_bucket[5m])))
+```
+
+Virtual names and labels are available through metric search, label discovery,
+and the series API. Real name searches still use the name rollup; virtual name
+discovery also reads histogram names and types from the series table. Bucket
+label discovery reads the distinct stored bound sets within the requested time
+range, not the samples.
+
+Only cumulative histogram samples can be read as virtual counters. Delta or
+unspecified temporality returns an error rather than an incorrect counter or
+rate. Convert delta histograms to cumulative before ingestion. Exponential
+histograms expose `_count` and `_sum` only: the stored flattened arrays do not
+preserve enough information to reconstruct their bucket boundaries. Use explicit
+histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
+These errors apply to selectors that name the metric exactly. A selector that
+can reach every histogram of a team, such as a regex on `__name__` or a label
+filter alone, skips an invalid histogram and logs a warning, so one bad
+histogram does not fail discovery or broad queries for the team.
+Removed bucket boundaries produce stale markers.
+
+Instant query fast paths stay available for exact `_bucket`, `_count`, and
+`_sum` names when the team stores no histogram with the base name, so real
+classic histograms keep their pushdown. Selectors without an exact name use the
+general engine because any virtual name can match.
+`CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
+
+The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native
+histograms, not these OpenTelemetry arrays.
 
 The rollups set two limits on the Prometheus label surface:
 
@@ -441,6 +523,7 @@ Snuffle is configured with environment variables.
 | `SNUFFLE_TLS_CERT_FILE` | empty | PEM server certificate; omit with the key to generate a self-signed certificate |
 | `SNUFFLE_TLS_KEY_FILE` | empty | PEM private key; required with the certificate |
 | `SNUFFLE_PPROF` | `false` | Expose Go pprof handlers under `/debug/pprof/` |
+| `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS` | `false` | Evaluate supported exact histogram `irate` quantile range queries without expanding bucket series; off by default so a deployment can enable this path after it compares results with the general engine |
 
 ### ClickHouse connection
 

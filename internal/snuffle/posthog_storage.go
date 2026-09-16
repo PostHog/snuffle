@@ -3,6 +3,7 @@ package snuffle
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -19,6 +20,41 @@ import (
 const postHogSeriesLabelColumns = "metric_name, service_name, resource_attributes, attributes"
 
 func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if alias, ok := postHogExactHistogramAlias(matchers); ok {
+		return q.selectPostHogExactHistogramSeries(ctx, mint, maxt, alias, matchers, false, false)
+	}
+	series, err := q.selectPostHogFloatSeries(ctx, mint, maxt, matchers...)
+	if err != nil {
+		return nil, err
+	}
+	return q.appendPostHogHistogramSeries(ctx, series, mint, maxt, matchers, false)
+}
+
+// selectPostHogSeriesSamples reads the series table once for labels, then
+// reads samples by fingerprint. Joining labels onto the samples scan shipped
+// both label maps on every sample row, and decoding those maps in Go
+// dominated range queries over many series.
+func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt int64, latestOnly bool, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
+	if alias, ok := postHogExactHistogramAlias(matchers); ok {
+		return q.selectPostHogExactHistogramSeries(ctx, mint, maxt, alias, matchers, true, latestOnly)
+	}
+	series, err := q.selectPostHogFloatSeries(ctx, mint, maxt, matchers...)
+	if err != nil {
+		return nil, err
+	}
+	if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
+		return nil, err
+	}
+	// A series can be selected by last_seen and still have no sample in the
+	// window (a query in the past, or a stale latest sample). Drop it, as the
+	// former join did.
+	series = slices.DeleteFunc(series, func(meta *seriesMeta) bool { return len(meta.samples) == 0 })
+	return q.appendPostHogHistogramSeries(ctx, series, mint, maxt, matchers, true)
+}
+
+// selectPostHogFloatSeries returns the float series matching the matchers,
+// with labels but without samples.
+func (q *CHQuerier) selectPostHogFloatSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	sql := postHogSelectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt, q.queryable.cfg.MaxSeries, nil)
 	series := make([]*seriesMeta, 0, 1024)
 	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
@@ -34,48 +70,6 @@ func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, m
 	}
 	if len(series) >= q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
-	}
-	return series, nil
-}
-
-func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt int64, latestOnly bool, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
-	sql := postHogSeriesSamplesSQL(q.queryable.cfg, matchers, mint, maxt, latestOnly)
-	series := make([]*seriesMeta, 0, 1024)
-	byID := make(map[uint64]*seriesMeta, 1024)
-	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		var id uint64
-		var metricName string
-		var serviceName string
-		var resourceAttrs map[string]string
-		var attrs map[string]string
-		var ts int64
-		var value float64
-		if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs, &ts, &value); err != nil {
-			return err
-		}
-		meta := byID[id]
-		if meta == nil {
-			labelMap := postHogLabelMap(metricName, serviceName, resourceAttrs, attrs)
-			if !matchesAll(labelMap, matchers) {
-				return nil
-			}
-			if len(series) >= q.queryable.cfg.MaxSeries {
-				return fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
-			}
-			meta = &seriesMeta{
-				id:         id,
-				metricName: metricName,
-				labelMap:   labelMap,
-				labels:     labels.FromMap(labelMap),
-			}
-			byID[id] = meta
-			series = append(series, meta)
-		}
-		meta.samples = append(meta.samples, samplePoint{t: ts, v: value})
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
 	return series, nil
 }
@@ -106,26 +100,30 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 		return nil
 	}
 	byID, ids := seriesIndex(series)
-	for _, batch := range idBatches(ids, q.queryable.cfg.IDChunkSize) {
+	return queryPostHogSeriesIDs(ctx, q.queryable.client, q.queryable.cfg.IDChunkSize, ids, func(batch []uint64, idCondition string) string {
 		metricNames := make(map[string]struct{}, 8)
 		for _, id := range batch {
 			if s := byID[id]; s != nil {
 				metricNames[s.metricName] = struct{}{}
 			}
 		}
-		sql := postHogLoadSamplesSQL(q.queryable.cfg, batch, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
-		if err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-			var id uint64
-			var ts int64
-			var value float64
-			if err := row.Scan(&id, &ts, &value); err != nil {
-				return err
-			}
-			if s := byID[id]; s != nil {
-				s.samples = append(s.samples, samplePoint{t: ts, v: value})
-			}
-			return nil
-		}); err != nil {
+		return postHogLoadSamplesWhereSQL(q.queryable.cfg, idCondition, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
+	}, sampleRowHandler(byID))
+}
+
+const postHogSeriesIDsTable = "series_ids"
+
+// queryPostHogSeriesIDs runs the SQL from sqlFor over the fingerprints in ids.
+// Small sets go as literal IN lists in chunks. A literal list of more than
+// chunkSize fingerprints can exceed the ClickHouse max_query_size, so larger
+// sets are sent once as an external table that the SQL reads with a subquery.
+func queryPostHogSeriesIDs(ctx context.Context, client *ClickHouseClient, chunkSize int, ids []uint64, sqlFor func(batch []uint64, idCondition string) string, handle func(clickHouseRow) error) error {
+	if len(ids) > chunkSize {
+		sql := sqlFor(ids, "series_fingerprint IN (SELECT id FROM "+postHogSeriesIDsTable+")")
+		return client.QueryRowsWithExternalUInt64s(ctx, postHogSeriesIDsTable, "id", ids, sql, handle)
+	}
+	for _, batch := range idBatches(ids, chunkSize) {
+		if err := client.QueryRows(ctx, sqlFor(batch, "series_fingerprint IN ("+joinUint64(batch)+")"), handle); err != nil {
 			return err
 		}
 	}
@@ -133,13 +131,17 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 }
 
 func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
+	return postHogLoadSamplesWhereSQL(cfg, "series_fingerprint IN ("+joinUint64(ids)+")", metricNames, matchers, mint, maxt, latestOnly)
+}
+
+func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []string, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
 	where := postHogSampleFilters(cfg, matchers, mint, maxt)
 	if exactMetricName(matchers) == "" {
 		if condition := metricNamesCondition(metricNames); condition != "" {
 			where = append(where, condition)
 		}
 	}
-	where = append(where, "series_fingerprint IN ("+joinUint64(ids)+")")
+	where = append(where, idCondition)
 	source := fmt.Sprintf(
 		"SELECT series_fingerprint AS series_id, timestamp, value FROM %s WHERE %s",
 		postHogSamplesTable(cfg),
@@ -160,31 +162,6 @@ func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, match
 		"SELECT series_id, toUnixTimestamp64Milli(timestamp) AS ts, value FROM (%s) ORDER BY series_id, timestamp",
 		source,
 	)
-}
-
-func postHogSeriesSamplesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
-	plan := newPostHogQueryPlan(cfg, matchers, nil, mint, maxt, true)
-	var perSeries string
-	if latestOnly {
-		perSeries = fmt.Sprintf(
-			"SELECT series_fingerprint AS series_id, max(timestamp) AS ts_col, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
-			postHogSamplesTable(cfg),
-			strings.Join(plan.sampleWhere(), " AND "),
-		)
-		perSeries = fmt.Sprintf("SELECT series_id, ts_col AS timestamp, value FROM (%s) WHERE %s", perSeries, nonStaleSampleSQL("value"))
-	} else {
-		perSeries = fmt.Sprintf(
-			"SELECT series_fingerprint AS series_id, timestamp, value FROM %s WHERE %s",
-			postHogSamplesTable(cfg),
-			strings.Join(plan.sampleWhere(), " AND "),
-		)
-	}
-	sql := fmt.Sprintf(
-		"SELECT series_id, %s, toUnixTimestamp64Milli(timestamp) AS ts, value FROM %s ORDER BY series_id, timestamp",
-		postHogSeriesLabelColumns,
-		plan.joinSeries(perSeries),
-	)
-	return plan.withSelectedSeries(sql)
 }
 
 // postHogSelectedSeriesSQL returns one row per series matching the matchers,
@@ -485,6 +462,13 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, err
 	}
+	virtual, err := q.postHogHistogramLabelValues(ctx, "", matchers)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range virtual {
+		names[name] = struct{}{}
+	}
 	return sortedLimited(names, limit), nil
 }
 
@@ -533,6 +517,13 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, err
 	}
+	virtual, err := q.postHogHistogramLabelValues(ctx, name, matchers)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range virtual {
+		values[value] = struct{}{}
+	}
 	return sortedLimited(values, limit), nil
 }
 
@@ -542,18 +533,20 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 // series scan.
 func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int, matchers []*labels.Matcher) (string, bool) {
 	switch {
+	case name == labels.MetricName && cfg.MetricNamesTable != "":
+		where, ok := postHogMetricNameFilters(cfg, mint, maxt, matchers)
+		if !ok {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s ORDER BY label_value%s",
+			postHogMetricNamesTable(cfg),
+			strings.Join(where, " AND "),
+			sqlLimit(limit),
+		), true
 	case postHogSampleColumnLabel(name):
 		if len(matchers) > 0 {
 			return "", false
-		}
-		if name == labels.MetricName && cfg.MetricNamesTable != "" {
-			return fmt.Sprintf(
-				"SELECT DISTINCT metric_name AS label_value FROM %s WHERE %s AND %s ORDER BY label_value%s",
-				postHogMetricNamesTable(cfg),
-				teamFilter(cfg),
-				strings.Join(postHogAttributeTimeFilters(mint, maxt), " AND "),
-				sqlLimit(limit),
-			), true
 		}
 		column, _ := postHogSeriesLabelExpr(name)
 		return fmt.Sprintf(
@@ -587,6 +580,29 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			sqlLimit(limit),
 		), true
 	}
+}
+
+// postHogMetricNameFilters filters the metric name rollup by team, time and
+// the matchers it can answer: any matcher on __name__, including the regex
+// that a metric search sends. A matcher on another label needs the series
+// table and reports false.
+func postHogMetricNameFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
+	filters := []string{teamFilter(cfg)}
+	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	for _, matcher := range matchers {
+		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
+			continue
+		}
+		if matcher.Name != labels.MetricName {
+			return nil, false
+		}
+		condition, ok := metricMatcherCondition(matcher)
+		if !ok {
+			return nil, false
+		}
+		filters = append(filters, condition)
+	}
+	return filters, true
 }
 
 // postHogAttributeFilters filters the attribute rollup by team, time and the

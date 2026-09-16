@@ -433,6 +433,33 @@ Implemented storage optimizations:
   rollups use MetricsQL calculations
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
+- PostHog-layout sample reads (float and histogram) select series first and
+  then read `(series_fingerprint, timestamp, value)` by fingerprint; joining
+  the series table onto the samples scan shipped both label maps on every
+  sample row and made Go map decoding the dominant cost of range queries.
+  Fingerprint sets larger than `CH_ID_CHUNK_SIZE` are sent as a ClickHouse
+  external table and read with one subquery, because a literal `IN (...)` list
+  of that size can exceed the server `max_query_size`
+- virtual histogram discovery reads `DISTINCT (series_fingerprint,
+  histogram_bounds)` instead of every sample row
+- virtual histogram series reuse their resolved labels within each request,
+  keyed by source fingerprint, suffix, and bucket boundary; later samples
+  append values without repeating label sorting and string formatting
+- exact histogram suffix selectors resolve real metric labels or virtual
+  source labels in one metadata query; a team-wide name check with `LIMIT 1`
+  keeps real metrics first, independent of label filters and the query time
+  window, and stops at the first matching series row.
+  Regex selectors retain the general alias lookup path.
+- histogram array reads use a RowBinary payload with checked, reusable typed
+  decoding instead of reflective per-element array scanning
+- exact virtual histogram quantile range queries over `sum by (le) (irate(...))`
+  share timestamp and window work across buckets and retain only the last 21
+  timestamps and two cumulative bucket vectors per source. They use the existing
+  MetricsQL counter and Prometheus quantile calculations. Real metrics, changing
+  bounds, overlapping source labels, and unsupported query shapes use the general
+  engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=true` enables this path; it is
+  off by default so a deployment can compare its results with the general
+  engine before it enables it.
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU
