@@ -18,6 +18,18 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 	if err != nil {
 		return queryData{}, false, nil
 	}
+	if s.cfg.postHogSchemaLayout() {
+		virtual := false
+		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+			if selector, ok := node.(*parser.VectorSelector); ok && postHogMaySelectHistogram(selector.LabelMatchers) {
+				virtual = true
+			}
+			return nil
+		})
+		if virtual {
+			return queryData{}, false, nil
+		}
+	}
 	expr, ok := unwrapInstantDefaultRollups(expr)
 	if !ok {
 		return queryData{}, false, nil

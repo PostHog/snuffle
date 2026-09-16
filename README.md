@@ -383,6 +383,50 @@ attribute keys and values, filtered by exact `__name__` and `service_name`
 matchers. Other matchers fall back to the series table. Remote write inserts into `metrics2_input`; its materialized
 views fan each row out to the samples, series, attribute, and name tables.
 
+#### OpenTelemetry histogram queries
+
+Snuffle exposes three virtual metrics for each stored PostHog explicit histogram:
+
+- `<name>_bucket{le="..."}` contains cumulative counts across bucket boundaries,
+  including the final `le="+Inf"` bucket.
+- `<name>_count` contains the observation count.
+- `<name>_sum` contains the observation sum, stored in the `value` column.
+
+These are read-time conversions of `histogram_bounds`, `histogram_counts`,
+`count`, and `value`. They do not write new series or change the stored base
+metric. Resource and metric labels are preserved. For buckets, the generated
+`le` label replaces any input attribute with that name. Units are not converted.
+
+A real metric with the exact generated name takes priority for the whole team,
+even if that real metric has different labels or no samples in the query window.
+This rule applies separately to `_bucket`, `_count`, and `_sum`. A real name in
+another team does not suppress a virtual metric. Priority lasts while the real
+name remains in the configured series table.
+
+For example, a histogram named `request_duration_seconds` supports:
+
+```promql
+sum by (le) (rate(request_duration_seconds_bucket[5m]))
+histogram_quantile(0.95, sum by (le) (rate(request_duration_seconds_bucket[5m])))
+```
+
+Virtual names and labels are available through metric search, label discovery,
+and the series API. Real name searches still use the name rollup; virtual name
+discovery also reads histogram names and types from the series table. Bucket
+label discovery reads the stored bounds within the requested time range.
+
+Only cumulative histogram samples can be read as virtual counters. Delta or
+unspecified temporality returns an error rather than an incorrect counter or
+rate. Convert delta histograms to cumulative before ingestion. Exponential
+histograms expose `_count` and `_sum` only: the stored flattened arrays do not
+preserve enough information to reconstruct their bucket boundaries. Use explicit
+histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
+Removed bucket boundaries produce stale markers.
+`CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
+
+The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native
+histograms, not these OpenTelemetry arrays.
+
 The rollups set two limits on the Prometheus label surface:
 
 - Attribute keys and values must be shorter than 256 characters. The

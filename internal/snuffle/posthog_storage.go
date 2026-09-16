@@ -35,7 +35,7 @@ func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, m
 	if len(series) >= q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return series, nil
+	return q.appendPostHogHistogramSeries(ctx, series, mint, maxt, matchers, false)
 }
 
 func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt int64, latestOnly bool, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
@@ -77,7 +77,7 @@ func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt i
 	if err != nil {
 		return nil, err
 	}
-	return series, nil
+	return q.appendPostHogHistogramSeries(ctx, series, mint, maxt, matchers, true)
 }
 
 func scanPostHogSeries(row clickHouseRow, matchers []*labels.Matcher) (*seriesMeta, error) {
@@ -485,6 +485,13 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, err
 	}
+	virtual, err := q.postHogHistogramLabelValues(ctx, "", matchers)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range virtual {
+		names[name] = struct{}{}
+	}
 	return sortedLimited(names, limit), nil
 }
 
@@ -532,6 +539,13 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 	values := make(map[string]struct{})
 	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, err
+	}
+	virtual, err := q.postHogHistogramLabelValues(ctx, name, matchers)
+	if err != nil {
+		return nil, err
+	}
+	for _, value := range virtual {
+		values[value] = struct{}{}
 	}
 	return sortedLimited(values, limit), nil
 }

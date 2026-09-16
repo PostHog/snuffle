@@ -1158,11 +1158,16 @@ func (s *Server) remoteReadSamples(ctx context.Context, req *prompb.ReadRequest)
 			return nil, err
 		}
 		q := &CHQuerier{queryable: s.queryable, mint: query.GetStartTimestampMs(), maxt: query.GetEndTimestampMs()}
-		series, err := q.selectSeries(ctx, query.GetStartTimestampMs(), query.GetEndTimestampMs(), matchers...)
-		if err != nil {
-			return nil, err
+		var series []*seriesMeta
+		if s.cfg.postHogSchemaLayout() {
+			series, err = q.selectPostHogSeriesSamples(ctx, q.mint, q.maxt, false, matchers...)
+		} else {
+			series, err = q.selectSeries(ctx, q.mint, q.maxt, matchers...)
+			if err == nil {
+				err = q.loadSamples(ctx, series, q.mint, q.maxt, false, matchers)
+			}
 		}
-		if err := q.loadSamples(ctx, series, query.GetStartTimestampMs(), query.GetEndTimestampMs(), false, matchers); err != nil {
+		if err != nil {
 			return nil, err
 		}
 		if err := q.loadHistograms(ctx, series, query.GetStartTimestampMs(), query.GetEndTimestampMs(), matchers); err != nil {
