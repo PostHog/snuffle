@@ -54,6 +54,21 @@ func TestTeamIDFromRequest(t *testing.T) {
 	}
 }
 
+func TestTeamHandlerReportsClickHouseReadBytes(t *testing.T) {
+	server := newServer(Config{DefaultTeamID: 1})
+	handler := server.teamHandler(func(_ *Server, w http.ResponseWriter, r *http.Request) {
+		recordClickHouseRead(r.Context(), 1, 2, 345)
+		writeAPISuccess(w, map[string]string{"status": "ok"})
+	})
+	rec := httptest.NewRecorder()
+
+	handler.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/query", nil))
+
+	if got := rec.Header().Get(clickHouseReadBytesHeader); got != "345" {
+		t.Fatalf("%s = %q, want 345", clickHouseReadBytesHeader, got)
+	}
+}
+
 func TestClickHouseCredentialsPassThrough(t *testing.T) {
 	for _, tc := range []struct {
 		name          string

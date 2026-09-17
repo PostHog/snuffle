@@ -166,7 +166,7 @@ type requestTeamIDKey struct{}
 func (s *Server) teamHandler(handler func(*Server, http.ResponseWriter, *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		stats := &promRequestStats{}
-		wrapped := &loggingResponseWriter{ResponseWriter: w}
+		wrapped := &loggingResponseWriter{ResponseWriter: w, stats: stats}
 		withStats := r.WithContext(withPromRequestStats(r.Context(), stats))
 		started := time.Now()
 		endpoint := normalizedEndpoint(withStats.URL.Path)
