@@ -5,9 +5,12 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"time"
 )
+
+const clickHouseReadBytesHeader = "X-Snuffle-ClickHouse-Read-Bytes"
 
 type promRequestStatsKey struct{}
 
@@ -62,6 +65,7 @@ func recordClickHouseWrite(ctx context.Context, rows int64) {
 
 type loggingResponseWriter struct {
 	http.ResponseWriter
+	stats        *promRequestStats
 	status       int
 	bytes        int64
 	errorType    string
@@ -74,12 +78,15 @@ func (w *loggingResponseWriter) WriteHeader(status int) {
 		return
 	}
 	w.status = status
+	if w.stats != nil {
+		w.Header().Set(clickHouseReadBytesHeader, strconv.FormatInt(w.stats.readBytes.Load(), 10))
+	}
 	w.ResponseWriter.WriteHeader(status)
 }
 
 func (w *loggingResponseWriter) Write(payload []byte) (int, error) {
 	if w.status == 0 {
-		w.status = http.StatusOK
+		w.WriteHeader(http.StatusOK)
 	}
 	n, err := w.ResponseWriter.Write(payload)
 	w.bytes += int64(n)
