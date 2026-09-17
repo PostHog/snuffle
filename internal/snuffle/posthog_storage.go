@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 )
@@ -18,6 +19,12 @@ import (
 // and metric_names3 has one row per metric name and hour.
 
 const postHogSeriesLabelColumns = "metric_name, service_name, resource_attributes, attributes"
+
+// postHogLabelWindowMillis is the longest gap between two labelled rows of a
+// series. Ingestion sends the labels of a series on one row per hour at most,
+// and only those rows reach the series table and the hourly rollups, so
+// last_seen and time_bucket can trail the newest sample by up to an hour.
+const postHogLabelWindowMillis = int64(time.Hour / time.Millisecond)
 
 func (q *CHQuerier) selectPostHogSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	if alias, ok := postHogExactHistogramAlias(matchers); ok {
@@ -189,11 +196,12 @@ func postHogMetricNamesTable(cfg Config) string {
 	return tableName(cfg.CHDatabase, cfg.MetricNamesTable)
 }
 
-// postHogSeriesFilters filters the series table. last_seen is the newest
-// sample time of a series, so a series last seen before mint has no samples
-// in the window.
+// postHogSeriesFilters filters the series table. last_seen is the time of the
+// newest labelled row of a series, which can be up to a label window before
+// its newest sample, so a series last seen a window before mint has no
+// samples in the window.
 func postHogSeriesFilters(cfg Config, matchers []*labels.Matcher, mint, _ int64) []string {
-	filters := []string{teamFilter(cfg), "last_seen >= " + chTimeMillis(mint)}
+	filters := []string{teamFilter(cfg), "last_seen >= " + chTimeMillis(mint-postHogLabelWindowMillis)}
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
 			continue
@@ -633,11 +641,12 @@ func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Ma
 }
 
 // postHogAttributeTimeFilters bounds the attribute and metric name rollups,
-// which bucket by hour.
+// which bucket by hour and only have a row in the hour of a labelled row, so
+// the window widens by a label window on each side.
 func postHogAttributeTimeFilters(mint, maxt int64) []string {
 	return []string{
-		"time_bucket >= toStartOfHour(" + chTimeMillis(mint) + ")",
-		"time_bucket <= toStartOfHour(" + chTimeMillis(maxt) + ")",
+		"time_bucket >= toStartOfHour(" + chTimeMillis(mint-postHogLabelWindowMillis) + ")",
+		"time_bucket <= toStartOfHour(" + chTimeMillis(maxt+postHogLabelWindowMillis) + ")",
 	}
 }
 
