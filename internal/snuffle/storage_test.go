@@ -375,7 +375,8 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 		"service_name = 'checkout'",
 		"metric_name = 'http_requests_total'",
 		"series_fingerprint IN (7,9)",
-		"formatRow('RowBinary', groupArray(toUnixTimestamp64Milli(timestamp)), groupArray(value)) AS points",
+		"arraySort(groupArray((toUnixTimestamp64Milli(timestamp), value))) AS points",
+		"arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas",
 		"GROUP BY series_id",
 	} {
 		if !strings.Contains(samplesSQL, want) {

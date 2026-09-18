@@ -470,9 +470,14 @@ Implemented storage optimizations:
 - other range queries and counter rollups use the Prometheus engine: automatic
   selector windows depend on the sample interval of each series, and counter
   rollups use MetricsQL calculations. PostHog-layout float samples arrive as
-  one RowBinary payload per series (`groupArray` in ClickHouse instead of an
-  `ORDER BY` over every sample), and float series iterate their samples in
-  place without a copy into the mixed float and histogram point type
+  one row per series: the first timestamp, the array of timestamp deltas and
+  the array of values (`groupArray` in ClickHouse instead of an `ORDER BY`
+  over every sample). Typed arrays compress far better than an opaque
+  RowBinary string: on a 24-hour read of 2.2M samples over 2010 series the
+  delta arrays moved 0.8 MiB with ZSTD and 1.5 MiB with LZ4, where the
+  RowBinary payload moved 6.2 MiB and 12.0 MiB. Float series iterate their
+  samples in place without a copy into the mixed float and histogram point
+  type
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
 - PostHog-layout sample reads (float and histogram) select series first and

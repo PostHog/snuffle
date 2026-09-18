@@ -2,9 +2,7 @@ package snuffle
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
-	"math"
 	"slices"
 	"strings"
 
@@ -121,15 +119,17 @@ func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(
 	}
 	return func(row clickHouseRow) error {
 		var id uint64
-		var payload []byte
-		if err := row.Scan(&id, &payload); err != nil {
+		var firstTS int64
+		var deltas []int64
+		var values []float64
+		if err := row.Scan(&id, &firstTS, &deltas, &values); err != nil {
 			return err
 		}
 		s := byID[id]
 		if s == nil {
 			return nil
 		}
-		samples, err := decodePackedSamples(payload, s.samples)
+		samples, err := decodeDeltaSamples(firstTS, deltas, values, s.samples)
 		if err != nil {
 			return fmt.Errorf("series %d: %w", id, err)
 		}
@@ -139,39 +139,20 @@ func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(
 	}
 }
 
-// decodePackedSamples appends samples from two RowBinary arrays to the input slice.
-// The first array contains Int64 timestamps.
-// The second array contains Float64 values.
-func decodePackedSamples(payload []byte, samples []samplePoint) ([]samplePoint, error) {
-	readArray := func() ([]byte, error) {
-		length, prefix := binary.Uvarint(payload)
-		if prefix <= 0 || length > uint64((len(payload)-prefix)/8) {
-			return nil, fmt.Errorf("invalid packed sample array length")
+// decodeDeltaSamples appends the samples of one series to the input slice.
+// The timestamps travel as the first timestamp plus the difference to each predecessor.
+// The first difference is zero.
+func decodeDeltaSamples(firstTS int64, deltas []int64, values []float64, samples []samplePoint) ([]samplePoint, error) {
+	if len(deltas) != len(values) {
+		return nil, fmt.Errorf("delta samples have %d timestamp deltas and %d values", len(deltas), len(values))
+	}
+	samples = slices.Grow(samples, len(values))
+	ts := firstTS
+	for index, value := range values {
+		if index > 0 {
+			ts += deltas[index]
 		}
-		payload = payload[prefix:]
-		size := int(length) * 8
-		values := payload[:size]
-		payload = payload[size:]
-		return values, nil
-	}
-	timestamps, err := readArray()
-	if err != nil {
-		return nil, err
-	}
-	values, err := readArray()
-	if err != nil {
-		return nil, err
-	}
-	if len(payload) != 0 || len(timestamps) != len(values) {
-		return nil, fmt.Errorf("packed samples have %d timestamp bytes, %d value bytes and %d trailing bytes", len(timestamps), len(values), len(payload))
-	}
-	count := len(timestamps) / 8
-	samples = slices.Grow(samples, count)
-	for index := 0; index < count; index++ {
-		samples = append(samples, samplePoint{
-			t: int64(binary.LittleEndian.Uint64(timestamps[index*8:])),
-			v: math.Float64frombits(binary.LittleEndian.Uint64(values[index*8:])),
-		})
+		samples = append(samples, samplePoint{t: ts, v: value})
 	}
 	return samples, nil
 }
@@ -223,12 +204,14 @@ func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []st
 			nonStaleSampleSQL("value"),
 		)
 	}
-	// ClickHouse returns one RowBinary array pair for each series.
-	// ClickHouse groups samples instead of sorting them.
-	// Go decodes one payload for each series instead of three values for each sample.
-	// The reader sorts series parts that arrive out of order.
+	// ClickHouse returns one row for each series.
+	// ClickHouse sorts the samples of a series into arrays.
+	// Go decodes typed arrays instead of three values for each sample.
+	// Timestamps travel as deltas: typed columns of small integers compress
+	// several times better than an opaque RowBinary string.
 	return withMaxThreads(fmt.Sprintf(
-		"SELECT series_id, formatRow('RowBinary', groupArray(toUnixTimestamp64Milli(timestamp)), groupArray(value)) AS points FROM (%s) GROUP BY series_id",
+		"SELECT series_id, points[1].1 AS first_ts, arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas, arrayMap(p -> p.2, points) AS vals "+
+			"FROM (SELECT series_id, arraySort(groupArray((toUnixTimestamp64Milli(timestamp), value))) AS points FROM (%s) GROUP BY series_id)",
 		source,
 	), cfg.RangeQueryThreads)
 }

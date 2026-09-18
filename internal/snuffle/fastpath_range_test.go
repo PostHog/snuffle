@@ -1,7 +1,6 @@
 package snuffle
 
 import (
-	"encoding/binary"
 	"math"
 	"strings"
 	"testing"
@@ -216,27 +215,19 @@ func TestMetricsQLSampleIntervalMarginSQLThresholds(t *testing.T) {
 	}
 }
 
-func TestDecodePackedSamples(t *testing.T) {
-	payload := binary.AppendUvarint(nil, 3)
-	for _, ts := range []int64{1000, 2000, 3000} {
-		payload = binary.LittleEndian.AppendUint64(payload, uint64(ts))
-	}
-	payload = binary.AppendUvarint(payload, 3)
-	for _, v := range []float64{1.5, math.NaN(), 3} {
-		payload = binary.LittleEndian.AppendUint64(payload, math.Float64bits(v))
-	}
-	samples, err := decodePackedSamples(payload, []samplePoint{{t: 500, v: 0}})
+func TestDecodeDeltaSamples(t *testing.T) {
+	samples, err := decodeDeltaSamples(1000, []int64{0, 1000, 1000}, []float64{1.5, math.NaN(), 3}, []samplePoint{{t: 500, v: 0}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(samples) != 4 || samples[0].t != 500 || samples[1].t != 1000 || samples[1].v != 1.5 || !math.IsNaN(samples[2].v) || samples[3].t != 3000 || samples[3].v != 3 {
 		t.Fatalf("samples = %+v", samples)
 	}
-	if _, err := decodePackedSamples(payload[:len(payload)-8], nil); err == nil {
-		t.Fatal("truncated payload decoded")
+	if _, err := decodeDeltaSamples(1000, []int64{0, 1000}, []float64{1}, nil); err == nil {
+		t.Fatal("mismatched arrays decoded")
 	}
-	if _, err := decodePackedSamples(append(payload, 0), nil); err == nil {
-		t.Fatal("trailing bytes decoded")
+	if samples, err := decodeDeltaSamples(0, nil, nil, nil); err != nil || len(samples) != 0 {
+		t.Fatalf("empty arrays: %v, %v", samples, err)
 	}
 }
 
