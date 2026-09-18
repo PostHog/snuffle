@@ -40,6 +40,7 @@ type Config struct {
 	TLSCertFile                 string
 	TLSKeyFile                  string
 	CHTimeout                   time.Duration
+	CHCompression               string
 	QueryTimeout                time.Duration
 	LookbackDelta               time.Duration
 	MaxSamples                  int
@@ -147,6 +148,7 @@ func ConfigFromEnv() Config {
 		TLSCertFile:                 tlsCertFile,
 		TLSKeyFile:                  tlsKeyFile,
 		CHTimeout:                   envDurationSeconds("CH_TIMEOUT_SECONDS", 30*time.Second),
+		CHCompression:               strings.ToLower(getenv("CH_COMPRESSION", "zstd")),
 		QueryTimeout:                envDurationSeconds("PROMQL_QUERY_TIMEOUT_SECONDS", 30*time.Second),
 		LookbackDelta:               envDuration("PROMQL_LOOKBACK_DELTA", 5*time.Minute),
 		MaxSamples:                  envInt("PROMQL_MAX_SAMPLES", 50_000_000, 1),

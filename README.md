@@ -535,6 +535,7 @@ Snuffle is configured with environment variables.
 | `CH_PASSWORD` | empty | Password for Snuffle-initiated work and optional request fallback |
 | `SNUFFLE_ALLOW_UNAUTHENTICATED` | `false` | Allow requests without decodable Basic credentials by using `CH_USER` and `CH_PASSWORD` |
 | `CH_TIMEOUT_SECONDS` | `30` | ClickHouse connection and operation timeout in seconds |
+| `CH_COMPRESSION` | `zstd` | Compression for ClickHouse native protocol blocks in both directions: `zstd`, `lz4`, or `none`. ZSTD moved about half the bytes of LZ4 for sample reads at the same ClickHouse CPU |
 
 ### Schema and tables
 
