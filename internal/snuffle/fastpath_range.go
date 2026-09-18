@@ -11,41 +11,41 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
-// The range pushdown evaluates `agg by (...) (F(selector[w]))` range queries
-// over the PostHog layout in one ClickHouse query. ClickHouse computes the
-// MetricsQL rollup for every series at every step and aggregates across
-// series, so one row per group and step returns to Go instead of every raw
-// sample. The Prometheus engine keeps every other shape.
+// Range pushdown evaluates `agg by (...) (F(selector[w]))` for PostHog in one ClickHouse query.
+// At each step, ClickHouse calculates rollups and aggregates across series.
+// It returns one row per group and step instead of each raw sample.
+// The Prometheus engine evaluates all other query shapes.
 
-// maxRangePushdownPoints matches the Prometheus engine limit on points per
-// series. Larger ranges fail in the engine with its own message.
+// maxRangePushdownPoints is the Prometheus engine limit for points in one series.
+// The engine returns its own error for larger ranges.
 const maxRangePushdownPoints = 11000
 
-// rangePushdownSentinel stands in for a missing previous sample. It is far
-// before any timestamp, so every "previous sample is recent enough" test is
-// false and the gap to it never overflows.
+// rangePushdownSentinel represents a missing previous sample.
+// Its value is before all valid timestamps.
+// The value makes recency checks false and prevents overflow.
 const rangePushdownSentinel = "toInt64(-4000000000000000000)"
 
-// rangeRollupCall is one MetricsQL counter or default rollup as rewritten by
-// prepareMetricsQLQuery: the function name without the internal prefix, the
-// selector inside the matrix, and the durations in milliseconds.
+// rangeRollupCall contains one MetricsQL counter rollup or default rollup.
+// prepareMetricsQLQuery rewrites the rollup before this type stores it.
+// The type stores the function name, the selector in the matrix, and durations in milliseconds.
+// The function name does not include the internal prefix.
 type rangeRollupCall struct {
 	name     string
 	selector *parser.VectorSelector
-	window   int64 // 0 selects the MetricsQL automatic window
+	window   int64 // Zero selects the MetricsQL automatic window.
 	step     int64
 	lookback int64
-	matrix   int64 // history read before each step: window (or step) plus lookback
+	matrix   int64 // History before each step: window or step, plus lookback.
 }
 
-// counter reports whether the function removes counter resets.
+// counter reports whether this rollup removes counter resets.
 func (c rangeRollupCall) counter() bool {
 	return c.name == "increase" || c.name == "rate" || c.name == "irate"
 }
 
-// windowTotal reports whether the function sums a whole window: increase and
-// delta start from zero without a usable previous sample and accept any
-// previous sample inside the matrix.
+// windowTotal reports whether this rollup sums the complete window.
+// increase and delta start from zero if no valid previous sample exists.
+// These functions accept any previous sample in the matrix.
 func (c rangeRollupCall) windowTotal() bool {
 	return c.name == "increase" || c.name == "delta"
 }
@@ -101,7 +101,7 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
 }
 
-// expansion is the largest number of steps one sample can contribute to.
+// expansion returns the maximum number of steps that can use one sample.
 func (c rangeRollupCall) expansion() int64 {
 	span := c.window
 	if c.name == "default_rollup" {
@@ -110,16 +110,17 @@ func (c rangeRollupCall) expansion() int64 {
 	return (span+c.step-1)/c.step + 1
 }
 
-// parseRangeRollupCall accepts the rewritten form
-// `__snuffle_F(selector[matrix], window, step, lookback, 0)` when the step and
-// lookback match the request and the selector has no offset or @ modifier.
-// A missing window is accepted for default_rollup only.
+// parseRangeRollupCall parses this rewritten form:
+// `__snuffle_F(selector[matrix], window, step, lookback, 0)`.
+// It requires the request step and lookback.
+// It rejects selectors that have an offset or an @ modifier.
+// Only default_rollup accepts a missing window.
 func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (rangeRollupCall, bool) {
 	call, ok := unparenExpr(expr).(*parser.Call)
 	if !ok || call.Func == nil || len(call.Args) != 5 {
 		return rangeRollupCall{}, false
 	}
-	// The engine registers the internal default_rollup under last_over_time.
+	// The engine registers the internal default_rollup as last_over_time.
 	name := strings.TrimPrefix(call.Func.Name, metricsQLInternalPrefix)
 	if call.Func.Name == metricsQLDefaultRollupName {
 		name = "default_rollup"
@@ -139,8 +140,8 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 	if numbers[3] != 0 || out.step != step.Milliseconds() || out.lookback != lookback.Milliseconds() || out.step <= 0 || out.lookback <= 0 {
 		return rangeRollupCall{}, false
 	}
-	// A counter without an explicit window sizes it from the sample interval
-	// of each step; that stays with the engine.
+	// The engine handles counters that have no explicit window.
+	// It calculates each window from the sample interval at that step.
 	if out.window == 0 && name != "default_rollup" {
 		return rangeRollupCall{}, false
 	}
@@ -164,25 +165,26 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 	return out, true
 }
 
-// rangeRollupSQL builds the pushdown query. Reading from the inside out:
+// rangeRollupSQL builds the ClickHouse pushdown query.
+// Read the query from the inner stage to the outer stage:
 //
-//  1. samples: the samples in [start - matrix, end]. Counters never see
-//     stale markers; default_rollup keeps them so a marker ends a series.
-//  2. series: one row per series with its samples sorted into arrays, the
-//     previous and next sample of each one, and the sample interval estimate
-//     of metricsQLSampleInterval over the whole range. VictoriaMetrics also
-//     estimates the interval once per series; the engine estimates it per
-//     step from the samples it can see, so the two differ on irregular series.
-//  3. steps: one row per sample and step it belongs to, with the step time
-//     t_i. Counters expand over the window; default_rollup reads the last
-//     sample, so a sample stops mattering once the next one arrives.
-//  4. contributions: metricsQLCounterValue split per sample. The first sample
-//     in a window differences with the previous sample when it is usable and
-//     starts the counter otherwise; later samples difference with their
-//     predecessor.
-//  5. rollups: the per-series, per-step value.
-//  6. the aggregate across series per group and step. sum over increase or
-//     delta is the sum of all contributions, so it skips step 5.
+//  1. samples reads samples from [start - matrix, end].
+//     It removes stale markers for counters but keeps them for default_rollup.
+//  2. series sorts each series into arrays.
+//     It adds the previous and next sample for each sample.
+//     metricsQLSampleInterval estimates one interval across the complete range.
+//     VictoriaMetrics also estimates one interval for each series.
+//     The engine estimates an interval for each step.
+//     Thus, irregular series can produce different results.
+//  3. steps joins each sample to its applicable steps.
+//     Counters use the window.
+//     default_rollup stops using a sample when the next sample arrives.
+//  4. contributions calculates the MetricsQL counter contribution for each sample.
+//     The first sample uses a valid previous sample or starts the counter.
+//     Later samples use their predecessor.
+//  5. rollups calculates one value for each series and step.
+//  6. The final stage aggregates series by group and step.
+//     A sum of increase or delta adds contributions directly and skips stage 5.
 func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, startMillis, points int64, aggSQL string, sumContributions bool) string {
 	start := strconv.FormatInt(startMillis, 10)
 	step := strconv.FormatInt(call.step, 10)
@@ -219,7 +221,7 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, st
 		series,
 	)
 
-	// A sample belongs to the steps t_i with ts <= t_i < ts + span.
+	// A sample applies when ts <= t_i and t_i < ts + span.
 	span := "window_ms"
 	if defaultRollup {
 		span = "least(" + matrix + ", ifNull(next_ts - ts, " + matrix + "))"
@@ -234,19 +236,19 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, st
 
 	diff := "v - p_v"
 	if call.counter() {
-		// MetricsQL treats a drop of less than an eighth as a partial reset.
+		// MetricsQL treats a drop below one eighth of the previous value as a partial reset.
 		diff = "if(v >= p_v, v - p_v, if((p_v - v) * 8 < p_v, 0, v))"
 	}
-	// Without a usable previous sample, increase and delta start from zero
-	// when the first value looks like a fresh counter; rate starts from the
-	// first sample.
+	// Without a valid previous sample, increase and delta start at zero when the value appears to start a new counter.
+	// rate starts at the first sample.
 	first := "0"
 	if call.windowTotal() {
 		first = "if(abs(v) < 10 * (abs(if(ifNull(next_ts, t_i + 1) <= t_i, ifNull(next_v, v) - v, 0)) + 1), v, 0)"
 	}
-	// increase and delta use the previous sample whenever it is inside the
-	// matrix, within the lookback of the window start, as VictoriaMetrics
-	// does. rate, irate and idelta also need it within the interval estimate.
+	// increase and delta use a previous sample that is inside the matrix.
+	// The sample must also be inside the lookback from the window start.
+	// VictoriaMetrics uses the same rule.
+	// rate, irate, and idelta also require the sample to be in the estimated interval.
 	hasPrev := "p_ts > t_i - " + matrix
 	if !call.windowTotal() {
 		hasPrev += " AND p_ts > t_i - window_ms - max_prev"
@@ -290,9 +292,9 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, st
 	return withRangePushdownSettings(plan.withSelectedSeries(sql), cfg.RangeQueryThreads)
 }
 
-// withRangePushdownSettings appends the query settings. Short-circuit
-// evaluation re-evaluates the expression tree of every lazily evaluated `if`
-// branch, which multiplied the query time several times over.
+// withRangePushdownSettings adds the ClickHouse query settings.
+// ClickHouse can evaluate the expression tree of each lazy `if` branch more than once.
+// This behavior made these queries several times slower.
 func withRangePushdownSettings(sql string, maxThreads int) string {
 	settings := "short_circuit_function_evaluation = 'disable'"
 	if maxThreads > 0 {
@@ -301,9 +303,9 @@ func withRangePushdownSettings(sql string, maxThreads int) string {
 	return sql + " SETTINGS " + settings
 }
 
-// rangeRollupValueSQL is the per-series, per-step value of each function in
-// terms of the contribution rows of one step. NULL means no point, as in
-// metricsQLValue.
+// rangeRollupValueSQL returns one function value for each series and step.
+// It calculates the value from that step's contribution rows.
+// NULL represents no point, as it does in metricsQLValue.
 func rangeRollupValueSQL(name string) string {
 	switch name {
 	case "increase", "delta":
@@ -315,13 +317,13 @@ func rangeRollupValueSQL(name string) string {
 	case "idelta":
 		return "if(count() >= 2 OR max(first_has_prev) = 1, argMax(c_diff, ts), argMax(v, ts))"
 	default:
-		// One row per step: the last sample, unless it is too old or a stale marker.
+		// This branch returns the last sample unless it is stale or too old.
 		return "any(if(t_i - ts < window_ms AND " + nonStaleSampleSQL("v") + ", v, NULL))"
 	}
 }
 
-// metricsQLSampleIntervalMarginSQL mirrors the margin table in
-// metricsQLSampleInterval for an Int64 interval expression in milliseconds.
+// metricsQLSampleIntervalMarginSQL implements the metricsQLSampleInterval margin table.
+// It accepts an Int64 interval in milliseconds.
 func metricsQLSampleIntervalMarginSQL(interval string) string {
 	i := interval
 	return fmt.Sprintf(
@@ -330,8 +332,7 @@ func metricsQLSampleIntervalMarginSQL(interval string) string {
 	)
 }
 
-// queryRangeAggregateResults folds rows ordered by group and step into one
-// matrix series per group.
+// queryRangeAggregateResults converts ordered rows into one matrix series for each group.
 func (s *Server) queryRangeAggregateResults(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
 	results := make([]sampleResult, 0, 64)
 	lastKey := ""

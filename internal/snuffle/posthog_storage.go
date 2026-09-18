@@ -113,8 +113,8 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 	}, postHogSampleRowHandler(byID, latestOnly))
 }
 
-// postHogSampleRowHandler decodes one series per row, unless the query kept
-// one sample per series as scalar columns.
+// postHogSampleRowHandler decodes each row as one series.
+// It uses scalar columns when the query keeps one sample for each series.
 func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(clickHouseRow) error {
 	if latestOnly {
 		return sampleRowHandler(byID)
@@ -139,8 +139,9 @@ func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(
 	}
 }
 
-// decodePackedSamples appends the samples in a RowBinary payload of two
-// arrays, Int64 timestamps then Float64 values, to samples.
+// decodePackedSamples appends samples from two RowBinary arrays to the input slice.
+// The first array contains Int64 timestamps.
+// The second array contains Float64 values.
 func decodePackedSamples(payload []byte, samples []samplePoint) ([]samplePoint, error) {
 	readArray := func() ([]byte, error) {
 		length, prefix := binary.Uvarint(payload)
@@ -222,10 +223,10 @@ func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []st
 			nonStaleSampleSQL("value"),
 		)
 	}
-	// One row per series with its samples packed as RowBinary arrays:
-	// ClickHouse groups instead of sorting, and Go decodes one payload per
-	// series instead of three driver values per sample. The reader sorts a
-	// series when its parts arrived out of order.
+	// ClickHouse returns one RowBinary array pair for each series.
+	// ClickHouse groups samples instead of sorting them.
+	// Go decodes one payload for each series instead of three values for each sample.
+	// The reader sorts series parts that arrive out of order.
 	return withMaxThreads(fmt.Sprintf(
 		"SELECT series_id, formatRow('RowBinary', groupArray(toUnixTimestamp64Milli(timestamp)), groupArray(value)) AS points FROM (%s) GROUP BY series_id",
 		source,

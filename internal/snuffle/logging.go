@@ -24,10 +24,10 @@ type promRequestStats struct {
 	writtenRows       atomic.Int64
 }
 
-// queryLogPhase is one timed part of a query handler, such as the engine
-// evaluation or the response encoding. ClickHouse time is recorded per query
-// in promRequestStats, so the difference between the evaluation and the
-// ClickHouse time is the work done in Go.
+// queryLogPhase stores one timed part of a query handler.
+// Examples include engine evaluation and response encoding.
+// promRequestStats records the ClickHouse time for each query.
+// The difference between evaluation time and ClickHouse time measures work in Go.
 type queryLogPhase struct {
 	name     string
 	duration time.Duration

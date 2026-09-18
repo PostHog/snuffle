@@ -13,11 +13,11 @@ import (
 	"time"
 )
 
-// TestRangePushdownLatency seeds a counter with SNUFFLE_E2E_BENCH_SERIES
-// series (default 2000) at one sample per minute over 24 hours, then times
-// `sum(increase(m[1m])) by (code)` at a one minute step through the pushdown
-// and through the Prometheus engine. It reports the timings and checks that
-// both paths agree.
+// TestRangePushdownLatency creates SNUFFLE_E2E_BENCH_SERIES counter series.
+// The default is 2,000 series.
+// It records one sample per minute for 24 hours.
+// It times `sum(increase(m[1m])) by (code)` with a one-minute step.
+// The test uses the pushdown and the Prometheus engine, then compares their results.
 func TestRangePushdownLatency(test *testing.T) {
 	if os.Getenv("SNUFFLE_E2E_BENCH") != "1" {
 		test.Skip("set SNUFFLE_E2E_BENCH=1 to run the ClickHouse range pushdown benchmark")
@@ -53,8 +53,8 @@ func TestRangePushdownLatency(test *testing.T) {
 	clusters := series / codes
 	const minutes = 24*60 + 7
 	columns := "team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, is_monotonic, value, count, has_labels, resource_attributes, attributes"
-	// The first and last sample of each series carry labels, so the series
-	// table holds one fresh row per series as it does after merges.
+	// Only the first and last samples of each series contain labels.
+	// After merges, the series table contains one current row for each series.
 	rows := fmt.Sprintf(`SELECT %d, '%s', cityHash64('bench', c.number, k.number), fromUnixTimestamp64Milli(%d + toInt64(m.number) * 60000, 'UTC'), now64(6), now64(6) + INTERVAL 1 DAY, 'envoy', 'sum', 'cumulative', true,
 		toFloat64(m.number) * toFloat64(1 + (c.number * 10 + k.number) %% 17) + toFloat64(k.number), 1, m.number IN (0, %d), map('region', 'eu'),
 		map('envoy_cluster_name', concat('cluster-', toString(c.number)), 'envoy_response_code', toString(200 + k.number * 37 %% 400))

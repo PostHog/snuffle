@@ -1232,8 +1232,9 @@ func (s *seriesMeta) Labels() labels.Labels {
 
 func (s *seriesMeta) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
 	if len(s.histograms) == 0 {
-		// Float series iterate their samples in place: no copy into the
-		// mixed point type and no sort when the samples are already ordered.
+		// Float series use their sample slice directly.
+		// They do not copy samples to mixed points.
+		// sortSamples does no work if the samples are already ordered.
 		sortSamples(s.samples)
 		return &floatSampleIterator{samples: s.samples, idx: -1}
 	}
@@ -1281,7 +1282,7 @@ type seriesPoint struct {
 	typ chunkenc.ValueType
 }
 
-// sortSamples orders samples by time when they are not already ordered.
+// sortSamples sorts samples by time only when necessary.
 func sortSamples(samples []samplePoint) {
 	if !slices.IsSortedFunc(samples, compareSampleTime) {
 		slices.SortFunc(samples, compareSampleTime)
@@ -1292,7 +1293,7 @@ func compareSampleTime(a, b samplePoint) int {
 	return cmp.Compare(a.t, b.t)
 }
 
-// floatSampleIterator is the chunkenc.Iterator of a series without histograms.
+// floatSampleIterator iterates a series that has no histograms.
 type floatSampleIterator struct {
 	samples []samplePoint
 	idx     int

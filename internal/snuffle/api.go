@@ -469,7 +469,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	writeAPISuccessTimed(w, responseDataFromValue(value))
 }
 
-// writeAPISuccessTimed records the response encoding time as a query phase.
+// writeAPISuccessTimed writes the API response and times its encoding phase.
 func writeAPISuccessTimed(w http.ResponseWriter, data any) {
 	started := time.Now()
 	writeAPISuccess(w, data)

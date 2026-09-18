@@ -18,10 +18,9 @@ import (
 	promvalue "github.com/prometheus/prometheus/model/value"
 )
 
-// TestRangePushdownMatchesEngine runs range queries through the ClickHouse
-// pushdown and the Prometheus engine over series with counter resets, partial
-// resets, gaps longer than the lookback, irregular intervals, stale markers
-// and late starts, and requires the same series and values from both.
+// TestRangePushdownMatchesEngine compares ClickHouse pushdown and Prometheus engine results.
+// The data includes full and partial resets, gaps longer than the lookback, irregular intervals, stale markers, and late starts.
+// Both paths must return the same series and values.
 func TestRangePushdownMatchesEngine(test *testing.T) {
 	if os.Getenv("SNUFFLE_E2E") != "1" {
 		test.Skip("set SNUFFLE_E2E=1 to run the ClickHouse e2e test")
@@ -84,9 +83,10 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 		}
 		return points
 	}
-	// Steady counter, one sample per minute.
+	// This steady counter has one sample per minute.
 	insertSeries("map('code', '200', 'cluster', 'a')", regular(time.Minute, 0, 40*time.Minute, 100, 7))
-	// Full reset at 20m and a partial reset (a drop of less than an eighth) at 30m.
+	// This counter has a full reset at 20 minutes and a partial reset at 30 minutes.
+	// The partial reset drops by less than one eighth of the previous value.
 	reset := regular(time.Minute, 0, 40*time.Minute, 1000, 50)
 	for i := range reset {
 		switch {
@@ -101,20 +101,21 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 		}
 	}
 	insertSeries("map('code', '200', 'cluster', 'b')", reset)
-	// Gaps longer than every tested matrix (window plus lookback), then a
-	// large value and later a fresh small counter.
+	// These gaps exceed all tested matrices.
+	// A large value follows the first gap, and a small new counter follows later.
 	gap := append(regular(time.Minute, 0, 6*time.Minute, 5000, 20), regular(time.Minute, 18*time.Minute, 24*time.Minute, 9000, 20)...)
 	gap = append(gap, regular(time.Minute, 36*time.Minute, 40*time.Minute, 2, 1)...)
 	insertSeries("map('code', '500', 'cluster', 'a')", gap)
-	// A stale marker in the middle of a steady series.
+	// This steady series has a stale marker in its middle.
 	marked := regular(time.Minute, 0, 40*time.Minute, 10, 3)
 	marked = append(marked, point{offset: 21*time.Minute + 15*time.Second, value: stale})
 	insertSeries("map('code', '500', 'cluster', 'b')", marked)
-	// Dense series that starts in the middle of the range.
+	// This dense series starts in the middle of the range.
 	insertSeries("map('code', '404', 'cluster', 'a')", regular(15*time.Second, 17*time.Minute+5*time.Second, 40*time.Minute, 0, 2))
-	// Irregular intervals under a separate metric name. The engine estimates
-	// the sample interval per step and the pushdown once per series, so only
-	// increase and delta, which do not use the estimate, must agree.
+	// This separate metric uses irregular sample intervals.
+	// The engine estimates the interval for each step.
+	// The pushdown estimates one interval for each series.
+	// Only increase and delta must match because they do not use this estimate.
 	const irregularMetric = "test_irregular_total"
 	irregular := make([]point, 0, 32)
 	for offset, value := time.Duration(0), 10.0; offset <= 40*time.Minute; value += 3 {
@@ -152,12 +153,13 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 	type rangeCase struct {
 		query string
 		step  time.Duration
-		// engine marks a shape the pushdown must leave to the Prometheus engine.
+		// engine is true when the Prometheus engine must evaluate the query.
 		engine bool
 	}
 	// Bare selectors read the last sample within max(step, interval margin).
-	// After a long gap the engine has one sample to estimate from and falls
-	// back to the step, so steps here stay above the one minute margin.
+	// After a long gap, the engine estimates the interval from one sample.
+	// It then uses the step.
+	// These cases use steps above the one-minute margin.
 	cases := []rangeCase{
 		{"sum(M) by (code)", 2 * time.Minute, false},
 		{"avg(M)", 90 * time.Second, false},
@@ -175,7 +177,7 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 			rangeCase{fmt.Sprintf("sum(%s(M[5m])) by (code)", fn), time.Minute, false},
 			rangeCase{fmt.Sprintf("max(%s(M[30s])) by (cluster)", fn), time.Minute, false},
 			rangeCase{fmt.Sprintf("min(%s(M[2m])) by (code, cluster)", fn), 30 * time.Second, false},
-			// rate without a window sizes it per step from the sample interval.
+			// The engine calculates a missing rate window from each step's sample interval.
 			rangeCase{fmt.Sprintf("count(%s(M))", fn), time.Minute, fn == "rate"},
 			rangeCase{fmt.Sprintf("sum(%s(M{code=\"500\"}[1m]))", fn), 45 * time.Second, false},
 		)

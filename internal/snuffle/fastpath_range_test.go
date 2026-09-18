@@ -25,8 +25,8 @@ func rangeTestConfig() Config {
 	}
 }
 
-// preparedRangeAggregate rewrites a query as handleQueryRange does and returns
-// the aggregate the pushdown inspects.
+// preparedRangeAggregate rewrites a query in the same way as handleQueryRange.
+// It returns the aggregate that the pushdown inspects.
 func preparedRangeAggregate(t *testing.T, query string, step time.Duration) *parser.AggregateExpr {
 	t.Helper()
 	start := time.UnixMilli(1_700_000_000_000)
@@ -76,7 +76,7 @@ func TestParseRangeRollupCallAcceptsCountersAndSelectors(t *testing.T) {
 
 func TestParseRangeRollupCallRejectsUnsupportedShapes(t *testing.T) {
 	for _, query := range []string{
-		// rate without a window sizes it per step from the sample interval.
+		// The engine calculates a missing rate window from each step's sample interval.
 		`sum(rate(http_requests_total))`,
 		`sum(increase(http_requests_total[1m] offset 5m))`,
 		`sum(increase(http_requests_total[1m] @ 1700000000))`,
@@ -89,7 +89,7 @@ func TestParseRangeRollupCallRejectsUnsupportedShapes(t *testing.T) {
 			t.Fatalf("%s: accepted", query)
 		}
 	}
-	// The step and lookback must be the ones the request was rewritten with.
+	// The parser rejects a step or lookback that differs from the rewritten request.
 	aggregate := preparedRangeAggregate(t, `sum(increase(http_requests_total[1m]))`, time.Minute)
 	if _, ok := parseRangeRollupCall(aggregate.Expr, 30*time.Second, 5*time.Minute); ok {
 		t.Fatal("accepted a call rewritten for another step")
