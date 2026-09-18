@@ -41,6 +41,7 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 	hostSelector := fmt.Sprintf(`%s{hostname=%q}`, metric, host)
 	metricSelector := fmt.Sprintf(`%s`, metric)
 	sumByRegion := fmt.Sprintf(`sum by (region) (%s)`, metric)
+	sumIncreaseByRegion := fmt.Sprintf(`sum by (region) (increase(%s[1m]))`, metric)
 	avgByEnvironment := fmt.Sprintf(`avg by (service_environment) (%s)`, metric)
 	topk := fmt.Sprintf(`topk(10, %s)`, metric)
 	instantUnion := tsbsInstantUnionQuery(metric, unionSelectors, unionRange, unionDivisor)
@@ -57,6 +58,7 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 		{name: "tsbs_range_or_union", path: "/api/v1/query_range", params: map[string]string{"query": instantUnion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_range_selector", path: "/api/v1/query_range", params: map[string]string{"query": hostSelector, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_range_sum_by_region", path: "/api/v1/query_range", params: map[string]string{"query": sumByRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_range_sum_increase_by_region", path: "/api/v1/query_range", params: map[string]string{"query": sumIncreaseByRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountHostname, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_region", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_filtered_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountFilteredHostname, "start": rangeStart, "end": rangeEnd, "step": step}},

@@ -2,7 +2,9 @@ package snuffle
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 
@@ -108,7 +110,69 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 			}
 		}
 		return postHogLoadSamplesWhereSQL(q.queryable.cfg, idCondition, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
-	}, sampleRowHandler(byID))
+	}, postHogSampleRowHandler(byID, latestOnly))
+}
+
+// postHogSampleRowHandler decodes one series per row, unless the query kept
+// one sample per series as scalar columns.
+func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(clickHouseRow) error {
+	if latestOnly {
+		return sampleRowHandler(byID)
+	}
+	return func(row clickHouseRow) error {
+		var id uint64
+		var payload []byte
+		if err := row.Scan(&id, &payload); err != nil {
+			return err
+		}
+		s := byID[id]
+		if s == nil {
+			return nil
+		}
+		samples, err := decodePackedSamples(payload, s.samples)
+		if err != nil {
+			return fmt.Errorf("series %d: %w", id, err)
+		}
+		s.samples = samples
+		sortSamples(s.samples)
+		return nil
+	}
+}
+
+// decodePackedSamples appends the samples in a RowBinary payload of two
+// arrays, Int64 timestamps then Float64 values, to samples.
+func decodePackedSamples(payload []byte, samples []samplePoint) ([]samplePoint, error) {
+	readArray := func() ([]byte, error) {
+		length, prefix := binary.Uvarint(payload)
+		if prefix <= 0 || length > uint64((len(payload)-prefix)/8) {
+			return nil, fmt.Errorf("invalid packed sample array length")
+		}
+		payload = payload[prefix:]
+		size := int(length) * 8
+		values := payload[:size]
+		payload = payload[size:]
+		return values, nil
+	}
+	timestamps, err := readArray()
+	if err != nil {
+		return nil, err
+	}
+	values, err := readArray()
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) != 0 || len(timestamps) != len(values) {
+		return nil, fmt.Errorf("packed samples have %d timestamp bytes, %d value bytes and %d trailing bytes", len(timestamps), len(values), len(payload))
+	}
+	count := len(timestamps) / 8
+	samples = slices.Grow(samples, count)
+	for index := 0; index < count; index++ {
+		samples = append(samples, samplePoint{
+			t: int64(binary.LittleEndian.Uint64(timestamps[index*8:])),
+			v: math.Float64frombits(binary.LittleEndian.Uint64(values[index*8:])),
+		})
+	}
+	return samples, nil
 }
 
 const postHogSeriesIDsTable = "series_ids"
@@ -158,10 +222,14 @@ func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []st
 			nonStaleSampleSQL("value"),
 		)
 	}
-	return fmt.Sprintf(
-		"SELECT series_id, toUnixTimestamp64Milli(timestamp) AS ts, value FROM (%s) ORDER BY series_id, timestamp",
+	// One row per series with its samples packed as RowBinary arrays:
+	// ClickHouse groups instead of sorting, and Go decodes one payload per
+	// series instead of three driver values per sample. The reader sorts a
+	// series when its parts arrived out of order.
+	return withMaxThreads(fmt.Sprintf(
+		"SELECT series_id, formatRow('RowBinary', groupArray(toUnixTimestamp64Milli(timestamp)), groupArray(value)) AS points FROM (%s) GROUP BY series_id",
 		source,
-	)
+	), cfg.RangeQueryThreads)
 }
 
 // postHogSelectedSeriesSQL returns one row per series matching the matchers,

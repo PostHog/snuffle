@@ -1,10 +1,12 @@
 package snuffle
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1229,6 +1231,12 @@ func (s *seriesMeta) Labels() labels.Labels {
 }
 
 func (s *seriesMeta) Iterator(_ chunkenc.Iterator) chunkenc.Iterator {
+	if len(s.histograms) == 0 {
+		// Float series iterate their samples in place: no copy into the
+		// mixed point type and no sort when the samples are already ordered.
+		sortSamples(s.samples)
+		return &floatSampleIterator{samples: s.samples, idx: -1}
+	}
 	points := make([]seriesPoint, 0, len(s.samples)+len(s.histograms))
 	for _, sample := range s.samples {
 		points = append(points, seriesPoint{t: sample.t, f: sample.v, typ: chunkenc.ValFloat})
@@ -1271,6 +1279,80 @@ type seriesPoint struct {
 	f   float64
 	h   prompb.Histogram
 	typ chunkenc.ValueType
+}
+
+// sortSamples orders samples by time when they are not already ordered.
+func sortSamples(samples []samplePoint) {
+	if !slices.IsSortedFunc(samples, compareSampleTime) {
+		slices.SortFunc(samples, compareSampleTime)
+	}
+}
+
+func compareSampleTime(a, b samplePoint) int {
+	return cmp.Compare(a.t, b.t)
+}
+
+// floatSampleIterator is the chunkenc.Iterator of a series without histograms.
+type floatSampleIterator struct {
+	samples []samplePoint
+	idx     int
+}
+
+func (it *floatSampleIterator) Next() chunkenc.ValueType {
+	if it.idx >= len(it.samples) {
+		return chunkenc.ValNone
+	}
+	it.idx++
+	if it.idx >= len(it.samples) {
+		return chunkenc.ValNone
+	}
+	return chunkenc.ValFloat
+}
+
+func (it *floatSampleIterator) Seek(t int64) chunkenc.ValueType {
+	if it.idx >= 0 && it.idx < len(it.samples) && it.samples[it.idx].t >= t {
+		return chunkenc.ValFloat
+	}
+	start := max(it.idx+1, 0)
+	pos := sort.Search(len(it.samples)-start, func(i int) bool {
+		return it.samples[start+i].t >= t
+	})
+	it.idx = start + pos
+	if it.idx >= len(it.samples) {
+		return chunkenc.ValNone
+	}
+	return chunkenc.ValFloat
+}
+
+func (it *floatSampleIterator) At() (int64, float64) {
+	if it.idx < 0 || it.idx >= len(it.samples) {
+		return math.MinInt64, math.NaN()
+	}
+	sample := it.samples[it.idx]
+	return sample.t, sample.v
+}
+
+func (it *floatSampleIterator) AtHistogram(*histogram.Histogram) (int64, *histogram.Histogram) {
+	return it.AtT(), nil
+}
+
+func (it *floatSampleIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *histogram.FloatHistogram) {
+	return it.AtT(), nil
+}
+
+func (it *floatSampleIterator) AtT() int64 {
+	if it.idx < 0 || it.idx >= len(it.samples) {
+		return math.MinInt64
+	}
+	return it.samples[it.idx].t
+}
+
+func (it *floatSampleIterator) AtST() int64 {
+	return 0
+}
+
+func (it *floatSampleIterator) Err() error {
+	return nil
 }
 
 type sampleIterator struct {

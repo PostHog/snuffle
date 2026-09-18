@@ -158,8 +158,9 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		}
 		scanned := int64(scannedRows.Load())
 		read := int64(readBytes.Load())
-		recordClickHouseRead(ctx, rowCount, scanned, read)
-		c.metrics.observeClickHouseQuery(status, time.Since(started), rowCount, scanned, read)
+		elapsed := time.Since(started)
+		recordClickHouseRead(ctx, rowCount, scanned, read, elapsed)
+		c.metrics.observeClickHouseQuery(status, elapsed, rowCount, scanned, read)
 	}()
 	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
 		scannedRows.Add(progress.Rows)

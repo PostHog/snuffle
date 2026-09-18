@@ -16,11 +16,21 @@ type promRequestStatsKey struct{}
 
 type promRequestStats struct {
 	clickHouseQueries atomic.Int64
+	clickHouseNanos   atomic.Int64
 	readRows          atomic.Int64
 	scannedRows       atomic.Int64
 	readBytes         atomic.Int64
 	clickHouseInserts atomic.Int64
 	writtenRows       atomic.Int64
+}
+
+// queryLogPhase is one timed part of a query handler, such as the engine
+// evaluation or the response encoding. ClickHouse time is recorded per query
+// in promRequestStats, so the difference between the evaluation and the
+// ClickHouse time is the work done in Go.
+type queryLogPhase struct {
+	name     string
+	duration time.Duration
 }
 
 var failedQueryLogger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
@@ -47,9 +57,10 @@ func promRequestStatsFromContext(ctx context.Context) *promRequestStats {
 	return stats
 }
 
-func recordClickHouseRead(ctx context.Context, rows, scannedRows, readBytes int64) {
+func recordClickHouseRead(ctx context.Context, rows, scannedRows, readBytes int64, elapsed time.Duration) {
 	if stats := promRequestStatsFromContext(ctx); stats != nil {
 		stats.clickHouseQueries.Add(1)
+		stats.clickHouseNanos.Add(elapsed.Nanoseconds())
 		stats.readRows.Add(rows)
 		stats.scannedRows.Add(scannedRows)
 		stats.readBytes.Add(readBytes)
@@ -71,6 +82,7 @@ type loggingResponseWriter struct {
 	errorType    string
 	errorMessage string
 	queryMeta    *queryLogMetadata
+	phases       []queryLogPhase
 }
 
 func (w *loggingResponseWriter) WriteHeader(status int) {
@@ -116,6 +128,18 @@ func (w *loggingResponseWriter) recordQueryLogBackend(backend string) {
 		w.queryMeta = &queryLogMetadata{}
 	}
 	w.queryMeta.backend = backend
+}
+
+func (w *loggingResponseWriter) recordQueryLogPhase(name string, duration time.Duration) {
+	w.phases = append(w.phases, queryLogPhase{name: name, duration: duration})
+}
+
+func recordQueryLogPhase(w http.ResponseWriter, name string, duration time.Duration) {
+	if recorder, ok := w.(interface {
+		recordQueryLogPhase(string, time.Duration)
+	}); ok {
+		recorder.recordQueryLogPhase(name, duration)
+	}
 }
 
 func recordResponseError(w http.ResponseWriter, errorType string, err error) {
@@ -171,12 +195,19 @@ func logPromRequestCompleted(r *http.Request, w *loggingResponseWriter, stats *p
 		slog.Int64("duration_ms", time.Since(started).Milliseconds()),
 		slog.Int64("response_bytes", w.bytes),
 		slog.Int64("clickhouse_queries", stats.clickHouseQueries.Load()),
+		slog.Int64("clickhouse_ms", time.Duration(stats.clickHouseNanos.Load()).Milliseconds()),
 		slog.Int64("read_rows", stats.readRows.Load()),
 		slog.Int64("scanned_rows", stats.scannedRows.Load()),
 		slog.Int64("read_bytes", stats.readBytes.Load()),
 		slog.Int64("clickhouse_inserts", stats.clickHouseInserts.Load()),
 		slog.Int64("written_rows", stats.writtenRows.Load()),
 	)
+	if w.queryMeta != nil && w.queryMeta.backend != "" {
+		attrs = append(attrs, slog.String("query_backend", w.queryMeta.backend))
+	}
+	for _, phase := range w.phases {
+		attrs = append(attrs, slog.Int64(phase.name+"_ms", phase.duration.Milliseconds()))
+	}
 	if w.errorType != "" {
 		attrs = append(attrs, slog.String("error_type", w.errorType))
 	}

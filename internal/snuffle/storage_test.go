@@ -375,7 +375,8 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 		"service_name = 'checkout'",
 		"metric_name = 'http_requests_total'",
 		"series_fingerprint IN (7,9)",
-		"ORDER BY series_id, timestamp",
+		"formatRow('RowBinary', groupArray(toUnixTimestamp64Milli(timestamp)), groupArray(value)) AS points",
+		"GROUP BY series_id",
 	} {
 		if !strings.Contains(samplesSQL, want) {
 			t.Fatalf("samples SQL %q does not contain %q", samplesSQL, want)
@@ -600,7 +601,7 @@ func TestPostHogLoadSamplesSQLReadsExternalSeriesIDs(t *testing.T) {
 	cfg := Config{SchemaLayout: "posthog", CHDatabase: "posthog", SamplesTable: "metrics2", TeamID: 7}
 	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")}
 	sql := postHogLoadSamplesWhereSQL(cfg, "series_fingerprint IN (SELECT id FROM series_ids)", []string{"http_requests_total"}, matchers, 1000, 2000, false)
-	for _, want := range []string{"series_fingerprint IN (SELECT id FROM series_ids)", "metric_name = 'http_requests_total'", "ORDER BY series_id, timestamp"} {
+	for _, want := range []string{"series_fingerprint IN (SELECT id FROM series_ids)", "metric_name = 'http_requests_total'", "GROUP BY series_id"} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}

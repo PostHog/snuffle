@@ -46,6 +46,9 @@ type Config struct {
 	MaxSeries                   int
 	IDChunkSize                 int
 	AggregateThreads            int
+	RangePushdown               bool
+	RangeQueryThreads           int
+	RangePushdownMaxExpansion   int
 	RemoteWriteInterval         time.Duration
 	SampleAttributes            bool
 	TeamID                      uint64
@@ -150,6 +153,9 @@ func ConfigFromEnv() Config {
 		MaxSeries:                   envInt("CH_MAX_SERIES", 1_000_000, 1),
 		IDChunkSize:                 envInt("CH_ID_CHUNK_SIZE", 20000, 1),
 		AggregateThreads:            envInt("CH_AGGREGATE_MAX_THREADS", aggregateThreadsDefault, 0),
+		RangePushdown:               envBool("SNUFFLE_RANGE_PUSHDOWN", true),
+		RangeQueryThreads:           envInt("CH_RANGE_QUERY_MAX_THREADS", 8, 0),
+		RangePushdownMaxExpansion:   envInt("CH_RANGE_PUSHDOWN_MAX_EXPANSION", 512, 1),
 		RemoteWriteInterval:         envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),
 		SampleAttributes:            envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
 		TeamID:                      defaultTeamID,
