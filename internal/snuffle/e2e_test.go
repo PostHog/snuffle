@@ -136,6 +136,62 @@ func TestEndToEndClickHouse(t *testing.T) {
 		t.Run("filtered label discovery", func(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)
 		})
+		t.Run("labelled row before the window", func(t *testing.T) {
+			assertPostHogLabelledRowBeforeWindow(t, ctx, client, cfg, api.URL)
+		})
+	}
+}
+
+// assertPostHogLabelledRowBeforeWindow checks that a series whose last
+// labelled row is older than the query window is still found through its
+// unlabelled samples: ingestion sends labels on one row per series per hour,
+// so the series table and the hourly rollups trail the samples.
+func assertPostHogLabelledRowBeforeWindow(t *testing.T, ctx context.Context, client *ClickHouseClient, cfg Config, baseURL string) {
+	t.Helper()
+	const metric = "snuffle_e2e_stale_labels"
+	const fingerprint = 987654323
+	labelledMS := e2eStartMS - 40*time.Minute.Milliseconds()
+	insert := fmt.Sprintf(`INSERT INTO %s
+		(team_id, metric_name, series_fingerprint, timestamp, observed_timestamp,
+		 original_expiry_timestamp, service_name, value, count, has_labels, resource_attributes, attributes)
+		SELECT %d, %s, %d, %s, now64(6), now64(6) + INTERVAL 1 DAY,
+		       'snuffle-stale', 1, 1, true, map('zone', 'stale-zone'), map()
+		UNION ALL
+		SELECT %d, %s, %d, %s, now64(6), now64(6) + INTERVAL 1 DAY,
+		       'snuffle-stale', 2, 1, false, map(), map()`,
+		tableName(cfg.CHDatabase, cfg.MetricsInputTable),
+		e2eTeamID, sqlString(metric), fingerprint, chTimeMillis(labelledMS),
+		e2eTeamID, sqlString(metric), fingerprint, chTimeMillis(e2eStartMS))
+	if err := client.Exec(ctx, insert); err != nil {
+		t.Fatalf("insert stale labels fixture: %v", err)
+	}
+
+	params := url.Values{
+		"match[]": {metric},
+		"start":   {"1700000010"},
+		"end":     {"1700000070"},
+	}
+	series := apiGet[[]map[string]string](t, baseURL, "/api/v1/series", params)
+	if len(series) != 1 || series[0]["zone"] != "stale-zone" {
+		t.Errorf("series = %#v, want one series with zone=stale-zone", series)
+	}
+	names := apiGet[[]string](t, baseURL, "/api/v1/label/__name__/values", params)
+	assertStringPresent(t, names, metric)
+	labelNames := apiGet[[]string](t, baseURL, "/api/v1/labels", params)
+	assertStringPresent(t, labelNames, "zone")
+
+	data := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", url.Values{
+		"query": {metric},
+		"time":  {"1700000070"},
+	})
+	if data.ResultType != "vector" || len(data.Result) != 1 {
+		t.Fatalf("instant query result = %#v", data)
+	}
+	if got := data.Result[0].Metric["zone"]; got != "stale-zone" {
+		t.Fatalf("instant query zone = %q", got)
+	}
+	if got := sampleString(data.Result[0].Value); got != "2" {
+		t.Fatalf("instant query value = %q", got)
 	}
 }
 

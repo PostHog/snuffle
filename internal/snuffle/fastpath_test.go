@@ -612,7 +612,7 @@ func TestPostHogQueryPlanReadsSeriesTableOnlyForMapLabels(t *testing.T) {
 	if !strings.Contains(plan.seriesSQL, "if(mapContains(resource_attributes, 'region'), resource_attributes['region'], attributes['region']) AS `__group_0`") {
 		t.Fatalf("expected map-backed group expression in series SQL, got %s", plan.seriesSQL)
 	}
-	if !strings.Contains(plan.seriesSQL, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") || !strings.Contains(plan.seriesSQL, "LIMIT 1 BY series_id LIMIT 10") {
+	if !strings.Contains(plan.seriesSQL, "last_seen >= "+chTimeMillis(1000-postHogLabelWindowMillis)) || !strings.Contains(plan.seriesSQL, "LIMIT 1 BY series_id LIMIT 10") {
 		t.Fatalf("series SQL must bound by last_seen and collapse duplicates: %s", plan.seriesSQL)
 	}
 	where := strings.Join(plan.sampleWhere(), " AND ")

@@ -171,7 +171,7 @@ func TestPostHogHistogramSQL(test *testing.T) {
 	}
 	aliases := []postHogHistogramAlias{{baseName: "test_duration_seconds", suffix: "_bucket"}}
 	sql = postHogHistogramSeriesSQL(cfg, 1000, 2000, aliases, matchers)
-	for _, want := range []string{"`test`.`metric_series3`", "resource_attributes, attributes", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "test_duration_seconds", "last_seen >= fromUnixTimestamp64Milli(1000", "LIMIT 1 BY series_id"} {
+	for _, want := range []string{"`test`.`metric_series3`", "resource_attributes, attributes", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "test_duration_seconds", "last_seen >= " + chTimeMillis(1000-postHogLabelWindowMillis), "LIMIT 1 BY series_id"} {
 		if !strings.Contains(sql, want) {
 			test.Fatalf("series SQL missing %q: %s", want, sql)
 		}
