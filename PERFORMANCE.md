@@ -457,10 +457,16 @@ Implemented storage optimizations:
   series and at the first step after a gap longer than the lookback: `rate`,
   `irate`, `idelta` and bare selectors accept a previous or last sample within
   the series interval margin, and `increase` and `delta` use the previous
-  sample whenever it lies within the lookback of the window start. Queries the
-  pushdown does not accept (`rate` without a window, offsets, `@`, `without`,
-  nested expressions, windows wider than `CH_RANGE_PUSHDOWN_MAX_EXPANSION`
-  steps, virtual histogram selectors) keep the engine path below
+  sample whenever it lies within the lookback of the window start. A selector
+  offset shifts the samples ClickHouse reads for every step. An offset on the
+  aggregate (`sum(...) offset 24h`, which the MetricsQL rewrite turns into a
+  `default_rollup` over a subquery) evaluates the aggregate on the
+  epoch-aligned step grid that covers the shifted range, then Go reads the
+  latest grid point within the MetricsQL window before each shifted step, as
+  the engine does for the subquery. Queries the pushdown does not accept
+  (`rate` without a window, `@`, `without`, nested expressions, windows wider
+  than `CH_RANGE_PUSHDOWN_MAX_EXPANSION` steps, virtual histogram selectors)
+  keep the engine path below
 - other range queries and counter rollups use the Prometheus engine: automatic
   selector windows depend on the sample interval of each series, and counter
   rollups use MetricsQL calculations. PostHog-layout float samples arrive as

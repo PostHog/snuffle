@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 )
 
@@ -36,6 +37,17 @@ type rangeRollupCall struct {
 	step     int64
 	lookback int64
 	matrix   int64 // History before each step: window or step, plus lookback.
+	offset   int64 // Selector offset: samples are read this long before each step.
+}
+
+// rangeOffsetSubquery is the form prepareMetricsQLQuery gives an offset on an
+// aggregate: `default_rollup((agg ...)[step+lookback:step] offset d)`. The
+// engine evaluates the aggregate on the step grid aligned to the epoch, then
+// reads the latest aggregate point before each shifted step.
+type rangeOffsetSubquery struct {
+	aggregate *parser.AggregateExpr
+	offset    int64
+	matrix    int64
 }
 
 // counter reports whether this rollup removes counter resets.
@@ -67,7 +79,11 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	if err != nil {
 		return queryData{}, false, nil
 	}
+	subquery, isSubquery := parseRangeOffsetSubquery(expr, step, s.cfg.LookbackDelta)
 	aggregate, ok := unparenExpr(expr).(*parser.AggregateExpr)
+	if isSubquery {
+		aggregate, ok = subquery.aggregate, true
+	}
 	if !ok || aggregate.Without || !postHogGroupingSupported(aggregate.Grouping) {
 		return queryData{}, false, nil
 	}
@@ -79,8 +95,20 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	if !ok || !postHogMatchersPushdownSafe(call.selector.LabelMatchers) {
 		return queryData{}, false, nil
 	}
-	points := (end.UnixMilli()-start.UnixMilli())/call.step + 1
-	if points > maxRangePushdownPoints || call.expansion() > int64(s.cfg.RangePushdownMaxExpansion) {
+	// The grid holds the step times the aggregate is evaluated at. An offset
+	// subquery evaluates it on the epoch-aligned grid that covers every
+	// shifted step and its matrix, as the engine does for subqueries.
+	gridStart, gridEnd := start.UnixMilli(), end.UnixMilli()
+	if isSubquery {
+		gridEnd -= subquery.offset
+		first := start.UnixMilli() - subquery.offset - subquery.matrix
+		gridStart = call.step * (first / call.step)
+		if gridStart <= first {
+			gridStart += call.step
+		}
+	}
+	points := (gridEnd-gridStart)/call.step + 1
+	if points <= 0 || points > maxRangePushdownPoints || call.expansion() > int64(s.cfg.RangePushdownMaxExpansion) {
 		return queryData{}, false, nil
 	}
 	virtual, err := s.postHogSelectsHistogram(ctx, call.selector.LabelMatchers)
@@ -90,15 +118,91 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end
 	if virtual {
 		return queryData{}, false, nil
 	}
-	mint := start.UnixMilli() - call.matrix
-	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, end.UnixMilli(), len(aggregate.Grouping) > 0)
+	evalStart := gridStart - call.offset
+	mint := evalStart - call.matrix
+	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, evalStart+(points-1)*call.step, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
-	sql := rangeRollupSQL(s.cfg, plan, call, start.UnixMilli(), points, aggSQL, sumContributions)
-	results, err := s.queryRangeAggregateResults(ctx, sql, aggregate.Grouping)
+	sql := rangeRollupSQL(s.cfg, plan, call, evalStart, gridStart, points, aggSQL, sumContributions)
+	groups, err := s.queryRangeAggregateGroups(ctx, sql, aggregate.Grouping)
 	if err != nil {
 		return queryData{}, true, err
 	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: results}, true, nil
+	if isSubquery {
+		groups = rangeOffsetSubqueryRollup(groups, subquery, start.UnixMilli(), end.UnixMilli(), call.step, s.cfg.LookbackDelta.Milliseconds())
+	}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: rangeAggregateSampleResults(groups)}, true, nil
+}
+
+// parseRangeOffsetSubquery accepts the rewritten form of `agg(...) offset d`:
+// the internal default_rollup over a subquery whose step is the request step
+// and whose range is the step plus the lookback.
+func parseRangeOffsetSubquery(expr parser.Expr, step, lookback time.Duration) (rangeOffsetSubquery, bool) {
+	call, ok := unparenExpr(expr).(*parser.Call)
+	if !ok || call.Func == nil || call.Func.Name != metricsQLDefaultRollupName || len(call.Args) != 5 {
+		return rangeOffsetSubquery{}, false
+	}
+	want := [4]int64{0, step.Milliseconds(), lookback.Milliseconds(), 0}
+	for index, arg := range call.Args[1:] {
+		number, ok := arg.(*parser.NumberLiteral)
+		if !ok || number.Val != float64(want[index]) {
+			return rangeOffsetSubquery{}, false
+		}
+	}
+	subquery, ok := call.Args[0].(*parser.SubqueryExpr)
+	if !ok || subquery.OriginalOffset == 0 || subquery.Offset != 0 || subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
+		return rangeOffsetSubquery{}, false
+	}
+	if subquery.Step != step || subquery.Range != step+lookback {
+		return rangeOffsetSubquery{}, false
+	}
+	aggregate, ok := unparenExpr(subquery.Expr).(*parser.AggregateExpr)
+	if !ok {
+		return rangeOffsetSubquery{}, false
+	}
+	return rangeOffsetSubquery{aggregate: aggregate, offset: subquery.OriginalOffset.Milliseconds(), matrix: subquery.Range.Milliseconds()}, true
+}
+
+// rangeOffsetSubqueryRollup applies the outer default_rollup of an offset
+// subquery: at each request step it reads the latest aggregate point on the
+// grid within the MetricsQL window before the shifted step, as metricsQLRollup
+// does with window 0.
+func rangeOffsetSubqueryRollup(groups []rangeAggregateGroup, subquery rangeOffsetSubquery, startMillis, endMillis, step, lookback int64) []rangeAggregateGroup {
+	out := make([]rangeAggregateGroup, 0, len(groups))
+	var window []promql.FPoint
+	for _, group := range groups {
+		result := rangeAggregateGroup{metric: group.metric, points: make([]samplePoint, 0, (endMillis-startMillis)/step+1)}
+		first, last := 0, 0
+		for ts := startMillis; ts <= endMillis; ts += step {
+			end := ts - subquery.offset
+			for first < len(group.points) && group.points[first].t <= end-subquery.matrix {
+				first++
+			}
+			if last < first {
+				last = first
+			}
+			for last < len(group.points) && group.points[last].t <= end {
+				last++
+			}
+			window = window[:0]
+			for _, point := range group.points[first:last] {
+				window = append(window, promql.FPoint{T: point.t, F: point.v})
+			}
+			if len(window) == 0 {
+				continue
+			}
+			maxPrev := min(metricsQLSampleInterval(window, step), lookback)
+			width := min(max(step, maxPrev), lookback)
+			latest := window[len(window)-1]
+			if latest.T <= end-width || math.IsNaN(latest.F) {
+				continue
+			}
+			result.points = append(result.points, samplePoint{t: ts, v: latest.F})
+		}
+		if len(result.points) > 0 {
+			out = append(out, result)
+		}
+	}
+	return out
 }
 
 // expansion returns the maximum number of steps that can use one sample.
@@ -113,7 +217,8 @@ func (c rangeRollupCall) expansion() int64 {
 // parseRangeRollupCall parses this rewritten form:
 // `__snuffle_F(selector[matrix], window, step, lookback, 0)`.
 // It requires the request step and lookback.
-// It rejects selectors that have an offset or an @ modifier.
+// It rejects selectors that have an @ modifier.
+// A selector offset shifts the samples read for every step.
 // Only default_rollup accepts a missing window.
 func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (rangeRollupCall, bool) {
 	call, ok := unparenExpr(expr).(*parser.Call)
@@ -158,14 +263,17 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 		return rangeRollupCall{}, false
 	}
 	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
-	if !ok || selector.OriginalOffset != 0 || selector.Offset != 0 || selector.Timestamp != nil || selector.StartOrEnd != 0 || selector.Anchored || selector.Smoothed {
+	if !ok || selector.Offset != 0 || selector.Timestamp != nil || selector.StartOrEnd != 0 || selector.Anchored || selector.Smoothed {
 		return rangeRollupCall{}, false
 	}
 	out.selector = selector
+	out.offset = selector.OriginalOffset.Milliseconds()
 	return out, true
 }
 
 // rangeRollupSQL builds the ClickHouse pushdown query.
+// Steps are evaluated from evalStartMillis and reported from outputStartMillis.
+// The two differ by the selector offset.
 // Read the query from the inner stage to the outer stage:
 //
 //  1. samples reads samples from [start - matrix, end].
@@ -185,8 +293,9 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 //  5. rollups calculates one value for each series and step.
 //  6. The final stage aggregates series by group and step.
 //     A sum of increase or delta adds contributions directly and skips stage 5.
-func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, startMillis, points int64, aggSQL string, sumContributions bool) string {
-	start := strconv.FormatInt(startMillis, 10)
+func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, evalStartMillis, outputStartMillis, points int64, aggSQL string, sumContributions bool) string {
+	start := strconv.FormatInt(evalStartMillis, 10)
+	outputStart := strconv.FormatInt(outputStartMillis, 10)
 	step := strconv.FormatInt(call.step, 10)
 	lookback := strconv.FormatInt(call.lookback, 10)
 	matrix := strconv.FormatInt(call.matrix, 10)
@@ -263,7 +372,7 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, st
 
 	groupBy := plan.groupAliases()
 	selectParts := append([]string{}, groupBy...)
-	selectParts = append(selectParts, "toInt64("+start+") + (toInt64(idx) - 1) * "+step+" AS ts")
+	selectParts = append(selectParts, "toInt64("+outputStart+") + (toInt64(idx) - 1) * "+step+" AS ts")
 	groupByParts := append(append([]string{}, groupBy...), "idx")
 	var sql string
 	if sumContributions {
@@ -332,9 +441,14 @@ func metricsQLSampleIntervalMarginSQL(interval string) string {
 	)
 }
 
-// queryRangeAggregateResults converts ordered rows into one matrix series for each group.
-func (s *Server) queryRangeAggregateResults(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
-	results := make([]sampleResult, 0, 64)
+type rangeAggregateGroup struct {
+	metric map[string]string
+	points []samplePoint
+}
+
+// queryRangeAggregateGroups converts ordered rows into one group for each label set.
+func (s *Server) queryRangeAggregateGroups(ctx context.Context, sql string, grouping []string) ([]rangeAggregateGroup, error) {
+	groups := make([]rangeAggregateGroup, 0, 64)
 	lastKey := ""
 	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
 		groupValues := make([]string, len(grouping))
@@ -349,13 +463,25 @@ func (s *Server) queryRangeAggregateResults(ctx context.Context, sql string, gro
 			return err
 		}
 		metric, key := groupingMetricAndKeyValues(groupValues, grouping)
-		if len(results) == 0 || key != lastKey {
-			results = append(results, sampleResult{Metric: metric, Values: make([][]any, 0, 128)})
+		if len(groups) == 0 || key != lastKey {
+			groups = append(groups, rangeAggregateGroup{metric: metric, points: make([]samplePoint, 0, 128)})
 			lastKey = key
 		}
-		last := &results[len(results)-1]
-		last.Values = append(last.Values, []any{float64(ts) / 1000, formatSample(value)})
+		last := &groups[len(groups)-1]
+		last.points = append(last.points, samplePoint{t: ts, v: value})
 		return nil
 	})
-	return results, err
+	return groups, err
+}
+
+func rangeAggregateSampleResults(groups []rangeAggregateGroup) []sampleResult {
+	results := make([]sampleResult, 0, len(groups))
+	for _, group := range groups {
+		values := make([][]any, 0, len(group.points))
+		for _, point := range group.points {
+			values = append(values, []any{float64(point.t) / 1000, formatSample(point.v)})
+		}
+		results = append(results, sampleResult{Metric: group.metric, Values: values})
+	}
+	return results
 }

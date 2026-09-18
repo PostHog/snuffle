@@ -78,7 +78,6 @@ func TestParseRangeRollupCallRejectsUnsupportedShapes(t *testing.T) {
 	for _, query := range []string{
 		// The engine calculates a missing rate window from each step's sample interval.
 		`sum(rate(http_requests_total))`,
-		`sum(increase(http_requests_total[1m] offset 5m))`,
 		`sum(increase(http_requests_total[1m] @ 1700000000))`,
 		`sum(increase(http_requests_total[1m]) * 2)`,
 		`sum(abs(http_requests_total))`,
@@ -125,7 +124,7 @@ func rangeTestSQL(t *testing.T, query string, step time.Duration) string {
 	start := int64(1_700_000_000_000)
 	plan := newPostHogQueryPlan(cfg, call.selector.LabelMatchers, aggregate.Grouping, start-call.matrix, start+3_600_000, len(aggregate.Grouping) > 0)
 	sum := aggregate.Op == parser.SUM && call.windowTotal()
-	return rangeRollupSQL(cfg, plan, call, start, 61, aggSQL, sum)
+	return rangeRollupSQL(cfg, plan, call, start, start, 61, aggSQL, sum)
 }
 
 func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
@@ -270,5 +269,110 @@ func TestFloatSeriesIteratorSortsAndSeeks(t *testing.T) {
 	}
 	if _, h := it.AtHistogram(nil); h != nil {
 		t.Fatal("float iterator returned a histogram")
+	}
+}
+
+func TestParseRangeRollupCallAcceptsSelectorOffset(t *testing.T) {
+	aggregate := preparedRangeAggregate(t, `sum(increase(http_requests_total[1m] offset 5m)) by (code)`, time.Minute)
+	call, ok := parseRangeRollupCall(aggregate.Expr, time.Minute, 5*time.Minute)
+	if !ok {
+		t.Fatal("selector offset not accepted")
+	}
+	if call.offset != 300_000 || call.window != 60_000 || call.matrix != 360_000 {
+		t.Fatalf("call = %+v", call)
+	}
+	aggregate = preparedRangeAggregate(t, `sum(rate(http_requests_total[1m] offset -1h))`, time.Minute)
+	call, ok = parseRangeRollupCall(aggregate.Expr, time.Minute, 5*time.Minute)
+	if !ok || call.offset != -3_600_000 {
+		t.Fatalf("negative offset: ok=%v call=%+v", ok, call)
+	}
+}
+
+func TestParseRangeOffsetSubquery(t *testing.T) {
+	start := time.UnixMilli(1_700_000_000_000)
+	parse := func(query string, step time.Duration) parser.Expr {
+		t.Helper()
+		prepared, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start, start.Add(time.Hour))
+		if err != nil {
+			t.Fatal(err)
+		}
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(prepared.query)
+		if err != nil {
+			t.Fatalf("parse %q: %v", prepared.query, err)
+		}
+		return expr
+	}
+	subquery, ok := parseRangeOffsetSubquery(parse(`sum(increase(http_requests_total[15m])) offset 24h`, time.Minute), time.Minute, 5*time.Minute)
+	if !ok || subquery.offset != 86_400_000 || subquery.matrix != 360_000 || subquery.aggregate == nil || subquery.aggregate.Op != parser.SUM {
+		t.Fatalf("aggregate offset: ok=%v subquery=%+v", ok, subquery)
+	}
+	if _, ok := parseRangeRollupCall(subquery.aggregate.Expr, time.Minute, 5*time.Minute); !ok {
+		t.Fatal("inner call not accepted")
+	}
+	for _, query := range []string{
+		`sum(increase(http_requests_total[15m]))`,
+		`sum(increase(http_requests_total[15m] offset 5m))`,
+		`max_over_time((sum(increase(http_requests_total[30s])) offset 24h)[30s:15s])`,
+		`sum(increase(http_requests_total[15m])) @ 1700000000 offset 24h`,
+	} {
+		if _, ok := parseRangeOffsetSubquery(parse(query, time.Minute), time.Minute, 5*time.Minute); ok {
+			t.Fatalf("%s: accepted as offset subquery", query)
+		}
+	}
+	if _, ok := parseRangeOffsetSubquery(parse(`sum(increase(http_requests_total[15m])) offset 24h`, time.Minute), 30*time.Second, 5*time.Minute); ok {
+		t.Fatal("accepted a subquery rewritten for another step")
+	}
+}
+
+func TestRangeRollupSQLReportsOutputStart(t *testing.T) {
+	cfg := rangeTestConfig()
+	aggregate := preparedRangeAggregate(t, `sum(rate(http_requests_total[1m] offset 1h)) by (code)`, time.Minute)
+	call, ok := parseRangeRollupCall(aggregate.Expr, time.Minute, cfg.LookbackDelta)
+	if !ok {
+		t.Fatal("not accepted")
+	}
+	aggSQL, _ := aggregateSQL(aggregate, "rollup_value")
+	output := int64(1_700_000_000_000)
+	eval := output - call.offset
+	plan := newPostHogQueryPlan(cfg, call.selector.LabelMatchers, aggregate.Grouping, eval-call.matrix, eval+3_600_000, true)
+	sql := rangeRollupSQL(cfg, plan, call, eval, output, 61, aggSQL, false)
+	for _, want := range []string{
+		"toInt64(1700000000000) + (toInt64(idx) - 1) * 60000 AS ts",
+		"ceil((ts - 1699996400000) / 60000)",
+		chTimeMillis(eval - call.matrix),
+	} {
+		if !strings.Contains(sql, want) {
+			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
+func TestRangeOffsetSubqueryRollupReadsLatestGridPoint(t *testing.T) {
+	step := int64(60_000)
+	gridStart := int64(1_700_000_000_000)
+	var grid []samplePoint
+	for i := int64(0); i < 10; i++ {
+		if i == 5 || i == 6 {
+			continue
+		}
+		grid = append(grid, samplePoint{t: gridStart + i*step, v: float64(i)})
+	}
+	groups := []rangeAggregateGroup{{metric: map[string]string{"code": "200"}, points: grid}}
+	offset := int64(3_600_000)
+	start := gridStart + offset + 2*step
+	end := start + 7*step
+	out := rangeOffsetSubqueryRollup(groups, rangeOffsetSubquery{offset: offset, matrix: 360_000}, start, end, step, 300_000)
+	if len(out) != 1 {
+		t.Fatalf("groups = %d", len(out))
+	}
+	want := map[int64]float64{0: 2, 1: 3, 2: 4, 3: 4, 5: 7, 6: 8, 7: 9}
+	if len(out[0].points) != len(want) {
+		t.Fatalf("points = %v", out[0].points)
+	}
+	for _, point := range out[0].points {
+		index := (point.t - start) / step
+		if value, ok := want[index]; !ok || value != point.v {
+			t.Fatalf("step %d: got %v, want %v", index, point.v, value)
+		}
 	}
 }

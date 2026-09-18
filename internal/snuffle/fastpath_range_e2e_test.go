@@ -182,6 +182,14 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 			rangeCase{fmt.Sprintf("sum(%s(M{code=\"500\"}[1m]))", fn), 45 * time.Second, false},
 		)
 	}
+	cases = append(cases,
+		rangeCase{"sum(increase(M[1m] offset 5m)) by (code)", time.Minute, false},
+		rangeCase{"sum(rate(M[2m] offset -3m)) by (code)", 30 * time.Second, false},
+		rangeCase{"sum(increase(M[1m])) by (code) offset 5m", time.Minute, false},
+		rangeCase{"sum(increase(M[1m])) offset 10m", 45 * time.Second, false},
+		rangeCase{"max(rate(M[2m])) by (cluster) offset 4m", 90 * time.Second, false},
+		rangeCase{"sum(M) by (code) offset 3m", 2 * time.Minute, false},
+	)
 	start := time.UnixMilli(base + 5*time.Minute.Milliseconds())
 	end := time.UnixMilli(base + 40*time.Minute.Milliseconds())
 	for _, tc := range cases {
