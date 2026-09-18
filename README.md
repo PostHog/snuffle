@@ -535,6 +535,7 @@ Snuffle is configured with environment variables.
 | `CH_PASSWORD` | empty | Password for Snuffle-initiated work and optional request fallback |
 | `SNUFFLE_ALLOW_UNAUTHENTICATED` | `false` | Allow requests without decodable Basic credentials by using `CH_USER` and `CH_PASSWORD` |
 | `CH_TIMEOUT_SECONDS` | `30` | ClickHouse connection and operation timeout in seconds |
+| `CH_COMPRESSION` | `zstd` | Compression for ClickHouse native protocol blocks in both directions: `zstd`, `lz4`, or `none`. ZSTD moved about half the bytes of LZ4 for sample reads at the same ClickHouse CPU |
 
 ### Schema and tables
 
@@ -573,7 +574,10 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `PROMQL_MAX_SAMPLES` | `50000000` | Prometheus engine sample limit |
 | `CH_MAX_SERIES` | `1000000` | Maximum matching series selected from ClickHouse |
 | `CH_ID_CHUNK_SIZE` | `20000` | Series ID batch size for selective reads |
-| `CH_AGGREGATE_MAX_THREADS` | `1` | ClickHouse `max_threads` for pushed-down aggregations; `0` leaves the ClickHouse default |
+| `CH_AGGREGATE_MAX_THREADS` | `1` | ClickHouse `max_threads` for pushed-down instant aggregations; `0` leaves the ClickHouse default |
+| `SNUFFLE_RANGE_PUSHDOWN` | `true` | Evaluate `agg by (...) (F(selector[w]))` range queries over the `posthog` layout in ClickHouse, where `F` is `increase`, `delta`, `rate`, `irate`, `idelta`, or a bare selector, with or without an `offset` on the selector or the aggregate; `false` keeps every range query in the Prometheus engine |
+| `CH_RANGE_QUERY_MAX_THREADS` | `8` | ClickHouse `max_threads` for range pushdowns and PostHog-layout sample reads; `0` leaves the ClickHouse default |
+| `CH_RANGE_PUSHDOWN_MAX_EXPANSION` | `512` | Largest `window / step` ratio a range pushdown accepts; wider windows fall back to the Prometheus engine |
 | `REMOTE_WRITE_SAMPLE_INTERVAL` | `15s` | Timestamp bucket for float samples and histograms; `0` preserves timestamps |
 | `SNUFFLE_SAMPLE_ATTRIBUTES` | layout-dependent | Store sample label maps on sample rows (`attributes_map_str` in `current`, `attributes` in `posthog`); false for `current`, true for `posthog` |
 | `SNUFFLE_LOG_RETENTION` | `720h` | Expiry assigned to log rows received through Loki push |

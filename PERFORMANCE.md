@@ -408,6 +408,23 @@ curl -fsS 'http://127.0.0.1:9091/debug/pprof/profile?seconds=45' \
 go tool pprof -top .perf/snuffle.cpu.pprof
 ```
 
+The range pushdown has its own opt-in benchmark against a local ClickHouse. It
+seeds 2000 counter series (`SNUFFLE_E2E_BENCH_SERIES`) at one sample per
+minute over 24 hours, runs
+`sum(increase(envoy_cluster_upstream_rq[1m])) by (envoy_response_code)` at a
+one minute step through the pushdown and through the Prometheus engine, checks
+that both agree, and logs the timings:
+
+```bash
+docker compose up -d clickhouse
+SNUFFLE_E2E_BENCH=1 go test -run TestRangePushdownLatency -v ./internal/snuffle/
+```
+
+On the two-CPU compose ClickHouse the pushdown answered in about 0.5 s and the
+engine in about 1.4 s (2.2 s before the packed sample reads). The pushdown
+parallelises across series in ClickHouse, so it gains more from larger servers
+than the engine path, whose evaluation runs in one Go goroutine.
+
 Compare the generated ClickHouse SQL and `system.query_log` rows when changing
 schema or query planning. Focus on read rows, read bytes, marks used, projection
 selection, number of HTTP requests, and response materialization cost.
@@ -428,9 +445,39 @@ Implemented storage optimizations:
 - instant aggregates, topk, and nested counts over bare selectors read the
   lookback window in SQL; samples can arrive outside Snuffle's remote-write
   timestamp buckets, so no read path depends on `REMOTE_WRITE_SAMPLE_INTERVAL`
-- range queries and counter rollups use the Prometheus engine: automatic
+- range queries of the shape `agg by (...) (F(selector[w]))` over the PostHog
+  layout run in one ClickHouse query when `F` is `increase`, `delta`, `rate`,
+  `irate`, `idelta`, or a bare selector (`SNUFFLE_RANGE_PUSHDOWN`). ClickHouse
+  sorts each series into arrays, computes the MetricsQL rollup at every step
+  and aggregates across series, so one row per group and step returns to Go.
+  `sum` over `increase` or `delta` sums the per-sample contributions directly.
+  The pushdown estimates the sample interval once per series over the query
+  range, as VictoriaMetrics does; the engine estimates it per step from the
+  samples inside the step's matrix. The two therefore differ on irregular
+  series and at the first step after a gap longer than the lookback: `rate`,
+  `irate`, `idelta` and bare selectors accept a previous or last sample within
+  the series interval margin, and `increase` and `delta` use the previous
+  sample whenever it lies within the lookback of the window start. A selector
+  offset shifts the samples ClickHouse reads for every step. An offset on the
+  aggregate (`sum(...) offset 24h`, which the MetricsQL rewrite turns into a
+  `default_rollup` over a subquery) evaluates the aggregate on the
+  epoch-aligned step grid that covers the shifted range, then Go reads the
+  latest grid point within the MetricsQL window before each shifted step, as
+  the engine does for the subquery. Queries the pushdown does not accept
+  (`rate` without a window, `@`, `without`, nested expressions, windows wider
+  than `CH_RANGE_PUSHDOWN_MAX_EXPANSION` steps, virtual histogram selectors)
+  keep the engine path below
+- other range queries and counter rollups use the Prometheus engine: automatic
   selector windows depend on the sample interval of each series, and counter
-  rollups use MetricsQL calculations
+  rollups use MetricsQL calculations. PostHog-layout float samples arrive as
+  one row per series: the first timestamp, the array of timestamp deltas and
+  the array of values (`groupArray` in ClickHouse instead of an `ORDER BY`
+  over every sample). Typed arrays compress far better than an opaque
+  RowBinary string: on a 24-hour read of 2.2M samples over 2010 series the
+  delta arrays moved 0.8 MiB with ZSTD and 1.5 MiB with LZ4, where the
+  RowBinary payload moved 6.2 MiB and 12.0 MiB. Float series iterate their
+  samples in place without a copy into the mixed float and histogram point
+  type
 - sample reads use exact selected IDs against a sample table ordered by
   `(team_id, metric_name, id, timestamp)` with tighter index granularity
 - PostHog-layout sample reads (float and histogram) select series first and
@@ -499,7 +546,14 @@ Implemented storage optimizations:
   series; raw sample joins stay normal joins so ClickHouse does not collapse
   samples before aggregation
 - aggregate pushdowns can use `CH_AGGREGATE_MAX_THREADS` to avoid per-query
-  thread over-subscription under concurrent dashboard traffic
+  thread over-subscription under concurrent dashboard traffic; range pushdowns
+  and PostHog sample reads use `CH_RANGE_QUERY_MAX_THREADS`
+- range pushdowns disable `short_circuit_function_evaluation`: with lazy `if`
+  branches ClickHouse re-evaluated the per-step expression tree once per
+  branch reference, which multiplied the query time several times over
+- the query log carries `clickhouse_ms`, `eval_ms` and `encode_ms` per
+  request, so the ClickHouse, Go evaluation and JSON encoding shares of a slow
+  query are visible without a profiler
 - the Go ClickHouse client reuses a precomputed endpoint and avoids copying
   scanner rows before JSON decoding
 - series labels are stored as an opaque JSON string and parsed in Go only when

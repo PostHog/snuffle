@@ -108,7 +108,53 @@ func (q *CHQuerier) loadPostHogSamples(ctx context.Context, series []*seriesMeta
 			}
 		}
 		return postHogLoadSamplesWhereSQL(q.queryable.cfg, idCondition, sortedLimited(metricNames, 0), matchers, mint, maxt, latestOnly)
-	}, sampleRowHandler(byID))
+	}, postHogSampleRowHandler(byID, latestOnly))
+}
+
+// postHogSampleRowHandler decodes each row as one series.
+// It uses scalar columns when the query keeps one sample for each series.
+func postHogSampleRowHandler(byID map[uint64]*seriesMeta, latestOnly bool) func(clickHouseRow) error {
+	if latestOnly {
+		return sampleRowHandler(byID)
+	}
+	return func(row clickHouseRow) error {
+		var id uint64
+		var firstTS int64
+		var deltas []int64
+		var values []float64
+		if err := row.Scan(&id, &firstTS, &deltas, &values); err != nil {
+			return err
+		}
+		s := byID[id]
+		if s == nil {
+			return nil
+		}
+		samples, err := decodeDeltaSamples(firstTS, deltas, values, s.samples)
+		if err != nil {
+			return fmt.Errorf("series %d: %w", id, err)
+		}
+		s.samples = samples
+		sortSamples(s.samples)
+		return nil
+	}
+}
+
+// decodeDeltaSamples appends the samples of one series to the input slice.
+// The timestamps travel as the first timestamp plus the difference to each predecessor.
+// The first difference is zero.
+func decodeDeltaSamples(firstTS int64, deltas []int64, values []float64, samples []samplePoint) ([]samplePoint, error) {
+	if len(deltas) != len(values) {
+		return nil, fmt.Errorf("delta samples have %d timestamp deltas and %d values", len(deltas), len(values))
+	}
+	samples = slices.Grow(samples, len(values))
+	ts := firstTS
+	for index, value := range values {
+		if index > 0 {
+			ts += deltas[index]
+		}
+		samples = append(samples, samplePoint{t: ts, v: value})
+	}
+	return samples, nil
 }
 
 const postHogSeriesIDsTable = "series_ids"
@@ -158,10 +204,16 @@ func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []st
 			nonStaleSampleSQL("value"),
 		)
 	}
-	return fmt.Sprintf(
-		"SELECT series_id, toUnixTimestamp64Milli(timestamp) AS ts, value FROM (%s) ORDER BY series_id, timestamp",
+	// ClickHouse returns one row for each series.
+	// ClickHouse sorts the samples of a series into arrays.
+	// Go decodes typed arrays instead of three values for each sample.
+	// Timestamps travel as deltas: typed columns of small integers compress
+	// several times better than an opaque RowBinary string.
+	return withMaxThreads(fmt.Sprintf(
+		"SELECT series_id, points[1].1 AS first_ts, arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas, arrayMap(p -> p.2, points) AS vals "+
+			"FROM (SELECT series_id, arraySort(groupArray((toUnixTimestamp64Milli(timestamp), value))) AS points FROM (%s) GROUP BY series_id)",
 		source,
-	)
+	), cfg.RangeQueryThreads)
 }
 
 // postHogSelectedSeriesSQL returns one row per series matching the matchers,

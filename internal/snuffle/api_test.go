@@ -57,7 +57,7 @@ func TestTeamIDFromRequest(t *testing.T) {
 func TestTeamHandlerReportsClickHouseReadBytes(t *testing.T) {
 	server := newServer(Config{DefaultTeamID: 1})
 	handler := server.teamHandler(func(_ *Server, w http.ResponseWriter, r *http.Request) {
-		recordClickHouseRead(r.Context(), 1, 2, 345)
+		recordClickHouseRead(r.Context(), 1, 2, 345, 0)
 		writeAPISuccess(w, map[string]string{"status": "ok"})
 	})
 	rec := httptest.NewRecorder()

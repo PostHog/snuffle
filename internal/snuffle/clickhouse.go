@@ -47,12 +47,34 @@ func NewClickHouseClient(cfg Config, metrics ...*bridgeMetrics) *ClickHouseClien
 	}
 }
 
+// clickHouseCompression selects the codec for blocks the client sends.
+func clickHouseCompression(cfg Config) clickhouse.CompressionMethod {
+	switch cfg.CHCompression {
+	case "none":
+		return clickhouse.CompressionNone
+	case "lz4":
+		return clickhouse.CompressionLZ4
+	default:
+		return clickhouse.CompressionZSTD
+	}
+}
+
+// clickHouseNetworkCompression selects the codec for blocks the server sends.
+func clickHouseNetworkCompression(cfg Config) string {
+	switch cfg.CHCompression {
+	case "none", "lz4":
+		return "lz4"
+	default:
+		return "zstd"
+	}
+}
+
 func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, error) {
 	return clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
 		Addr:     clickHouseAddrs(cfg),
 		Compression: &clickhouse.Compression{
-			Method: clickhouse.CompressionLZ4,
+			Method: clickHouseCompression(cfg),
 		},
 		Auth: clickhouse.Auth{
 			Database: cfg.CHDatabase,
@@ -60,6 +82,7 @@ func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, err
 			Password: password,
 		},
 		Settings: clickhouse.Settings{
+			"network_compression_method":                         clickHouseNetworkCompression(cfg),
 			"allow_experimental_time_series_aggregate_functions": 1,
 			// Every selector filters the label index on its sort-key prefix
 			// (team_id, metric_name, label_name, label_value), which no
@@ -158,8 +181,9 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		}
 		scanned := int64(scannedRows.Load())
 		read := int64(readBytes.Load())
-		recordClickHouseRead(ctx, rowCount, scanned, read)
-		c.metrics.observeClickHouseQuery(status, time.Since(started), rowCount, scanned, read)
+		elapsed := time.Since(started)
+		recordClickHouseRead(ctx, rowCount, scanned, read, elapsed)
+		c.metrics.observeClickHouseQuery(status, elapsed, rowCount, scanned, read)
 	}()
 	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
 		scannedRows.Add(progress.Rows)

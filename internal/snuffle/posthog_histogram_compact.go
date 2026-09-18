@@ -26,7 +26,7 @@ type compactHistogramPlan struct {
 	steps                              int
 }
 
-func histogramUnparen(expr parser.Expr) parser.Expr {
+func unparenExpr(expr parser.Expr) parser.Expr {
 	for {
 		paren, ok := expr.(*parser.ParenExpr)
 		if !ok {
@@ -37,7 +37,7 @@ func histogramUnparen(expr parser.Expr) parser.Expr {
 }
 
 func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback time.Duration) *compactHistogramPlan {
-	call, ok := histogramUnparen(expr).(*parser.Call)
+	call, ok := unparenExpr(expr).(*parser.Call)
 	if !ok {
 		return nil
 	}
@@ -63,17 +63,17 @@ func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback
 		if index == plan.bucketArg || (plan.bucketArg == 0 && index == 1) {
 			continue
 		}
-		number, ok := histogramUnparen(arg).(*parser.NumberLiteral)
+		number, ok := unparenExpr(arg).(*parser.NumberLiteral)
 		if !ok || math.IsNaN(number.Val) || math.IsInf(number.Val, 0) || quantiles[number.Val] {
 			return nil
 		}
 		quantiles[number.Val] = true
 	}
-	aggregate, ok := histogramUnparen(call.Args[plan.bucketArg]).(*parser.AggregateExpr)
+	aggregate, ok := unparenExpr(call.Args[plan.bucketArg]).(*parser.AggregateExpr)
 	if !ok || aggregate.Op != parser.SUM || aggregate.Without || len(aggregate.Grouping) != 1 || aggregate.Grouping[0] != "le" {
 		return nil
 	}
-	rate, ok := histogramUnparen(aggregate.Expr).(*parser.Call)
+	rate, ok := unparenExpr(aggregate.Expr).(*parser.Call)
 	if !ok || rate.Func.Name != metricsQLInternalPrefix+"irate" || len(rate.Args) != 5 {
 		return nil
 	}
@@ -273,7 +273,7 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 	plan := evaluator.plan
 	vectors := make([]promql.Vector, len(plan.call.Args))
 	for index, arg := range plan.call.Args {
-		if number, ok := histogramUnparen(arg).(*parser.NumberLiteral); ok {
+		if number, ok := unparenExpr(arg).(*parser.NumberLiteral); ok {
 			vectors[index] = promql.Vector{{F: number.Val}}
 		}
 	}
