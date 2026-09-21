@@ -22,7 +22,7 @@ func TestRangePushdownLatency(test *testing.T) {
 	if os.Getenv("SNUFFLE_E2E_BENCH") != "1" {
 		test.Skip("set SNUFFLE_E2E_BENCH=1 to run the ClickHouse range pushdown benchmark")
 	}
-	test.Setenv("CH_SCHEMA_LAYOUT", "posthog")
+	test.Setenv("CH_SCHEMA_LAYOUT", getenv("SNUFFLE_E2E_BENCH_SCHEMA", "posthog"))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 	cfg := ConfigFromEnv()
@@ -44,7 +44,11 @@ func TestRangePushdownLatency(test *testing.T) {
 	cfg.CHDatabase = database
 	cfg.TeamID = e2eTeamID
 	client := NewClickHouseClient(cfg)
-	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", "create_metrics_posthog_schema.sql"))
+	schema := "create_metrics_schema.sql"
+	if cfg.postHogSchemaLayout() {
+		schema = "create_metrics_posthog_schema.sql"
+	}
+	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", schema))
 
 	const metric = "envoy_cluster_upstream_rq"
 	const base = int64(1_700_000_000_000)
@@ -61,8 +65,19 @@ func TestRangePushdownLatency(test *testing.T) {
 		FROM numbers(%d) AS c CROSS JOIN numbers(%d) AS k CROSS JOIN numbers(%d) AS m`,
 		e2eTeamID, metric, base, minutes-1, clusters, codes, minutes)
 	seeded := time.Now()
-	if err := client.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) %s", tableName(database, cfg.MetricsInputTable), columns, rows)); err != nil {
-		test.Fatal(err)
+	if cfg.postHogSchemaLayout() {
+		if err := client.Exec(ctx, fmt.Sprintf("INSERT INTO %s (%s) %s", tableName(database, cfg.MetricsInputTable), columns, rows)); err != nil {
+			test.Fatal(err)
+		}
+	} else {
+		seriesSQL := fmt.Sprintf("INSERT INTO %s SELECT %d, cityHash64('bench', c.number, k.number), '%s', toJSONString(map('envoy_cluster_name', concat('cluster-', toString(c.number)), 'envoy_response_code', toString(200+k.number*37%%400))), fromUnixTimestamp64Milli(%d), fromUnixTimestamp64Milli(%d) FROM numbers(%d) AS c CROSS JOIN numbers(%d) AS k", tableName(database, cfg.SeriesTable), e2eTeamID, metric, base, base+int64(minutes-1)*60000, clusters, codes)
+		if err := client.Exec(ctx, seriesSQL); err != nil {
+			test.Fatal(err)
+		}
+		samplesSQL := fmt.Sprintf("INSERT INTO %s SELECT %d, '%s', fromUnixTimestamp64Milli(%d+toInt64(m.number)*60000), cityHash64('bench', c.number, k.number), toFloat64(m.number)*toFloat64(1+(c.number*10+k.number)%%17)+toFloat64(k.number) FROM numbers(%d) AS c CROSS JOIN numbers(%d) AS k CROSS JOIN numbers(%d) AS m", tableName(database, cfg.SamplesTable), e2eTeamID, metric, base, clusters, codes, minutes)
+		if err := client.Exec(ctx, samplesSQL); err != nil {
+			test.Fatal(err)
+		}
 	}
 	test.Logf("seeded %d series x %d minutes in %s", clusters*codes, minutes, time.Since(seeded).Round(time.Millisecond))
 

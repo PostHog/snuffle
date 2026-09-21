@@ -71,11 +71,17 @@ var rangePushdownFunctions = map[string]bool{
 	"default_rollup": true,
 }
 
-func (s *Server) tryFastRangeQuery(ctx context.Context, query string, start, end time.Time, step time.Duration) (queryData, bool, error) {
-	if !s.cfg.postHogSchemaLayout() || !s.cfg.RangePushdown {
+func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (queryData, bool, error) {
+	if !s.cfg.RangePushdown {
 		return queryData{}, false, nil
 	}
-	expr, err := s.parser.ParseExpr(query)
+	if !s.cfg.postHogSchemaLayout() {
+		return s.tryNativeRangeQuery(ctx, prepared, start, end, step)
+	}
+	if prepared.runningSum {
+		return queryData{}, false, nil
+	}
+	expr, err := s.parser.ParseExpr(prepared.query)
 	if err != nil {
 		return queryData{}, false, nil
 	}

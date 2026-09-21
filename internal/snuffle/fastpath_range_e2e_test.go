@@ -205,7 +205,7 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 			if err != nil {
 				test.Fatal(err)
 			}
-			got, ok, err := pushdown.tryFastRangeQuery(ctx, prepared.query, start, end, tc.step)
+			got, ok, err := pushdown.tryFastRangeQuery(ctx, prepared, start, end, tc.step)
 			if err != nil {
 				test.Fatal(err)
 			}

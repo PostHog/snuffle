@@ -418,12 +418,22 @@ that both agree, and logs the timings:
 ```bash
 docker compose up -d clickhouse
 SNUFFLE_E2E_BENCH=1 go test -run TestRangePushdownLatency -v ./internal/snuffle/
+# Run the same comparison against Snuffle's native schema:
+SNUFFLE_E2E_BENCH=1 SNUFFLE_E2E_BENCH_SCHEMA=current \
+  go test -run TestRangePushdownLatency -v ./internal/snuffle/
 ```
 
-On the two-CPU compose ClickHouse the pushdown answered in about 0.5 s and the
+For PostHog, on the two-CPU compose ClickHouse the pushdown answered in about 0.5 s and the
 engine in about 1.4 s (2.2 s before the packed sample reads). The pushdown
 parallelises across series in ClickHouse, so it gains more from larger servers
 than the engine path, whose evaluation runs in one Go goroutine.
+
+For the native schema, a three-run comparison on the same two-CPU setup gave
+median times of 787 ms for pushdown and 1143 ms for the engine (31% lower).
+The native path issued one query instead of three and returned 14,400 rows
+instead of 2,892,000. It scanned approximately twice as many sample rows because
+the regular and sparse-series branches each read the source. These timings
+are for the counter benchmark above, not every supported expression.
 
 Compare the generated ClickHouse SQL and `system.query_log` rows when changing
 schema or query planning. Focus on read rows, read bytes, marks used, projection
@@ -467,6 +477,20 @@ Implemented storage optimizations:
   (`rate` without a window, `@`, `without`, nested expressions, windows wider
   than `CH_RANGE_PUSHDOWN_MAX_EXPANSION` steps, virtual histogram selectors)
   keep the engine path below
+- native-layout range queries push bare selectors, `increase`, `delta`, `rate`
+  (including implicit windows), `irate`, `idelta`, and basic `*_over_time`
+  functions into one SQL statement. Aggregations, nested counts, scalar
+  arithmetic and plain `or` unions compose over those results. Selector and
+  aggregate offsets are supported; outer `running_sum` sums the evaluated
+  points in Go. Unlike the PostHog implementation, the native path calculates
+  the sample interval from the last 20 intervals in each step's matrix, matching
+  the engine for irregular samples. For `increase` and `delta`, series without
+  lookback-sized gaps use adjacent-sample contributions; sparse series keep
+  the per-step calculation. A sum can aggregate contributions directly.
+  The statement also checks the series limit and matching native histogram
+  data; histograms retain engine evaluation. Unsupported expressions (including
+  general subqueries, `@`, vector arithmetic and custom union matching) and
+  windows above the expansion limit use the engine. SQL errors are returned.
 - other range queries and counter rollups use the Prometheus engine: automatic
   selector windows depend on the sample interval of each series, and counter
   rollups use MetricsQL calculations. PostHog-layout float samples arrive as
@@ -518,10 +542,8 @@ Implemented storage optimizations:
   `IN (...)` lists
 - topk/bottomk carries metric names and label JSON through `selected_series`,
   avoiding a second series-table lookup for the winning IDs
-- plain `/query_range` selectors use `timeSeriesLastToGrid` to return one row
-  per series with an array of step values
-- safe `/query_range` aggregates use ClickHouse grid functions and aggregate
-  arrays server-side, avoiding raw-sample materialization in Go
+- native `/query_range` selectors and supported aggregates return evaluated
+  step values from ClickHouse, avoiding raw-sample materialization in Go
 - no-op Grafana regexes such as `=~".*"` do not disable ClickHouse pushdown
 - `/series` resolves labelsets without reading samples
 - label metadata endpoints push `limit` into ClickHouse when clients provide it
