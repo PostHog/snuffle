@@ -2,8 +2,10 @@ package snuffle
 
 import (
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -355,7 +357,7 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 	seriesSQL := postHogSelectedSeriesSQL(cfg, matchers, 1000, 2000, cfg.MaxSeries, nil)
 	for _, want := range []string{
 		"SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes FROM `posthog`.`metric_series2` WHERE",
-		"last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"last_seen >= " + chTimeMillis(1000-postHogLabelWindowMillis),
 		"if(mapContains(resource_attributes, 'status'), resource_attributes['status'], attributes['status']) = '200'",
 		"LIMIT 1 BY series_id LIMIT 500",
 	} {
@@ -389,6 +391,26 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 		if strings.Contains(samplesSQL, notWant) {
 			t.Fatalf("samples SQL must not contain %q:\n%s", notWant, samplesSQL)
 		}
+	}
+}
+
+func TestPostHogSeriesAndRollupFiltersWidenByLabelWindow(t *testing.T) {
+	cfg := Config{TeamID: 7, SchemaLayout: "posthog"}
+	mint := 2 * time.Hour.Milliseconds()
+	maxt := mint + 5*time.Minute.Milliseconds()
+
+	seriesFilters := postHogSeriesFilters(cfg, nil, mint, maxt)
+	if want := "last_seen >= fromUnixTimestamp64Milli(3600000, 'UTC')"; !slices.Contains(seriesFilters, want) {
+		t.Fatalf("series filters %q do not contain %q", seriesFilters, want)
+	}
+
+	rollupFilters := postHogAttributeTimeFilters(mint, maxt)
+	want := []string{
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(3600000, 'UTC'))",
+		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(11100000, 'UTC'))",
+	}
+	if !slices.Equal(rollupFilters, want) {
+		t.Fatalf("rollup filters = %q, want %q", rollupFilters, want)
 	}
 }
 
@@ -444,8 +466,8 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 	for _, want := range []string{
 		"SELECT DISTINCT attribute_key FROM `posthog`.`metric_attributes3` WHERE",
 		teamFilter(cfg),
-		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
-		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"time_bucket >= toStartOfHour(" + chTimeMillis(1000-postHogLabelWindowMillis) + ")",
+		"time_bucket <= toStartOfHour(" + chTimeMillis(2000+postHogLabelWindowMillis) + ")",
 		"metric_name = 'http_requests_total'",
 		"service_name = 'checkout'",
 		"ORDER BY attribute_key" + sqlLimit(100),
@@ -500,8 +522,8 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 	for _, want := range []string{
 		"SELECT DISTINCT metric_name AS label_value FROM `posthog`.`metric_names3` WHERE",
 		teamFilter(cfg),
-		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
-		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
+		"time_bucket >= toStartOfHour(" + chTimeMillis(1000-postHogLabelWindowMillis) + ")",
+		"time_bucket <= toStartOfHour(" + chTimeMillis(2000+postHogLabelWindowMillis) + ")",
 		"ORDER BY label_value",
 	} {
 		if !strings.Contains(sql, want) {
@@ -532,7 +554,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 	}
 
 	sql, ok = postHogLabelValuesSQL(cfg, "service_name", 1000, 2000, 0, nil)
-	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") || !strings.Contains(sql, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") {
+	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") || !strings.Contains(sql, "last_seen >= "+chTimeMillis(1000-postHogLabelWindowMillis)) {
 		t.Fatalf("service names should read the series table: %s", sql)
 	}
 

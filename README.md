@@ -410,6 +410,9 @@ names, filtered by any `__name__` matcher, and `metric_attributes3` lists
 attribute keys and values, filtered by exact `__name__` and `service_name`
 matchers. Other matchers fall back to the series table. Remote write inserts into `metrics2_input`; its materialized
 views fan each row out to the samples, series, attribute, and name tables.
+Ingestion sends the labels of a series on one row per hour at most, and only
+labelled rows reach the series, attribute, and name tables, so series
+selection and label discovery widen the query window by one hour on each side.
 
 #### OpenTelemetry histogram queries
 

@@ -374,7 +374,8 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		assertValue(test, metric+"_count", 30)
 		assertValue(test, metric+"_sum", 36)
 		assertValue(test, `sum({__name__=~"test_duration_seconds_(bucket|count)"})`, 807)
-		insertReal(metric+"_sum", e2eTeamID, e2eStartMS-3600000)
+		// Older than the query window and the label window before it.
+		insertReal(metric+"_sum", e2eTeamID, e2eStartMS-2*postHogLabelWindowMillis)
 		if result := query(test, metric+"_sum"); len(result.Result) != 0 {
 			test.Fatalf("real name outside the query window must still take priority: %v", result)
 		}
