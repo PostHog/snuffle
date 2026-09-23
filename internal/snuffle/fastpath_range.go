@@ -117,16 +117,17 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery,
 	if points <= 0 || points > maxRangePushdownPoints || call.expansion() > int64(s.cfg.RangePushdownMaxExpansion) {
 		return queryData{}, false, nil
 	}
-	virtual, err := s.postHogSelectsHistogram(ctx, call.selector.LabelMatchers)
+	evalStart := gridStart - call.offset
+	mint := evalStart - call.matrix
+	maxt := evalStart + (points-1)*call.step
+	virtual, err := s.postHogSelectsHistogram(ctx, mint, maxt, call.selector.LabelMatchers)
 	if err != nil {
 		return queryData{}, false, err
 	}
 	if virtual {
 		return queryData{}, false, nil
 	}
-	evalStart := gridStart - call.offset
-	mint := evalStart - call.matrix
-	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, evalStart+(points-1)*call.step, len(aggregate.Grouping) > 0)
+	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, maxt, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
 	sql := rangeRollupSQL(s.cfg, plan, call, evalStart, gridStart, points, aggSQL, sumContributions)
 	groups, err := s.queryRangeAggregateGroups(ctx, sql, aggregate.Grouping)

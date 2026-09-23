@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/prometheus/prometheus/model/labels"
+	promvalue "github.com/prometheus/prometheus/model/value"
 )
 
 func histogramTestConfig() Config {
@@ -161,13 +162,16 @@ func TestPostHogHistogramSQL(test *testing.T) {
 		labels.MustNewMatcher(labels.MatchEqual, "le", "1"),
 	}
 	sql := postHogHistogramAliasesSQL(cfg, 1000, 2000, matchers)
-	for _, want := range []string{"metric_name = 'test_duration_seconds'", "suffix = '_bucket'", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "NOT IN (SELECT metric_name FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'test_duration_seconds_bucket')"} {
+	for _, want := range []string{"metric_name = 'test_duration_seconds'", "suffix = '_bucket'", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'"} {
 		if !strings.Contains(sql, want) {
 			test.Fatalf("SQL missing %q: %s", want, sql)
 		}
 	}
 	if strings.Contains(sql, "['le']") {
 		test.Fatalf("virtual le must not filter source attributes: %s", sql)
+	}
+	if strings.Contains(sql, "NOT IN") {
+		test.Fatalf("stored component series must not suppress virtual names: %s", sql)
 	}
 	aliases := []postHogHistogramAlias{{baseName: "test_duration_seconds", suffix: "_bucket"}}
 	sql = postHogHistogramSeriesSQL(cfg, 1000, 2000, aliases, matchers)
@@ -431,12 +435,58 @@ func TestPostHogHistogramDiscoveryAndExistenceSQL(test *testing.T) {
 			test.Fatalf("bounds SQL must not read samples via %q: %s", notWant, sql)
 		}
 	}
-	sql = postHogHistogramSourceExistsSQL(cfg, aliases[0])
-	if want := "SELECT 1 FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'test_duration_seconds' AND metric_type = 'histogram' LIMIT 1"; sql != want {
+	sql = postHogHistogramSourceExistsSQL(cfg, 1000, 2000, aliases[0])
+	if want := "SELECT 1 FROM `test`.`metrics4_series` WHERE team_id = 42 AND time_bucket >= toStartOfHour(" + chTimeMillis(1000) + ") AND time_bucket <= toStartOfHour(" + chTimeMillis(2000) + ") AND metric_name = 'test_duration_seconds' AND metric_type = 'histogram' LIMIT 1"; sql != want {
 		test.Fatalf("bucket existence SQL = %s, want %s", sql, want)
 	}
-	sql = postHogHistogramSourceExistsSQL(cfg, postHogHistogramAlias{baseName: "test_duration_seconds", suffix: "_count"})
+	sql = postHogHistogramSourceExistsSQL(cfg, 1000, 2000, postHogHistogramAlias{baseName: "test_duration_seconds", suffix: "_count"})
 	if !strings.Contains(sql, "metric_type IN ('histogram', 'exponential_histogram')") {
 		test.Fatalf("count existence SQL must accept exponential histograms: %s", sql)
+	}
+}
+
+func TestMergePostHogHistogramSeries(test *testing.T) {
+	series := func(name, le string, samples ...samplePoint) *seriesMeta {
+		labelMap := map[string]string{labels.MetricName: name, "service_name": "api"}
+		if le != "" {
+			labelMap["le"] = le
+		}
+		set := labels.FromMap(labelMap)
+		return &seriesMeta{id: set.Hash(), metricName: name, labelMap: labelMap, labels: set, samples: samples}
+	}
+	stale := math.Float64frombits(promvalue.StaleNaN)
+	real := []*seriesMeta{
+		series("duration_bucket", "1", samplePoint{t: 2000, v: 8}),
+		series("duration_bucket", "+Inf", samplePoint{t: 2000, v: 10}),
+		series("duration_count", "", samplePoint{t: 2000, v: 10}),
+	}
+	virtual := []*seriesMeta{
+		series("duration_bucket", "1", samplePoint{t: 1000, v: 5}, samplePoint{t: 2000, v: stale}, samplePoint{t: 3000, v: 12}),
+		series("duration_bucket", "+Inf", samplePoint{t: 1000, v: 6}, samplePoint{t: 3000, v: 15}),
+		series("duration_sum", "", samplePoint{t: 1000, v: 3}, samplePoint{t: 3000, v: 9}),
+	}
+	merged := mergePostHogHistogramSeries(real, virtual)
+	got := make(map[string][]samplePoint, len(merged))
+	for _, meta := range merged {
+		got[meta.labels.String()] = meta.samples
+	}
+	want := map[string][]samplePoint{
+		real[0].labels.String():    {{t: 1000, v: 5}, {t: 2000, v: 8}, {t: 3000, v: 12}},
+		real[1].labels.String():    {{t: 1000, v: 6}, {t: 2000, v: 10}, {t: 3000, v: 15}},
+		real[2].labels.String():    {{t: 2000, v: 10}},
+		virtual[2].labels.String(): {{t: 1000, v: 3}, {t: 3000, v: 9}},
+	}
+	if len(merged) != len(want) || !reflect.DeepEqual(got, want) {
+		test.Fatalf("merged series = %v, want %v", got, want)
+	}
+	if only := mergePostHogHistogramSeries(nil, virtual); len(only) != len(virtual) {
+		test.Fatalf("virtual only = %d series", len(only))
+	}
+	if only := mergePostHogHistogramSeries(real, nil); len(only) != len(real) {
+		test.Fatalf("real only = %d series", len(only))
+	}
+	unsorted := mergeSamplesPreferFirst([]samplePoint{{t: 3000, v: 3}, {t: 1000, v: 1}}, []samplePoint{{t: 2000, v: 2}, {t: 1000, v: 9}})
+	if !reflect.DeepEqual(unsorted, []samplePoint{{t: 1000, v: 1}, {t: 2000, v: 2}, {t: 3000, v: 3}}) {
+		test.Fatalf("unsorted merge = %v", unsorted)
 	}
 }

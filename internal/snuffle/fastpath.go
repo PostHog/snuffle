@@ -19,15 +19,29 @@ func (s *Server) tryFastInstantQuery(ctx context.Context, query string, evalTime
 		return queryData{}, false, nil
 	}
 	if s.cfg.postHogSchemaLayout() {
-		var selectors []*parser.VectorSelector
-		parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		type selectorRange struct {
+			selector *parser.VectorSelector
+			matrix   time.Duration
+		}
+		var selectors []selectorRange
+		parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
 			if selector, ok := node.(*parser.VectorSelector); ok {
-				selectors = append(selectors, selector)
+				var matrix time.Duration
+				if len(path) > 0 {
+					if parent, ok := path[len(path)-1].(*parser.MatrixSelector); ok {
+						matrix = parent.Range
+					}
+				}
+				selectors = append(selectors, selectorRange{selector: selector, matrix: matrix})
 			}
 			return nil
 		})
-		for _, selector := range selectors {
-			virtual, err := s.postHogSelectsHistogram(ctx, selector.LabelMatchers)
+		for _, item := range selectors {
+			window, ok := selectorWindowFor(item.selector, evalTime, s.cfg.LookbackDelta)
+			if !ok {
+				return queryData{}, false, nil
+			}
+			virtual, err := s.postHogSelectsHistogram(ctx, window.mint-item.matrix.Milliseconds(), window.maxt, item.selector.LabelMatchers)
 			if err != nil {
 				return queryData{}, false, err
 			}

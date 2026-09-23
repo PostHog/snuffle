@@ -43,7 +43,6 @@ func postHogExactHistogramMetadataSQL(cfg Config, mint, maxt int64, alias postHo
 	} else {
 		virtualWhere = append(virtualWhere, postHogHistogramTypeFilter)
 	}
-	virtualWhere = append(virtualWhere, fmt.Sprintf("%s NOT IN (SELECT metric_name FROM %s WHERE %s AND metric_name = %s LIMIT 1)", sqlString(name), postHogSeriesTable(cfg), teamFilter(cfg), sqlString(name)))
 	where := []string{
 		teamFilter(cfg),
 		"metric_name IN (" + sqlString(name) + ", " + sqlString(alias.baseName) + ")",
@@ -111,7 +110,67 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return append(series, virtual...), nil
+	return mergePostHogHistogramSeries(series, virtual), nil
+}
+
+// mergePostHogHistogramSeries joins real component series and virtual
+// histogram series that share a label set into one series. A histogram whose
+// scrape arrived split across requests is stored as a native row for the
+// complete part and as plain rows for the rest, so both forms carry the same
+// labels. Samples of a shared series merge by timestamp. Where both forms have
+// a sample at one timestamp, the real sample wins, which removes the stale
+// marker the virtual builder writes for a bucket missing from a native row.
+func mergePostHogHistogramSeries(real, virtual []*seriesMeta) []*seriesMeta {
+	if len(real) == 0 {
+		return virtual
+	}
+	if len(virtual) == 0 {
+		return real
+	}
+	byLabels := make(map[string]*seriesMeta, len(virtual))
+	for _, meta := range virtual {
+		byLabels[meta.labels.String()] = meta
+	}
+	merged := make([]*seriesMeta, 0, len(real)+len(virtual))
+	for _, meta := range real {
+		target, ok := byLabels[meta.labels.String()]
+		if !ok {
+			merged = append(merged, meta)
+			continue
+		}
+		target.samples = mergeSamplesPreferFirst(meta.samples, target.samples)
+	}
+	return append(merged, virtual...)
+}
+
+// mergeSamplesPreferFirst returns the union of two sorted sample lists. At a
+// shared timestamp the sample from the first list is kept.
+func mergeSamplesPreferFirst(preferred, other []samplePoint) []samplePoint {
+	if len(other) == 0 {
+		return preferred
+	}
+	if len(preferred) == 0 {
+		return other
+	}
+	sortSamples(preferred)
+	sortSamples(other)
+	out := make([]samplePoint, 0, len(preferred)+len(other))
+	i, j := 0, 0
+	for i < len(preferred) || j < len(other) {
+		switch {
+		case j >= len(other) || (i < len(preferred) && preferred[i].t < other[j].t):
+			out = append(out, preferred[i])
+			i++
+		case i >= len(preferred) || other[j].t < preferred[i].t:
+			out = append(out, other[j])
+			j++
+		default:
+			out = append(out, preferred[i])
+			i++
+			j++
+		}
+	}
+	return out
 }
 
 func postHogMaySelectHistogram(matchers []*labels.Matcher) bool {
@@ -127,22 +186,22 @@ func postHogMaySelectHistogram(matchers []*labels.Matcher) bool {
 }
 
 // postHogHistogramSourceExistsSQL finds one stored histogram series that can
-// back virtual series for the alias. The series table is keyed by team and
-// metric name, so this is a primary key lookup.
-func postHogHistogramSourceExistsSQL(cfg Config, alias postHogHistogramAlias) string {
+// back virtual series for the alias inside the query window. The series table
+// is keyed by team, metric name, and hour, so this is a primary key lookup.
+func postHogHistogramSourceExistsSQL(cfg Config, mint, maxt int64, alias postHogHistogramAlias) string {
 	typeFilter := postHogHistogramTypeFilter
 	if alias.suffix == "_bucket" {
 		typeFilter = "metric_type = 'histogram'"
 	}
-	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s AND metric_name = %s AND %s LIMIT 1", postHogSeriesTable(cfg), teamFilter(cfg), sqlString(alias.baseName), typeFilter)
+	return fmt.Sprintf("SELECT 1 FROM %s WHERE %s AND metric_name = %s AND %s LIMIT 1", postHogSeriesTable(cfg), strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "), sqlString(alias.baseName), typeFilter)
 }
 
 // postHogSelectsHistogram reports whether the selector can return virtual
-// histogram series. Without an exact metric name, any virtual name can match.
-// An exact name with a histogram suffix, such as a real classic histogram's
-// _bucket series, only does when the team stores a histogram with the base
-// name.
-func (s *Server) postHogSelectsHistogram(ctx context.Context, matchers []*labels.Matcher) (bool, error) {
+// histogram series inside the query window. Without an exact metric name, any
+// virtual name can match. An exact name with a histogram suffix, such as a
+// classic histogram's _bucket series, only does when the team stores a
+// histogram with the base name in the window.
+func (s *Server) postHogSelectsHistogram(ctx context.Context, mint, maxt int64, matchers []*labels.Matcher) (bool, error) {
 	if !postHogMaySelectHistogram(matchers) {
 		return false, nil
 	}
@@ -151,7 +210,7 @@ func (s *Server) postHogSelectsHistogram(ctx context.Context, matchers []*labels
 		return true, nil
 	}
 	found := false
-	err := s.client.QueryRows(ctx, postHogHistogramSourceExistsSQL(s.cfg, alias), func(clickHouseRow) error {
+	err := s.client.QueryRows(ctx, postHogHistogramSourceExistsSQL(s.cfg, mint, maxt, alias), func(clickHouseRow) error {
 		found = true
 		return nil
 	})
@@ -172,16 +231,12 @@ func postHogHistogramAliasesSQL(cfg Config, mint, maxt int64, matchers []*labels
 	where := postHogSeriesFilters(cfg, postHogHistogramBaseMatchers(matchers), mint, maxt)
 	where = append(where, "metric_type IN ('histogram', 'exponential_histogram')")
 	where = append(where, "(metric_type != 'exponential_histogram' OR suffix != '_bucket')")
-	realWhere := []string{teamFilter(cfg)}
 	for _, matcher := range matchers {
 		if matcher.Name != labels.MetricName {
 			continue
 		}
 		if condition, ok := stringColumnMatcherCondition("concat(metric_name, suffix)", matcher); ok {
 			where = append(where, condition)
-		}
-		if condition, ok := metricMatcherCondition(matcher); ok {
-			realWhere = append(realWhere, condition)
 		}
 	}
 	if name := exactMetricName(matchers); name != "" {
@@ -192,7 +247,6 @@ func postHogHistogramAliasesSQL(cfg Config, mint, maxt int64, matchers []*labels
 			}
 		}
 	}
-	where = append(where, fmt.Sprintf("concat(metric_name, suffix) NOT IN (SELECT metric_name FROM %s WHERE %s)", postHogSeriesTable(cfg), strings.Join(realWhere, " AND ")))
 	return fmt.Sprintf("SELECT DISTINCT metric_name AS base_name, suffix FROM %s ARRAY JOIN ['_bucket', '_count', '_sum'] AS suffix WHERE %s ORDER BY base_name, suffix%s", postHogSeriesTable(cfg), strings.Join(where, " AND "), sqlLimit(cfg.MaxSeries+1))
 }
 
@@ -547,7 +601,7 @@ func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*
 	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return append(series, virtual...), nil
+	return mergePostHogHistogramSeries(series, virtual), nil
 }
 
 func (q *CHQuerier) postHogHistogramLabelValues(ctx context.Context, name string, matchers []*labels.Matcher) ([]string, error) {

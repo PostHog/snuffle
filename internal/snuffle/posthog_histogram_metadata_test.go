@@ -45,11 +45,13 @@ func TestPostHogExactHistogramMetadataSQL(test *testing.T) {
 				"metric_name IN ('duration" + suffix + "', 'duration')",
 				"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000",
 				"LIMIT 1 BY series_id LIMIT 100",
-				"'duration" + suffix + "' NOT IN (SELECT metric_name FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'duration" + suffix + "' LIMIT 1)",
 			} {
 				if !strings.Contains(sql, want) {
 					test.Fatalf("SQL missing %q: %s", want, sql)
 				}
+			}
+			if strings.Contains(sql, "NOT IN") {
+				test.Fatalf("stored component series must not suppress the virtual branch: %s", sql)
 			}
 			branches := strings.Split(sql, ") OR (")
 			if len(branches) != 2 || !strings.Contains(branches[0], "['le']") || strings.Contains(branches[1], "['le']") {

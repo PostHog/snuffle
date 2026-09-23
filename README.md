@@ -441,11 +441,15 @@ These are read-time conversions of `histogram_bounds`, `histogram_counts`,
 metric. Resource and metric labels are preserved. For buckets, the generated
 `le` label replaces any input attribute with that name. Units are not converted.
 
-A real metric with the exact generated name takes priority for the whole team,
-even if that real metric has different labels or no samples in the query window.
-This rule applies separately to `_bucket`, `_count`, and `_sum`. A real name in
-another team does not suppress a virtual metric. Priority lasts while the real
-name remains in the configured series table.
+Stored series with a generated name, such as classic Prometheus `_bucket`,
+`_count`, and `_sum` series written through remote write, are read together
+with the virtual series. Capture folds a complete classic histogram scrape into
+one native row, and writes the parts of a split scrape as plain rows. Snuffle
+merges a stored series and a virtual series that carry the same label set into
+one series, so a histogram that is stored in both forms reads as one continuous
+counter. Samples merge by timestamp. Where both forms have a sample at one
+timestamp, the stored sample is used. Stored series with other label sets are
+returned next to the virtual series.
 
 For example, a histogram named `request_duration_seconds` supports:
 
@@ -472,10 +476,12 @@ filter alone, skips an invalid histogram and logs a warning, so one bad
 histogram does not fail discovery or broad queries for the team.
 Removed bucket boundaries produce stale markers.
 
-Instant query fast paths stay available for exact `_bucket`, `_count`, and
-`_sum` names when the team stores no histogram with the base name, so real
-classic histograms keep their pushdown. Selectors without an exact name use the
-general engine because any virtual name can match.
+Query fast paths stay available for exact `_bucket`, `_count`, and `_sum`
+names when the team stores no histogram with the base name inside the query
+window, so classic histograms that are never folded keep their pushdown.
+Selectors without an exact name use the general engine because any virtual name
+can match. The compact histogram path also uses the general engine when the
+window contains stored series for the generated name.
 `CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
 
 The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native

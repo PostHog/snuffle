@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -69,6 +71,20 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, value, count, has_labels, attributes)
 			SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'other', 'sum', 777, 1, true, map('le', '0.5')`,
 			tableName(database, cfg.MetricsInputTable), team, sqlString(name), sqlString(name), chTimeMillis(timestamp))
+		if err := client.Exec(ctx, sql); err != nil {
+			test.Fatal(err)
+		}
+	}
+	insertPlain := func(name string, timestamp int64, value float64, attributes map[string]string) {
+		test.Helper()
+		pairs := make([]string, 0, len(attributes)*2)
+		for _, key := range slices.Sorted(maps.Keys(attributes)) {
+			pairs = append(pairs, sqlString(key), sqlString(attributes[key]))
+		}
+		fingerprint := name + "|" + strings.Join(pairs, "|")
+		sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, value, count, has_labels, resource_attributes, attributes)
+			SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'sum', %v, 1, true, map('region', 'resource'), map(%s)`,
+			tableName(database, cfg.MetricsInputTable), e2eTeamID, sqlString(name), sqlString(fingerprint), chTimeMillis(timestamp), value, strings.Join(pairs, ", "))
 		if err := client.Exec(ctx, sql); err != nil {
 			test.Fatal(err)
 		}
@@ -312,7 +328,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			test.Fatalf("remote read = %v", response)
 		}
 	})
-	test.Run("real names take priority", func(test *testing.T) {
+	test.Run("real and virtual series coexist", func(test *testing.T) {
 		insertReal(metric+"_bucket", e2eTeamID, e2eEndMS)
 		compactCfg := cfg
 		compactCfg.TeamID = e2eTeamID
@@ -334,31 +350,114 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, metric+"_bucket"), labels.MustNewMatcher(labels.MatchEqual, "le", "0.5")}
 			var series []*seriesMeta
 			var err error
-			wantQueries := int64(1)
 			if withSamples {
 				series, err = querier.selectPostHogSeriesSamples(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, true, matchers...)
-				wantQueries = 2
 			} else {
 				series, err = querier.selectPostHogSeries(withPromRequestStats(ctx, stats), e2eStartMS, e2eEndMS, matchers...)
 			}
-			if err != nil || len(series) != 1 || stats.clickHouseQueries.Load() != wantQueries {
-				test.Fatalf("real metric samples=%v: series=%d queries=%d error=%v", withSamples, len(series), stats.clickHouseQueries.Load(), err)
+			if err != nil || len(series) != 2 {
+				test.Fatalf("real and virtual samples=%v: series=%d queries=%d error=%v", withSamples, len(series), stats.clickHouseQueries.Load(), err)
 			}
-			if series[0].labelMap["service_name"] != "other" || (withSamples && (len(series[0].samples) != 1 || series[0].samples[0].v != 777)) {
-				test.Fatalf("real metric samples=%v: %+v", withSamples, series[0])
+			byService := map[string]*seriesMeta{}
+			for _, meta := range series {
+				byService[meta.labelMap["service_name"]] = meta
+			}
+			real, virtual := byService["other"], byService["api"]
+			if real == nil || virtual == nil {
+				test.Fatalf("real and virtual samples=%v: %+v", withSamples, series)
+			}
+			if withSamples && (len(real.samples) != 1 || real.samples[0].v != 777 || len(virtual.samples) == 0 || virtual.samples[len(virtual.samples)-1].v != 6) {
+				test.Fatalf("real and virtual latest samples: real=%+v virtual=%+v", real.samples, virtual.samples)
 			}
 		}
-		assertValue(test, metric+"_bucket", 777)
-		assertValue(test, "sum("+metric+"_bucket)", 777)
-		if result := query(test, metric+`_bucket{service_name="api"}`); len(result.Result) != 0 {
-			test.Fatalf("real name must suppress the virtual metric across label filters: %v", result)
-		}
+		assertValue(test, metric+`_bucket{service_name="other"}`, 777)
+		assertValue(test, metric+`_bucket{service_name="api",le="0.5"}`, 6)
+		assertValue(test, "sum("+metric+"_bucket)", 777+6+15+30)
 		assertValue(test, metric+"_count", 30)
 		assertValue(test, metric+"_sum", 36)
-		assertValue(test, `sum({__name__=~"test_duration_seconds_(bucket|count)"})`, 807)
+		assertValue(test, `sum({__name__=~"test_duration_seconds_(bucket|count)"})`, 777+6+15+30+30)
 		insertReal(metric+"_sum", e2eTeamID, e2eStartMS-3600000)
-		if result := query(test, metric+"_sum"); len(result.Result) != 0 {
-			test.Fatalf("real name outside the query window must still take priority: %v", result)
+		assertValue(test, metric+"_sum", 36)
+	})
+	test.Run("mixed native and plain rows merge", func(test *testing.T) {
+		const name = "test_mixed_seconds"
+		base := map[string]string{"region": "metric", "status": "200"}
+		bucket := func(le string) map[string]string {
+			attributes := maps.Clone(base)
+			attributes["le"] = le
+			return attributes
+		}
+		native := func(timestamp int64, sum float64, count uint64, counts string) {
+			test.Helper()
+			sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes)
+				SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'histogram', 'cumulative', %v, %d, [0.5, 1.0], %s, true, map('region', 'resource'), map('region', 'metric', 'status', '200')`,
+				tableName(database, cfg.MetricsInputTable), e2eTeamID, sqlString(name), sqlString(name), chTimeMillis(timestamp), sum, count, counts)
+			if err := client.Exec(ctx, sql); err != nil {
+				test.Fatal(err)
+			}
+		}
+		t1, t2, t3 := e2eStartMS, e2eStartMS+30000, e2eStartMS+60000
+		native(t1, 12, 10, "[2, 3, 5]")
+		insertPlain(name+"_bucket", t2, 4, bucket("0.5"))
+		insertPlain(name+"_bucket", t2, 10, bucket("1"))
+		insertPlain(name+"_bucket", t2, 20, bucket("+Inf"))
+		insertPlain(name+"_count", t2, 20, base)
+		insertPlain(name+"_sum", t2, 24, base)
+		native(t3, 36, 30, "[6, 9, 15]")
+		rangeQuery := func(expression string) queryDataDTO {
+			test.Helper()
+			return apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {expression}, "start": {"1700000010"}, "end": {"1700000070"}, "step": {"30"}})
+		}
+		for _, testcase := range []struct {
+			expression string
+			values     []string
+		}{
+			{name + `_bucket{le="0.5"}`, []string{"2", "4", "6"}},
+			{name + `_bucket{le="1"}`, []string{"5", "10", "15"}},
+			{name + `_bucket{le="+Inf"}`, []string{"10", "20", "30"}},
+			{name + "_count", []string{"10", "20", "30"}},
+			{name + "_sum", []string{"12", "24", "36"}},
+		} {
+			result := rangeQuery(testcase.expression)
+			if len(result.Result) != 1 || len(result.Result[0].Values) != len(testcase.values) {
+				test.Fatalf("%s: %+v", testcase.expression, result)
+			}
+			for index, point := range result.Result[0].Values {
+				if got := sampleString(point); got != testcase.values[index] {
+					test.Fatalf("%s sample %d = %s, want %s", testcase.expression, index, got, testcase.values[index])
+				}
+			}
+		}
+		increase := rangeQuery("sum by (le) (increase(" + name + "_bucket[1m]))")
+		if len(increase.Result) != 3 {
+			test.Fatalf("increase by le = %+v", increase)
+		}
+		for _, series := range increase.Result {
+			last := sampleString(series.Values[len(series.Values)-1])
+			want := map[string]string{"0.5": "4", "1": "10", "+Inf": "20"}[series.Metric["le"]]
+			if last != want {
+				test.Fatalf("increase le=%s = %s, want %s", series.Metric["le"], last, want)
+			}
+		}
+		assertValue(test, "histogram_quantile(0.5, sum by (le) (rate("+name+"_bucket[1m])))", 1)
+		params := url.Values{"start": {"1700000010"}, "end": {"1700000070"}, "match[]": {name + "_bucket"}}
+		bounds := apiGet[[]string](test, api.URL, "/api/v1/label/le/values", params)
+		if !reflect.DeepEqual(bounds, []string{"+Inf", "0.5", "1"}) {
+			test.Fatalf("bounds = %v", bounds)
+		}
+		series := apiGet[[]map[string]string](test, api.URL, "/api/v1/series", params)
+		if len(series) != 3 {
+			test.Fatalf("series = %v", series)
+		}
+		names := apiGet[[]string](test, api.URL, "/api/v1/label/__name__/values", url.Values{"start": {"1700000010"}, "end": {"1700000070"}, "match[]": {`{__name__=~"test_mixed_seconds.*"}`}})
+		seen := make(map[string]int, len(names))
+		for _, value := range names {
+			seen[value]++
+		}
+		for _, suffix := range postHogHistogramSuffixes {
+			if seen[name+suffix] != 1 {
+				test.Fatalf("names must list %s once: %v", name+suffix, names)
+			}
 		}
 	})
 	test.Run("exponential count and sum", func(test *testing.T) {
@@ -388,7 +487,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			names = append(names, series.Metric[labels.MetricName])
 		}
 		sort.Strings(names)
-		if want := []string{"test_duration_seconds_count", "test_exponential_seconds_count"}; !reflect.DeepEqual(names, want) {
+		if want := []string{"test_duration_seconds_count", "test_exponential_seconds_count", "test_mixed_seconds_count"}; !reflect.DeepEqual(names, want) {
 			test.Fatalf("broad selector over a delta histogram = %v, want %v", names, want)
 		}
 	})
@@ -417,8 +516,8 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		if !reflect.DeepEqual(snapshot(got), snapshot(want)) {
 			test.Fatalf("external table read differs from chunked read")
 		}
-		if count := stats.clickHouseQueries.Load(); count != 4 {
-			test.Fatalf("used %d queries, want series, aliases, histogram series and one external sample read", count)
+		if count := stats.clickHouseQueries.Load(); count != 5 {
+			test.Fatalf("used %d queries, want series, one stored sample read, aliases, histogram series and one external sample read", count)
 		}
 	})
 	test.Run("fast path checks for stored histograms", func(test *testing.T) {
@@ -433,7 +532,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_exponential_seconds_sum"), true},
 			{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "requests_.*"), true},
 		} {
-			virtual, err := teamServer.postHogSelectsHistogram(ctx, []*labels.Matcher{testcase.matcher})
+			virtual, err := teamServer.postHogSelectsHistogram(ctx, e2eStartMS, e2eEndMS, []*labels.Matcher{testcase.matcher})
 			if err != nil || virtual != testcase.virtual {
 				test.Fatalf("%s selects histogram = %v (%v), want %v", testcase.matcher, virtual, err, testcase.virtual)
 			}
