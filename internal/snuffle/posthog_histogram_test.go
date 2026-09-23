@@ -237,6 +237,42 @@ func TestPostHogHistogramRepeatedSamples(test *testing.T) {
 	}
 }
 
+func TestPostHogHistogramBoundSetsMergeByLabels(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	complete := histogramTestSample()
+	complete.id = 1
+	complete.timestamp = 3000
+	complete.sum, complete.count, complete.counts = 36, 30, []uint64{6, 9, 15}
+	partial := histogramTestSample()
+	partial.id = 2
+	partial.timestamp = 2000
+	partial.sum, partial.count, partial.bounds, partial.counts = 24, 20, []float64{0.5}, []uint64{4, 16}
+	first := histogramTestSample()
+	first.id = 1
+	for _, sample := range []postHogHistogramSample{complete, first, partial} {
+		if err := builder.add(sample, postHogHistogramSuffixes); err != nil {
+			test.Fatal(err)
+		}
+	}
+	for _, meta := range builder.series {
+		sortSamples(meta.samples)
+	}
+	got := make(map[string][]samplePoint, len(builder.series))
+	for _, meta := range builder.series {
+		got[meta.metricName+"|"+meta.labelMap["le"]] = meta.samples
+	}
+	want := map[string][]samplePoint{
+		"test_duration_seconds_bucket|0.5":  {{t: 1000, v: 2}, {t: 2000, v: 4}, {t: 3000, v: 6}},
+		"test_duration_seconds_bucket|1":    {{t: 1000, v: 5}, {t: 3000, v: 15}},
+		"test_duration_seconds_bucket|+Inf": {{t: 1000, v: 10}, {t: 2000, v: 20}, {t: 3000, v: 30}},
+		"test_duration_seconds_count|":      {{t: 1000, v: 10}, {t: 2000, v: 20}, {t: 3000, v: 30}},
+		"test_duration_seconds_sum|":        {{t: 1000, v: 12}, {t: 2000, v: 24}, {t: 3000, v: 36}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		test.Fatalf("bound sets did not merge into sorted series: %v", got)
+	}
+}
+
 func TestPostHogHistogramSourceIdentity(test *testing.T) {
 	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
 	for index := 0; index < 3; index++ {

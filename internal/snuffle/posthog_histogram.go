@@ -586,6 +586,9 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	if err != nil {
 		return nil, err
 	}
+	for _, meta := range builder.series {
+		sortSamples(meta.samples)
+	}
 	return builder.series, nil
 }
 
