@@ -17,7 +17,7 @@ func storageSchemaLayout(value string) schemaLayout {
 	switch strings.ToLower(strings.TrimSpace(value)) {
 	case "", "current", "default", "prometheus", "prom":
 		return schemaLayoutCurrent
-	case "posthog", "posthog_compat", "posthog-compatible":
+	case "posthog", "posthog_compat", "posthog-compatible", "posthog4", "metrics4":
 		return schemaLayoutPostHog
 	default:
 		return schemaLayoutCurrent

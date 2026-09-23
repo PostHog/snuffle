@@ -43,9 +43,9 @@ func TestPostHogExactHistogramMetadataSQL(test *testing.T) {
 			for _, want := range []string{
 				"SELECT series_fingerprint AS series_id, " + postHogSeriesLabelColumns,
 				"metric_name IN ('duration" + suffix + "', 'duration')",
-				"last_seen >= fromUnixTimestamp64Milli(1000",
+				"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000",
 				"LIMIT 1 BY series_id LIMIT 100",
-				"'duration" + suffix + "' NOT IN (SELECT metric_name FROM `test`.`metric_series3` WHERE team_id = 42 AND metric_name = 'duration" + suffix + "' LIMIT 1)",
+				"'duration" + suffix + "' NOT IN (SELECT metric_name FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'duration" + suffix + "' LIMIT 1)",
 			} {
 				if !strings.Contains(sql, want) {
 					test.Fatalf("SQL missing %q: %s", want, sql)

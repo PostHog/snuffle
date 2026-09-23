@@ -11,7 +11,7 @@ import (
 )
 
 func histogramTestConfig() Config {
-	return Config{SchemaLayout: "posthog", CHDatabase: "test", SamplesTable: "metrics2", SeriesTable: "metric_series3", MaxSeries: 100, MaxSamples: 1000, TeamID: 42}
+	return Config{SchemaLayout: "posthog", CHDatabase: "test", SamplesTable: "metrics4_samples", SeriesTable: "metrics4_series", MaxSeries: 100, MaxSamples: 1000, TeamID: 42}
 }
 
 func histogramTestSample() postHogHistogramSample {
@@ -161,7 +161,7 @@ func TestPostHogHistogramSQL(test *testing.T) {
 		labels.MustNewMatcher(labels.MatchEqual, "le", "1"),
 	}
 	sql := postHogHistogramAliasesSQL(cfg, 1000, 2000, matchers)
-	for _, want := range []string{"metric_name = 'test_duration_seconds'", "suffix = '_bucket'", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "NOT IN (SELECT metric_name FROM `test`.`metric_series3` WHERE team_id = 42 AND metric_name = 'test_duration_seconds_bucket')"} {
+	for _, want := range []string{"metric_name = 'test_duration_seconds'", "suffix = '_bucket'", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "NOT IN (SELECT metric_name FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'test_duration_seconds_bucket')"} {
 		if !strings.Contains(sql, want) {
 			test.Fatalf("SQL missing %q: %s", want, sql)
 		}
@@ -171,7 +171,7 @@ func TestPostHogHistogramSQL(test *testing.T) {
 	}
 	aliases := []postHogHistogramAlias{{baseName: "test_duration_seconds", suffix: "_bucket"}}
 	sql = postHogHistogramSeriesSQL(cfg, 1000, 2000, aliases, matchers)
-	for _, want := range []string{"`test`.`metric_series3`", "resource_attributes, attributes", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "test_duration_seconds", "last_seen >= fromUnixTimestamp64Milli(1000", "LIMIT 1 BY series_id"} {
+	for _, want := range []string{"`test`.`metrics4_series`", "resource_attributes, attributes", "metric_type IN ('histogram', 'exponential_histogram')", "service_name = 'api'", "test_duration_seconds", "time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000", "LIMIT 1 BY series_id"} {
 		if !strings.Contains(sql, want) {
 			test.Fatalf("series SQL missing %q: %s", want, sql)
 		}
@@ -185,7 +185,7 @@ func TestPostHogHistogramSQL(test *testing.T) {
 			test.Fatalf("samples SQL missing %q: %s", want, sql)
 		}
 	}
-	for _, notWant := range []string{"resource_attributes", "JOIN", "selected_series", "metric_series3"} {
+	for _, notWant := range []string{"resource_attributes", "INNER JOIN", "selected_series", "metrics4_series"} {
 		if strings.Contains(sql, notWant) {
 			test.Fatalf("samples SQL must not carry labels via %q: %s", notWant, sql)
 		}
@@ -432,7 +432,7 @@ func TestPostHogHistogramDiscoveryAndExistenceSQL(test *testing.T) {
 		}
 	}
 	sql = postHogHistogramSourceExistsSQL(cfg, aliases[0])
-	if want := "SELECT 1 FROM `test`.`metric_series3` WHERE team_id = 42 AND metric_name = 'test_duration_seconds' AND metric_type = 'histogram' LIMIT 1"; sql != want {
+	if want := "SELECT 1 FROM `test`.`metrics4_series` WHERE team_id = 42 AND metric_name = 'test_duration_seconds' AND metric_type = 'histogram' LIMIT 1"; sql != want {
 		test.Fatalf("bucket existence SQL = %s, want %s", sql, want)
 	}
 	sql = postHogHistogramSourceExistsSQL(cfg, postHogHistogramAlias{baseName: "test_duration_seconds", suffix: "_count"})

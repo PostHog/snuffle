@@ -365,7 +365,7 @@ Metrics and logs choose their layouts independently.
 | Data | Layout | Best for | Schema |
 | --- | --- | --- | --- |
 | Metrics | `current` (default) | New Snuffle deployments optimized around Prometheus series, samples, labels, histograms, exemplars, and metadata | [`scripts/create_metrics_schema.sql`](scripts/create_metrics_schema.sql) |
-| Metrics | `posthog` | Existing PostHog-style `metrics2`, `metric_series3`, `metric_attributes3`, and `metric_names3` tables | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
+| Metrics | `posthog` | PostHog `metrics4_samples`, `metrics4_series`, `metrics4_attributes`, and `metrics4_names` tables, which store the points of each series-hour as arrays | [`scripts/create_metrics_posthog_schema.sql`](scripts/create_metrics_posthog_schema.sql) |
 | Logs | `snuffle` (default with `current` metrics) | New deployments with a narrow log table, stream dictionary, label index, and minute rollups | [`scripts/create_logs_snuffle_schema.sql`](scripts/create_logs_snuffle_schema.sql) |
 | Logs | `posthog` (default with `posthog` metrics) | Existing PostHog-style `logs34` and `log_attributes3` tables | [`scripts/create_logs_posthog_schema.sql`](scripts/create_logs_posthog_schema.sql) |
 
@@ -399,17 +399,33 @@ the hot log table narrow while retaining selector and aggregation support.
 ### PostHog-compatible data
 
 In PostHog metrics mode, series identity is the `series_fingerprint` shared by
-`metric_series3` and `metrics2`. Snuffle selects series from `metric_series3`,
-builds Prometheus labels from `metric_name`, `service_name`,
-`resource_attributes`, and `attributes`, and reads samples from `metrics2` by
-fingerprint. A sample row carries only the fingerprint, timestamp, and value;
-labels are read once per series, never per sample row. `metric_series3` keeps one row per series and expiry day, so
-series reads collapse duplicates by fingerprint. Label discovery reads the
-hourly rollups instead of the series table: `metric_names3` lists metric
-names, filtered by any `__name__` matcher, and `metric_attributes3` lists
-attribute keys and values, filtered by exact `__name__` and `service_name`
-matchers. Other matchers fall back to the series table. Remote write inserts into `metrics2_input`; its materialized
-views fan each row out to the samples, series, attribute, and name tables.
+`metrics4_series` and `metrics4_samples`. `metrics4_samples` stores the points
+of one series and hour in parallel arrays (`timestamp_arr`, `value_arr`,
+`count_arr`, `histogram_counts_arr`) under the key
+`(team_id, metric_name, time_bucket, series_fingerprint)`. Partial rows for one
+series-hour exist until ClickHouse merges them, so every read combines the
+arrays of all rows. Snuffle selects series from `metrics4_series`, builds
+Prometheus labels from `metric_name`, `service_name`, `resource_attributes`,
+and `attributes`, and reads samples by fingerprint. Labels are read once per
+series, never per sample. `metrics4_series` keeps one label row for each
+series and hour, so series selection filters on the hour buckets of the query
+window and collapses duplicates by fingerprint.
+
+Range reads and the range pushdown filter each row's points to the window
+with `arrayFilter`, then combine and sort them with `groupArrayArray`, so no
+sample becomes a row inside ClickHouse. Instant reads and histogram reads
+expand the arrays with `ARRAY JOIN`; ClickHouse applies the primary key before
+the expansion. Every sample read adds `indexHint(arrayMin(timestamp_arr) <=
+maxt AND arrayMax(timestamp_arr) >= mint)`, so minmax skip indexes on those
+expressions drop the series-hour rows whose points all fall outside the
+window. The hint takes part in index analysis only and filters no rows.
+
+Label discovery reads the hourly rollups instead of the series table:
+`metrics4_names` lists metric names, filtered by any `__name__` matcher, and
+`metrics4_attributes` lists attribute keys and values, filtered by exact
+`__name__` and `service_name` matchers. Other matchers fall back to the series
+table. Remote write inserts into `metrics4_input`; its materialized views fan
+each row out to the samples, series, attribute, and name tables.
 
 #### OpenTelemetry histogram queries
 
@@ -542,13 +558,13 @@ Snuffle is configured with environment variables.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `CH_SCHEMA_LAYOUT` | `current` | Metrics layout: `current` or `posthog`; `SNUFFLE_SCHEMA_LAYOUT` is accepted as a legacy fallback |
-| `CH_SERIES_TABLE` | `metrics_series` / `metric_series3` | Series table |
-| `CH_SAMPLES_TABLE` | `metrics_samples` / `metrics2` | Float sample table |
+| `CH_SERIES_TABLE` | `metrics_series` / `metrics4_series` | Series table |
+| `CH_SAMPLES_TABLE` | `metrics_samples` / `metrics4_samples` | Float sample table |
 | `CH_LABEL_INDEX_TABLE` | `metrics_label_index` / empty | Metrics label index |
-| `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metric_attributes3` | PostHog attribute discovery table |
-| `CH_METRIC_NAMES_TABLE` | empty / `metric_names3` | PostHog metric name discovery table; empty reads metric names from the series table |
-| `CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME` | `false` / `true` | Whether the PostHog attribute table has a `metric_name` column; set `false` with `metric_attributes2` |
-| `CH_METRICS_INPUT_TABLE` | empty / `metrics2_input` | PostHog remote write target; its materialized views feed the samples, series, attribute, and name tables |
+| `CH_ATTRIBUTE_TABLE` | `metric_attributes` / `metrics4_attributes` | PostHog attribute discovery table |
+| `CH_METRIC_NAMES_TABLE` | empty / `metrics4_names` | PostHog metric name discovery table; empty reads metric names from the series table |
+| `CH_ATTRIBUTE_TABLE_HAS_METRIC_NAME` | `false` / `true` | Whether the PostHog attribute table has a `metric_name` column |
+| `CH_METRICS_INPUT_TABLE` | empty / `metrics4_input` | PostHog remote write target; its materialized views feed the samples, series, attribute, and name tables |
 | `CH_LABEL_POSTINGS_TABLE` | empty | Optional optimized metrics postings table |
 | `CH_ACTIVITY_TABLE` | empty | Optional series-activity table |
 | `CH_METRICS_TABLE` | `metrics_metadata` / empty | Metric metadata table |

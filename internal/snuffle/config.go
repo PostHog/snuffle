@@ -96,12 +96,12 @@ func ConfigFromEnv() Config {
 	logStreamStatsTableDefault := "log_stream_stats"
 	aggregateThreadsDefault := 1
 	if schemaLayout == schemaLayoutPostHog {
-		seriesTableDefault = "metric_series3"
-		samplesTableDefault = "metrics2"
+		seriesTableDefault = "metrics4_series"
+		samplesTableDefault = "metrics4_samples"
 		labelIndexTableDefault = ""
-		attributeTableDefault = "metric_attributes3"
-		metricNamesTableDefault = "metric_names3"
-		metricsInputTableDefault = "metrics2_input"
+		attributeTableDefault = "metrics4_attributes"
+		metricNamesTableDefault = "metrics4_names"
+		metricsInputTableDefault = "metrics4_input"
 		histogramsTableDefault = ""
 		exemplarsTableDefault = ""
 		metadataTableDefault = ""

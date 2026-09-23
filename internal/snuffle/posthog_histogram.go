@@ -250,7 +250,7 @@ func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, ids []uint64, alia
 func postHogHistogramSamplesWhereSQL(cfg Config, mint, maxt int64, idCondition string, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
 	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
 	where = append(where, postHogHistogramTypeFilter, idCondition)
-	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id, timestamp", postHogSamplesTable(cfg), strings.Join(where, " AND "))
+	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM %s ORDER BY series_id, timestamp", postHogSampleRowsFrom(cfg, where, true))
 }
 
 // postHogHistogramBoundsSQL reads the distinct bound sets of the selected
@@ -258,7 +258,8 @@ func postHogHistogramSamplesWhereSQL(cfg Config, mint, maxt int64, idCondition s
 // postHogHistogramSamplesWhereSQL with zero counts, so the series builder
 // creates the same virtual series without reading every sample row.
 func postHogHistogramBoundsSQL(cfg Config, mint, maxt int64, idCondition string, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
-	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
+	where := postHogSampleRowFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
+	where = append(where, postHogSampleRowHasPointFilter(mint, maxt))
 	where = append(where, postHogHistogramTypeFilter, idCondition)
 	return fmt.Sprintf("SELECT DISTINCT series_fingerprint AS series_id, toInt64(0) AS ts, toFloat64(0) AS value, toUInt64(0) AS count, formatRow('RowBinary', histogram_bounds, arrayWithConstant(length(histogram_bounds) + 1, toUInt64(0))) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id", postHogSamplesTable(cfg), strings.Join(where, " AND "))
 }

@@ -84,7 +84,7 @@ func TestConfigFromEnvSchemaLayout(t *testing.T) {
 	if !cfg.SampleAttributes {
 		t.Fatalf("SampleAttributes = false, want true for posthog layout")
 	}
-	if cfg.SamplesTable != "metrics2" || cfg.SeriesTable != "metric_series3" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metric_attributes3" || cfg.MetricNamesTable != "metric_names3" || cfg.MetricsInputTable != "metrics2_input" {
+	if cfg.SamplesTable != "metrics4_samples" || cfg.SeriesTable != "metrics4_series" || cfg.LabelIndexTable != "" || cfg.AttributeTable != "metrics4_attributes" || cfg.MetricNamesTable != "metrics4_names" || cfg.MetricsInputTable != "metrics4_input" {
 		t.Fatalf("posthog tables = samples %q series %q label_index %q attributes %q names %q input %q", cfg.SamplesTable, cfg.SeriesTable, cfg.LabelIndexTable, cfg.AttributeTable, cfg.MetricNamesTable, cfg.MetricsInputTable)
 	}
 	if cfg.MetricsRetention != 90*24*time.Hour {

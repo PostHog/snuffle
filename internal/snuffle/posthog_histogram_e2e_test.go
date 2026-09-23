@@ -47,7 +47,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 	}()
 	cfg.CHDatabase = database
 	client := NewClickHouseClient(cfg)
-	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", "create_metrics_posthog_schema.sql"))
+	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", metricsSchemaFile(cfg.storageSchemaLayout())))
 	const metric = "test_duration_seconds"
 	insertHistogram := func(name, temporality, metricType string, team uint64) {
 		test.Helper()
@@ -311,24 +311,6 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		if len(response.Results[0].Timeseries) != 1 || len(response.Results[0].Timeseries[0].Samples) != 3 || response.Results[0].Timeseries[0].Samples[2].Value != 15 {
 			test.Fatalf("remote read = %v", response)
 		}
-	})
-	test.Run("legacy tables", func(test *testing.T) {
-		legacy := cfg
-		legacy.SeriesTable = "metric_series2"
-		legacy.AttributeTable = "metric_attributes2"
-		legacy.AttributeTableHasMetricName = false
-		legacy.MetricNamesTable = ""
-		legacyMux := http.NewServeMux()
-		newServer(legacy).routes(legacyMux)
-		legacyAPI := httptest.NewServer(legacyMux)
-		defer legacyAPI.Close()
-		result := apiGet[queryDataDTO](test, legacyAPI.URL, "/api/v1/query", url.Values{"query": {metric + `_bucket{le="1"}`}, "time": {"1700000070"}})
-		if len(result.Result) != 1 || sampleString(result.Result[0].Value) != "15" {
-			test.Fatalf("legacy histogram query = %v", result)
-		}
-		params := url.Values{"start": {"1700000010"}, "end": {"1700000070"}, "match[]": {metric + "_bucket"}}
-		names := apiGet[[]string](test, legacyAPI.URL, "/api/v1/label/__name__/values", params)
-		assertStringPresent(test, names, metric+"_bucket")
 	})
 	test.Run("real names take priority", func(test *testing.T) {
 		insertReal(metric+"_bucket", e2eTeamID, e2eEndMS)

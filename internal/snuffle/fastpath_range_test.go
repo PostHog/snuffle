@@ -14,8 +14,8 @@ func rangeTestConfig() Config {
 	return Config{
 		SchemaLayout:      "posthog",
 		CHDatabase:        "test",
-		SamplesTable:      "metrics2",
-		SeriesTable:       "metric_series3",
+		SamplesTable:      "metrics4_samples",
+		SeriesTable:       "metrics4_series",
 		MaxSeries:         100,
 		TeamID:            42,
 		LookbackDelta:     5 * time.Minute,
@@ -130,11 +130,11 @@ func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
 	sql := rangeTestSQL(t, `sum(increase(http_requests_total[1m])) by (code)`, time.Minute)
 	for _, want := range []string{
 		"WITH selected_series AS (",
-		"`test`.`metric_series3`",
-		"last_seen >= fromUnixTimestamp64Milli(1699999640000, 'UTC')",
+		"`test`.`metrics4_series`",
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1699999640000, 'UTC'))",
 		"metric_name = 'http_requests_total'",
-		"reinterpretAsUInt64(value) != 9218868437227405314",
-		"arraySort(x -> x.1, groupArray((ts, v))) AS pts",
+		"reinterpretAsUInt64(p.2) != 9218868437227405314",
+		"arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts",
 		"quantileExactInclusiveOrDefault(0.6)",
 		"toInt64(60000) AS window_ms",
 		"ARRAY JOIN range(step_lo, step_hi) AS idx",
@@ -150,7 +150,7 @@ func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
 	}
-	for _, notWant := range []string{"rollup_value", "max_prev)", "HAVING"} {
+	for _, notWant := range []string{"rollup_value", "max_prev)", "HAVING isNotNull"} {
 		if strings.Contains(sql, notWant) {
 			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
 		}

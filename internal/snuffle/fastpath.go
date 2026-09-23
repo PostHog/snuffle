@@ -131,10 +131,9 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	}
 	perIDSelect = append(perIDSelect, plan.perSeriesGroupSelects()...)
 	perID := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
+		"SELECT %s FROM %s GROUP BY series_id",
 		strings.Join(perIDSelect, ", "),
-		postHogSamplesTable(s.cfg),
-		strings.Join(plan.sampleWhere(), " AND "),
+		postHogSampleRowsFrom(s.cfg, plan.sampleWhere(), false),
 	)
 
 	perID = fmt.Sprintf("SELECT * FROM (%s) WHERE %s", perID, nonStaleSampleSQL("value"))
@@ -268,10 +267,9 @@ func postHogAggregateUnionSQL(cfg Config, plan *postHogAggregateUnionPlan, group
 	perSeriesSelects = append(perSeriesSelects, plan.plan.perSeriesGroupSelects()...)
 	perSeriesSelects = append(perSeriesSelects, plan.gridVals+" AS vals")
 	perSeries := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
+		"SELECT %s FROM %s GROUP BY series_id",
 		strings.Join(perSeriesSelects, ", "),
-		postHogSamplesTable(cfg),
-		strings.Join(plan.where, " AND "),
+		postHogSampleRowsFrom(cfg, plan.where, false),
 	)
 	perSeries = fmt.Sprintf(
 		"SELECT %s FROM %s",
@@ -596,10 +594,9 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 	}
 	perSeriesSelects = append(perSeriesSelects, plan.perSeriesGroupSelects()...)
 	perSeries := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY series_id",
+		"SELECT %s FROM %s GROUP BY series_id",
 		strings.Join(perSeriesSelects, ", "),
-		postHogSamplesTable(s.cfg),
-		strings.Join(plan.sampleWhere(), " AND "),
+		postHogSampleRowsFrom(s.cfg, plan.sampleWhere(), false),
 	)
 	sql := fmt.Sprintf(
 		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s",
@@ -995,9 +992,8 @@ func (s *Server) tryPostHogTopK(ctx context.Context, selector *parser.VectorSele
 	}
 	plan := newPostHogQueryPlan(s.cfg, selector.LabelMatchers, nil, window.mint, window.maxt, true)
 	latest := fmt.Sprintf(
-		"SELECT series_fingerprint AS series_id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY series_id",
-		postHogSamplesTable(s.cfg),
-		strings.Join(plan.sampleWhere(), " AND "),
+		"SELECT series_fingerprint AS series_id, argMax(value, timestamp) AS value FROM %s GROUP BY series_id",
+		postHogSampleRowsFrom(s.cfg, plan.sampleWhere(), false),
 	)
 	latest = fmt.Sprintf(
 		"SELECT series_id, value FROM (%s) WHERE %s ORDER BY value %s LIMIT %d",

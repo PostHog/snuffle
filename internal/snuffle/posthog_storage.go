@@ -9,13 +9,14 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 )
 
-// PostHog metrics live in two tables: metric_series3 holds the labels of each
-// series (keyed by series_fingerprint, one row per expiry day) and metrics2
-// holds the samples keyed by the same fingerprint. Queries select series from
-// the series table, then read samples by fingerprint and join the labels back
-// in. Two hourly rollups answer discovery without a series scan:
-// metric_attributes3 has one row per metric, service, attribute pair and hour,
-// and metric_names3 has one row per metric name and hour.
+// PostHog metrics live in two tables: metrics4_series holds the labels of each
+// series (keyed by series_fingerprint, one row per hour) and metrics4_samples
+// holds the points of each series-hour in parallel arrays keyed by the same
+// fingerprint. Queries select series from the series table, then read samples
+// by fingerprint and join the labels back in. Two hourly rollups answer
+// discovery without a series scan: metrics4_attributes has one row per metric,
+// service, attribute pair and hour, and metrics4_names has one row per metric
+// name and hour.
 
 const postHogSeriesLabelColumns = "metric_name, service_name, resource_attributes, attributes"
 
@@ -45,7 +46,7 @@ func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt i
 	if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
 		return nil, err
 	}
-	// A series can be selected by last_seen and still have no sample in the
+	// A series can be selected by its hour bucket and still have no sample in the
 	// window (a query in the past, or a stale latest sample). Drop it, as the
 	// former join did.
 	series = slices.DeleteFunc(series, func(meta *seriesMeta) bool { return len(meta.samples) == 0 })
@@ -181,19 +182,18 @@ func postHogLoadSamplesSQL(cfg Config, ids []uint64, metricNames []string, match
 }
 
 func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []string, matchers []*labels.Matcher, mint, maxt int64, latestOnly bool) string {
-	where := postHogSampleFilters(cfg, matchers, mint, maxt)
+	where := postHogSampleRowFilters(cfg, matchers, mint, maxt)
 	if exactMetricName(matchers) == "" {
 		if condition := metricNamesCondition(metricNames); condition != "" {
 			where = append(where, condition)
 		}
 	}
 	where = append(where, idCondition)
-	source := fmt.Sprintf(
-		"SELECT series_fingerprint AS series_id, timestamp, value FROM %s WHERE %s",
-		postHogSamplesTable(cfg),
-		strings.Join(where, " AND "),
-	)
 	if latestOnly {
+		source := fmt.Sprintf(
+			"SELECT series_fingerprint AS series_id, timestamp, value FROM %s",
+			postHogSampleRowsFrom(cfg, append(where, postHogSamplePointFilters(mint, maxt)...), false),
+		)
 		latest := fmt.Sprintf(
 			"SELECT series_id, max(timestamp) AS ts_col, argMax(value, timestamp) AS value FROM (%s) GROUP BY series_id",
 			source,
@@ -209,18 +209,38 @@ func postHogLoadSamplesWhereSQL(cfg Config, idCondition string, metricNames []st
 	// Go decodes typed arrays instead of three values for each sample.
 	// Timestamps travel as deltas: typed columns of small integers compress
 	// several times better than an opaque RowBinary string.
+	points := fmt.Sprintf(
+		"SELECT series_fingerprint AS series_id, arraySort(groupArrayArray(%s)) AS points FROM %s WHERE %s GROUP BY series_id HAVING notEmpty(points)",
+		postHogPointsSQL(mint, maxt, false),
+		postHogSamplesTable(cfg),
+		strings.Join(where, " AND "),
+	)
 	return withMaxThreads(fmt.Sprintf(
-		"SELECT series_id, points[1].1 AS first_ts, arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas, arrayMap(p -> p.2, points) AS vals "+
-			"FROM (SELECT series_id, arraySort(groupArray((toUnixTimestamp64Milli(timestamp), value))) AS points FROM (%s) GROUP BY series_id)",
-		source,
+		"SELECT series_id, tupleElement(points[1], 1) AS first_ts, arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas, arrayMap(p -> p.2, points) AS vals FROM (%s)",
+		points,
 	), cfg.RangeQueryThreads)
+}
+
+func postHogSampleRowsFrom(cfg Config, where []string, histogram bool) string {
+	arrays := "timestamp_arr AS timestamp, value_arr AS value"
+	if histogram {
+		arrays += ", count_arr AS count, histogram_counts_arr AS histogram_counts"
+	}
+	return postHogSamplesTable(cfg) + " ARRAY JOIN " + arrays + " WHERE " + strings.Join(where, " AND ")
+}
+
+func postHogPointsSQL(mint, maxt int64, nonStale bool) string {
+	predicate := fmt.Sprintf("p.1 >= %d AND p.1 <= %d", mint, maxt)
+	if nonStale {
+		predicate += " AND " + nonStaleSampleSQL("p.2")
+	}
+	return "arrayFilter(p -> " + predicate + ", arrayZip(arrayMap(t -> toUnixTimestamp64Milli(t), timestamp_arr), value_arr))"
 }
 
 // postHogSelectedSeriesSQL returns one row per series matching the matchers,
 // with the label columns and any extra select expressions. The series table
-// is a ReplacingMergeTree keyed by fingerprint and partitioned by expiry day,
-// so unmerged duplicates and rows from other expiry days are collapsed with
-// LIMIT 1 BY.
+// is a ReplacingMergeTree keyed by fingerprint and hour, so unmerged
+// duplicates and rows from other hours are collapsed with LIMIT 1 BY.
 func postHogSelectedSeriesSQL(cfg Config, matchers []*labels.Matcher, mint, maxt int64, limit int, extraSelects []string) string {
 	return postHogSelectedSeriesWhereSQL(cfg, postHogSeriesFilters(cfg, matchers, mint, maxt), limit, extraSelects)
 }
@@ -241,11 +261,11 @@ func postHogMetricNamesTable(cfg Config) string {
 	return tableName(cfg.CHDatabase, cfg.MetricNamesTable)
 }
 
-// postHogSeriesFilters filters the series table. last_seen is the newest
-// sample time of a series, so a series last seen before mint has no samples
-// in the window.
-func postHogSeriesFilters(cfg Config, matchers []*labels.Matcher, mint, _ int64) []string {
-	filters := []string{teamFilter(cfg), "last_seen >= " + chTimeMillis(mint)}
+// postHogSeriesFilters filters the series table. metrics4_series keeps one
+// row for each series and hour, so the hour buckets of the window select the
+// active series.
+func postHogSeriesFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
+	filters := append([]string{teamFilter(cfg)}, postHogAttributeTimeFilters(mint, maxt)...)
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
 			continue
@@ -261,8 +281,13 @@ func postHogSeriesFilters(cfg Config, matchers []*labels.Matcher, mint, _ int64)
 // service_name exist there; other label matchers go through the series
 // table.
 func postHogSampleFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
+	return append(postHogSampleRowFilters(cfg, matchers, mint, maxt), postHogSamplePointFilters(mint, maxt)...)
+}
+
+func postHogSampleRowFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
 	filters := []string{teamFilter(cfg)}
-	filters = append(filters, sampleTimeFilters(cfg, mint, maxt)...)
+	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	filters = append(filters, postHogTimeRangeHint(mint, maxt))
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) || postHogMatcherCanSkip(matcher) {
 			continue
@@ -272,6 +297,21 @@ func postHogSampleFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int
 		}
 	}
 	return filters
+}
+
+func postHogTimeRangeHint(mint, maxt int64) string {
+	return "indexHint(arrayMin(timestamp_arr) <= " + chTimeMillis(maxt) + " AND arrayMax(timestamp_arr) >= " + chTimeMillis(mint) + ")"
+}
+
+func postHogSamplePointFilters(mint, maxt int64) []string {
+	return []string{
+		"timestamp >= " + chTimeMillis(mint),
+		"timestamp <= " + chTimeMillis(maxt),
+	}
+}
+
+func postHogSampleRowHasPointFilter(mint, maxt int64) string {
+	return fmt.Sprintf("arrayExists(t -> t >= %s AND t <= %s, timestamp_arr)", chTimeMillis(mint), chTimeMillis(maxt))
 }
 
 func postHogMatcherCanSkip(matcher *labels.Matcher) bool {
@@ -432,7 +472,14 @@ func (p *postHogQueryPlan) withSelectedSeries(sql string) string {
 // metric_name membership keeps the primary key usable when the matchers do
 // not pin the metric name.
 func (p *postHogQueryPlan) sampleWhere() []string {
-	where := postHogSampleFilters(p.cfg, p.matchers, p.mint, p.maxt)
+	return p.sampleWhereFrom(postHogSampleFilters(p.cfg, p.matchers, p.mint, p.maxt))
+}
+
+func (p *postHogQueryPlan) sampleRowWhere() []string {
+	return p.sampleWhereFrom(postHogSampleRowFilters(p.cfg, p.matchers, p.mint, p.maxt))
+}
+
+func (p *postHogQueryPlan) sampleWhereFrom(where []string) []string {
 	if p.useSeries {
 		where = append(where, "series_fingerprint IN (SELECT series_id FROM selected_series)")
 		if exactMetricName(p.matchers) == "" {

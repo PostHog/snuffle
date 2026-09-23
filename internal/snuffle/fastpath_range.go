@@ -307,14 +307,11 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 	matrix := strconv.FormatInt(call.matrix, 10)
 	defaultRollup := call.name == "default_rollup"
 
-	where := plan.sampleWhere()
-	if !defaultRollup {
-		where = append(where, nonStaleSampleSQL("value"))
-	}
 	samples := fmt.Sprintf(
-		"SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value AS v FROM %s WHERE %s",
+		"SELECT series_fingerprint AS series_id, %s AS pts_part FROM %s WHERE %s",
+		postHogPointsSQL(plan.mint, plan.maxt, !defaultRollup),
 		postHogSamplesTable(cfg),
-		strings.Join(where, " AND "),
+		strings.Join(plan.sampleRowWhere(), " AND "),
 	)
 
 	windowExpr := strconv.FormatInt(call.window, 10)
@@ -322,12 +319,12 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 		windowExpr = "least(greatest(" + step + ", max_prev), " + lookback + ")"
 	}
 	series := fmt.Sprintf(
-		"SELECT series_id, arraySort(x -> x.1, groupArray((ts, v))) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
+		"SELECT series_id, arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
 			"arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), tss)), NULL) AS prev_tss, arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), vs)), NULL) AS prev_vs, "+
 			"arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), tss)), NULL) AS next_tss, arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), vs)), NULL) AS next_vs, "+
 			"toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayPopFront(arrayDifference(tss))))) AS series_gap, "+
 			"least(if(series_gap <= 0, toInt64(%s), %s), %s) AS max_prev, toInt64(%s) AS window_ms "+
-			"FROM (%s) GROUP BY series_id",
+			"FROM (%s) GROUP BY series_id HAVING notEmpty(pts)",
 		step, metricsQLSampleIntervalMarginSQL("series_gap"), lookback, windowExpr, samples,
 	)
 	neighbours := fmt.Sprintf(

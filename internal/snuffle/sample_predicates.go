@@ -20,10 +20,7 @@ func sampleTimeFilters(cfg Config, mint, maxt int64) []string {
 		"timestamp <= " + chTimeMillis(maxt),
 	}
 	if cfg.postHogSchemaLayout() {
-		filters = append(filters,
-			"time_bucket >= toStartOfHour("+chTimeMillis(mint)+")",
-			"time_bucket <= toStartOfHour("+chTimeMillis(maxt)+")",
-		)
+		filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
 	} else {
 		filters = append(filters,
 			"toStartOfTenMinutes(timestamp) >= toStartOfTenMinutes("+chTimeMillis(mint)+")",
