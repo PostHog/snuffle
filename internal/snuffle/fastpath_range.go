@@ -117,16 +117,17 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery,
 	if points <= 0 || points > maxRangePushdownPoints || call.expansion() > int64(s.cfg.RangePushdownMaxExpansion) {
 		return queryData{}, false, nil
 	}
-	virtual, err := s.postHogSelectsHistogram(ctx, call.selector.LabelMatchers)
+	evalStart := gridStart - call.offset
+	mint := evalStart - call.matrix
+	maxt := evalStart + (points-1)*call.step
+	virtual, err := s.postHogSelectsHistogram(ctx, mint, maxt, call.selector.LabelMatchers)
 	if err != nil {
 		return queryData{}, false, err
 	}
 	if virtual {
 		return queryData{}, false, nil
 	}
-	evalStart := gridStart - call.offset
-	mint := evalStart - call.matrix
-	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, evalStart+(points-1)*call.step, len(aggregate.Grouping) > 0)
+	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, maxt, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
 	sql := rangeRollupSQL(s.cfg, plan, call, evalStart, gridStart, points, aggSQL, sumContributions)
 	groups, err := s.queryRangeAggregateGroups(ctx, sql, aggregate.Grouping)
@@ -307,14 +308,11 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 	matrix := strconv.FormatInt(call.matrix, 10)
 	defaultRollup := call.name == "default_rollup"
 
-	where := plan.sampleWhere()
-	if !defaultRollup {
-		where = append(where, nonStaleSampleSQL("value"))
-	}
 	samples := fmt.Sprintf(
-		"SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value AS v FROM %s WHERE %s",
+		"SELECT series_fingerprint AS series_id, %s AS pts_part FROM %s WHERE %s",
+		postHogPointsSQL(plan.mint, plan.maxt, !defaultRollup),
 		postHogSamplesTable(cfg),
-		strings.Join(where, " AND "),
+		strings.Join(plan.sampleRowWhere(), " AND "),
 	)
 
 	windowExpr := strconv.FormatInt(call.window, 10)
@@ -322,12 +320,12 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 		windowExpr = "least(greatest(" + step + ", max_prev), " + lookback + ")"
 	}
 	series := fmt.Sprintf(
-		"SELECT series_id, arraySort(x -> x.1, groupArray((ts, v))) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
+		"SELECT series_id, arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
 			"arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), tss)), NULL) AS prev_tss, arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), vs)), NULL) AS prev_vs, "+
 			"arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), tss)), NULL) AS next_tss, arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), vs)), NULL) AS next_vs, "+
 			"toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayPopFront(arrayDifference(tss))))) AS series_gap, "+
 			"least(if(series_gap <= 0, toInt64(%s), %s), %s) AS max_prev, toInt64(%s) AS window_ms "+
-			"FROM (%s) GROUP BY series_id",
+			"FROM (%s) GROUP BY series_id HAVING notEmpty(pts)",
 		step, metricsQLSampleIntervalMarginSQL("series_gap"), lookback, windowExpr, samples,
 	)
 	neighbours := fmt.Sprintf(

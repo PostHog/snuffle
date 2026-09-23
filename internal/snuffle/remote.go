@@ -922,7 +922,7 @@ func (s *Server) insertRemoteSampleRows(ctx context.Context, batchRows remoteWri
 // carry, so the samples table agrees with it.
 const postHogEmptyResourceFingerprint = uint64(4761183170873013810)
 
-// insertPostHogRemoteSampleRows writes into the metrics2_input table; its
+// insertPostHogRemoteSampleRows writes into the metrics4_input table; its
 // materialized views fan each row out to the samples, series, and attribute
 // tables. Remote-write labels are stored as attributes without the __str
 // suffix the native attributes_map_str column uses.

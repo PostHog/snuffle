@@ -61,12 +61,12 @@ func TestEndToEndClickHouse(t *testing.T) {
 	cfg.CHAddr = chAddr
 	cfg.CHDatabase = dbName
 	if cfg.postHogSchemaLayout() {
-		cfg.SeriesTable = "metric_series3"
-		cfg.SamplesTable = "metrics2"
-		cfg.MetricsInputTable = "metrics2_input"
+		cfg.SeriesTable = "metrics4_series"
+		cfg.SamplesTable = "metrics4_samples"
+		cfg.MetricsInputTable = "metrics4_input"
 		cfg.LabelIndexTable = ""
-		cfg.AttributeTable = "metric_attributes3"
-		cfg.MetricNamesTable = "metric_names3"
+		cfg.AttributeTable = "metrics4_attributes"
+		cfg.MetricNamesTable = "metrics4_names"
 		cfg.LabelPostingsTable = ""
 		cfg.ActivityTable = ""
 		cfg.MetricsTable = ""
@@ -309,15 +309,20 @@ func createMetricsSchema(t *testing.T, ctx context.Context, client *ClickHouseCl
 	t.Helper()
 	schemaPath := os.Getenv("SNUFFLE_E2E_SCHEMA_FILE")
 	if schemaPath == "" {
-		schemaName := "create_metrics_schema.sql"
-		if storageSchemaLayout(os.Getenv("CH_SCHEMA_LAYOUT")) == schemaLayoutPostHog {
-			schemaName = "create_metrics_posthog_schema.sql"
-		}
-		schemaPath = filepath.Join(repoRoot(t), "scripts", schemaName)
+		schemaPath = filepath.Join(repoRoot(t), "scripts", metricsSchemaFile(storageSchemaLayout(os.Getenv("CH_SCHEMA_LAYOUT"))))
 	} else if !filepath.IsAbs(schemaPath) {
 		schemaPath = filepath.Join(repoRoot(t), schemaPath)
 	}
 	loadE2ESchema(t, ctx, client, schemaPath)
+}
+
+func metricsSchemaFile(layout schemaLayout) string {
+	switch layout {
+	case schemaLayoutPostHog:
+		return "create_metrics_posthog_schema.sql"
+	default:
+		return "create_metrics_schema.sql"
+	}
 }
 
 func loadE2ESchema(t *testing.T, ctx context.Context, client *ClickHouseClient, schemaPath string) {
@@ -587,15 +592,17 @@ func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *Clic
 		t.Fatalf("insert discovery fixture: %v", err)
 	}
 
-	for _, version := range []string{"3", "2"} {
-		t.Run("metadata"+version, func(t *testing.T) {
+	type catalog struct {
+		name       string
+		series     string
+		attributes string
+	}
+	catalogs := []catalog{{name: "metadata4", series: "metrics4_series", attributes: "metrics4_attributes"}}
+	for _, version := range catalogs {
+		t.Run(version.name, func(t *testing.T) {
 			readCfg := cfg
-			readCfg.SeriesTable = "metric_series" + version
-			readCfg.AttributeTable = "metric_attributes" + version
-			if version == "2" {
-				readCfg.MetricNamesTable = ""
-				readCfg.AttributeTableHasMetricName = false
-			}
+			readCfg.SeriesTable = version.series
+			readCfg.AttributeTable = version.attributes
 			mux := http.NewServeMux()
 			newServer(readCfg).routes(mux)
 			api := httptest.NewServer(mux)
@@ -629,22 +636,6 @@ func assertPostHogFilteredLabels(t *testing.T, ctx context.Context, client *Clic
 				})
 			}
 
-			if version == "2" {
-				// The old table can contain names that have not reached the new table.
-				const oldMetric = "snuffle_e2e_old_catalog_only"
-				insertOld := fmt.Sprintf(`INSERT INTO %s
-					(team_id, metric_name, series_fingerprint, last_seen, original_expiry_timestamp)
-					VALUES (%d, %s, 987654322, %s, now64(6) + INTERVAL 1 DAY)`,
-					tableName(cfg.CHDatabase, readCfg.SeriesTable), e2eTeamID, sqlString(oldMetric), chTimeMillis(e2eStartMS))
-				if err := client.Exec(ctx, insertOld); err != nil {
-					t.Fatalf("insert old catalog fixture: %v", err)
-				}
-				names := apiGet[[]string](t, api.URL, "/api/v1/label/__name__/values", url.Values{
-					"start": {"1700000010"},
-					"end":   {"1700000070"},
-				})
-				assertStringPresent(t, names, oldMetric)
-			}
 		})
 	}
 }

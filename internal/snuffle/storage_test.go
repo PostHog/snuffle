@@ -342,8 +342,8 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 	cfg := Config{
 		CHDatabase:   "posthog",
 		SchemaLayout: "posthog",
-		SeriesTable:  "metric_series2",
-		SamplesTable: "metrics2",
+		SeriesTable:  "metrics4_series",
+		SamplesTable: "metrics4_samples",
 		MaxSeries:    500,
 	}
 	matchers := []*labels.Matcher{
@@ -354,8 +354,9 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 
 	seriesSQL := postHogSelectedSeriesSQL(cfg, matchers, 1000, 2000, cfg.MaxSeries, nil)
 	for _, want := range []string{
-		"SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes FROM `posthog`.`metric_series2` WHERE",
-		"last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')",
+		"SELECT series_fingerprint AS series_id, metric_name, service_name, resource_attributes, attributes FROM `posthog`.`metrics4_series` WHERE",
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"if(mapContains(resource_attributes, 'status'), resource_attributes['status'], attributes['status']) = '200'",
 		"LIMIT 1 BY series_id LIMIT 500",
 	} {
@@ -363,21 +364,21 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 			t.Fatalf("series SQL %q does not contain %q", seriesSQL, want)
 		}
 	}
-	if strings.Contains(seriesSQL, "metrics2") {
+	if strings.Contains(seriesSQL, "metrics4_samples") {
 		t.Fatalf("series selection must not read the samples table:\n%s", seriesSQL)
 	}
 
 	samplesSQL := postHogLoadSamplesSQL(cfg, []uint64{7, 9}, []string{"http_requests_total"}, matchers, 1000, 2000, false)
 	for _, want := range []string{
-		"SELECT series_fingerprint AS series_id, timestamp, value FROM `posthog`.`metrics2` WHERE",
+		"arraySort(groupArrayArray(arrayFilter(p -> p.1 >= 1000 AND p.1 <= 2000, arrayZip(arrayMap(t -> toUnixTimestamp64Milli(t), timestamp_arr), value_arr)))) AS points FROM `posthog`.`metrics4_samples` WHERE",
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"service_name = 'checkout'",
 		"metric_name = 'http_requests_total'",
 		"series_fingerprint IN (7,9)",
-		"arraySort(groupArray((toUnixTimestamp64Milli(timestamp), value))) AS points",
+		"indexHint(arrayMin(timestamp_arr) <= fromUnixTimestamp64Milli(2000, 'UTC') AND arrayMax(timestamp_arr) >= fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"arrayDifference(arrayMap(p -> p.1, points)) AS ts_deltas",
-		"GROUP BY series_id",
+		"GROUP BY series_id HAVING notEmpty(points)",
 	} {
 		if !strings.Contains(samplesSQL, want) {
 			t.Fatalf("samples SQL %q does not contain %q", samplesSQL, want)
@@ -385,7 +386,7 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 	}
 	// Labels are read once per series. A sample row carries the fingerprint,
 	// the timestamp, and the value only.
-	for _, notWant := range []string{"resource_attributes", "attributes", "JOIN", "selected_series", "metric_series2", "'status'"} {
+	for _, notWant := range []string{"resource_attributes", "attributes", "ARRAY JOIN", "INNER JOIN", "selected_series", "metrics4_series", "'status'", "timestamp >="} {
 		if strings.Contains(samplesSQL, notWant) {
 			t.Fatalf("samples SQL must not contain %q:\n%s", notWant, samplesSQL)
 		}
@@ -396,8 +397,8 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 	cfg := Config{
 		CHDatabase:   "posthog",
 		SchemaLayout: "posthog",
-		SeriesTable:  "metric_series2",
-		SamplesTable: "metrics2",
+		SeriesTable:  "metrics4_series",
+		SamplesTable: "metrics4_samples",
 	}
 	matchers := []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchEqual, "status", "200"),
@@ -405,8 +406,9 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 
 	sql := postHogLoadSamplesSQL(cfg, []uint64{1, 2}, []string{"http_requests_total"}, matchers, 1000, 2000, true)
 	for _, want := range []string{
-		"`posthog`.`metrics2`",
+		"`posthog`.`metrics4_samples` ARRAY JOIN timestamp_arr AS timestamp, value_arr AS value WHERE",
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
+		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
 		"metric_name = 'http_requests_total'",
 		"series_fingerprint IN (1,2)",
 		"argMax(value, timestamp)",
@@ -416,7 +418,7 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
-	if strings.Contains(sql, "metric_series2") || strings.Contains(sql, "'status'") {
+	if strings.Contains(sql, "metrics4_series") || strings.Contains(sql, "'status'") {
 		t.Fatalf("sample loading must not consult the series table: %s", sql)
 	}
 }
@@ -425,9 +427,9 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 	cfg := Config{
 		CHDatabase:                  "posthog",
 		SchemaLayout:                "posthog",
-		SeriesTable:                 "metric_series3",
-		AttributeTable:              "metric_attributes3",
-		MetricNamesTable:            "metric_names3",
+		SeriesTable:                 "metrics4_series",
+		AttributeTable:              "metrics4_attributes",
+		MetricNamesTable:            "metrics4_names",
 		AttributeTableHasMetricName: true,
 		TeamID:                      7,
 	}
@@ -442,7 +444,7 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		t.Fatalf("exact metric and service matchers should read the attribute rollup")
 	}
 	for _, want := range []string{
-		"SELECT DISTINCT attribute_key FROM `posthog`.`metric_attributes3` WHERE",
+		"SELECT DISTINCT attribute_key FROM `posthog`.`metrics4_attributes` WHERE",
 		teamFilter(cfg),
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
@@ -454,7 +456,7 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
-	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "'status'") {
+	if strings.Contains(sql, "metrics4_series") || strings.Contains(sql, "'status'") {
 		t.Fatalf("label names must not consult the series table: %s", sql)
 	}
 
@@ -485,9 +487,9 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 	cfg := Config{
 		CHDatabase:                  "posthog",
 		SchemaLayout:                "posthog",
-		SeriesTable:                 "metric_series3",
-		AttributeTable:              "metric_attributes3",
-		MetricNamesTable:            "metric_names3",
+		SeriesTable:                 "metrics4_series",
+		AttributeTable:              "metrics4_attributes",
+		MetricNamesTable:            "metrics4_names",
 		AttributeTableHasMetricName: true,
 		TeamID:                      7,
 	}
@@ -498,7 +500,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 		t.Fatalf("metric names should read the metric name rollup")
 	}
 	for _, want := range []string{
-		"SELECT DISTINCT metric_name AS label_value FROM `posthog`.`metric_names3` WHERE",
+		"SELECT DISTINCT metric_name AS label_value FROM `posthog`.`metrics4_names` WHERE",
 		teamFilter(cfg),
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
@@ -508,7 +510,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
-	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "last_seen") {
+	if strings.Contains(sql, "metrics4_series") || strings.Contains(sql, "last_seen") {
 		t.Fatalf("metric names must not consult the series table: %s", sql)
 	}
 
@@ -517,7 +519,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 		t.Fatalf("map label values for an exact metric should read the attribute rollup")
 	}
 	for _, want := range []string{
-		"SELECT DISTINCT attribute_value AS label_value FROM `posthog`.`metric_attributes3` WHERE",
+		"SELECT DISTINCT attribute_value AS label_value FROM `posthog`.`metrics4_attributes` WHERE",
 		"metric_name = 'http_requests_total'",
 		"attribute_key = 'status'",
 		"ORDER BY label_value" + sqlLimit(50),
@@ -532,7 +534,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 	}
 
 	sql, ok = postHogLabelValuesSQL(cfg, "service_name", 1000, 2000, 0, nil)
-	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") || !strings.Contains(sql, "last_seen >= fromUnixTimestamp64Milli(1000, 'UTC')") {
+	if !ok || !strings.Contains(sql, "`posthog`.`metrics4_series`") || !strings.Contains(sql, "time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))") {
 		t.Fatalf("service names should read the series table: %s", sql)
 	}
 
@@ -544,7 +546,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 		t.Fatalf("metric name search should read the metric name rollup")
 	}
 	for _, want := range []string{
-		"FROM `posthog`.`metric_names3` WHERE",
+		"FROM `posthog`.`metrics4_names` WHERE",
 		"match(metric_name, ",
 		"ORDER BY label_value" + sqlLimit(1000),
 	} {
@@ -552,7 +554,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
 	}
-	if strings.Contains(sql, "metric_series3") || strings.Contains(sql, "'status'") {
+	if strings.Contains(sql, "metrics4_series") || strings.Contains(sql, "'status'") {
 		t.Fatalf("metric name search must not consult the series table: %s", sql)
 	}
 
@@ -562,7 +564,7 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 
 	cfg.MetricNamesTable = ""
 	sql, ok = postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 0, nil)
-	if !ok || !strings.Contains(sql, "`posthog`.`metric_series3`") {
+	if !ok || !strings.Contains(sql, "`posthog`.`metrics4_series`") {
 		t.Fatalf("without a metric name rollup, metric names should read the series table: %s", sql)
 	}
 }
@@ -599,7 +601,7 @@ func TestTopKSelectedSeriesCarriesLabelsAndMetricConstraint(t *testing.T) {
 }
 
 func TestPostHogLoadSamplesSQLReadsExternalSeriesIDs(t *testing.T) {
-	cfg := Config{SchemaLayout: "posthog", CHDatabase: "posthog", SamplesTable: "metrics2", TeamID: 7}
+	cfg := Config{SchemaLayout: "posthog", CHDatabase: "posthog", SamplesTable: "metrics4_samples", TeamID: 7}
 	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")}
 	sql := postHogLoadSamplesWhereSQL(cfg, "series_fingerprint IN (SELECT id FROM series_ids)", []string{"http_requests_total"}, matchers, 1000, 2000, false)
 	for _, want := range []string{"series_fingerprint IN (SELECT id FROM series_ids)", "metric_name = 'http_requests_total'", "GROUP BY series_id"} {

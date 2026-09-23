@@ -44,11 +44,7 @@ func TestRangePushdownLatency(test *testing.T) {
 	cfg.CHDatabase = database
 	cfg.TeamID = e2eTeamID
 	client := NewClickHouseClient(cfg)
-	schema := "create_metrics_schema.sql"
-	if cfg.postHogSchemaLayout() {
-		schema = "create_metrics_posthog_schema.sql"
-	}
-	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", schema))
+	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", metricsSchemaFile(cfg.storageSchemaLayout())))
 
 	const metric = "envoy_cluster_upstream_rq"
 	const base = int64(1_700_000_000_000)

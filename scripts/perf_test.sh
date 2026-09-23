@@ -334,7 +334,11 @@ wait_for_http() {
 
 table_count() {
   local table="$1"
-  ch_client --query "SELECT count() FROM $table" | tr -d '[:space:]'
+  if [[ "$table" == "metrics4_samples" ]]; then
+    ch_client --query "SELECT sum(length(value_arr)) FROM $table" | tr -d '[:space:]'
+  else
+    ch_client --query "SELECT count() FROM $table" | tr -d '[:space:]'
+  fi
 }
 
 wait_for_table_rows() {
@@ -587,7 +591,7 @@ run_tsbs_metrics() {
 }
 
 run_posthog_metrics() {
-  run_tsbs_metrics "$1" "posthog_metrics" "$ROOT/scripts/create_metrics_posthog_schema.sql" "posthog" "metrics2" "1" "tsbs-posthog-metrics"
+  run_tsbs_metrics "$1" "posthog_metrics" "$ROOT/scripts/create_metrics_posthog_schema.sql" "posthog" "metrics4_samples" "1" "tsbs-posthog-metrics"
 }
 
 run_snuffle_metrics() {
@@ -626,7 +630,7 @@ run_posthog_logs() {
   fi
   write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
 
-  start_snuffle "$run_dir" "posthog" "metrics2" "1" "posthog" "$logs_table" "" "" "$attributes_table" ""
+  start_snuffle "$run_dir" "posthog" "metrics4_samples" "1" "posthog" "$logs_table" "" "" "$attributes_table" ""
   wait_for_http "$SNUFFLE_URL/-/healthy"
   run_bridge_bench "$run_dir" "posthog_logs"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "posthog-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
@@ -672,7 +676,7 @@ run_snuffle_logs() {
   fi
   write_load_result "$load_results" "$POSTHOG_LOG_ROWS" "$duration_ms"
 
-  start_snuffle "$run_dir" "posthog" "metrics2" "1" "snuffle" "$logs_table" "$streams_table" "$labels_table" "$attributes_table" "$stats_table"
+  start_snuffle "$run_dir" "posthog" "metrics4_samples" "1" "snuffle" "$logs_table" "$streams_table" "$labels_table" "$attributes_table" "$stats_table"
   wait_for_http "$SNUFFLE_URL/-/healthy"
   run_bridge_bench "$run_dir" "snuffle_logs"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$POSTHOG_LOG_ROWS" "snuffle-logs-synthetic" "synthetic-v1" "logs" "$POSTHOG_LOG_ROWS" "$POSTHOG_LOG_START" "${POSTHOG_LOG_RANGE_SECONDS}s" "$POSTHOG_LOG_STEP" "" "" "" "$attempt"
