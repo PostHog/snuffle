@@ -158,6 +158,9 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		for _, expression := range []string{
 			`histogram_quantiles("p", 0.5, 0.9, sum by(le)(irate(` + metric + `_bucket)))`,
 			`histogram_quantile(0.5, sum by(le)(irate(` + metric + `_bucket[1m])))`,
+			`histogram_quantile(0.9, sum by(le)(rate(` + metric + `_bucket)))`,
+			`histogram_quantiles("p", 0.5, 0.99, sum by(le)(rate(` + metric + `_bucket[2m])))`,
+			`histogram_quantile(0.5, sum by(le)(increase(` + metric + `_bucket[1m])))`,
 		} {
 			prepared, err := prepareMetricsQLQuery(expression, step, teamCfg.LookbackDelta, start, end)
 			if err != nil {

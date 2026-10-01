@@ -35,6 +35,11 @@ func TestCompactHistogramPlans(test *testing.T) {
 		`histogram_quantiles("p", 0.5, 0.9, sum by(le)(irate(duration_bucket)))`,
 		`histogram_quantile(0.5, sum by(le)(irate(duration_bucket[2m])))`,
 		`(histogram_quantile(0.5, (sum by(le)(irate(duration_bucket{service_name=~"api.*"})))))`,
+		`histogram_quantile(0.5, sum by(le)(rate(duration_bucket)))`,
+		`histogram_quantile(0.5, sum by(le)(rate(duration_bucket[5m])))`,
+		`histogram_quantiles("p", 0.5, 0.9, sum by(le)(increase(duration_bucket[1m])))`,
+		`histogram_quantile(0.5, sum by(le)(delta(duration_bucket)))`,
+		`histogram_quantile(0.5, sum by(le)(idelta(duration_bucket[2m])))`,
 	} {
 		if plan, _ := compactTestPlan(test, query, start, start.Add(time.Hour), time.Minute); plan == nil {
 			test.Fatalf("no plan for %s", query)
@@ -42,7 +47,8 @@ func TestCompactHistogramPlans(test *testing.T) {
 	}
 	for _, query := range []string{
 		`histogram_quantiles("p", 0.5, 0.5, sum by(le)(irate(duration_bucket)))`,
-		`histogram_quantile(0.5, sum by(le)(rate(duration_bucket)))`,
+		`histogram_quantile(0.5, sum by(le)(avg_over_time(duration_bucket[1m])))`,
+		`histogram_quantile(0.5, sum by(le)(duration_bucket))`,
 		`histogram_quantile(0.5, sum by(le,service_name)(irate(duration_bucket)))`,
 		`histogram_quantile(0.5, sum without(service_name)(irate(duration_bucket)))`,
 		`histogram_quantile(0.5, sum by(le)(irate({__name__=~"duration.*"})))`,
@@ -170,7 +176,8 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 		if iteration%2 == 0 {
 			window = "[2m]"
 		}
-		query := `histogram_quantiles("p", 0, 0.5, 0.9, 1, sum by(le)(irate(duration_bucket` + window + `)))`
+		function := metricsQLCounterFunctions[iteration%len(metricsQLCounterFunctions)]
+		query := `histogram_quantiles("p", 0, 0.5, 0.9, 1, sum by(le)(` + function + `(duration_bucket` + window + `)))`
 		compareCompactHistogram(test, samples, query, start, start.Add(10*time.Minute), 30*time.Second)
 	}
 	compareCompactHistogram(test, nil, `histogram_quantile(0.5,sum by(le)(irate(duration_bucket)))`, start, start.Add(time.Minute), time.Minute)
@@ -185,6 +192,10 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 	}
 	for _, label := range []string{"le", "__name__", "service_name"} {
 		compareCompactHistogram(test, frequent, `histogram_quantiles("`+label+`",0.5,0.9,sum by(le)(irate(duration_bucket)))`, start, start.Add(time.Minute), 10*time.Second)
+	}
+	for _, function := range metricsQLCounterFunctions {
+		compareCompactHistogram(test, frequent, `histogram_quantile(0.9,sum by(le)(`+function+`(duration_bucket)))`, start, start.Add(time.Minute), 10*time.Second)
+		compareCompactHistogram(test, frequent, `histogram_quantile(0.9,sum by(le)(`+function+`(duration_bucket[45s])))`, start, start.Add(time.Minute), 10*time.Second)
 	}
 }
 

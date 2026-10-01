@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -18,12 +19,13 @@ import (
 var errCompactHistogramFallback = errors.New("histogram requires the general evaluation path")
 
 type compactHistogramPlan struct {
-	call                               *parser.Call
-	selector                           *parser.VectorSelector
-	alias                              postHogHistogramAlias
-	bucketArg                          int
-	start, end, step, window, lookback int64
-	steps                              int
+	call                                              *parser.Call
+	selector                                          *parser.VectorSelector
+	alias                                             postHogHistogramAlias
+	function                                          string
+	bucketArg                                         int
+	start, end, step, window, lookback, selectorRange int64
+	steps                                             int
 }
 
 func unparenExpr(expr parser.Expr) parser.Expr {
@@ -74,7 +76,11 @@ func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback
 		return nil
 	}
 	rate, ok := unparenExpr(aggregate.Expr).(*parser.Call)
-	if !ok || rate.Func.Name != metricsQLInternalPrefix+"irate" || len(rate.Args) != 5 {
+	if !ok || len(rate.Args) != 5 {
+		return nil
+	}
+	plan.function = strings.TrimPrefix(rate.Func.Name, metricsQLInternalPrefix)
+	if plan.function == rate.Func.Name || !slices.Contains(metricsQLCounterFunctions, plan.function) {
 		return nil
 	}
 	var numbers [4]int64
@@ -85,15 +91,23 @@ func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback
 		}
 		numbers[index] = int64(number.Val)
 	}
+	// A zero window is an implicit rate window: the rewrite fetches one step
+	// of history before the lookback, and each step resolves the window from
+	// the sample interval.
 	plan.window = numbers[0]
-	if plan.window <= 0 || numbers[1] != plan.step || numbers[2] != plan.lookback || numbers[3] != 0 || plan.step <= 0 || plan.lookback <= 0 {
+	if numbers[1] != plan.step || numbers[2] != plan.lookback || numbers[3] != 0 || plan.step <= 0 || plan.lookback <= 0 {
 		return nil
 	}
-	if plan.window > math.MaxInt64-plan.lookback || plan.start < math.MinInt64+plan.window+plan.lookback {
+	fetched := plan.window
+	if fetched == 0 {
+		fetched = plan.step
+	}
+	if fetched > math.MaxInt64-plan.lookback || plan.start < math.MinInt64+fetched+plan.lookback {
 		return nil
 	}
+	plan.selectorRange = fetched + plan.lookback
 	matrix, ok := rate.Args[0].(*parser.MatrixSelector)
-	if !ok || matrix.Range.Milliseconds() != plan.window+plan.lookback {
+	if !ok || matrix.Range.Milliseconds() != plan.selectorRange {
 		return nil
 	}
 	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
@@ -133,14 +147,17 @@ func (sum *compactHistogramSum) add(value float64) {
 	sum.value, sum.present = next, true
 }
 
+// compactHistogramEvaluator reads the samples of one source series at a time.
+// For each bucket it keeps the points inside the selector range, which are
+// the points that the engine passes to the counter function.
 type compactHistogramEvaluator struct {
 	plan                  *compactHistogramPlan
 	cfg                   Config
 	buckets               map[string][]compactHistogramSum
 	columns               [][]compactHistogramSum
 	bounds                []float64
-	previous, current     []float64
-	times                 []promql.FPoint
+	current               []float64
+	history               [][]promql.FPoint
 	sourceID              uint64
 	haveSource            bool
 	grid, samples, series int
@@ -160,18 +177,27 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 		if !finish && timestamp >= until {
 			break
 		}
-		first := sort.Search(len(evaluator.times), func(index int) bool { return evaluator.times[index].T > timestamp-plan.window-plan.lookback })
-		history := evaluator.times[first:]
-		if len(history) >= 2 && history[len(history)-1].T > timestamp-plan.window {
-			maxPrevious := min(metricsQLSampleInterval(history, plan.step), plan.lookback)
-			points := [2]promql.FPoint{history[len(history)-2], history[len(history)-1]}
-			firstPoint := 0
-			if points[0].T <= timestamp-plan.window {
-				firstPoint = 1
+		if len(evaluator.history) > 0 {
+			// Later steps start later, so points before the range are not
+			// needed again. Shift in place to keep the capacity for appends.
+			times := evaluator.history[0]
+			if first := sort.Search(len(times), func(index int) bool { return times[index].T > timestamp-plan.selectorRange }); first > 0 {
+				for index, points := range evaluator.history {
+					evaluator.history[index] = points[:copy(points, points[first:])]
+				}
 			}
+		}
+		if len(evaluator.history) > 0 && len(evaluator.history[0]) > 0 {
+			times := evaluator.history[0]
+			maxPrevious := min(metricsQLSampleInterval(times, plan.step), plan.lookback)
+			window := plan.window
+			if window == 0 {
+				window = max(plan.step, maxPrevious)
+			}
+			start := timestamp - window
+			firstPoint := sort.Search(len(times), func(index int) bool { return times[index].T > start })
 			for index, column := range evaluator.columns {
-				points[0].F, points[1].F = evaluator.previous[index], evaluator.current[index]
-				value := metricsQLCounterValue("irate", points[:], firstPoint, timestamp-plan.window, maxPrevious, plan.lookback)
+				value := metricsQLCounterValue(plan.function, evaluator.history[index], firstPoint, start, maxPrevious, plan.lookback)
 				if !math.IsNaN(value) {
 					column[evaluator.grid].add(value)
 				}
@@ -208,8 +234,11 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		}
 		evaluator.series += len(sample.counts)
 		evaluator.bounds = append(evaluator.bounds[:0], sample.bounds...)
-		evaluator.previous = make([]float64, len(sample.counts))
 		evaluator.current = make([]float64, len(sample.counts))
+		evaluator.history = slices.Grow(evaluator.history[:0], len(sample.counts))[:len(sample.counts)]
+		for index := range evaluator.history {
+			evaluator.history[index] = evaluator.history[index][:0]
+		}
 		evaluator.columns = evaluator.columns[:0]
 		for index := range sample.counts {
 			bound := "+Inf"
@@ -226,7 +255,6 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 			}
 			evaluator.columns = append(evaluator.columns, column)
 		}
-		evaluator.times = evaluator.times[:0]
 		evaluator.grid, evaluator.sourceID, evaluator.haveSource = 0, sample.id, true
 	} else if !slices.EqualFunc(evaluator.bounds, sample.bounds, func(left, right float64) bool { return math.Float64bits(left) == math.Float64bits(right) }) {
 		return errCompactHistogramFallback
@@ -234,8 +262,9 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 	if err := evaluator.advance(ctx, sample.timestamp, false); err != nil {
 		return err
 	}
-	duplicate := len(evaluator.times) > 0 && evaluator.times[len(evaluator.times)-1].T == sample.timestamp
-	if len(evaluator.times) > 0 && evaluator.times[len(evaluator.times)-1].T > sample.timestamp {
+	times := evaluator.history[0]
+	duplicate := len(times) > 0 && times[len(times)-1].T == sample.timestamp
+	if len(times) > 0 && times[len(times)-1].T > sample.timestamp {
 		return errCompactHistogramFallback
 	}
 	var cumulative uint64
@@ -253,16 +282,14 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		if duplicate && evaluator.current[index] != float64(cumulative) {
 			return errCompactHistogramFallback
 		}
-		evaluator.previous[index], evaluator.current[index] = evaluator.current[index], float64(cumulative)
+		evaluator.current[index] = float64(cumulative)
 	}
 	if cumulative != sample.count {
 		return errCompactHistogramFallback
 	}
-	if len(evaluator.times) == 21 {
-		copy(evaluator.times, evaluator.times[1:])
-		evaluator.times = evaluator.times[:20]
+	for index, value := range evaluator.current {
+		evaluator.history[index] = append(evaluator.history[index], promql.FPoint{T: sample.timestamp, F: value})
 	}
-	evaluator.times = append(evaluator.times, promql.FPoint{T: sample.timestamp})
 	return nil
 }
 
