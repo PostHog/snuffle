@@ -18,6 +18,11 @@ import (
 
 var errCompactHistogramFallback = errors.New("histogram requires the general evaluation path")
 
+// compactHistogramInstantPoints is the number of points that irate and idelta
+// need for each bucket: they read the last two points, and
+// metricsQLSampleInterval reads the last 21 timestamps.
+const compactHistogramInstantPoints = 21
+
 type compactHistogramPlan struct {
 	call                                              *parser.Call
 	selector                                          *parser.VectorSelector
@@ -25,7 +30,7 @@ type compactHistogramPlan struct {
 	function                                          string
 	bucketArg                                         int
 	start, end, step, window, lookback, selectorRange int64
-	steps                                             int
+	steps, maxPoints                                  int
 }
 
 func unparenExpr(expr parser.Expr) parser.Expr {
@@ -82,6 +87,9 @@ func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback
 	plan.function = strings.TrimPrefix(rate.Func.Name, metricsQLInternalPrefix)
 	if plan.function == rate.Func.Name || !slices.Contains(metricsQLCounterFunctions, plan.function) {
 		return nil
+	}
+	if plan.function == "irate" || plan.function == "idelta" {
+		plan.maxPoints = compactHistogramInstantPoints
 	}
 	var numbers [4]int64
 	for index, arg := range rate.Args[1:] {
@@ -181,7 +189,13 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 			// Later steps start later, so points before the range are not
 			// needed again. Shift in place to keep the capacity for appends.
 			times := evaluator.history[0]
-			if first := sort.Search(len(times), func(index int) bool { return times[index].T > timestamp-plan.selectorRange }); first > 0 {
+			first := sort.Search(len(times), func(index int) bool { return times[index].T > timestamp-plan.selectorRange })
+			// irate and idelta read only the newest points. Trim them when the
+			// history reaches twice the limit, so that the copy runs rarely.
+			if plan.maxPoints > 0 && len(times)-first > 2*plan.maxPoints {
+				first = len(times) - plan.maxPoints
+			}
+			if first > 0 {
 				for index, points := range evaluator.history {
 					evaluator.history[index] = points[:copy(points, points[first:])]
 				}
