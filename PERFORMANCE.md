@@ -523,14 +523,14 @@ Implemented storage optimizations:
   Regex selectors retain the general alias lookup path.
 - histogram array reads use a RowBinary payload with checked, reusable typed
   decoding instead of reflective per-element array scanning
-- exact virtual histogram quantile range queries over `sum by (le) (irate(...))`
-  share timestamp and window work across buckets and retain only the last 21
-  timestamps and two cumulative bucket vectors per source. They use the existing
-  MetricsQL counter and Prometheus quantile calculations. Real metrics, changing
-  bounds, overlapping source labels, and unsupported query shapes use the general
-  engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=true` enables this path; it is
-  off by default so a deployment can compare its results with the general
-  engine before it enables it.
+- exact virtual histogram quantile range queries over `sum by (le)` of a
+  counter function (`rate`, `irate`, `increase`, `delta`, `idelta`) share
+  timestamp and window work across buckets. They read one source at a time and
+  retain only the points of its selector range for each bucket. They use the
+  existing MetricsQL counter and Prometheus quantile calculations. Real metrics,
+  changing bounds, overlapping source labels, and unsupported query shapes use
+  the general engine. `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS=false` turns this path
+  off.
 - small selected-ID sample reads preserve metric constraints so ClickHouse can
   use the sample-table key prefix
 - sample reads use plain `MergeTree` rows. This removes replacement merge CPU
