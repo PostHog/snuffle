@@ -271,8 +271,7 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 	default:
 		return "", nil, false
 	}
-	parserKind := ""
-	parserParams := map[string]string{}
+	var parser logQLSQLParser
 	filters := make([]string, 0, len(rangeAgg.selector.stages))
 	unwrapValueExpr := ""
 	for _, stage := range rangeAgg.selector.stages {
@@ -280,41 +279,38 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 		case "line_filter":
 			filters = append(filters, logQLLineFilterCondition(*stage.lineFilter))
 		case "parser":
-			if parserKind != "" {
+			if parser.kind != "" {
 				return "", nil, false
 			}
 			switch stage.parser {
 			case "json":
-				parserKind = "json"
-				parserParams = parseParserParams(stage.parserParam)
+				parser = logQLSQLParser{kind: "json", jsonPaths: parseParserParams(stage.parserParam)}
 			case "logfmt":
 				if strings.TrimSpace(stage.parserParam) != "" {
 					return "", nil, false
 				}
-				parserKind = "logfmt"
+				parser = logQLSQLParser{kind: "logfmt"}
 			case "regexp":
-				params, ok := logQLSQLNamedCaptureParams(stage.parserParam)
+				groups, ok := logQLSQLNamedCaptureGroups(stage.parserParam)
 				if !ok {
 					return "", nil, false
 				}
-				parserKind = "regexp"
-				parserParams = params
+				parser = logQLSQLParser{kind: "regexp", regex: stage.parserParam, groups: groups}
 			case "pattern":
 				re, err := compileLogQLPattern(stage.parserParam)
 				if err != nil {
 					return "", nil, false
 				}
-				params, ok := logQLSQLNamedCaptureParams(re.String())
+				groups, ok := logQLSQLNamedCaptureGroups(re.String())
 				if !ok {
 					return "", nil, false
 				}
-				parserKind = "pattern"
-				parserParams = params
+				parser = logQLSQLParser{kind: "pattern", regex: re.String(), groups: groups}
 			default:
 				return "", nil, false
 			}
 		case "label_filter":
-			condition, ok := logQLSQLLabelFiltersCondition(cfg, stage.labelFilters, parserKind, parserParams)
+			condition, ok := logQLSQLLabelFiltersCondition(cfg, stage.labelFilters, parser)
 			if !ok {
 				return "", nil, false
 			}
@@ -322,7 +318,7 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 				filters = append(filters, condition)
 			}
 		case "unwrap":
-			valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, stage.unwrapLabel, parserKind, parserParams, false)
+			valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, stage.unwrapLabel, parser, false)
 			if !ok {
 				return "", nil, false
 			}
@@ -340,17 +336,17 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 	return unwrapValueExpr, filters, true
 }
 
-func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
+func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parser logQLSQLParser) (string, bool) {
 	if len(filters) == 0 {
 		return "", true
 	}
-	first, ok := logQLSQLLabelFilterCondition(cfg, filters[0], parserKind, parserParams)
+	first, ok := logQLSQLLabelFilterCondition(cfg, filters[0], parser)
 	if !ok {
 		return "", false
 	}
 	condition := first
 	for i := 1; i < len(filters); i++ {
-		next, ok := logQLSQLLabelFilterCondition(cfg, filters[i], parserKind, parserParams)
+		next, ok := logQLSQLLabelFilterCondition(cfg, filters[i], parser)
 		if !ok {
 			return "", false
 		}
@@ -363,7 +359,7 @@ func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parse
 	return condition, true
 }
 
-func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parserKind string, parserParams map[string]string) (string, bool) {
+func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parser logQLSQLParser) (string, bool) {
 	if filter.name == "__error__" {
 		switch filter.op {
 		case "=", "==":
@@ -374,7 +370,7 @@ func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parserKin
 			return "", false
 		}
 	}
-	valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, filter.name, parserKind, parserParams, true)
+	valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, filter.name, parser, true)
 	if !ok {
 		return "", false
 	}
@@ -397,8 +393,17 @@ func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parserKin
 	}
 }
 
-func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parserParams map[string]string, withFallback bool) (string, bool) {
-	switch parserKind {
+// logQLSQLParser is the single parser stage of a SQL-pushed LogQL pipeline.
+// jsonPaths applies to json; regex and groups apply to regexp and pattern.
+type logQLSQLParser struct {
+	kind      string
+	jsonPaths map[string]string
+	regex     string
+	groups    map[string]int
+}
+
+func logQLSQLPipelineLabelValueExpr(cfg Config, label string, parser logQLSQLParser, withFallback bool) (string, bool) {
+	switch parser.kind {
 	case "logfmt":
 		parsed := "extractKeyValuePairs(body, '=', ' ')[" + sqlString(label) + "]"
 		if !withFallback {
@@ -407,7 +412,7 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
 		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
 	case "json":
-		path := parserParams[label]
+		path := parser.jsonPaths[label]
 		if path == "" {
 			path = label
 		}
@@ -418,14 +423,14 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
 		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
 	case "regexp", "pattern":
-		index := parserParams[label]
-		if index == "" {
+		index, ok := parser.groups[label]
+		if !ok {
 			if withFallback {
 				return logQLMetricLabelFilterValueExpr(cfg, label), true
 			}
 			return "", false
 		}
-		parsed := "arrayElement(extractGroups(body, " + sqlString(parserParams["__regex"]) + "), " + index + ")"
+		parsed := "arrayElement(extractGroups(body, " + sqlString(parser.regex) + "), " + strconv.Itoa(index) + ")"
 		if !withFallback {
 			return parsed, true
 		}
@@ -438,21 +443,19 @@ func logQLSQLPipelineLabelValueExpr(cfg Config, label, parserKind string, parser
 	}
 }
 
-func logQLSQLNamedCaptureParams(pattern string) (map[string]string, bool) {
+func logQLSQLNamedCaptureGroups(pattern string) (map[string]int, bool) {
 	re, err := regexp.Compile(pattern)
 	if err != nil {
 		return nil, false
 	}
-	params := map[string]string{"__regex": pattern}
-	haveNamedCapture := false
+	groups := map[string]int{}
 	for i, name := range re.SubexpNames() {
 		if i == 0 || name == "" {
 			continue
 		}
-		params[sanitizeLogLabelName(name)] = strconv.Itoa(i)
-		haveNamedCapture = true
+		groups[sanitizeLogLabelName(name)] = i
 	}
-	return params, haveNamedCapture
+	return groups, len(groups) > 0
 }
 
 func logQLJSONSQLPath(path string) string {

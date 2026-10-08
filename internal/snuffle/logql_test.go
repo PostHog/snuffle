@@ -1240,3 +1240,58 @@ func TestLokiPushJSONRows(t *testing.T) {
 		t.Fatalf("fields = %#v", fields)
 	}
 }
+
+func TestLogQLUnwrapSQLKeepsRegexOutOfCaptureIndexes(t *testing.T) {
+	pattern := `(?P<v>[0-9]+) or 1=1 --`
+	for _, tt := range []struct {
+		name   string
+		query  string
+		wantOK bool
+	}{
+		{"unwrap __regex", `sum_over_time({app="api"} | regexp "` + pattern + `" | unwrap __regex [1m])`, false},
+		{"filter __regex", `sum_over_time({app="api"} | regexp "` + pattern + `" | __regex="x" | unwrap v [1m])`, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			valueExpr, filters, ok := buildLogQLUnwrapMetricSQL(Config{}, expr.rangeAgg)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			sql := valueExpr + " " + strings.Join(filters, " ")
+			if strings.Count(sql, pattern) != strings.Count(sql, sqlString(pattern)) {
+				t.Fatalf("regexp reached SQL unquoted: %s", sql)
+			}
+		})
+	}
+}
+
+func TestLokiQueryRangeRejectsTooManyPoints(t *testing.T) {
+	server := &Server{cfg: Config{QueryTimeout: time.Second}}
+	for _, tt := range []struct {
+		name, start, end, step string
+	}{
+		{"tiny step", "0", "1000000000000", "1ms"},
+		{"end wraps int64", "9223372036854775000", "9223372036854775807", "1m"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			params := url.Values{"query": {"1"}, "start": {tt.start}, "end": {tt.end}, "step": {tt.step}}
+			rec := httptest.NewRecorder()
+			server.handleLokiQueryRange(rec, httptest.NewRequest(http.MethodGet, "/loki/api/v1/query_range?"+params.Encode(), nil))
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, body %s", rec.Code, rec.Body.String())
+			}
+		})
+	}
+	if got := logQLRangePoints(math.MinInt64, math.MaxInt64, math.MaxInt64); got != 3 {
+		t.Fatalf("logQLRangePoints across full int64 range = %d, want 3", got)
+	}
+}
+
+func TestParseLogQLRejectsLoneBangInLabelFilter(t *testing.T) {
+	if _, err := parseLogQL(`{app="api"} | json | !x="1"`); err == nil {
+		t.Fatal("parseLogQL accepted a lone '!' in a label filter")
+	}
+}
