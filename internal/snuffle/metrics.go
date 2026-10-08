@@ -508,8 +508,12 @@ func (s *Server) instrumentHandler(endpoint string, handler http.Handler) http.H
 }
 
 func normalizedEndpoint(path string) string {
-	if strings.HasPrefix(path, "/api/v1/label/") && strings.HasSuffix(path, "/values") {
+	// Label routes carry a caller-chosen name; keep it out of metric labels.
+	if strings.HasPrefix(path, "/api/v1/label/") {
 		return "/api/v1/label/:name/values"
+	}
+	if strings.HasPrefix(path, "/loki/api/v1/label/") {
+		return "/loki/api/v1/label/:name/values"
 	}
 	return path
 }

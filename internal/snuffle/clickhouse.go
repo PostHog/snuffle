@@ -69,7 +69,8 @@ func clickHouseNetworkCompression(cfg Config) string {
 	}
 }
 
-func openClickHouse(cfg Config, username, password string) (clickhouse.Conn, error) {
+// openClickHouse is a variable so tests can capture the SQL Snuffle sends.
+var openClickHouse = func(cfg Config, username, password string) (clickhouse.Conn, error) {
 	return clickhouse.Open(&clickhouse.Options{
 		Protocol: clickhouse.Native,
 		Addr:     clickHouseAddrs(cfg),

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"sort"
 	"strconv"
@@ -247,7 +248,15 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeLokiSuccess(w, lokiQueryData{ResultType: "streams", Result: logStreamResults(rows, limit, direction), Stats: lokiEmptyStats()})
 		return
 	}
-	metricStart, metricEnd := alignLogQLMetricRange(start, end, step)
+	metricStart, metricEnd, err := alignLogQLMetricRange(start, end, step)
+	if err != nil {
+		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
+	if logQLRangePoints(metricStart.UnixNano(), metricEnd.UnixNano(), step.Nanoseconds()) > maxRangePushdownPoints {
+		writeLokiError(w, http.StatusBadRequest, "bad_data", fmt.Errorf("exceeded maximum resolution of %d points per timeseries; decrease the query resolution (step)", maxRangePushdownPoints))
+		return
+	}
 	startNS, endNS := logQLMetricFetchBounds(expr, metricStart.UnixNano(), metricEnd.UnixNano())
 	recordQueryLogBackend(w, "logql-sql")
 	if data, ok, err := s.tryLogQLRangeMetricSQL(ctx, expr, metricStart, metricEnd, step); ok {
@@ -494,26 +503,37 @@ func maxDuration(a, b time.Duration) time.Duration {
 	return b
 }
 
-func alignLogQLMetricRange(start, end time.Time, step time.Duration) (time.Time, time.Time) {
+func alignLogQLMetricRange(start, end time.Time, step time.Duration) (time.Time, time.Time, error) {
 	if step <= 0 {
 		step = time.Minute
 	}
-	stepNS := step.Nanoseconds()
-	return time.Unix(0, ceilInt64(start.UnixNano(), stepNS)).UTC(), time.Unix(0, ceilInt64(end.UnixNano(), stepNS)).UTC()
+	alignedStart, err := ceilUnixNanoTime(start, step.Nanoseconds())
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid start: %w", err)
+	}
+	alignedEnd, err := ceilUnixNanoTime(end, step.Nanoseconds())
+	if err != nil {
+		return time.Time{}, time.Time{}, fmt.Errorf("invalid end: %w", err)
+	}
+	return alignedStart, alignedEnd, nil
 }
 
-func ceilInt64(value, multiple int64) int64 {
-	if multiple <= 0 {
-		return value
+// ceilUnixNanoTime rounds t up to a multiple of stepNS in int64 Unix nanoseconds.
+func ceilUnixNanoTime(t time.Time, stepNS int64) (time.Time, error) {
+	value := t.UnixNano()
+	if !time.Unix(0, value).Equal(t) {
+		return time.Time{}, errors.New("timestamp out of range")
 	}
-	rem := value % multiple
-	if rem == 0 {
-		return value
+	rem := value % stepNS
+	if rem > 0 {
+		if value > math.MaxInt64-(stepNS-rem) {
+			return time.Time{}, errors.New("timestamp out of range")
+		}
+		value += stepNS - rem
+	} else {
+		value -= rem
 	}
-	if value >= 0 {
-		return value + multiple - rem
-	}
-	return value - rem
+	return time.Unix(0, value).UTC(), nil
 }
 
 func (s *Server) handleLokiLabels(w http.ResponseWriter, r *http.Request) {

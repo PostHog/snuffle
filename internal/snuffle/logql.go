@@ -2059,7 +2059,10 @@ func evaluateLogQLRangeMetric(expr *logQLExpr, rows []logRow, startNS, endNS int
 	if step <= 0 {
 		step = time.Minute
 	}
-	for ts := startNS; ts <= endNS; ts += step.Nanoseconds() {
+	stepNS := step.Nanoseconds()
+	points := logQLRangePoints(startNS, endNS, stepNS)
+	for i := uint64(0); i < points; i++ {
+		ts := startNS + int64(i*uint64(stepNS))
 		samples := evaluateLogQLMetricAt(expr, rows, ts)
 		for _, sample := range samples {
 			key := labelsKey(sample.labels)
@@ -2077,6 +2080,14 @@ func evaluateLogQLRangeMetric(expr *logQLExpr, rows []logRow, startNS, endNS int
 	}
 	sort.Slice(out, func(i, j int) bool { return labelsKey(out[i].Metric) < labelsKey(out[j].Metric) })
 	return out
+}
+
+// logQLRangePoints counts the steps in [startNS, endNS] without int64 overflow.
+func logQLRangePoints(startNS, endNS, stepNS int64) uint64 {
+	if endNS < startNS {
+		return 0
+	}
+	return uint64(endNS-startNS)/uint64(stepNS) + 1
 }
 
 type logMetricSample struct {
@@ -3274,6 +3285,9 @@ func lexLogQLFilter(input string) ([]string, error) {
 			start := i
 			for i < len(input) && !unicode.IsSpace(rune(input[i])) && !strings.ContainsRune("=!<>,", rune(input[i])) {
 				i++
+			}
+			if i == start {
+				return nil, fmt.Errorf("unexpected %q in label filter", input[i])
 			}
 			tokens = append(tokens, input[start:i])
 		}
