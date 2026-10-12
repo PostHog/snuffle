@@ -103,7 +103,7 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 		}
 		matrix, err := evaluator.evaluate(context.Background(), branch.plan)
 		if err == nil {
-			matrix, err = replaceCompactHistogramLabels(matrix, branch.replaces)
+			matrix, err = applyCompactSeriesFunctions(matrix, branch.functions)
 		}
 		if err != nil {
 			test.Fatal(err)
@@ -238,6 +238,11 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 		quantile("0.5", "rate") + ` or ` + quantile("0.9", "rate"),
 		`label_replace(label_replace(` + quantile("0.5", "increase") + `, "q", "p$1", "clause", "(.*)"), "q", "", "q", "p")`,
 		`label_replace(` + quantile("0.5", "rate") + `, "q", "x", "missing", "y") or ` + labelled("0.9", "rate", "b"),
+		`label_join(` + quantile("0.5", "rate") + `, "q", "-", "clause", "missing")`,
+		`round(clamp(abs(ln(` + quantile("0.9", "rate") + `)), 0.5, 1.5), 0.1) or sgn(` + labelled("0.5", "rate", "b") + `)`,
+		`clamp(` + quantile("0.9", "rate") + `, 2, 1) or ` + labelled("0.5", "rate", "b"),
+		`clamp_min(sqrt(` + quantile("0.9", "rate") + `), 0.8) or clamp_max(exp(` + labelled("0.5", "rate", "b") + `), 1.2)`,
+		`floor(log2(` + quantile("0.9", "rate") + `)) or ceil(log10(` + labelled("0.5", "rate", "b") + `))`,
 	} {
 		compareCompactHistogram(test, frequent, query, start, start.Add(time.Minute), 10*time.Second)
 		compareCompactHistogram(test, nil, query, start, start.Add(time.Minute), 10*time.Second)
@@ -274,7 +279,7 @@ func TestCompactHistogramUnionPlans(test *testing.T) {
 		return planCompactHistogramUnion(expr, start, start.Add(time.Hour), time.Minute, 5*time.Minute)
 	}
 	quantile := `histogram_quantile(0.5, sum by(le)(rate(duration_bucket)))`
-	if branches := plan(`label_replace(` + quantile + `, "clause", "a", "", "") or (label_replace(` + quantile + `, "clause", "b", "", ""))`); len(branches) != 2 || len(branches[1].replaces) != 1 {
+	if branches := plan(`label_replace(` + quantile + `, "clause", "a", "", "") or (label_replace(` + quantile + `, "clause", "b", "", ""))`); len(branches) != 2 || len(branches[1].functions) != 1 {
 		test.Fatalf("wanted two labelled branches, got %v", branches)
 	}
 	for _, query := range []string{
@@ -284,7 +289,9 @@ func TestCompactHistogramUnionPlans(test *testing.T) {
 		quantile + ` or sum(rate(duration_count))`,
 		`label_replace(` + quantile + `, "__name__", "x", "", "")`,
 		`label_replace(` + quantile + `, "clause", "a", "", "(")`,
-		`label_join(` + quantile + `, "clause", "-", "le")`,
+		`label_join(` + quantile + `, "__name__", "-", "le")`,
+		`round(` + quantile + `, scalar(up))`,
+		`timestamp(` + quantile + `)`,
 	} {
 		if branches := plan(query); branches != nil {
 			test.Fatalf("unsafe plan for %s", query)

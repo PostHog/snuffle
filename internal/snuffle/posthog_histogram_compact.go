@@ -391,55 +391,157 @@ func dropCompactHistogramNaNs(matrix promql.Matrix) promql.Matrix {
 	return result
 }
 
-// compactLabelReplace is a label_replace call around a compact quantile.
-type compactLabelReplace struct {
-	destination, replacement, source string
-	regex                            *regexp.Regexp
+// compactSeriesFunction is a function call around a compact quantile, applied
+// to the quantile result.
+type compactSeriesFunction func(promql.Matrix) promql.Matrix
+
+// compactSeriesFunctions are the functions that can wrap a compact quantile.
+// Each one reads every series on its own, so running it on the compact result
+// gives the engine's result. A parser returns false for arguments that the
+// engine rejects or that need the general path.
+var compactSeriesFunctions = map[string]func(*parser.Call) (compactSeriesFunction, bool){
+	"label_replace": parseCompactLabelReplace,
+	"label_join":    parseCompactLabelJoin,
+	"abs":           parseCompactValueFunction,
+	"ceil":          parseCompactValueFunction,
+	"floor":         parseCompactValueFunction,
+	"round":         parseCompactValueFunction,
+	"clamp":         parseCompactValueFunction,
+	"clamp_min":     parseCompactValueFunction,
+	"clamp_max":     parseCompactValueFunction,
+	"sgn":           parseCompactValueFunction,
+	"sqrt":          parseCompactValueFunction,
+	"exp":           parseCompactValueFunction,
+	"ln":            parseCompactValueFunction,
+	"log2":          parseCompactValueFunction,
+	"log10":         parseCompactValueFunction,
 }
 
-func parseCompactLabelReplace(call *parser.Call) (compactLabelReplace, bool) {
-	if len(call.Args) != 5 {
-		return compactLabelReplace{}, false
-	}
-	var values [4]string
-	for index, arg := range call.Args[1:] {
+func compactStringArgs(args parser.Expressions) ([]string, bool) {
+	values := make([]string, len(args))
+	for index, arg := range args {
 		literal, ok := unparenExpr(arg).(*parser.StringLiteral)
 		if !ok {
-			return compactLabelReplace{}, false
+			return nil, false
 		}
 		values[index] = literal.Val
 	}
-	// The engine reports invalid arguments, and a new metric name changes how
-	// the engine removes names. Both stay on the general path.
-	regex, err := regexp.Compile("^(?s:" + values[3] + ")$")
-	if err != nil || !model.UTF8Validation.IsValidLabelName(values[0]) || values[0] == labels.MetricName {
-		return compactLabelReplace{}, false
-	}
-	return compactLabelReplace{destination: values[0], replacement: values[1], source: values[2], regex: regex}, true
+	return values, true
 }
 
-// apply matches the engine's label_replace: an empty result removes the label.
-func (replace compactLabelReplace) apply(metric labels.Labels) labels.Labels {
-	value := metric.Get(replace.source)
-	indexes := replace.regex.FindStringSubmatchIndex(value)
-	if indexes == nil {
-		return metric
+// compactLabelDestination reports whether a label function may write the
+// label. A new metric name changes how the engine removes names.
+func compactLabelDestination(name string) bool {
+	return model.UTF8Validation.IsValidLabelName(name) && name != labels.MetricName
+}
+
+// parseCompactLabelReplace matches the engine's label_replace: the regex is
+// anchored, and an empty result removes the label.
+func parseCompactLabelReplace(call *parser.Call) (compactSeriesFunction, bool) {
+	if len(call.Args) != 5 {
+		return nil, false
 	}
-	builder := labels.NewBuilder(metric)
-	builder.Set(replace.destination, string(replace.regex.ExpandString(nil, replace.replacement, value, indexes)))
-	return builder.Labels()
+	values, ok := compactStringArgs(call.Args[1:])
+	if !ok || !compactLabelDestination(values[0]) {
+		return nil, false
+	}
+	destination, replacement, source := values[0], values[1], values[2]
+	regex, err := regexp.Compile("^(?s:" + values[3] + ")$")
+	if err != nil {
+		return nil, false
+	}
+	return func(matrix promql.Matrix) promql.Matrix {
+		for index := range matrix {
+			value := matrix[index].Metric.Get(source)
+			indexes := regex.FindStringSubmatchIndex(value)
+			if indexes == nil {
+				continue
+			}
+			builder := labels.NewBuilder(matrix[index].Metric)
+			builder.Set(destination, string(regex.ExpandString(nil, replacement, value, indexes)))
+			matrix[index].Metric = builder.Labels()
+		}
+		return matrix
+	}, true
+}
+
+// parseCompactLabelJoin matches the engine's label_join.
+func parseCompactLabelJoin(call *parser.Call) (compactSeriesFunction, bool) {
+	if len(call.Args) < 3 {
+		return nil, false
+	}
+	values, ok := compactStringArgs(call.Args[1:])
+	if !ok || !compactLabelDestination(values[0]) {
+		return nil, false
+	}
+	destination, separator, sources := values[0], values[1], values[2:]
+	for _, source := range sources {
+		if !model.UTF8Validation.IsValidLabelName(source) {
+			return nil, false
+		}
+	}
+	return func(matrix promql.Matrix) promql.Matrix {
+		joined := make([]string, len(sources))
+		for index := range matrix {
+			for position, source := range sources {
+				joined[position] = matrix[index].Metric.Get(source)
+			}
+			builder := labels.NewBuilder(matrix[index].Metric)
+			builder.Set(destination, strings.Join(joined, separator))
+			matrix[index].Metric = builder.Labels()
+		}
+		return matrix
+	}, true
+}
+
+// parseCompactValueFunction accepts an element-wise function whose other
+// arguments are numbers. It calls the engine's implementation for each point.
+func parseCompactValueFunction(call *parser.Call) (compactSeriesFunction, bool) {
+	function := promql.FunctionCalls[call.Func.Name]
+	if function == nil || len(call.Args) == 0 {
+		return nil, false
+	}
+	vectors := make([]promql.Vector, len(call.Args))
+	for index, arg := range call.Args[1:] {
+		number, ok := unparenExpr(arg).(*parser.NumberLiteral)
+		if !ok {
+			return nil, false
+		}
+		vectors[index+1] = promql.Vector{{F: number.Val}}
+	}
+	return func(matrix promql.Matrix) promql.Matrix {
+		result := make(promql.Matrix, 0, len(matrix))
+		helper := &promql.EvalNodeHelper{}
+		for _, series := range matrix {
+			output := promql.Series{Metric: series.Metric}
+			for _, point := range series.Floats {
+				vectors[0] = promql.Vector{{Metric: series.Metric, T: point.T, F: point.F}}
+				helper.Ts, helper.Out = point.T, helper.Out[:0]
+				values, _ := function(vectors, nil, call.Args, helper)
+				for _, sample := range values {
+					output.Metric = sample.Metric
+					output.Floats = append(output.Floats, promql.FPoint{T: point.T, F: sample.F})
+				}
+			}
+			if len(output.Floats) > 0 {
+				result = append(result, output)
+			}
+		}
+		return result
+	}, true
 }
 
 // compactHistogramBranch is one operand of a union of quantiles: the quantile
-// plan and the label_replace calls around it, innermost first.
+// plan and the functions around it, innermost first.
 type compactHistogramBranch struct {
-	plan     *compactHistogramPlan
-	replaces []compactLabelReplace
+	plan      *compactHistogramPlan
+	functions []compactSeriesFunction
 }
 
-// planCompactHistogramUnion accepts a quantile call, label_replace calls around
-// it, and unions of those joined with a plain `or`. A dashboard that charts
-// several quantiles, each with its own series label, sends this form.
+// planCompactHistogramUnion accepts a quantile call, functions from
+// compactSeriesFunctions around it, and unions of those joined with a plain
+// `or`. A dashboard that charts several quantiles, each with its own series
+// label, sends this form.
 func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, lookback time.Duration) []compactHistogramBranch {
 	var branches []compactHistogramBranch
 	var collect func(parser.Expr) bool
@@ -451,25 +553,29 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 			}
 			return collect(binary.LHS) && collect(binary.RHS)
 		}
-		var replaces []compactLabelReplace
+		var functions []compactSeriesFunction
 		for {
 			call, ok := expr.(*parser.Call)
-			if !ok || call.Func.Name != "label_replace" {
+			if !ok {
 				break
 			}
-			replace, ok := parseCompactLabelReplace(call)
+			parse, ok := compactSeriesFunctions[call.Func.Name]
+			if !ok {
+				break
+			}
+			function, ok := parse(call)
 			if !ok {
 				return false
 			}
-			replaces = append(replaces, replace)
+			functions = append(functions, function)
 			expr = unparenExpr(call.Args[0])
 		}
-		slices.Reverse(replaces)
+		slices.Reverse(functions)
 		plan := planCompactHistogram(expr, start, end, step, lookback)
 		if plan == nil || len(branches) >= maxAggregateUnionSelectors {
 			return false
 		}
-		branches = append(branches, compactHistogramBranch{plan: plan, replaces: replaces})
+		branches = append(branches, compactHistogramBranch{plan: plan, functions: functions})
 		return true
 	}
 	if !collect(expr) {
@@ -478,15 +584,15 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 	return branches
 }
 
-// replaceCompactHistogramLabels applies the label_replace calls of a branch.
-// When two series end with the same labels, the engine merges them or fails,
-// so that case stays on the general path.
-func replaceCompactHistogramLabels(matrix promql.Matrix, replaces []compactLabelReplace) (promql.Matrix, error) {
-	for _, replace := range replaces {
+// applyCompactSeriesFunctions applies the functions of a branch. When two
+// series end with the same labels, the engine merges them or fails, so that
+// case stays on the general path.
+func applyCompactSeriesFunctions(matrix promql.Matrix, functions []compactSeriesFunction) (promql.Matrix, error) {
+	for _, function := range functions {
+		matrix = function(matrix)
 		seen := make(map[string]bool, len(matrix))
-		for index := range matrix {
-			matrix[index].Metric = replace.apply(matrix[index].Metric)
-			key := matrix[index].Metric.String()
+		for _, series := range matrix {
+			key := series.Metric.String()
 			if seen[key] {
 				return nil, errCompactHistogramFallback
 			}
@@ -583,7 +689,7 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 		}
 		matrix, err := evaluator.evaluate(ctx, branch.plan)
 		if err == nil {
-			matrix, err = replaceCompactHistogramLabels(matrix, branch.replaces)
+			matrix, err = applyCompactSeriesFunctions(matrix, branch.functions)
 		}
 		if errors.Is(err, errCompactHistogramFallback) {
 			return nil, false, nil
