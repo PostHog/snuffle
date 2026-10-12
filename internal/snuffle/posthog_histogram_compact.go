@@ -1,16 +1,19 @@
 package snuffle
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
@@ -169,6 +172,7 @@ type compactHistogramEvaluator struct {
 	sourceID              uint64
 	haveSource            bool
 	grid, samples, series int
+	output                int
 }
 
 func newCompactHistogramEvaluator(plan *compactHistogramPlan, cfg Config) *compactHistogramEvaluator {
@@ -311,7 +315,18 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 	if err := evaluator.advance(ctx, 0, true); err != nil {
 		return nil, err
 	}
-	plan := evaluator.plan
+	matrix, err := evaluator.evaluate(ctx, evaluator.plan)
+	if err != nil {
+		return nil, err
+	}
+	return dropCompactHistogramNaNs(matrix), nil
+}
+
+// evaluate applies the quantile call of plan to the summed buckets. Plans that
+// share the bucket expression share the evaluator, so one read of the buckets
+// serves several quantiles. The result keeps NaN points: in a union they still
+// hide a later operand's series with the same labels, as in the engine.
+func (evaluator *compactHistogramEvaluator) evaluate(ctx context.Context, plan *compactHistogramPlan) (promql.Matrix, error) {
 	vectors := make([]promql.Vector, len(plan.call.Args))
 	for index, arg := range plan.call.Args {
 		if number, ok := unparenExpr(arg).(*parser.NumberLiteral); ok {
@@ -330,7 +345,6 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 	byLabels := make(map[string]int)
 	result := promql.Matrix{}
 	helper := &promql.EvalNodeHelper{}
-	samples := 0
 	for grid := 0; grid < plan.steps; grid++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -346,9 +360,6 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 		helper.Ts, helper.Out = plan.start+int64(grid)*plan.step, helper.Out[:0]
 		values, _ := promql.FunctionCalls[plan.call.Func.Name](vectors, nil, plan.call.Args, helper)
 		for _, sample := range values {
-			if math.IsNaN(sample.F) {
-				continue
-			}
 			key := sample.Metric.String()
 			index, exists := byLabels[key]
 			if !exists {
@@ -356,15 +367,191 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 				byLabels[key] = index
 				result = append(result, promql.Series{Metric: sample.Metric})
 			}
-			if evaluator.cfg.MaxSamples > 0 && samples >= evaluator.cfg.MaxSamples {
-				return nil, errCompactHistogramFallback
+			if !math.IsNaN(sample.F) {
+				if evaluator.cfg.MaxSamples > 0 && evaluator.output >= evaluator.cfg.MaxSamples {
+					return nil, errCompactHistogramFallback
+				}
+				evaluator.output++
 			}
 			result[index].Floats = append(result[index].Floats, promql.FPoint{T: helper.Ts, F: sample.F})
-			samples++
+		}
+	}
+	return result, nil
+}
+
+func dropCompactHistogramNaNs(matrix promql.Matrix) promql.Matrix {
+	result := matrix[:0]
+	for _, series := range matrix {
+		series.Floats = slices.DeleteFunc(series.Floats, func(point promql.FPoint) bool { return math.IsNaN(point.F) })
+		if len(series.Floats) > 0 {
+			result = append(result, series)
 		}
 	}
 	sort.Sort(result)
-	return result, nil
+	return result
+}
+
+// compactLabelReplace is a label_replace call around a compact quantile.
+type compactLabelReplace struct {
+	destination, replacement, source string
+	regex                            *regexp.Regexp
+}
+
+func parseCompactLabelReplace(call *parser.Call) (compactLabelReplace, bool) {
+	if len(call.Args) != 5 {
+		return compactLabelReplace{}, false
+	}
+	var values [4]string
+	for index, arg := range call.Args[1:] {
+		literal, ok := unparenExpr(arg).(*parser.StringLiteral)
+		if !ok {
+			return compactLabelReplace{}, false
+		}
+		values[index] = literal.Val
+	}
+	// The engine reports invalid arguments, and a new metric name changes how
+	// the engine removes names. Both stay on the general path.
+	regex, err := regexp.Compile("^(?s:" + values[3] + ")$")
+	if err != nil || !model.UTF8Validation.IsValidLabelName(values[0]) || values[0] == labels.MetricName {
+		return compactLabelReplace{}, false
+	}
+	return compactLabelReplace{destination: values[0], replacement: values[1], source: values[2], regex: regex}, true
+}
+
+// apply matches the engine's label_replace: an empty result removes the label.
+func (replace compactLabelReplace) apply(metric labels.Labels) labels.Labels {
+	value := metric.Get(replace.source)
+	indexes := replace.regex.FindStringSubmatchIndex(value)
+	if indexes == nil {
+		return metric
+	}
+	builder := labels.NewBuilder(metric)
+	builder.Set(replace.destination, string(replace.regex.ExpandString(nil, replace.replacement, value, indexes)))
+	return builder.Labels()
+}
+
+// compactHistogramBranch is one operand of a union of quantiles: the quantile
+// plan and the label_replace calls around it, innermost first.
+type compactHistogramBranch struct {
+	plan     *compactHistogramPlan
+	replaces []compactLabelReplace
+}
+
+// planCompactHistogramUnion accepts a quantile call, label_replace calls around
+// it, and unions of those joined with a plain `or`. A dashboard that charts
+// several quantiles, each with its own series label, sends this form.
+func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, lookback time.Duration) []compactHistogramBranch {
+	var branches []compactHistogramBranch
+	var collect func(parser.Expr) bool
+	collect = func(expr parser.Expr) bool {
+		expr = unparenExpr(expr)
+		if binary, ok := expr.(*parser.BinaryExpr); ok {
+			if binary.Op != parser.LOR || binary.VectorMatching == nil || binary.VectorMatching.On || len(binary.VectorMatching.MatchingLabels) != 0 {
+				return false
+			}
+			return collect(binary.LHS) && collect(binary.RHS)
+		}
+		var replaces []compactLabelReplace
+		for {
+			call, ok := expr.(*parser.Call)
+			if !ok || call.Func.Name != "label_replace" {
+				break
+			}
+			replace, ok := parseCompactLabelReplace(call)
+			if !ok {
+				return false
+			}
+			replaces = append(replaces, replace)
+			expr = unparenExpr(call.Args[0])
+		}
+		slices.Reverse(replaces)
+		plan := planCompactHistogram(expr, start, end, step, lookback)
+		if plan == nil || len(branches) >= maxAggregateUnionSelectors {
+			return false
+		}
+		branches = append(branches, compactHistogramBranch{plan: plan, replaces: replaces})
+		return true
+	}
+	if !collect(expr) {
+		return nil
+	}
+	return branches
+}
+
+// replaceCompactHistogramLabels applies the label_replace calls of a branch.
+// When two series end with the same labels, the engine merges them or fails,
+// so that case stays on the general path.
+func replaceCompactHistogramLabels(matrix promql.Matrix, replaces []compactLabelReplace) (promql.Matrix, error) {
+	for _, replace := range replaces {
+		seen := make(map[string]bool, len(matrix))
+		for index := range matrix {
+			matrix[index].Metric = replace.apply(matrix[index].Metric)
+			key := matrix[index].Metric.String()
+			if seen[key] {
+				return nil, errCompactHistogramFallback
+			}
+			seen[key] = true
+		}
+	}
+	return matrix, nil
+}
+
+// compactHistogramUnion combines branch results with the semantics of `or`: at
+// each step, a series is kept unless an earlier branch had a series with the
+// same labels, ignoring the metric name, at that step.
+type compactHistogramUnion struct {
+	result   promql.Matrix
+	byLabels map[string]int
+	present  map[int64]map[string]bool
+}
+
+func (union *compactHistogramUnion) add(matrix promql.Matrix) {
+	if union.byLabels == nil {
+		union.byLabels, union.present = make(map[string]int), make(map[int64]map[string]bool)
+	}
+	type mark struct {
+		timestamp int64
+		signature string
+	}
+	var marks []mark
+	for _, series := range matrix {
+		signature := series.Metric.DropMetricName().String()
+		key := series.Metric.String()
+		for _, point := range series.Floats {
+			if union.present[point.T][signature] {
+				continue
+			}
+			marks = append(marks, mark{point.T, signature})
+			if math.IsNaN(point.F) {
+				continue
+			}
+			index, exists := union.byLabels[key]
+			if !exists {
+				index = len(union.result)
+				union.byLabels[key] = index
+				union.result = append(union.result, promql.Series{Metric: series.Metric})
+			}
+			union.result[index].Floats = append(union.result[index].Floats, point)
+		}
+	}
+	for _, mark := range marks {
+		if union.present[mark.timestamp] == nil {
+			union.present[mark.timestamp] = make(map[string]bool)
+		}
+		union.present[mark.timestamp][mark.signature] = true
+	}
+}
+
+func (union *compactHistogramUnion) matrix() promql.Matrix {
+	for _, series := range union.result {
+		slices.SortFunc(series.Floats, func(left, right promql.FPoint) int { return cmp.Compare(left.T, right.T) })
+	}
+	result := union.result
+	if result == nil {
+		result = promql.Matrix{}
+	}
+	sort.Sort(result)
+	return result
 }
 
 func (server *Server) tryCompactHistogramRange(ctx context.Context, query string, start, end time.Time, step time.Duration) (promql.Matrix, bool, error) {
@@ -375,10 +562,43 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 	if err != nil {
 		return nil, false, nil
 	}
-	plan := planCompactHistogram(expr, start, end, step, server.cfg.LookbackDelta)
-	if plan == nil {
+	branches := planCompactHistogramUnion(expr, start, end, step, server.cfg.LookbackDelta)
+	if branches == nil {
 		return nil, false, nil
 	}
+	// Branches over the same buckets differ only in their quantiles, so each
+	// distinct bucket expression is read once.
+	evaluators := make(map[string]*compactHistogramEvaluator)
+	var union compactHistogramUnion
+	for _, branch := range branches {
+		key := branch.plan.call.Args[branch.plan.bucketArg].String()
+		evaluator, exists := evaluators[key]
+		if !exists {
+			var handled bool
+			evaluator, handled, err = server.readCompactHistogram(ctx, branch.plan)
+			if !handled || err != nil {
+				return nil, handled, err
+			}
+			evaluators[key] = evaluator
+		}
+		matrix, err := evaluator.evaluate(ctx, branch.plan)
+		if err == nil {
+			matrix, err = replaceCompactHistogramLabels(matrix, branch.replaces)
+		}
+		if errors.Is(err, errCompactHistogramFallback) {
+			return nil, false, nil
+		}
+		if err != nil {
+			return nil, true, err
+		}
+		union.add(matrix)
+	}
+	return union.matrix(), true, nil
+}
+
+// readCompactHistogram reads the buckets of plan and sums them on the step
+// grid. It reports false when the data needs the general evaluation path.
+func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHistogramPlan) (*compactHistogramEvaluator, bool, error) {
 	querier := &CHQuerier{queryable: server.queryable}
 	mint := plan.start - plan.window - plan.lookback + 1
 	real, sources, ids, err := querier.selectPostHogExactHistogramMetadata(ctx, mint, plan.end, plan.alias, plan.selector.LabelMatchers)
@@ -414,12 +634,14 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 		}
 		return evaluator.add(ctx, sample)
 	})
-	var result promql.Matrix
 	if err == nil {
-		result, err = evaluator.result(ctx)
+		err = evaluator.advance(ctx, 0, true)
 	}
 	if errors.Is(err, errCompactHistogramFallback) {
 		return nil, false, nil
 	}
-	return result, true, err
+	if err != nil {
+		return nil, true, err
+	}
+	return evaluator, true, nil
 }

@@ -481,7 +481,9 @@ names when the team stores no histogram with the base name inside the query
 window, so classic histograms that are never folded keep their pushdown.
 Selectors without an exact name use the general engine because any virtual name
 can match. The compact histogram path also uses the general engine when the
-window contains stored series for the generated name.
+window contains stored series for the generated name. The compact path also
+accepts `label_replace` around a quantile, and quantiles joined with `or`
+without `on` or `ignoring`. Quantiles of the same buckets read the buckets once.
 `CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
 
 The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native
