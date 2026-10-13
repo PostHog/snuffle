@@ -204,6 +204,8 @@ func TestPrepareMetricsQLQueryQuotesDottedNames(t *testing.T) {
 		`{"a.b"}`,
 		`a.b{x="1"}`,
 		`sum(a.b / on("http.route") c.d)`,
+		`a.b{c.d="1"}`,
+		`x / on("c.d") group_left("e.f") y`,
 	}
 	p := parser.NewParser(parser.Options{})
 	for _, query := range queries {
