@@ -195,3 +195,26 @@ func TestCarryUnsupportedFunctions(t *testing.T) {
 		}
 	}
 }
+
+func TestPrepareMetricsQLQueryQuotesDottedNames(t *testing.T) {
+	queries := []string{
+		`histogram_quantile(0.95, sum by (le, "http.route") (rate({"http.server.request.duration_bucket"}[5m])))`,
+		`sum without ("http.route") (rate({"http.server.request.duration_bucket"}[5m]))`,
+		`sum(rate({"http.server.request.duration_bucket", "http.route"="/a.b"}[5m])) by (le)`,
+		`{"a.b"}`,
+		`a.b{x="1"}`,
+		`sum(a.b / on("http.route") c.d)`,
+		`a.b{c.d="1"}`,
+		`x / on("c.d") group_left("e.f") y`,
+	}
+	p := parser.NewParser(parser.Options{})
+	for _, query := range queries {
+		prepared, err := prepareMetricsQLQuery(query, time.Minute, 0, time.Unix(0, 0), time.Unix(600, 0))
+		if err != nil {
+			t.Fatalf("prepare %q: %v", query, err)
+		}
+		if _, err := p.ParseExpr(prepared.query); err != nil {
+			t.Errorf("Prometheus rejected %q (from %q): %v", prepared.query, query, err)
+		}
+	}
+}

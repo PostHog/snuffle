@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,7 +116,7 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 	if err := rewriter.rewrite(&expr, step, start.Equal(end)); err != nil {
 		return metricsQLQuery{}, err
 	}
-	prepared.query = string(expr.AppendString(nil))
+	prepared.query = quoteDottedIdents(string(expr.AppendString(nil)))
 	return prepared, nil
 }
 
@@ -197,6 +198,65 @@ func skipSpaces(query string, i int) int {
 	}
 	return i
 }
+
+// quoteDottedIdents rewrites the dotted names that the MetricsQL printer emits
+// bare (http.server.duration) into the quoted form that Prometheus requires.
+// A dotted metric name becomes a quoted selector entry, and a dotted label name
+// in a matcher or a grouping list becomes a quoted string. The input is always
+// printer output, so braces and grouping lists never nest.
+func quoteDottedIdents(query string) string {
+	var out strings.Builder
+	inBraces, inList := false, false
+	for i := 0; i < len(query); {
+		c := query[i]
+		switch {
+		case c == '"' || c == '\'' || c == '`':
+			end := skipQuotedString(query, i)
+			out.WriteString(query[i:end])
+			i = end
+		case isIdentStart(c):
+			end := i
+			for end < len(query) && (isIdentPart(query[end]) || query[end] == '.') {
+				end++
+			}
+			ident := query[i:end]
+			i = end
+			next := byte(0)
+			if i < len(query) {
+				next = query[i]
+			}
+			switch {
+			case !strings.Contains(ident, "."):
+				out.WriteString(ident)
+				if next == '(' && groupingModifiers[ident] {
+					inList = true
+				}
+			case inBraces || inList:
+				out.WriteString(strconv.Quote(ident))
+			case next == '{':
+				out.WriteString("{" + strconv.Quote(ident) + ",")
+				i++
+				inBraces = true
+			default:
+				out.WriteString("{" + strconv.Quote(ident) + "}")
+			}
+		default:
+			switch c {
+			case '{':
+				inBraces = true
+			case '}':
+				inBraces = false
+			case ')':
+				inList = false
+			}
+			out.WriteByte(c)
+			i++
+		}
+	}
+	return out.String()
+}
+
+var groupingModifiers = map[string]bool{"by": true, "without": true, "on": true, "ignoring": true, "group_left": true, "group_right": true}
 
 func isIdentStart(c byte) bool {
 	return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
