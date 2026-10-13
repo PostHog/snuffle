@@ -5,6 +5,7 @@ import (
 	"math"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -115,7 +116,7 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 	if err := rewriter.rewrite(&expr, step, start.Equal(end)); err != nil {
 		return metricsQLQuery{}, err
 	}
-	prepared.query = string(expr.AppendString(nil))
+	prepared.query = quoteDottedIdents(string(expr.AppendString(nil)))
 	return prepared, nil
 }
 
@@ -196,6 +197,90 @@ func skipSpaces(query string, i int) int {
 		i++
 	}
 	return i
+}
+
+// quoteDottedIdents rewrites the dotted names that the MetricsQL printer emits
+// bare (http.server.duration) into the quoted form that Prometheus requires.
+// A dotted metric name becomes a quoted selector entry, and a dotted label name
+// in a matcher or a grouping list becomes a quoted string.
+func quoteDottedIdents(query string) string {
+	var out strings.Builder
+	// parens records which open parentheses belong to a grouping modifier.
+	var parens []bool
+	braces := 0
+	lastIdent := ""
+	for i := 0; i < len(query); {
+		c := query[i]
+		switch {
+		case c == '"' || c == '\'' || c == '`':
+			end := skipQuotedString(query, i)
+			out.WriteString(query[i:end])
+			i = end
+			lastIdent = ""
+		case isIdentStart(c):
+			end := i
+			for end < len(query) && (isIdentPart(query[end]) || query[end] == '.') {
+				end++
+			}
+			ident := query[i:end]
+			i = end
+			if !strings.Contains(ident, ".") {
+				out.WriteString(ident)
+				lastIdent = strings.ToLower(ident)
+				continue
+			}
+			lastIdent = ""
+			quoted := strconv.Quote(ident)
+			inList := len(parens) > 0 && parens[len(parens)-1]
+			switch {
+			case braces > 0 || inList:
+				out.WriteString(quoted)
+			case i < len(query) && query[i] == '{':
+				out.WriteString("{" + quoted)
+				i++
+				if i < len(query) && query[i] != '}' {
+					out.WriteString(",")
+				}
+				braces++
+			default:
+				out.WriteString("{" + quoted + "}")
+			}
+		case c >= '0' && c <= '9':
+			end := i
+			for end < len(query) && (isIdentPart(query[end]) || query[end] == '.') {
+				end++
+			}
+			out.WriteString(query[i:end])
+			i = end
+			lastIdent = ""
+		default:
+			switch c {
+			case '(':
+				switch lastIdent {
+				case "by", "without", "on", "ignoring", "group_left", "group_right":
+					parens = append(parens, true)
+				default:
+					parens = append(parens, false)
+				}
+			case ')':
+				if len(parens) > 0 {
+					parens = parens[:len(parens)-1]
+				}
+			case '{':
+				braces++
+			case '}':
+				if braces > 0 {
+					braces--
+				}
+			}
+			out.WriteByte(c)
+			i++
+			if c != ' ' {
+				lastIdent = ""
+			}
+		}
+	}
+	return out.String()
 }
 
 func isIdentStart(c byte) bool {
