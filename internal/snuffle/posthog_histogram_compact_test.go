@@ -70,25 +70,52 @@ func TestCompactHistogramPlans(test *testing.T) {
 
 func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, query string, start, end time.Time, step time.Duration) {
 	test.Helper()
-	plan, prepared := compactTestPlan(test, query, start, end, step)
-	if plan == nil {
+	prepared, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start, end)
+	if err != nil {
+		test.Fatal(err)
+	}
+	expr, err := parser.NewParser(parser.Options{}).ParseExpr(prepared.query)
+	if err != nil {
+		test.Fatal(err)
+	}
+	branches := planCompactHistogramUnion(expr, start, end, step, 5*time.Minute)
+	if branches == nil {
 		test.Fatal("missing compact plan")
 	}
 	cfg := histogramTestConfig()
 	cfg.MaxSamples, cfg.MaxSeries = 1000000, 10000
-	evaluator := newCompactHistogramEvaluator(plan, cfg)
-	builder := newPostHogHistogramSeriesBuilder(cfg, plan.selector.LabelMatchers, true)
-	for _, sample := range samples {
-		if err := evaluator.add(context.Background(), sample); err != nil {
+	evaluators := make(map[string]*compactHistogramEvaluator)
+	var union compactHistogramUnion
+	for _, branch := range branches {
+		key := branch.plan.call.Args[branch.plan.bucketArg].String()
+		evaluator, exists := evaluators[key]
+		if !exists {
+			evaluator = newCompactHistogramEvaluator(branch.plan, cfg)
+			for _, sample := range samples {
+				if err := evaluator.add(context.Background(), sample); err != nil {
+					test.Fatal(err)
+				}
+			}
+			if err := evaluator.advance(context.Background(), 0, true); err != nil {
+				test.Fatal(err)
+			}
+			evaluators[key] = evaluator
+		}
+		matrix, err := evaluator.evaluate(context.Background(), branch.plan)
+		if err == nil {
+			matrix, err = applyCompactSeriesFunctions(matrix, branch.functions)
+		}
+		if err != nil {
 			test.Fatal(err)
 		}
+		union.add(matrix)
+	}
+	actual := union.matrix()
+	builder := newPostHogHistogramSeriesBuilder(cfg, branches[0].plan.selector.LabelMatchers, true)
+	for _, sample := range samples {
 		if err := builder.add(sample, []string{"_bucket"}); err != nil {
 			test.Fatal(err)
 		}
-	}
-	actual, err := evaluator.result(context.Background())
-	if err != nil {
-		test.Fatal(err)
 	}
 	queryable := &storage.MockQueryable{MockQuerier: &storage.MockQuerier{SelectMockFunction: func(_ bool, _ *storage.SelectHints, _ ...*labels.Matcher) storage.SeriesSet {
 		var series []storage.Series
@@ -98,7 +125,7 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 		return &seriesSet{series: series, idx: -1}
 	}}}
 	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: cfg.MaxSamples, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true})
-	engineQuery, err := engine.NewRangeQuery(context.Background(), queryable, promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared, start, end, step)
+	engineQuery, err := engine.NewRangeQuery(context.Background(), queryable, promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, start, end, step)
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -196,6 +223,79 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 	for _, function := range metricsQLCounterFunctions {
 		compareCompactHistogram(test, frequent, `histogram_quantile(0.9,sum by(le)(`+function+`(duration_bucket)))`, start, start.Add(time.Minute), 10*time.Second)
 		compareCompactHistogram(test, frequent, `histogram_quantile(0.9,sum by(le)(`+function+`(duration_bucket[45s])))`, start, start.Add(time.Minute), 10*time.Second)
+	}
+	quantile := func(q, function string) string {
+		return `histogram_quantile(` + q + `, sum by (le) (` + function + `(duration_bucket)))`
+	}
+	labelled := func(q, function, clause string) string {
+		return `label_replace(` + quantile(q, function) + `, "clause", "` + clause + `", "", "")`
+	}
+	for _, query := range []string{
+		labelled("0.5", "rate", "a") + ` or ` + labelled("0.9", "rate", "b") + ` or ` + labelled("0.95", "rate", "c") + ` or ` + labelled("0.99", "rate", "d"),
+		// Different buckets read separately; the same labels keep the first branch.
+		labelled("0.5", "rate", "a") + ` or ` + labelled("0.9", "irate", "b") + ` or ` + labelled("0.99", "rate", "a"),
+		// Without distinct labels, `or` keeps only the first quantile.
+		quantile("0.5", "rate") + ` or ` + quantile("0.9", "rate"),
+		`label_replace(label_replace(` + quantile("0.5", "increase") + `, "q", "p$1", "clause", "(.*)"), "q", "", "q", "p")`,
+		`label_replace(` + quantile("0.5", "rate") + `, "q", "x", "missing", "y") or ` + labelled("0.9", "rate", "b"),
+		`label_join(` + quantile("0.5", "rate") + `, "q", "-", "clause", "missing")`,
+		`round(clamp(abs(ln(` + quantile("0.9", "rate") + `)), 0.5, 1.5), 0.1) or sgn(` + labelled("0.5", "rate", "b") + `)`,
+		`clamp(` + quantile("0.9", "rate") + `, 2, 1) or ` + labelled("0.5", "rate", "b"),
+		`clamp_min(sqrt(` + quantile("0.9", "rate") + `), 0.8) or clamp_max(exp(` + labelled("0.5", "rate", "b") + `), 1.2)`,
+		`floor(log2(` + quantile("0.9", "rate") + `)) or ceil(log10(` + labelled("0.5", "rate", "b") + `))`,
+	} {
+		compareCompactHistogram(test, frequent, query, start, start.Add(time.Minute), 10*time.Second)
+		compareCompactHistogram(test, nil, query, start, start.Add(time.Minute), 10*time.Second)
+	}
+}
+
+func TestCompactHistogramUnionKeepsNaNSignatures(test *testing.T) {
+	var union compactHistogramUnion
+	union.add(promql.Matrix{{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 1, F: math.NaN()}, {T: 2, F: 1}}}})
+	union.add(promql.Matrix{
+		{Metric: labels.FromStrings("__name__", "x", "job", "a"), Floats: []promql.FPoint{{T: 1, F: 5}, {T: 3, F: 6}}},
+		{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 0, F: 7}}},
+	})
+	want := promql.Matrix{
+		{Metric: labels.FromStrings("__name__", "x", "job", "a"), Floats: []promql.FPoint{{T: 3, F: 6}}},
+		{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 0, F: 7}, {T: 2, F: 1}}},
+	}
+	if got := union.matrix(); got.String() != want.String() {
+		test.Fatalf("union: %v != %v", got, want)
+	}
+}
+
+func TestCompactHistogramUnionPlans(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	plan := func(query string) []compactHistogramBranch {
+		prepared, err := prepareMetricsQLQuery(query, time.Minute, 5*time.Minute, start, start.Add(time.Hour))
+		if err != nil {
+			test.Fatal(err)
+		}
+		expr, err := parser.NewParser(parser.Options{}).ParseExpr(prepared.query)
+		if err != nil {
+			test.Fatal(err)
+		}
+		return planCompactHistogramUnion(expr, start, start.Add(time.Hour), time.Minute, 5*time.Minute)
+	}
+	quantile := `histogram_quantile(0.5, sum by(le)(rate(duration_bucket)))`
+	if branches := plan(`label_replace(` + quantile + `, "clause", "a", "", "") or (label_replace(` + quantile + `, "clause", "b", "", ""))`); len(branches) != 2 || len(branches[1].functions) != 1 {
+		test.Fatalf("wanted two labelled branches, got %v", branches)
+	}
+	for _, query := range []string{
+		quantile + ` or on(service_name) ` + quantile,
+		quantile + ` or ignoring(service_name) ` + quantile,
+		quantile + ` and ` + quantile,
+		quantile + ` or sum(rate(duration_count))`,
+		`label_replace(` + quantile + `, "__name__", "x", "", "")`,
+		`label_replace(` + quantile + `, "clause", "a", "", "(")`,
+		`label_join(` + quantile + `, "__name__", "-", "le")`,
+		`round(` + quantile + `, scalar(up))`,
+		`timestamp(` + quantile + `)`,
+	} {
+		if branches := plan(query); branches != nil {
+			test.Fatalf("unsafe plan for %s", query)
+		}
 	}
 }
 
