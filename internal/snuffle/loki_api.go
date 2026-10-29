@@ -327,6 +327,14 @@ func (s *Server) queryLogQLMetricRows(ctx context.Context, expr *logQLExpr, star
 	if len(selectors) == 0 {
 		return nil, nil
 	}
+	maxRows := s.cfg.LogQueryMaxRows
+	if maxRows <= 0 {
+		maxRows = 100000
+	}
+	// fetch one row past the cap so a truncated input is an error rather
+	// than a plausible but wrong metric
+	fetchCfg := s.cfg
+	fetchCfg.LogQueryMaxRows = maxRows + 1
 	allRows := make([]logRow, 0)
 	seen := map[string]struct{}{}
 	for _, selector := range selectors {
@@ -335,10 +343,13 @@ func (s *Server) queryLogQLMetricRows(ctx context.Context, expr *logQLExpr, star
 			continue
 		}
 		seen[key] = struct{}{}
-		sql := logQLSelectSQL(s.cfg, selector, startNS, endNS, s.cfg.LogQueryMaxRows, "forward")
+		sql := logQLSelectSQL(fetchCfg, selector, startNS, endNS, maxRows+1, "forward")
 		rows, err := scanLogRows(ctx, s.client, sql)
 		if err != nil {
 			return nil, err
+		}
+		if len(rows) > maxRows {
+			return nil, fmt.Errorf("query needs more than %d log lines evaluated outside ClickHouse (SNUFFLE_LOG_QUERY_MAX_ROWS); narrow the selector or time range, or aggregate with sum by (...) so it can run in ClickHouse", maxRows)
 		}
 		allRows = append(allRows, rows...)
 	}
