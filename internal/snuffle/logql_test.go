@@ -1356,3 +1356,16 @@ func TestEvaluateLogQLMatchesResourceAttributesAndHalfOpenWindows(t *testing.T) 
 		t.Fatalf("result = %#v, want 1 at 1m and 2 at 2m", got)
 	}
 }
+
+func TestLogQLWindowFanoutSQLCapsRepeatsAtPointCount(t *testing.T) {
+	// one evaluation point with a 5m window at a 1us step: window/step is
+	// 300M, but a row can only ever reach the single point
+	sql := logQLWindowFanoutSQL("(SELECT 1)", 5*time.Minute/time.Microsecond, 0, 0, time.Microsecond)
+	if !strings.Contains(sql, "range(toUInt64(1))") {
+		t.Fatalf("fanout not capped at the point count: %s", sql)
+	}
+	sql = logQLWindowFanoutSQL("(SELECT 1)", 5, 0, int64(time.Hour), time.Minute)
+	if !strings.Contains(sql, "range(toUInt64(5))") {
+		t.Fatalf("fanout = %s, want window/step when under the point count", sql)
+	}
+}

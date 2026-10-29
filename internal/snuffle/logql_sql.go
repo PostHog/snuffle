@@ -638,7 +638,7 @@ func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetri
 			step.Nanoseconds(),
 			plan.rangeAgg.window.Nanoseconds(),
 			strings.Join(selects, ", "),
-			logQLWindowFanoutSQL(fmt.Sprintf("(SELECT *, intDiv(ts_ns + step_ns - 1, step_ns) * step_ns AS bucket_ns FROM %s)", sourceSQL), plan.rangeAgg.window/step),
+			logQLWindowFanoutSQL(fmt.Sprintf("(SELECT *, intDiv(ts_ns + step_ns - 1, step_ns) * step_ns AS bucket_ns FROM %s)", sourceSQL), plan.rangeAgg.window/step, startNS, endNS, step),
 			strings.Join(groupBy, ", "),
 			strings.Join(orderBy, ", "),
 		)
@@ -707,18 +707,7 @@ func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQ
 		sourceSQL,
 		strings.Join(bucketGroupBy, ", "),
 	)
-	windowSteps := plan.rangeAgg.window / step
-	if windowSteps < 1 {
-		windowSteps = 1
-	}
-	fanoutSelects := append([]string{}, outerGroupBy...)
-	fanoutSelects = append(fanoutSelects, "value_count", "value_sum", "value_sum_squares", "value_min", "value_max")
-	fanoutSQL := fmt.Sprintf(
-		"(SELECT %s FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM %s ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
-		strings.Join(fanoutSelects, ", "),
-		bucketSQL,
-		int64(windowSteps),
-	)
+	fanoutSQL := logQLWindowFanoutSQL(bucketSQL, plan.rangeAgg.window/step, startNS, endNS, step)
 	sql := fmt.Sprintf(
 		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s GROUP BY %s ORDER BY %s",
 		startNS,
@@ -1027,20 +1016,11 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 		windowSteps = 1
 	}
 	if plan.rangeAgg.fn == "count_over_time" && len(plan.groupLabels) > 0 && !plan.hasTopK {
-		fanoutSelects := []string{"eval_ns"}
 		outerGroupBy := []string{"eval_ns"}
 		for i := range plan.groupLabels {
-			alias := fmt.Sprintf("label_%d", i)
-			fanoutSelects = append(fanoutSelects, alias)
-			outerGroupBy = append(outerGroupBy, alias)
+			outerGroupBy = append(outerGroupBy, fmt.Sprintf("label_%d", i))
 		}
-		fanoutSelects = append(fanoutSelects, "log_count", "byte_count")
-		fanoutSQL := fmt.Sprintf(
-			"(SELECT %s FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM (%s) ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
-			strings.Join(fanoutSelects, ", "),
-			bucketSQL,
-			int64(windowSteps),
-		)
+		fanoutSQL := logQLWindowFanoutSQL("("+bucketSQL+")", windowSteps, startNS, endNS, step)
 		sql := fmt.Sprintf(
 			"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s, toFloat64(sum(log_count)) AS value FROM %s GROUP BY %s ORDER BY %s",
 			startNS,
@@ -1192,7 +1172,7 @@ func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetri
 		step.Nanoseconds(),
 		plan.rangeAgg.window.Nanoseconds(),
 		strings.Join(outerSelects, ", "),
-		logQLWindowFanoutSQL(bucketSQL, plan.rangeAgg.window/step),
+		logQLWindowFanoutSQL(bucketSQL, plan.rangeAgg.window/step, startNS, endNS, step),
 		strings.Join(outerGroupBy, ", "),
 		strings.Join(orderBy, ", "),
 	)
@@ -1204,15 +1184,21 @@ func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetri
 // step-aligned bucket_ns, once per evaluation point in [start_ns, end_ns]
 // whose window (eval_ns - window_ns, eval_ns] contains the bucket. It needs
 // start_ns, end_ns, step_ns and window_ns in scope and window_ns to be a
-// multiple of step_ns.
-func logQLWindowFanoutSQL(source string, windowSteps time.Duration) string {
-	if windowSteps < 1 {
-		windowSteps = 1
+// multiple of step_ns. A row can reach at most every evaluation point, so the
+// repeat count is capped at the point count: window/step alone is unbounded
+// (a 5m window at a 1us step would repeat each row 300M times).
+func logQLWindowFanoutSQL(source string, windowSteps time.Duration, startNS, endNS int64, step time.Duration) string {
+	repeats := int64(windowSteps)
+	if points := int64(logQLRangePoints(startNS, endNS, step.Nanoseconds())); repeats > points {
+		repeats = points
+	}
+	if repeats < 1 {
+		repeats = 1
 	}
 	return fmt.Sprintf(
 		"(SELECT * FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM %s ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
 		source,
-		int64(windowSteps),
+		repeats,
 	)
 }
 
