@@ -1295,3 +1295,64 @@ func TestParseLogQLRejectsLoneBangInLabelFilter(t *testing.T) {
 		t.Fatal("parseLogQL accepted a lone '!' in a label filter")
 	}
 }
+
+func TestLogQLPostHogMetricSQLPlanPushesPipelines(t *testing.T) {
+	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
+	s := `{k8s.namespace.name="ns"} |= "committed"`
+	for _, tt := range []struct {
+		query  string
+		wantOK bool
+		want   string
+	}{
+		{`sum by (governor_mpp) (count_over_time(` + s + ` [5m]))`, true, ""},
+		{`sum(count_over_time(` + s + ` | json [5m]))`, true, ""},
+		{`sum(count_over_time(` + s + ` | json | __error__="" [5m]))`, true, "isValidJSON(body)"},
+		{`sum(count_over_time(` + s + ` | governor_mode="enforce" [5m]))`, true, "attributes_map_str['governor_mode__str']"},
+		{`sum(rate(` + s + ` | partitions_touched >= 2 [5m]))`, true, "toFloat64OrNull("},
+		{`sum(count_over_time(` + s + ` | partitions_touched == 2 [5m]))`, true, ") = 2"},
+		{`quantile_over_time(0.5, ` + s + ` | json | partitions_touched >= 2 | unwrap rewrite_ms [5m]) by (service_name)`, true, "if(attributes_map_str['rewrite_ms__str'] != ''"},
+		{`sum(count_over_time(` + s + ` | line_format "{{.msg}}" [5m]))`, false, ""},
+		{`sum(count_over_time(` + s + ` | json | unwrap rewrite_ms [5m]))`, false, ""},
+	} {
+		t.Run(tt.query, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := buildLogQLMetricSQLPlan(cfg, expr)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			sql := plan.unwrapValueExpr + " " + strings.Join(plan.selectorFilters, " ") + " " + strings.Join(plan.groupExprs, " ")
+			for _, matcher := range plan.rangeAgg.selector.matchers {
+				sql += " " + logQLMetricMatcherCondition(cfg, matcher)
+			}
+			if !strings.Contains(sql, tt.want) {
+				t.Fatalf("SQL %s does not contain %q", sql, tt.want)
+			}
+			if strings.Contains(sql, "mapContains(") {
+				t.Fatalf("SQL decodes whole attribute maps: %s", sql)
+			}
+		})
+	}
+}
+
+func TestEvaluateLogQLMatchesResourceAttributesAndHalfOpenWindows(t *testing.T) {
+	expr, err := parseLogQL(`sum(count_over_time({k8s.namespace.name="ns"} | line_format "{{.msg}}" [1m]))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels, streamLabels, fields := labelsAndFieldsFromLogColumns("svc", "info", "", "", map[string]string{"k8s.namespace.name": "ns"}, map[string]string{"msg__str": "hi"})
+	row := logRow{line: "hi", labels: labels, streamLabels: streamLabels, fields: fields}
+	rows := []logRow{row, row, row}
+	rows[0].tsNS = int64(time.Minute) // on the boundary: belongs to the window ending at 1m only
+	rows[1].tsNS = int64(90 * time.Second)
+	rows[2].tsNS = int64(2 * time.Minute)
+	got := evaluateLogQLRangeMetric(expr, rows, int64(time.Minute), int64(2*time.Minute), time.Minute)
+	if len(got) != 1 || len(got[0].Values) != 2 || got[0].Values[0][1] != "1" || got[0].Values[1][1] != "2" {
+		t.Fatalf("result = %#v, want 1 at 1m and 2 at 2m", got)
+	}
+}

@@ -931,7 +931,10 @@ func parseLogQLLabelFilterStage(input string) ([]logQLLabelFilter, error) {
 }
 
 func (m logQLLabelMatcher) matches(labels map[string]string) bool {
-	value := logQLMatcherLabelValue(labels, m.name)
+	return m.matchesValue(logQLMatcherLabelValue(labels, m.name))
+}
+
+func (m logQLLabelMatcher) matchesValue(value string) bool {
 	switch m.op {
 	case "=":
 		return value == m.value
@@ -1000,6 +1003,10 @@ func (f logQLLabelFilter) matches(row *logRow) bool {
 	if value == "" {
 		value = row.fields[f.name]
 	}
+	if f.numeric && (f.op == "==" || f.op == "!=") {
+		left, ok := parseLogQLComparableValue(value, f.valueType)
+		return ok && (left == f.numValue) == (f.op == "==")
+	}
 	switch f.op {
 	case "=", "==":
 		return value == f.value
@@ -1043,8 +1050,16 @@ func (s logQLSelector) apply(row *logRow) bool {
 	if len(streamLabels) == 0 {
 		streamLabels = row.labels
 	}
-	if !s.matchesLabels(streamLabels) {
-		return false
+	// Selector matchers were already applied in SQL, where a label also
+	// resolves from resource attributes; those only live in fields here.
+	for _, matcher := range s.matchers {
+		value := logQLMatcherLabelValue(streamLabels, matcher.name)
+		if value == "" {
+			value = row.fields[matcher.name]
+		}
+		if !matcher.matchesValue(value) {
+			return false
+		}
 	}
 	for _, stage := range s.stages {
 		switch stage.kind {
@@ -1735,7 +1750,7 @@ func logQLStreamLabelValueExpr(cfg Config, name string) string {
 		return "if(service_name != '', service_name, resource_attributes['service.name'])"
 	case "level", "severity", "severity_text", "detected_level":
 		if name == "detected_level" {
-			return "if(mapContains(attributes_map_str, 'detected_level__str'), attributes_map_str['detected_level__str'], severity_text)"
+			return "if(attributes_map_str['detected_level__str'] != '', attributes_map_str['detected_level__str'], severity_text)"
 		}
 		return "severity_text"
 	case "trace_id":
@@ -1743,10 +1758,16 @@ func logQLStreamLabelValueExpr(cfg Config, name string) string {
 	case "span_id":
 		return "span_id"
 	default:
-		attrKey := sqlString(name + "__str")
-		resourceKey := sqlString(name)
-		return "if(mapContains(attributes_map_str, " + attrKey + "), attributes_map_str[" + attrKey + "], resource_attributes[" + resourceKey + "])"
+		// A single-key lookup reads one map bucket; mapContains decodes
+		// every key of the row's map, which is ~6x the bytes on PostHog's
+		// logs table. An empty attribute falls through to the resource.
+		attr := logQLPostHogAttributeExpr(name)
+		return "if(" + attr + " != '', " + attr + ", resource_attributes[" + sqlString(name) + "])"
 	}
+}
+
+func logQLPostHogAttributeExpr(name string) string {
+	return "attributes_map_str[" + sqlString(name+"__str") + "]"
 }
 
 func logQLLabelValueExpr(cfg Config, name string) string {
@@ -2131,12 +2152,12 @@ func evaluateLogQLRangeAggregation(agg *logQLRangeAggregation, rows []logRow, ts
 	grouped := map[string][]logRow{}
 	groupLabels := map[string]map[string]string{}
 	for _, row := range rows {
-		if row.tsNS < startNS || row.tsNS > tsNS {
+		if row.tsNS <= startNS || row.tsNS > tsNS {
 			continue
 		}
 		rowCopy := row
 		rowCopy.labels = cloneStringMap(row.labels)
-		rowCopy.fields = make(map[string]string)
+		rowCopy.fields = cloneStringMap(row.fields)
 		if !agg.selector.apply(&rowCopy) {
 			continue
 		}
@@ -2259,15 +2280,16 @@ func rangeAggregationValue(fn string, rows []logRow, window time.Duration, param
 		if len(values) == 0 {
 			return math.NaN()
 		}
+		// linear interpolation between closest ranks, as Prometheus and
+		// Loki, matching quantileExactInclusive in the SQL pushdown
 		sort.Float64s(values)
-		index := int(math.Ceil(param*float64(len(values)))) - 1
-		if index < 0 {
-			index = 0
+		rank := param * float64(len(values)-1)
+		lower := int(math.Floor(rank))
+		if lower >= len(values)-1 {
+			return values[len(values)-1]
 		}
-		if index >= len(values) {
-			index = len(values) - 1
-		}
-		return values[index]
+		weight := rank - float64(lower)
+		return values[lower]*(1-weight) + values[lower+1]*weight
 	}
 	return math.NaN()
 }

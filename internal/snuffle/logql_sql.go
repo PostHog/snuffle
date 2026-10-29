@@ -108,24 +108,12 @@ func buildLogQLRangeAggSQLPlan(cfg Config, rangeAgg *logQLRangeAggregation, grou
 	valueExpr := ""
 	switch rangeAgg.fn {
 	case "count_over_time":
-		if !logQLMetricSelectorSQLSafe(rangeAgg.selector) {
-			return nil
-		}
 		valueExpr = "toFloat64(sum(log_count))"
 	case "rate":
-		if !logQLMetricSelectorSQLSafe(rangeAgg.selector) {
-			return nil
-		}
 		valueExpr = fmt.Sprintf("toFloat64(sum(log_count)) / %s", formatDurationSeconds(rangeAgg.window))
 	case "bytes_over_time":
-		if !logQLMetricSelectorSQLSafe(rangeAgg.selector) {
-			return nil
-		}
 		valueExpr = "toFloat64(sum(byte_count))"
 	case "bytes_rate":
-		if !logQLMetricSelectorSQLSafe(rangeAgg.selector) {
-			return nil
-		}
 		valueExpr = fmt.Sprintf("toFloat64(sum(byte_count)) / %s", formatDurationSeconds(rangeAgg.window))
 	default:
 		unwrapValueExpr, selectorFilters, ok := buildLogQLUnwrapMetricSQL(cfg, rangeAgg)
@@ -143,26 +131,20 @@ func buildLogQLRangeAggSQLPlan(cfg Config, rangeAgg *logQLRangeAggregation, grou
 			selectorFilters: selectorFilters,
 		}
 	}
+	selectorFilters, unwrapValueExpr, ok := logQLSQLPipeline(cfg, rangeAgg.selector.stages)
+	if !ok || unwrapValueExpr != "" {
+		return nil
+	}
 	groupLabels, groupExprs := logQLSQLGroupingExprs(cfg, grouping)
 	return &logQLMetricSQLPlan{
-		rangeAgg:    rangeAgg,
-		grouping:    grouping,
-		outerAgg:    outerAgg,
-		valueExpr:   valueExpr,
-		groupLabels: groupLabels,
-		groupExprs:  groupExprs,
+		rangeAgg:        rangeAgg,
+		grouping:        grouping,
+		outerAgg:        outerAgg,
+		valueExpr:       valueExpr,
+		groupLabels:     groupLabels,
+		groupExprs:      groupExprs,
+		selectorFilters: selectorFilters,
 	}
-}
-
-func logQLMetricSelectorSQLSafe(selector logQLSelector) bool {
-	for _, stage := range selector.stages {
-		switch stage.kind {
-		case "line_filter":
-		default:
-			return false
-		}
-	}
-	return true
 }
 
 func logQLSQLGroupingExprs(cfg Config, grouping *logQLGrouping) ([]string, []string) {
@@ -208,29 +190,6 @@ func logQLMetricGroupLabelValueExpr(cfg Config, label string) string {
 	}
 }
 
-func logQLMetricBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64) []string {
-	filters := []string{
-		teamFilter(cfg),
-		"timestamp >= " + chTimeNanos(startNS),
-		"timestamp <= " + chTimeNanos(endNS),
-		"time_bucket >= toStartOfDay(" + chTimeNanos(startNS) + ")",
-		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
-	}
-	for _, matcher := range selector.matchers {
-		filters = append(filters, logQLMetricMatcherCondition(cfg, matcher))
-	}
-	canPushLine := true
-	for _, stage := range selector.stages {
-		if stage.kind == "line_format" {
-			canPushLine = false
-		}
-		if canPushLine && stage.kind == "line_filter" {
-			filters = append(filters, logQLLineFilterCondition(*stage.lineFilter))
-		}
-	}
-	return filters
-}
-
 func logQLMetricMatcherCondition(cfg Config, m logQLLabelMatcher) string {
 	return logQLStringCondition(logQLMetricLabelFilterValueExpr(cfg, m.name), m.op, m.value, true)
 }
@@ -267,52 +226,63 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 		return "", nil, false
 	}
 	switch rangeAgg.fn {
-	case "sum_over_time", "avg_over_time", "min_over_time", "max_over_time", "stdvar_over_time", "stddev_over_time", "first_over_time", "last_over_time":
+	case "sum_over_time", "avg_over_time", "min_over_time", "max_over_time", "stdvar_over_time", "stddev_over_time", "first_over_time", "last_over_time", "quantile_over_time":
 	default:
 		return "", nil, false
 	}
+	filters, unwrapValueExpr, ok := logQLSQLPipeline(cfg, rangeAgg.selector.stages)
+	if !ok || unwrapValueExpr == "" {
+		return "", nil, false
+	}
+	return unwrapValueExpr, filters, true
+}
+
+// logQLSQLPipeline translates a selector pipeline into SQL row filters and,
+// when it ends in unwrap, the unwrapped value expression. ok is false when
+// any stage has no SQL form.
+func logQLSQLPipeline(cfg Config, stages []logQLStage) ([]string, string, bool) {
 	var parser logQLSQLParser
-	filters := make([]string, 0, len(rangeAgg.selector.stages))
+	filters := make([]string, 0, len(stages))
 	unwrapValueExpr := ""
-	for _, stage := range rangeAgg.selector.stages {
+	for _, stage := range stages {
 		switch stage.kind {
 		case "line_filter":
 			filters = append(filters, logQLLineFilterCondition(*stage.lineFilter))
 		case "parser":
 			if parser.kind != "" {
-				return "", nil, false
+				return nil, "", false
 			}
 			switch stage.parser {
 			case "json":
 				parser = logQLSQLParser{kind: "json", jsonPaths: parseParserParams(stage.parserParam)}
 			case "logfmt":
 				if strings.TrimSpace(stage.parserParam) != "" {
-					return "", nil, false
+					return nil, "", false
 				}
 				parser = logQLSQLParser{kind: "logfmt"}
 			case "regexp":
 				groups, ok := logQLSQLNamedCaptureGroups(stage.parserParam)
 				if !ok {
-					return "", nil, false
+					return nil, "", false
 				}
 				parser = logQLSQLParser{kind: "regexp", regex: stage.parserParam, groups: groups}
 			case "pattern":
 				re, err := compileLogQLPattern(stage.parserParam)
 				if err != nil {
-					return "", nil, false
+					return nil, "", false
 				}
 				groups, ok := logQLSQLNamedCaptureGroups(re.String())
 				if !ok {
-					return "", nil, false
+					return nil, "", false
 				}
 				parser = logQLSQLParser{kind: "pattern", regex: re.String(), groups: groups}
 			default:
-				return "", nil, false
+				return nil, "", false
 			}
 		case "label_filter":
 			condition, ok := logQLSQLLabelFiltersCondition(cfg, stage.labelFilters, parser)
 			if !ok {
-				return "", nil, false
+				return nil, "", false
 			}
 			if condition != "" {
 				filters = append(filters, condition)
@@ -320,20 +290,17 @@ func buildLogQLUnwrapMetricSQL(cfg Config, rangeAgg *logQLRangeAggregation) (str
 		case "unwrap":
 			valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, stage.unwrapLabel, parser, false)
 			if !ok {
-				return "", nil, false
+				return nil, "", false
 			}
 			unwrapValueExpr = logQLSQLUnwrapValueExpr(valueExpr, stage.unwrapFunc)
 			if unwrapValueExpr == "" {
-				return "", nil, false
+				return nil, "", false
 			}
 		default:
-			return "", nil, false
+			return nil, "", false
 		}
 	}
-	if unwrapValueExpr == "" {
-		return "", nil, false
-	}
-	return unwrapValueExpr, filters, true
+	return filters, unwrapValueExpr, true
 }
 
 func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parser logQLSQLParser) (string, bool) {
@@ -361,11 +328,18 @@ func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parse
 
 func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parser logQLSQLParser) (string, bool) {
 	if filter.name == "__error__" {
+		// Only the json parser can fail in SQL (the body is not valid
+		// JSON). Other stages never set __error__ here; rows whose unwrap
+		// value doesn't parse are dropped instead of labelled.
+		errorExpr := "''"
+		if parser.kind == "json" {
+			errorExpr = "if(isValidJSON(body), '', 'JSONParserErr')"
+		}
 		switch filter.op {
 		case "=", "==":
-			return sqlString(filter.value) + " = ''", true
-		case "!=":
-			return sqlString(filter.value) + " != ''", true
+			return logQLStringCondition(errorExpr, "=", filter.value, true), true
+		case "!=", "=~", "!~":
+			return logQLStringCondition(errorExpr, filter.op, filter.value, true), true
 		default:
 			return "", false
 		}
@@ -375,19 +349,25 @@ func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parser lo
 		return "", false
 	}
 	switch filter.op {
-	case "=", "==":
-		return logQLStringCondition(valueExpr, "=", filter.value, true), true
-	case "!=", "=~", "!~":
-		return logQLStringCondition(valueExpr, filter.op, filter.value, true), true
-	case ">", ">=", "<", "<=":
+	case "==", "!=", ">", ">=", "<", "<=":
 		if !filter.numeric {
-			return "", false
+			break
 		}
 		left := logQLSQLComparableValueExpr(valueExpr, filter.valueType)
 		if left == "" {
 			return "", false
 		}
-		return left + " " + filter.op + " " + strconv.FormatFloat(filter.numValue, 'g', -1, 64), true
+		op := filter.op
+		if op == "==" {
+			op = "="
+		}
+		return left + " " + op + " " + strconv.FormatFloat(filter.numValue, 'g', -1, 64), true
+	}
+	switch filter.op {
+	case "=", "==":
+		return logQLStringCondition(valueExpr, "=", filter.value, true), true
+	case "!=", "=~", "!~":
+		return logQLStringCondition(valueExpr, filter.op, filter.value, true), true
 	default:
 		return "", false
 	}
@@ -404,24 +384,27 @@ type logQLSQLParser struct {
 
 func logQLSQLPipelineLabelValueExpr(cfg Config, label string, parser logQLSQLParser, withFallback bool) (string, bool) {
 	switch parser.kind {
-	case "logfmt":
-		parsed := "extractKeyValuePairs(body, '=', ' ')[" + sqlString(label) + "]"
-		if !withFallback {
-			return parsed, true
+	case "logfmt", "json":
+		var parsed string
+		if parser.kind == "logfmt" {
+			parsed = "extractKeyValuePairs(body, '=', ' ')[" + sqlString(label) + "]"
+		} else {
+			path := parser.jsonPaths[label]
+			if path == "" {
+				path = label
+			}
+			parsed = "JSON_VALUE(body, " + sqlString(logQLJSONSQLPath(path)) + ")"
 		}
-		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
-		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
-	case "json":
-		path := parser.jsonPaths[label]
-		if path == "" {
-			path = label
+		if withFallback {
+			parsed = "ifNull(nullIf(" + parsed + ", ''), " + logQLMetricLabelFilterValueExpr(cfg, label) + ")"
 		}
-		parsed := "JSON_VALUE(body, " + sqlString(logQLJSONSQLPath(path)) + ")"
-		if !withFallback {
-			return parsed, true
+		if cfg.postHogLogSchemaLayout() && parser.jsonPaths[label] == "" {
+			// PostHog ingestion already parsed the body into attributes, so
+			// read the attribute and only parse the body when it is missing.
+			attr := logQLPostHogAttributeExpr(label)
+			parsed = "if(" + attr + " != '', " + attr + ", " + parsed + ")"
 		}
-		fallback := logQLMetricLabelFilterValueExpr(cfg, label)
-		return "ifNull(nullIf(" + parsed + ", ''), " + fallback + ")", true
+		return parsed, true
 	case "regexp", "pattern":
 		index, ok := parser.groups[label]
 		if !ok {
@@ -542,7 +525,7 @@ func (s *Server) queryLogQLMetricSQL(ctx context.Context, plan *logQLMetricSQLPl
 	}
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds() - plan.rangeAgg.offset.Nanoseconds()
 	fetchEndNS := endNS - plan.rangeAgg.offset.Nanoseconds()
-	where := logQLMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
+	where := logQLMetricBaseFilters(s.cfg, plan, fetchStartNS, fetchEndNS)
 
 	selects := []string{"eval_ns"}
 	groupBy := []string{"eval_ns"}
@@ -630,7 +613,7 @@ func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetri
 	}
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds() - plan.rangeAgg.offset.Nanoseconds()
 	fetchEndNS := endNS - plan.rangeAgg.offset.Nanoseconds()
-	where := logQLUnwrapMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS, plan.selectorFilters)
+	where := logQLMetricBaseFilters(s.cfg, plan, fetchStartNS, fetchEndNS)
 	sourceSQL := logQLUnwrapMetricSourceSQL(s.cfg, plan, where)
 
 	selects := []string{"eval_ns"}
@@ -643,7 +626,24 @@ func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetri
 		orderBy = append(orderBy, alias)
 	}
 	orderBy = append(orderBy, "eval_ns")
-	selects = append(selects, logQLUnwrapWindowAggregateExpr(plan.rangeAgg.fn)+" AS value")
+	selects = append(selects, logQLUnwrapWindowAggregateExpr(plan.rangeAgg)+" AS value")
+
+	if plan.rangeAgg.window%step == 0 && plan.rangeAgg.offset == 0 {
+		// Fan each row out to the window/step evaluation points that see it,
+		// instead of joining every row against every point.
+		sql := fmt.Sprintf(
+			"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s GROUP BY %s ORDER BY %s",
+			startNS,
+			endNS,
+			step.Nanoseconds(),
+			plan.rangeAgg.window.Nanoseconds(),
+			strings.Join(selects, ", "),
+			logQLWindowFanoutSQL(fmt.Sprintf("(SELECT *, intDiv(ts_ns + step_ns - 1, step_ns) * step_ns AS bucket_ns FROM %s)", sourceSQL), plan.rangeAgg.window/step),
+			strings.Join(groupBy, ", "),
+			strings.Join(orderBy, ", "),
+		)
+		return s.scanLogQLMetricSQLResults(ctx, logQLMetricResultSQL(sql, plan), plan.groupLabels)
+	}
 
 	sql := fmt.Sprintf(
 		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s AS logs CROSS JOIN (SELECT start_ns + (toInt64(number) * step_ns) AS eval_ns FROM numbers(%d)) AS grid WHERE logs.ts_ns > eval_ns - window_ns AND logs.ts_ns <= eval_ns GROUP BY %s ORDER BY %s",
@@ -675,7 +675,7 @@ func logQLUnwrapMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration
 func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
 	fetchEndNS := endNS
-	where := logQLUnwrapMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS, plan.selectorFilters)
+	where := logQLMetricBaseFilters(s.cfg, plan, fetchStartNS, fetchEndNS)
 	sourceSQL := logQLUnwrapMetricSourceSQL(s.cfg, plan, where)
 
 	bucketSelects := []string{
@@ -734,7 +734,7 @@ func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQ
 	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
 }
 
-func logQLUnwrapMetricBaseFilters(cfg Config, selector logQLSelector, startNS, endNS int64, selectorFilters []string) []string {
+func logQLMetricBaseFilters(cfg Config, plan *logQLMetricSQLPlan, startNS, endNS int64) []string {
 	filters := []string{
 		teamFilter(cfg),
 		"timestamp >= " + chTimeNanos(startNS),
@@ -742,11 +742,10 @@ func logQLUnwrapMetricBaseFilters(cfg Config, selector logQLSelector, startNS, e
 		"time_bucket >= toStartOfDay(" + chTimeNanos(startNS) + ")",
 		"time_bucket <= toStartOfDay(" + chTimeNanos(endNS) + ")",
 	}
-	for _, matcher := range selector.matchers {
+	for _, matcher := range plan.rangeAgg.selector.matchers {
 		filters = append(filters, logQLMetricMatcherCondition(cfg, matcher))
 	}
-	filters = append(filters, selectorFilters...)
-	return filters
+	return append(filters, plan.selectorFilters...)
 }
 
 func logQLUnwrapMetricSourceSQL(cfg Config, plan *logQLMetricSQLPlan, where []string) string {
@@ -761,8 +760,11 @@ func logQLUnwrapMetricSourceSQL(cfg Config, plan *logQLMetricSQLPlan, where []st
 	)
 }
 
-func logQLUnwrapWindowAggregateExpr(fn string) string {
-	switch fn {
+func logQLUnwrapWindowAggregateExpr(rangeAgg *logQLRangeAggregation) string {
+	switch rangeAgg.fn {
+	case "quantile_over_time":
+		// linear interpolation between closest ranks, as Prometheus and Loki
+		return "toFloat64(assumeNotNull(quantileExactInclusive(" + strconv.FormatFloat(rangeAgg.param, 'g', -1, 64) + ")(unwrap_value)))"
 	case "sum_over_time":
 		return "toFloat64(assumeNotNull(sum(unwrap_value)))"
 	case "avg_over_time":
@@ -1154,123 +1156,9 @@ func logQLSnuffleStatsBaseFilters(cfg Config, selector logQLSelector, startNS, e
 }
 
 func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
-	if !logQLMetricPreferWindowBucketSQL(plan) {
-		return s.queryLogQLMetricBucketJoinSQL(ctx, plan, startNS, endNS, step)
-	}
-	points := int64(1)
-	if endNS > startNS {
-		points = ((endNS - startNS) / step.Nanoseconds()) + 1
-	}
-	if points < 1 {
-		points = 1
-	}
 	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
 	fetchEndNS := endNS
-	where := logQLMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
-
-	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "count() AS log_count", "sum(length(body)) AS byte_count"}
-	bucketGroupBy := []string{"bucket_ns"}
-	outerSelects := []string{"eval_ns"}
-	orderBy := make([]string, 0, len(plan.groupLabels)+1)
-	for i, expr := range plan.groupExprs {
-		alias := fmt.Sprintf("label_%d", i)
-		bucketSelects = append(bucketSelects, expr+" AS "+alias)
-		bucketGroupBy = append(bucketGroupBy, alias)
-		outerSelects = append(outerSelects, alias)
-		orderBy = append(orderBy, alias)
-	}
-	orderBy = append(orderBy, "eval_ns")
-
-	bucketSQL := fmt.Sprintf(
-		"SELECT %s FROM %s WHERE %s GROUP BY %s",
-		strings.Join(bucketSelects, ", "),
-		logQLLogsTableSQL(s.cfg),
-		strings.Join(where, " AND "),
-		strings.Join(bucketGroupBy, ", "),
-	)
-	windowSteps := plan.rangeAgg.window / step
-	if windowSteps < 1 {
-		windowSteps = 1
-	}
-	windowFrame := int64(windowSteps) - 1
-	groupSelects := []string{"1 AS group_key"}
-	gridSelects := []string{"start_ns + (toInt64(n.number) * step_ns) AS eval_ns"}
-	joinConditions := []string{"buckets.bucket_ns = grid.eval_ns"}
-	partitionBy := ""
-	if len(plan.groupLabels) > 0 {
-		groupSelects = groupSelects[:0]
-		for i := range plan.groupLabels {
-			alias := fmt.Sprintf("label_%d", i)
-			groupSelects = append(groupSelects, alias)
-			gridSelects = append(gridSelects, alias)
-			joinConditions = append(joinConditions, "buckets."+alias+" = grid."+alias)
-		}
-		partitionBy = "PARTITION BY " + strings.Join(groupSelects, ", ") + " "
-	}
-	groupsSQL := "SELECT " + strings.Join(groupSelects, ", ") + " FROM buckets"
-	if len(plan.groupLabels) > 0 {
-		groupsSQL = "SELECT DISTINCT " + strings.Join(groupSelects, ", ") + " FROM buckets"
-	}
-	valueExpr := "toFloat64(window_log_count)"
-	switch plan.rangeAgg.fn {
-	case "rate":
-		valueExpr = fmt.Sprintf("toFloat64(window_log_count) / %s", formatDurationSeconds(plan.rangeAgg.window))
-	case "bytes_over_time":
-		valueExpr = "toFloat64(window_byte_count)"
-	case "bytes_rate":
-		valueExpr = fmt.Sprintf("toFloat64(window_byte_count) / %s", formatDurationSeconds(plan.rangeAgg.window))
-	}
-	sql := fmt.Sprintf(
-		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, buckets AS (%s), groups AS (%s) SELECT %s, %s AS value FROM (SELECT %s, sum(ifNull(log_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_log_count, sum(ifNull(byte_count, 0)) OVER (%sORDER BY eval_ns ROWS BETWEEN %d PRECEDING AND CURRENT ROW) AS window_byte_count FROM (SELECT %s FROM groups CROSS JOIN numbers(%d) AS n) AS grid LEFT JOIN buckets ON %s) WHERE window_log_count > 0 ORDER BY %s",
-		startNS,
-		step.Nanoseconds(),
-		bucketSQL,
-		groupsSQL,
-		strings.Join(outerSelects, ", "),
-		valueExpr,
-		strings.Join(outerSelects, ", "),
-		partitionBy,
-		windowFrame,
-		partitionBy,
-		windowFrame,
-		strings.Join(gridSelects, ", "),
-		points,
-		strings.Join(joinConditions, " AND "),
-		strings.Join(orderBy, ", "),
-	)
-	sql = logQLMetricResultSQL(sql, plan)
-	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
-}
-
-func logQLMetricPreferWindowBucketSQL(plan *logQLMetricSQLPlan) bool {
-	if plan == nil {
-		return false
-	}
-	if plan.hasTopK || plan.comparison != nil {
-		return true
-	}
-	for _, label := range plan.groupLabels {
-		switch label {
-		case "region", "env", "environment", "format", "level", "severity", "severity_text", "detected_level", "status":
-			continue
-		default:
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
-	points := int64(1)
-	if endNS > startNS {
-		points = ((endNS - startNS) / step.Nanoseconds()) + 1
-	}
-	if points < 1 {
-		points = 1
-	}
-	fetchStartNS := startNS - plan.rangeAgg.window.Nanoseconds()
-	fetchEndNS := endNS
-	where := logQLMetricBaseFilters(s.cfg, plan.rangeAgg.selector, fetchStartNS, fetchEndNS)
+	where := logQLMetricBaseFilters(s.cfg, plan, fetchStartNS, fetchEndNS)
 
 	bucketSelects := []string{"intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + step_ns - 1, step_ns) * step_ns AS bucket_ns", "count() AS log_count", "sum(length(body)) AS byte_count"}
 	bucketGroupBy := []string{"bucket_ns"}
@@ -1286,17 +1174,10 @@ func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLM
 		orderBy = append(orderBy, alias)
 	}
 	orderBy = append(orderBy, "eval_ns")
-	valueExpr := "toFloat64(sum(log_count))"
-	switch plan.rangeAgg.fn {
-	case "rate":
-		valueExpr = fmt.Sprintf("toFloat64(sum(log_count)) / %s", formatDurationSeconds(plan.rangeAgg.window))
-	case "bytes_over_time":
-		valueExpr = "toFloat64(sum(byte_count))"
-	case "bytes_rate":
-		valueExpr = fmt.Sprintf("toFloat64(sum(byte_count)) / %s", formatDurationSeconds(plan.rangeAgg.window))
-	}
-	outerSelects = append(outerSelects, valueExpr+" AS value")
+	outerSelects = append(outerSelects, plan.valueExpr+" AS value")
 
+	// The bucket scan runs once; each step bucket fans out to the
+	// window/step evaluation points whose window covers it.
 	bucketSQL := fmt.Sprintf(
 		"(SELECT %s FROM %s WHERE %s GROUP BY %s)",
 		strings.Join(bucketSelects, ", "),
@@ -1305,18 +1186,34 @@ func (s *Server) queryLogQLMetricBucketJoinSQL(ctx context.Context, plan *logQLM
 		strings.Join(bucketGroupBy, ", "),
 	)
 	sql := fmt.Sprintf(
-		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s AS buckets CROSS JOIN (SELECT start_ns + (toInt64(number) * step_ns) AS eval_ns FROM numbers(%d)) AS grid WHERE buckets.bucket_ns > eval_ns - window_ns AND buckets.bucket_ns <= eval_ns GROUP BY %s ORDER BY %s",
+		"WITH toInt64(%d) AS start_ns, toInt64(%d) AS end_ns, toInt64(%d) AS step_ns, toInt64(%d) AS window_ns SELECT %s FROM %s GROUP BY %s ORDER BY %s",
 		startNS,
+		endNS,
 		step.Nanoseconds(),
 		plan.rangeAgg.window.Nanoseconds(),
 		strings.Join(outerSelects, ", "),
-		bucketSQL,
-		points,
+		logQLWindowFanoutSQL(bucketSQL, plan.rangeAgg.window/step),
 		strings.Join(outerGroupBy, ", "),
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
 	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+}
+
+// logQLWindowFanoutSQL repeats each row of source, which carries a
+// step-aligned bucket_ns, once per evaluation point in [start_ns, end_ns]
+// whose window (eval_ns - window_ns, eval_ns] contains the bucket. It needs
+// start_ns, end_ns, step_ns and window_ns in scope and window_ns to be a
+// multiple of step_ns.
+func logQLWindowFanoutSQL(source string, windowSteps time.Duration) string {
+	if windowSteps < 1 {
+		windowSteps = 1
+	}
+	return fmt.Sprintf(
+		"(SELECT * FROM (SELECT *, start_ns + (intDiv(greatest(bucket_ns - start_ns, toInt64(0)) + step_ns - 1, step_ns) * step_ns) + (toInt64(offset) * step_ns) AS eval_ns FROM %s ARRAY JOIN range(toUInt64(%d)) AS offset) WHERE eval_ns >= start_ns AND eval_ns <= end_ns AND bucket_ns > eval_ns - window_ns AND bucket_ns <= eval_ns)",
+		source,
+		int64(windowSteps),
+	)
 }
 
 func (s *Server) scanLogQLMetricSQLResults(ctx context.Context, sql string, groupLabels []string) ([]logMetricMatrixResult, error) {
