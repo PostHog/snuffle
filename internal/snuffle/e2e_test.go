@@ -110,6 +110,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("invalid ClickHouse credentials", func(t *testing.T) {
 		assertInvalidClickHouseCredentials(t, api.URL)
 	})
+	t.Run("query log comments", func(t *testing.T) {
+		assertQueryLogComments(t, ctx, rootClient, api.URL)
+	})
 
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)

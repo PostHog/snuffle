@@ -249,6 +249,44 @@ curl --get http://localhost:9091/t/42/api/v1/query \
 Every ClickHouse query against series, labels, samples, histograms, exemplars,
 metadata, or logs includes the resolved tenant filter.
 
+### Query attribution
+
+Every ClickHouse query and insert that Snuffle sends carries a JSON
+`log_comment`, so `system.query_log` can attribute it:
+
+```json
+{"service_name":"snuffle","team_id":42,"product":"metrics","query_type":"query_range"}
+```
+
+- `service_name` is always `snuffle`.
+- `team_id` is the resolved tenant above.
+- `product` is `metrics` for `/api/v1/*` routes and `logs` for
+  `/loki/api/v1/*` routes.
+- `query_type` names the endpoint: `query`, `query_range`, `series`, `labels`,
+  `label_values`, `metadata`, `query_exemplars`, `remote_read`,
+  `remote_write`, `loki_query`, `loki_query_range`, `loki_series`,
+  `loki_labels`, `loki_label_values`, `loki_index_stats`, or `loki_push`.
+  Self-scrape writes use `self_scrape`. One PromQL or LogQL request can run
+  several ClickHouse queries, and they all share the request's tags.
+
+Callers can add tags with the `X-PostHog-Query-Tags` header, which holds a JSON
+object of at most 4 KiB. Snuffle copies only these keys, and only with these
+JSON types:
+
+| Type | Keys |
+| --- | --- |
+| string | `access_method`, `api_key_label`, `api_key_mask`, `client_query_id`, `feature`, `id`, `kind`, `name`, `org_id`, `product`, `request_name`, `route_id`, `session_id`, `workload` |
+| integer | `user_id`, `dashboard_id`, `insight_id` |
+| boolean | `is_impersonated` |
+
+A caller `product` replaces the route default. `service_name`, `team_id`, and
+`query_type` always come from Snuffle. Snuffle never rejects a request because
+of this header: it drops an oversized or malformed header, `null` values, and
+unknown, reserved, or mistyped keys, and counts each drop in
+`snuffle_query_tags_rejected_total{reason}`. The tags are caller-supplied
+attribution, not authorization. Set `SNUFFLE_QUERY_TAGS_HEADER=` to ignore the
+header.
+
 ## API compatibility
 
 ### Prometheus-compatible API
@@ -618,6 +656,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `SNUFFLE_DEFAULT_TEAM_ID` | `0` | Tenant used when no path, header, or query tenant is provided |
 | `SNUFFLE_TEAM_HEADER` | `X-Team-ID` | Tenant request header |
 | `SNUFFLE_TEAM_QUERY_PARAM` | `team_id` | Tenant query parameter |
+| `SNUFFLE_QUERY_TAGS_HEADER` | `X-PostHog-Query-Tags` | Request header with caller query tags for `log_comment`; empty ignores it |
 | `SNUFFLE_SELF_SCRAPE_ENABLED` | `true` | Write Snuffle's own metrics into the configured metrics tables |
 | `SNUFFLE_SELF_SCRAPE_INTERVAL` | `15s` | Self-scrape interval; `0` disables downstream writes while keeping `/metrics` |
 | `SNUFFLE_SELF_SCRAPE_TEAM_ID` | default team | Tenant for self-scraped metrics |

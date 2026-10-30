@@ -126,6 +126,15 @@ func (c *ClickHouseClient) connection(ctx context.Context) (clickhouse.Conn, err
 	return requestConn.conn, requestConn.err
 }
 
+// withLogCommentSetting sends the request's query tags as log_comment.
+// clickhouse.WithSettings replaces the whole settings map, so every per-query
+// setting has to be added here.
+func withLogCommentSetting(ctx context.Context) context.Context {
+	return clickhouse.Context(ctx, clickhouse.WithSettings(clickhouse.Settings{
+		"log_comment": logCommentFromContext(ctx),
+	}))
+}
+
 func clickHouseAddrs(cfg Config) []string {
 	addr := strings.TrimSpace(cfg.CHAddr)
 	if addr == "" {
@@ -186,6 +195,7 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		recordClickHouseRead(ctx, rowCount, scanned, read, elapsed)
 		c.metrics.observeClickHouseQuery(status, elapsed, rowCount, scanned, read)
 	}()
+	ctx = withLogCommentSetting(ctx)
 	ctx = clickhouse.Context(ctx, clickhouse.WithProgress(func(progress *clickhouse.Progress) {
 		scannedRows.Add(progress.Rows)
 		readBytes.Add(progress.Bytes)
@@ -217,7 +227,7 @@ func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
 	if err != nil {
 		return fmt.Errorf("connect clickhouse: %w", err)
 	}
-	if err := conn.Exec(ctx, sql); err != nil {
+	if err := conn.Exec(withLogCommentSetting(ctx), sql); err != nil {
 		return fmt.Errorf("execute clickhouse statement: %w", err)
 	}
 	return nil
@@ -257,6 +267,7 @@ func (c *ClickHouseClient) insertColumns(ctx context.Context, sql string, async 
 	if err != nil {
 		return fmt.Errorf("connect clickhouse: %w", err)
 	}
+	ctx = withLogCommentSetting(ctx)
 	insertMode := "native insert"
 	if async {
 		ctx = clickhouse.Context(ctx, clickhouse.WithAsync(true))
