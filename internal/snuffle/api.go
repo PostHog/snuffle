@@ -194,6 +194,9 @@ func (s *Server) teamHandler(handler func(*Server, http.ResponseWriter, *http.Re
 		}
 		haveTeamID = true
 
+		tags := routeQueryTags(endpoint, teamID)
+		tags.caller = s.callerQueryTags(withStats)
+		withStats = withStats.WithContext(withQueryTags(withStats.Context(), tags))
 		handler(s.withTeamID(teamID), wrapped, withStats)
 	}
 }
@@ -252,6 +255,17 @@ func (s *Server) teamIDFromRequest(r *http.Request) (uint64, error) {
 		}
 	}
 	return s.cfg.DefaultTeamID, nil
+}
+
+func (s *Server) callerQueryTags(r *http.Request) map[string]any {
+	if s.cfg.QueryTagsHeader == "" {
+		return nil
+	}
+	tags, rejected := parseCallerQueryTags(r.Header.Get(s.cfg.QueryTagsHeader))
+	for _, reason := range rejected {
+		s.metrics.observeRejectedQueryTag(reason)
+	}
+	return tags
 }
 
 func parseTeamID(value string) (uint64, error) {

@@ -60,6 +60,8 @@ type bridgeMetrics struct {
 	clickHouseInsertBytes    *prometheus.CounterVec
 	clickHouseInsertInflight prometheus.Gauge
 
+	queryTagsRejected *prometheus.CounterVec
+
 	selfScrapes       *prometheus.CounterVec
 	selfScrapeLatency *prometheus.HistogramVec
 	selfScrapeSeries  prometheus.Gauge
@@ -238,6 +240,12 @@ func newBridgeMetrics() *bridgeMetrics {
 			Help:      "ClickHouse native inserts currently in flight.",
 		}),
 
+		queryTagsRejected: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "snuffle",
+			Name:      "query_tags_rejected_total",
+			Help:      "Caller query tags dropped from log_comment, by reason.",
+		}, []string{"reason"}),
+
 		selfScrapes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "snuffle",
 			Name:      "self_scrapes_total",
@@ -300,6 +308,7 @@ func newBridgeMetrics() *bridgeMetrics {
 		m.clickHouseInsertedRows,
 		m.clickHouseInsertBytes,
 		m.clickHouseInsertInflight,
+		m.queryTagsRejected,
 		m.selfScrapes,
 		m.selfScrapeLatency,
 		m.selfScrapeSeries,
@@ -419,6 +428,13 @@ func (m *bridgeMetrics) observeClickHouseInsert(table, mode, status string, dura
 	if status == "ok" && bytes > 0 {
 		m.clickHouseInsertBytes.WithLabelValues(table, mode).Add(float64(bytes))
 	}
+}
+
+func (m *bridgeMetrics) observeRejectedQueryTag(reason string) {
+	if m == nil {
+		return
+	}
+	m.queryTagsRejected.WithLabelValues(reason).Inc()
 }
 
 func valueStats(value parser.Value) (series, samples, histograms int) {
@@ -559,6 +575,7 @@ func (s *Server) scrapeAndWriteSelfMetrics(parent context.Context) {
 
 	ctx, cancel := context.WithTimeout(parent, s.cfg.CHTimeout)
 	defer cancel()
+	ctx = withQueryTags(ctx, queryTags{teamID: s.cfg.SelfScrapeTeamID, product: "metrics", queryType: selfScrapeQueryType})
 
 	req, samples, err := s.selfScrapeWriteRequest(time.Now())
 	if err != nil {

@@ -56,6 +56,7 @@ type Config struct {
 	DefaultTeamID               uint64
 	TeamHeader                  string
 	TeamQueryParam              string
+	QueryTagsHeader             string
 	Pprof                       bool
 	PostHogCompactHistograms    bool
 	SelfScrapeEnabled           bool
@@ -164,6 +165,7 @@ func ConfigFromEnv() Config {
 		DefaultTeamID:               defaultTeamID,
 		TeamHeader:                  getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:              getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
+		QueryTagsHeader:             getenv("SNUFFLE_QUERY_TAGS_HEADER", "X-PostHog-Query-Tags"),
 		Pprof:                       envBool("SNUFFLE_PPROF", false),
 		PostHogCompactHistograms:    envBool("SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS", true),
 		SelfScrapeEnabled:           envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
