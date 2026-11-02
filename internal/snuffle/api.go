@@ -77,10 +77,7 @@ func newServer(cfg Config) *Server {
 		LookbackDelta:        cfg.LookbackDelta,
 		EnableAtModifier:     true,
 		EnableNegativeOffset: true,
-		// Keep __name__ until the end of the query (Prometheus 3's promql-delayed-name-removal), as
-		// VictoriaMetrics does: sum by (x) (rate({__name__=~"a|b"}[5m])) over two metrics that share label
-		// sets (every PostHog ingestion pod exports both logs_ and metrics_ counters) otherwise fails with
-		// "vector cannot contain metrics with the same labelset" before the sum merges them.
+		// Like VictoriaMetrics: sum by (x) (rate({__name__=~"a|b"}[5m])) works when a and b share labels.
 		EnableDelayedNameRemoval: true,
 		NoStepSubqueryIntervalFn: func(rangeMillis int64) int64 {
 			if rangeMillis <= 0 {
