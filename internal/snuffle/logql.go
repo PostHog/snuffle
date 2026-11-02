@@ -289,7 +289,7 @@ type logMetricMatrixResult struct {
 }
 
 const (
-	maxLogQLQueryBytes = 64 << 10
+	maxLogQLQueryBytes = 1 << 20
 	maxLogQLNesting    = 128
 )
 

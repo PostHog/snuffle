@@ -1328,3 +1328,18 @@ func TestLogQLTemplatesCannotLoopOrRecurse(t *testing.T) {
 		t.Errorf("a million-wide printf rendered %d bytes", len(got))
 	}
 }
+
+func TestQuerySizeLimitsAllowLargeSelectors(t *testing.T) {
+	// A multi-value variable expands to a long alternation; ~800KB here.
+	values := make([]string, 50000)
+	for i := range values {
+		values[i] = fmt.Sprintf("service-%06d", i)
+	}
+	regex := strings.Join(values, "|")
+	if _, err := parseLogQLQuery(`sum(count_over_time({service_name=~"` + regex + `"}[5m]))`); err != nil {
+		t.Errorf("large LogQL selector: %v", err)
+	}
+	if err := checkPromQLShape(`sum(rate(m{job=~"` + regex + `"}[5m]))`); err != nil {
+		t.Errorf("large PromQL selector: %v", err)
+	}
+}

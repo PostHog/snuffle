@@ -85,7 +85,7 @@ type metricsQLQuery struct {
 // Counter functions use separate names so Prometheus SQL optimizations cannot
 // replace their calculations with extrapolated PromQL results.
 const (
-	maxPromQLQueryBytes = 256 << 10
+	maxPromQLQueryBytes = 1 << 20
 	maxPromQLOperators  = 1000
 	maxPromQLNesting    = 256
 )
