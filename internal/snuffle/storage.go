@@ -1414,7 +1414,8 @@ func (it *sampleIterator) AtFloatHistogram(*histogram.FloatHistogram) (int64, *h
 	if !ok {
 		return math.MinInt64, nil
 	}
-	if point.typ != chunkenc.ValFloatHistogram {
+	// The engine reads integer histograms through this method too.
+	if point.typ != chunkenc.ValFloatHistogram && point.typ != chunkenc.ValHistogram {
 		return point.t, nil
 	}
 	return point.t, point.h.ToFloatHistogram()

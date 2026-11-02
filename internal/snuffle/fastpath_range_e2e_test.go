@@ -29,6 +29,7 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	cfg := ConfigFromEnv()
+	cfg.AllowUnauthenticated = true
 	cfg.CHAddr = getenv("SNUFFLE_E2E_CH_ADDR", "127.0.0.1:9000")
 	cfg.CHDatabase = ""
 	root := NewClickHouseClient(cfg)

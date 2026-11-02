@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"text/template"
+	"text/template/parse"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -284,6 +286,47 @@ type logMetricVectorResult struct {
 type logMetricMatrixResult struct {
 	Metric map[string]string `json:"metric"`
 	Values [][]any           `json:"values"`
+}
+
+const (
+	maxLogQLQueryBytes = 64 << 10
+	maxLogQLNesting    = 128
+)
+
+// parseLogQLQuery parses a query from a request. The parser rescans the rest
+// of the input at every nesting level, so size and depth are bounded first.
+func parseLogQLQuery(input string) (*logQLExpr, error) {
+	if len(input) > maxLogQLQueryBytes {
+		return nil, fmt.Errorf("query is %d bytes, more than the %d byte limit", len(input), maxLogQLQueryBytes)
+	}
+	depth := 0
+	quote := byte(0)
+	escaped := false
+	for i := 0; i < len(input); i++ {
+		c := input[i]
+		if quote != 0 {
+			switch {
+			case escaped:
+				escaped = false
+			case quote == '"' && c == '\\':
+				escaped = true
+			case c == quote:
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '`':
+			quote = c
+		case '(':
+			if depth++; depth > maxLogQLNesting {
+				return nil, fmt.Errorf("query nests more than %d parentheses deep", maxLogQLNesting)
+			}
+		case ')':
+			depth--
+		}
+	}
+	return parseLogQL(input)
 }
 
 func parseLogQL(input string) (*logQLExpr, error) {
@@ -779,6 +822,9 @@ func parseLogQLStage(segment string) (logQLStage, error) {
 		if strings.TrimSpace(tail) != "" {
 			return logQLStage{}, fmt.Errorf("unexpected line_format tail %q", tail)
 		}
+		if err := checkLogQLTemplate(value); err != nil {
+			return logQLStage{}, fmt.Errorf("line_format: %w", err)
+		}
 		return logQLStage{kind: "line_format", lineFormat: value}, nil
 	case "label_format":
 		formats, err := parseLogQLLabelFormats(rest)
@@ -870,6 +916,9 @@ func parseLogQLLabelFormats(input string) ([]logQLLabelFormat, error) {
 				return nil, err
 			}
 			if strings.Contains(unquoted, "{{") {
+				if err := checkLogQLTemplate(unquoted); err != nil {
+					return nil, fmt.Errorf("label_format: %w", err)
+				}
 				formats = append(formats, logQLLabelFormat{name: name, constValue: unquoted, isTemplate: true})
 			} else {
 				formats = append(formats, logQLLabelFormat{name: name, constValue: unquoted, isConst: true})
@@ -1453,6 +1502,72 @@ func compileLogQLPattern(pattern string) (*regexp.Regexp, error) {
 	return regexp.Compile(b.String())
 }
 
+// logQLTemplateExtraBytes is how far a rendered template may outgrow the line
+// it renders. Templates cannot loop, so the budget bounds the rest of the work.
+const logQLTemplateExtraBytes = 64 << 10
+
+var errLogQLTemplateTooLarge = errors.New("template output exceeds its size limit")
+
+// logQLTemplateBudget is the bytes one render may still produce, through
+// function results and through output.
+type logQLTemplateBudget struct {
+	left int
+}
+
+func (b *logQLTemplateBudget) take(n int) error {
+	if b.left -= n; b.left < 0 {
+		return errLogQLTemplateTooLarge
+	}
+	return nil
+}
+
+func (b *logQLTemplateBudget) result(value string) (string, error) {
+	if err := b.take(len(value)); err != nil {
+		return "", err
+	}
+	return value, nil
+}
+
+func (b *logQLTemplateBudget) Write(p []byte) (int, error) {
+	return len(p), b.take(len(p))
+}
+
+// checkLogQLTemplate rejects the template actions that loop or recurse, so
+// rendering stays linear in the template's size.
+func checkLogQLTemplate(tpl string) error {
+	parsed, err := template.New("logql").Funcs(logQLTemplateFuncs(&logRow{}, &logQLTemplateBudget{})).Parse(tpl)
+	if err != nil {
+		// renderLogQLTemplate substitutes {{.field}} itself when Go cannot parse it.
+		return nil
+	}
+	if len(parsed.Templates()) > 1 {
+		return errors.New("templates cannot define templates")
+	}
+	return checkLogQLTemplateNode(parsed.Root)
+}
+
+func checkLogQLTemplateNode(node parse.Node) error {
+	switch n := node.(type) {
+	case *parse.ListNode:
+		if n == nil {
+			return nil
+		}
+		for _, child := range n.Nodes {
+			if err := checkLogQLTemplateNode(child); err != nil {
+				return err
+			}
+		}
+	case *parse.IfNode:
+		if err := checkLogQLTemplateNode(n.List); err != nil {
+			return err
+		}
+		return checkLogQLTemplateNode(n.ElseList)
+	case *parse.RangeNode, *parse.WithNode, *parse.TemplateNode, *parse.BreakNode, *parse.ContinueNode:
+		return fmt.Errorf("templates cannot use %T actions", node)
+	}
+	return nil
+}
+
 func renderLogQLTemplate(tpl string, row *logRow) string {
 	data := map[string]string{}
 	for key, value := range row.fields {
@@ -1465,34 +1580,47 @@ func renderLogQLTemplate(tpl string, row *logRow) string {
 	data["__line__"] = row.line
 	data["line"] = row.line
 	data["timestamp"] = strconv.FormatFloat(float64(row.tsNS)/1e9, 'f', -1, 64)
-	parsed, err := template.New("logql").Option("missingkey=zero").Funcs(logQLTemplateFuncs(row)).Parse(tpl)
+	budget := &logQLTemplateBudget{left: 4*len(row.line) + logQLTemplateExtraBytes}
+	parsed, err := template.New("logql").Option("missingkey=zero").Funcs(logQLTemplateFuncs(row, budget)).Parse(tpl)
 	if err == nil {
 		var buf bytes.Buffer
-		if err := parsed.Execute(&buf, data); err == nil {
+		err := parsed.Execute(io.MultiWriter(budget, &buf), data)
+		if err == nil || errors.Is(err, errLogQLTemplateTooLarge) {
 			return buf.String()
 		}
 	}
 	re := regexp.MustCompile(`\{\{\s*\.?([A-Za-z_][A-Za-z0-9_\.]*)\s*\}\}`)
+	limit := len(row.line) + logQLTemplateExtraBytes
 	return re.ReplaceAllStringFunc(tpl, func(match string) string {
 		parts := re.FindStringSubmatch(match)
 		if len(parts) != 2 {
 			return match
 		}
-		return row.value(parts[1])
+		value := row.value(parts[1])
+		if limit -= len(value); limit < 0 {
+			return ""
+		}
+		return value
 	})
 }
 
-func logQLTemplateFuncs(row *logRow) template.FuncMap {
+// logQLTemplateFuncs charges every string a function builds to the budget.
+// The overrides replace text/template builtins that can build large strings.
+func logQLTemplateFuncs(row *logRow, budget *logQLTemplateBudget) template.FuncMap {
 	return template.FuncMap{
-		"lower":     strings.ToLower,
-		"upper":     strings.ToUpper,
-		"title":     strings.Title,
+		"lower":     func(input string) (string, error) { return budget.result(strings.ToLower(input)) },
+		"upper":     func(input string) (string, error) { return budget.result(strings.ToUpper(input)) },
+		"title":     func(input string) (string, error) { return budget.result(strings.Title(input)) },
 		"trim":      strings.TrimSpace,
 		"contains":  strings.Contains,
 		"hasPrefix": strings.HasPrefix,
 		"hasSuffix": strings.HasSuffix,
-		"replace": func(old, newValue, input string) string {
-			return strings.ReplaceAll(input, old, newValue)
+		"replace": func(old, newValue, input string) (string, error) {
+			// Check the size first: an empty old inserts newValue at every rune.
+			if err := budget.take(len(input) + strings.Count(input, old)*(len(newValue)-len(old))); err != nil {
+				return "", err
+			}
+			return strings.ReplaceAll(input, old, newValue), nil
 		},
 		"default": func(defaultValue, input string) string {
 			if input == "" {
@@ -1524,8 +1652,24 @@ func logQLTemplateFuncs(row *logRow) template.FuncMap {
 			return string(runes[start:end])
 		},
 		"__line__": func() string { return row.line },
+		"print":    func(args ...any) (string, error) { return budget.result(fmt.Sprint(args...)) },
+		"println":  func(args ...any) (string, error) { return budget.result(fmt.Sprintln(args...)) },
+		"printf": func(format string, args ...any) (string, error) {
+			// fmt pads to any width up to a million, whatever the arguments.
+			if logQLPrintfWidth.MatchString(format) {
+				return "", errLogQLTemplateTooLarge
+			}
+			return budget.result(fmt.Sprintf(format, args...))
+		},
+		"html":     func(args ...any) (string, error) { return budget.result(template.HTMLEscaper(args...)) },
+		"js":       func(args ...any) (string, error) { return budget.result(template.JSEscaper(args...)) },
+		"urlquery": func(args ...any) (string, error) { return budget.result(template.URLQueryEscaper(args...)) },
 	}
 }
+
+// logQLPrintfWidth matches a printf verb with a width or precision above 999,
+// or one taken from the arguments.
+var logQLPrintfWidth = regexp.MustCompile(`%[-+# 0]*(\*|\d{4,}|\d*\.(\*|\d{4,}))`)
 
 var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
 
@@ -1969,9 +2113,12 @@ func logLabelsFromCoreColumns(serviceName, severityText, traceID, spanID string)
 	return labels
 }
 
-func applyLogQLSelector(rows []logRow, selector logQLSelector) []logRow {
+func applyLogQLSelector(ctx context.Context, rows []logRow, selector logQLSelector) ([]logRow, error) {
 	out := rows[:0]
 	for i := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		row := rows[i]
 		row.labels = cloneStringMap(row.labels)
 		row.fields = cloneStringMap(row.fields)
@@ -1979,12 +2126,13 @@ func applyLogQLSelector(rows []logRow, selector logQLSelector) []logRow {
 			out = append(out, row)
 		}
 	}
-	return out
+	return out, nil
 }
 
 func finalizeLogQLRowsAfterSQLFilter(rows []logRow, selector logQLSelector, fullyPushed bool) []logRow {
 	if !fullyPushed {
-		return applyLogQLSelector(rows, selector)
+		rows, _ = applyLogQLSelector(context.Background(), rows, selector)
+		return rows
 	}
 	return annotateLogQLPushedEqualityMatchers(rows, selector)
 }
@@ -2054,7 +2202,7 @@ func evaluateLogQLInstantMetric(expr *logQLExpr, rows []logRow, tsNS int64) []lo
 	return metricSamplesToVector(samples, tsNS)
 }
 
-func evaluateLogQLRangeMetric(expr *logQLExpr, rows []logRow, startNS, endNS int64, step time.Duration) []logMetricMatrixResult {
+func evaluateLogQLRangeMetric(ctx context.Context, expr *logQLExpr, rows []logRow, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
 	series := map[string]*logMetricMatrixResult{}
 	if step <= 0 {
 		step = time.Minute
@@ -2062,6 +2210,10 @@ func evaluateLogQLRangeMetric(expr *logQLExpr, rows []logRow, startNS, endNS int
 	stepNS := step.Nanoseconds()
 	points := logQLRangePoints(startNS, endNS, stepNS)
 	for i := uint64(0); i < points; i++ {
+		// Each point re-runs the pipeline over every row.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ts := startNS + int64(i*uint64(stepNS))
 		samples := evaluateLogQLMetricAt(expr, rows, ts)
 		for _, sample := range samples {
@@ -2079,7 +2231,7 @@ func evaluateLogQLRangeMetric(expr *logQLExpr, rows []logRow, startNS, endNS int
 		out = append(out, *result)
 	}
 	sort.Slice(out, func(i, j int) bool { return labelsKey(out[i].Metric) < labelsKey(out[j].Metric) })
-	return out
+	return out, nil
 }
 
 // logQLRangePoints counts the steps in [startNS, endNS] without int64 overflow.

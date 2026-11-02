@@ -111,12 +111,25 @@ func (s *Server) routes(mux *http.ServeMux) {
 	}
 
 	api := s.apiRoutes()
-	routes.Handle("/api/v1/", gzipJSONHandler(api))
+	routes.Handle("/api/v1/", s.requireCredentials(gzipJSONHandler(api)))
 	loki := s.lokiRoutes()
-	routes.Handle("/loki/api/v1/", gzipJSONHandler(loki))
+	routes.Handle("/loki/api/v1/", s.requireCredentials(gzipJSONHandler(loki)))
 	routes.HandleFunc("/t/", s.handleTeamPath(routes))
 	routes.HandleFunc("/team/", s.handleTeamPath(routes))
 	mux.Handle("/", s.clickHouseAuthHandler(routes))
+}
+
+// requireCredentials refuses tenant data routes that carry no ClickHouse
+// login, which would otherwise connect as ClickHouse's passwordless default.
+func (s *Server) requireCredentials(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, _, ok := r.BasicAuth(); !ok && !s.cfg.AllowUnauthenticated {
+			w.Header().Set("WWW-Authenticate", `Basic realm="snuffle"`)
+			writeAPIError(w, http.StatusUnauthorized, "unauthorized", errors.New("missing ClickHouse credentials"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) clickHouseAuthHandler(next http.Handler) http.Handler {
@@ -254,6 +267,9 @@ func (s *Server) teamIDFromRequest(r *http.Request) (uint64, error) {
 			return parseTeamID(value)
 		}
 	}
+	if !s.cfg.AllowDefaultTeam {
+		return 0, fmt.Errorf("missing team: use the %s header or a /t/{team_id}/ path", s.cfg.TeamHeader)
+	}
 	return s.cfg.DefaultTeamID, nil
 }
 
@@ -269,7 +285,9 @@ func (s *Server) callerQueryTags(r *http.Request) map[string]any {
 }
 
 func parseTeamID(value string) (uint64, error) {
-	teamID, err := strconv.ParseUint(value, 10, 64)
+	// team_id is Int32 in the log and PostHog metrics tables, so a larger id
+	// would wrap into another team on insert.
+	teamID, err := strconv.ParseUint(value, 10, 31)
 	if err != nil {
 		return 0, fmt.Errorf("invalid team_id %q", value)
 	}
@@ -415,6 +433,10 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	if end.Before(start) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("end timestamp must not be before start time"))
+		return
+	}
+	if end.Sub(start)/step >= maxRangePushdownPoints {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", fmt.Errorf("exceeded maximum resolution of %d points per timeseries; decrease the query resolution (step)", maxRangePushdownPoints))
 		return
 	}
 
@@ -768,6 +790,10 @@ func (s *Server) handleQueryExemplars(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", errors.New("end timestamp must not be before start time"))
 		return
 	}
+	if err := checkPromQLShape(query); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		return
+	}
 	expr, err := s.parser.ParseExpr(query)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
@@ -1082,13 +1108,18 @@ func parseStep(value string) (time.Duration, error) {
 	if value == "" {
 		return 0, errors.New("missing step parameter")
 	}
-	if parsed, err := time.ParseDuration(value); err == nil && parsed > 0 {
-		return parsed, nil
+	step := time.Duration(0)
+	if parsed, err := time.ParseDuration(value); err == nil {
+		step = parsed
+	} else if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds*float64(time.Second) < math.MaxInt64 {
+		step = time.Duration(seconds * float64(time.Second))
 	}
-	if seconds, err := strconv.ParseFloat(value, 64); err == nil && seconds > 0 {
-		return time.Duration(seconds * float64(time.Second)), nil
+	// Smaller steps truncate to zero in the range loops, and a step past the
+	// int64 range wraps negative.
+	if step < time.Millisecond {
+		return 0, fmt.Errorf("invalid step %q: must be at least 1ms", value)
 	}
-	return 0, fmt.Errorf("invalid step %q", value)
+	return step, nil
 }
 
 func parseLimit(value string) (int, error) {

@@ -84,7 +84,74 @@ type metricsQLQuery struct {
 // prepareMetricsQLQuery expands MetricsQL syntax before either execution path.
 // Counter functions use separate names so Prometheus SQL optimizations cannot
 // replace their calculations with extrapolated PromQL results.
+const (
+	maxPromQLQueryBytes = 256 << 10
+	maxPromQLOperators  = 1000
+	maxPromQLNesting    = 256
+)
+
+// checkPromQLShape bounds a query before it is parsed. The Prometheus parser
+// recomputes each node's type from its children, so parsing takes time
+// quadratic in the operator count and nesting depth, before any timeout.
+// Matchers, ranges and strings are skipped; "==" counts twice.
+func checkPromQLShape(query string) error {
+	if len(query) > maxPromQLQueryBytes {
+		return fmt.Errorf("query is %d bytes, more than the %d byte limit", len(query), maxPromQLQueryBytes)
+	}
+	depth, operators, brackets := 0, 0, 0
+	quote := byte(0)
+	escaped := false
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+		if quote != 0 {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\' && quote != '`':
+				escaped = true
+			case c == quote:
+				quote = 0
+			}
+			continue
+		}
+		switch {
+		case c == '"' || c == '\'' || c == '`':
+			quote = c
+		case c == '{' || c == '[':
+			brackets++
+		case c == '}' || c == ']':
+			brackets--
+		case brackets > 0:
+		case c == '(':
+			if depth++; depth > maxPromQLNesting {
+				return fmt.Errorf("query nests more than %d parentheses deep", maxPromQLNesting)
+			}
+		case c == ')':
+			depth--
+		case strings.IndexByte("+-*/%^<>=!", c) >= 0:
+			operators++
+		case c == '_' || 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z':
+			end := i + 1
+			for end < len(query) && (query[end] == '_' || query[end] == ':' || 'a' <= query[end] && query[end] <= 'z' || 'A' <= query[end] && query[end] <= 'Z' || '0' <= query[end] && query[end] <= '9') {
+				end++
+			}
+			switch strings.ToLower(query[i:end]) {
+			case "and", "or", "unless", "atan2":
+				operators++
+			}
+			i = end - 1
+		}
+		if operators > maxPromQLOperators {
+			return fmt.Errorf("query has more than %d operators", maxPromQLOperators)
+		}
+	}
+	return nil
+}
+
 func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, end time.Time) (metricsQLQuery, error) {
+	if err := checkPromQLShape(query); err != nil {
+		return metricsQLQuery{}, err
+	}
 	expr, err := metricsql.Parse(carryUnsupportedFunctions(query))
 	if err != nil {
 		return metricsQLQuery{}, err

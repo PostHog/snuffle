@@ -38,8 +38,17 @@ func TestTeamIDFromRequest(t *testing.T) {
 	}}
 
 	req := httptest.NewRequest("GET", "/api/v1/query", nil)
+	if got, err := server.teamIDFromRequest(req); err == nil {
+		t.Fatalf("a request without a team resolved to team %d, want an error", got)
+	}
+	server.cfg.AllowDefaultTeam = true
 	if got, err := server.teamIDFromRequest(req); err != nil || got != 3 {
 		t.Fatalf("default team = (%d, %v), want 3", got, err)
+	}
+
+	req = httptest.NewRequest("GET", "/api/v1/query?tenant=2147483648", nil)
+	if got, err := server.teamIDFromRequest(req); err == nil {
+		t.Fatalf("team 2147483648 resolved to %d, want an error: team_id is Int32", got)
 	}
 
 	req = httptest.NewRequest("GET", "/api/v1/query?tenant=5", nil)
@@ -55,7 +64,7 @@ func TestTeamIDFromRequest(t *testing.T) {
 }
 
 func TestTeamHandlerReportsClickHouseReadBytes(t *testing.T) {
-	server := newServer(Config{DefaultTeamID: 1})
+	server := newServer(Config{DefaultTeamID: 1, AllowDefaultTeam: true})
 	handler := server.teamHandler(func(_ *Server, w http.ResponseWriter, r *http.Request) {
 		recordClickHouseRead(r.Context(), 1, 2, 345, 0)
 		writeAPISuccess(w, map[string]string{"status": "ok"})
@@ -219,7 +228,10 @@ func TestMetricsQLNumericResponses(t *testing.T) {
 	} {
 		t.Run(tc.path, func(t *testing.T) {
 			rec := httptest.NewRecorder()
-			mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("X-Team-ID", "1")
+			req.SetBasicAuth("default", "")
+			mux.ServeHTTP(rec, req)
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status %d: %s", rec.Code, rec.Body.String())
 			}

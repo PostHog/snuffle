@@ -103,7 +103,7 @@ func (s *Server) handleLokiPush(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := s.decodeLokiPushRows(r)
 	if err != nil {
-		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
+		writeLokiError(w, requestBodyStatus(err), "bad_data", err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.CHTimeout)
@@ -146,7 +146,7 @@ func (s *Server) handleLokiQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	direction := lokiDirection(r.Form.Get("direction"))
 	recordQueryLogBackend(w, "logql-parser")
-	expr, err := parseLogQL(query)
+	expr, err := parseLogQLQuery(query)
 	if err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 		return
@@ -231,7 +231,7 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	direction := lokiDirection(r.Form.Get("direction"))
 	recordQueryLogBackend(w, "logql-parser")
-	expr, err := parseLogQL(query)
+	expr, err := parseLogQLQuery(query)
 	if err != nil {
 		writeLokiError(w, http.StatusBadRequest, "bad_data", err)
 		return
@@ -273,7 +273,12 @@ func (s *Server) handleLokiQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
 		return
 	}
-	writeLokiSuccess(w, lokiQueryData{ResultType: "matrix", Result: evaluateLogQLRangeMetric(expr, rows, metricStart.UnixNano(), metricEnd.UnixNano(), step), Stats: lokiEmptyStats()})
+	matrix, err := evaluateLogQLRangeMetric(ctx, expr, rows, metricStart.UnixNano(), metricEnd.UnixNano(), step)
+	if err != nil {
+		writeLokiError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
+	writeLokiSuccess(w, lokiQueryData{ResultType: "matrix", Result: matrix, Stats: lokiEmptyStats()})
 }
 
 func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, startNS, endNS int64, limit int, direction string) ([]logRow, error) {
@@ -303,7 +308,9 @@ func (s *Server) queryLogQLRows(ctx context.Context, selector logQLSelector, sta
 		}
 		rawCount := len(rows)
 		if !fullyPushed {
-			rows = applyLogQLSelector(rows, selector)
+			if rows, err = applyLogQLSelector(ctx, rows, selector); err != nil {
+				return nil, err
+			}
 		}
 		if len(rows) >= limit || rawCount < candidateLimit || candidateLimit >= maxRows {
 			if len(rows) > limit {
@@ -335,7 +342,12 @@ func (s *Server) queryLogQLMetricRows(ctx context.Context, expr *logQLExpr, star
 			continue
 		}
 		seen[key] = struct{}{}
-		sql := logQLSelectSQL(s.cfg, selector, startNS, endNS, s.cfg.LogQueryMaxRows, "forward")
+		// The row limit covers the whole query, not each selector.
+		remaining := s.cfg.LogQueryMaxRows - len(allRows)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("query reads more than %d log lines across its selectors; narrow them or the time range", s.cfg.LogQueryMaxRows)
+		}
+		sql := logQLSelectSQL(s.cfg, selector, startNS, endNS, remaining, "forward")
 		rows, err := scanLogRows(ctx, s.client, sql)
 		if err != nil {
 			return nil, err
@@ -933,7 +945,7 @@ func (s *Server) decodeLokiPushRows(r *http.Request) ([]lokiLogInsertRow, error)
 		}
 		return s.decodeLokiPushProto(decoded)
 	}
-	reader := io.Reader(r.Body)
+	reader := io.ReadCloser(r.Body)
 	if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 		gz, err := gzip.NewReader(r.Body)
 		if err != nil {
@@ -942,6 +954,7 @@ func (s *Server) decodeLokiPushRows(r *http.Request) ([]lokiLogInsertRow, error)
 		defer gz.Close()
 		reader = gz
 	}
+	reader = http.MaxBytesReader(nil, reader, maxRequestBodyBytes)
 	var req lokiPushRequest
 	if err := json.NewDecoder(reader).Decode(&req); err != nil {
 		return nil, fmt.Errorf("decode loki push JSON: %w", err)
