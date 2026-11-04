@@ -352,6 +352,7 @@ type postHogHistogramSeriesBuilder struct {
 	previousBucket map[uint64]map[string]*seriesMeta
 	skipped        map[uint64]struct{}
 	delta          map[*seriesMeta]bool
+	temporality    map[string]string
 	samples        int
 }
 
@@ -386,7 +387,7 @@ type postHogHistogramSourceSeries struct {
 // of the team, so one invalid histogram must not fail it; the builder skips
 // that source and logs it once.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), delta: make(map[*seriesMeta]bool)}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), delta: make(map[*seriesMeta]bool), temporality: make(map[string]string)}
 }
 
 func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
@@ -496,6 +497,15 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative or delta histograms", sample.metricName, sample.temporality)
 		}
 		if source.temporality == "" {
+			// Sources with one label set write to the same series. This check
+			// refuses a conflicting source before it appends any point. The
+			// key leaves out le because the generated le label replaces an
+			// input attribute with that name.
+			key := labels.NewBuilder(labels.FromMap(source.labels)).Del("le").Labels().String()
+			if seen, exists := builder.temporality[key]; exists && seen != sample.temporality {
+				return nil, postHogMixedTemporality(sample.metricName)
+			}
+			builder.temporality[key] = sample.temporality
 			source.temporality = sample.temporality
 		}
 		if source.temporality != sample.temporality {
@@ -514,15 +524,8 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			builder.byLabels[key] = meta
 			builder.series = append(builder.series, meta)
 		}
-		// The source check above keeps the temporality of a bound source
-		// fixed. The series therefore needs a check only when a source first
-		// binds to it.
 		if builder.withSamples {
-			delta := sample.temporality == "delta"
-			if seen, exists := builder.delta[meta]; exists && seen != delta {
-				return nil, postHogMixedTemporality(sample.metricName)
-			}
-			builder.delta[meta] = delta
+			builder.delta[meta] = sample.temporality == "delta"
 		}
 		source.series[seriesKey] = meta
 	}

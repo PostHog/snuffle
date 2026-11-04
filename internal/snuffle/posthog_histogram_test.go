@@ -618,15 +618,44 @@ func TestPostHogHistogramMixedTemporality(test *testing.T) {
 			if err := strict.add(testcase.second, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
 				test.Fatalf("exact selector accepted mixed temporality: %v", err)
 			}
+			later := histogramTestSample()
+			later.timestamp, later.count, later.counts = 3000, 15, []uint64{3, 4, 8}
 			broad := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
-			for _, sample := range []postHogHistogramSample{histogramTestSample(), testcase.second} {
+			for _, sample := range []postHogHistogramSample{histogramTestSample(), testcase.second, later} {
 				if err := broad.add(sample, []string{"_count"}); err != nil {
 					test.Fatalf("broad selector must skip the mixed sample: %v", err)
 				}
 			}
-			if got := histogramSeriesByName(broad.finish())["test_duration_seconds_count|"]; !reflect.DeepEqual(got, []samplePoint{{t: 1000, v: 10}}) {
-				test.Fatalf("broad selector kept %v, want only the cumulative point", got)
+			if got := histogramSeriesByName(broad.finish())["test_duration_seconds_count|"]; !reflect.DeepEqual(got, []samplePoint{{t: 1000, v: 10}, {t: 3000, v: 15}}) {
+				test.Fatalf("broad selector kept %v, want only the cumulative points", got)
 			}
 		})
 	}
+	test.Run("bucket bound only the delta source has", func(test *testing.T) {
+		second := deltaHistogramTestSample(2, 2000, 1, 1)
+		second.bounds = []float64{2}
+		broad := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+		for _, sample := range []postHogHistogramSample{histogramTestSample(), second} {
+			if err := broad.add(sample, []string{"_bucket"}); err != nil {
+				test.Fatalf("broad selector must skip the mixed sample: %v", err)
+			}
+		}
+		if got, kept := histogramSeriesByName(broad.finish())["test_duration_seconds_bucket|2"]; kept {
+			test.Fatalf("broad selector kept %v from the skipped delta source", got)
+		}
+	})
+	// The generated le label replaces an input attribute named le. These
+	// sources therefore build the same bucket series.
+	test.Run("sources that differ only in an le attribute", func(test *testing.T) {
+		second := deltaHistogramTestSample(2, 2000, 2, 3, 5)
+		second.attributes = map[string]string{"region": "metric", "le": "original"}
+		exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_bucket")}
+		strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+		if err := strict.add(histogramTestSample(), []string{"_bucket"}); err != nil {
+			test.Fatal(err)
+		}
+		if err := strict.add(second, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
+			test.Fatalf("exact selector accepted mixed temporality: %v", err)
+		}
+	})
 }
