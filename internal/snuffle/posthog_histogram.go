@@ -110,7 +110,7 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return mergePostHogHistogramSeries(series, virtual), nil
+	return mergePostHogHistogramSeries(series, virtual, true)
 }
 
 // mergePostHogHistogramSeries joins real component series and virtual
@@ -120,12 +120,15 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 // labels. Samples of a shared series merge by timestamp. Where both forms have
 // a sample at one timestamp, the real sample wins, which removes the stale
 // marker the virtual builder writes for a bucket missing from a native row.
-func mergePostHogHistogramSeries(real, virtual []*seriesMeta) []*seriesMeta {
+// A delta virtual series holds a running total that starts at the query range,
+// so it cannot merge with a stored series. An exact selector fails on that
+// pair. A broad selector keeps the stored series and drops the delta one.
+func mergePostHogHistogramSeries(real, virtual []*seriesMeta, strict bool) ([]*seriesMeta, error) {
 	if len(real) == 0 {
-		return virtual
+		return virtual, nil
 	}
 	if len(virtual) == 0 {
-		return real
+		return real, nil
 	}
 	byLabels := make(map[string]*seriesMeta, len(virtual))
 	for _, meta := range virtual {
@@ -138,9 +141,23 @@ func mergePostHogHistogramSeries(real, virtual []*seriesMeta) []*seriesMeta {
 			merged = append(merged, meta)
 			continue
 		}
+		if target.delta {
+			if strict {
+				return nil, invalidPostHogHistogram("histogram series %q has stored series with the same labels as its delta series", target.metricName)
+			}
+			slog.Warn("skipping delta histogram series that shares labels with a stored series", "metric", target.metricName)
+			delete(byLabels, meta.labels.String())
+			merged = append(merged, meta)
+			continue
+		}
 		target.samples = mergeSamplesPreferFirst(meta.samples, target.samples)
 	}
-	return append(merged, virtual...)
+	for _, meta := range virtual {
+		if byLabels[meta.labels.String()] == meta {
+			merged = append(merged, meta)
+		}
+	}
+	return merged, nil
 }
 
 // mergeSamplesPreferFirst returns the union of two sorted sample lists. At a
@@ -351,6 +368,7 @@ type postHogHistogramSeriesBuilder struct {
 	bySource       map[uint64]*postHogHistogramSourceSeries
 	previousBucket map[uint64]map[string]*seriesMeta
 	skipped        map[uint64]struct{}
+	temporality    map[string]string
 	samples        int
 }
 
@@ -374,8 +392,11 @@ type postHogHistogramSeriesKey struct {
 }
 
 type postHogHistogramSourceSeries struct {
-	labels map[string]string
-	series map[postHogHistogramSeriesKey]*seriesMeta
+	labels         map[string]string
+	series         map[postHogHistogramSeriesKey]*seriesMeta
+	temporality    string
+	bucketsChecked bool
+	totalsChecked  bool
 }
 
 // newPostHogHistogramSeriesBuilder builds virtual series from stored
@@ -384,7 +405,7 @@ type postHogHistogramSourceSeries struct {
 // of the team, so one invalid histogram must not fail it; the builder skips
 // that source and logs it once.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{})}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), temporality: make(map[string]string)}
 }
 
 func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
@@ -489,8 +510,24 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			return nil, nil
 		}
 	}
-	if builder.withSamples && sample.temporality != "cumulative" {
-		return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
+	if builder.withSamples {
+		if sample.temporality != "cumulative" && sample.temporality != "delta" {
+			return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative or delta histograms", sample.metricName, sample.temporality)
+		}
+		if source.temporality != "" && source.temporality != sample.temporality {
+			return nil, postHogMixedTemporality(sample.metricName)
+		}
+		checked := &source.totalsChecked
+		if seriesKey.suffix == "_bucket" {
+			checked = &source.bucketsChecked
+		}
+		if !*checked {
+			if err := builder.checkLabelSetTemporality(source, seriesKey.suffix, sample); err != nil {
+				return nil, err
+			}
+			*checked = true
+		}
+		source.temporality = sample.temporality
 	}
 	if meta == nil {
 		labelSet := labels.FromMap(labelMap)
@@ -504,6 +541,9 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			builder.byLabels[key] = meta
 			builder.series = append(builder.series, meta)
 		}
+		if builder.withSamples {
+			meta.delta = sample.temporality == "delta"
+		}
 		source.series[seriesKey] = meta
 	}
 	if builder.withSamples {
@@ -512,6 +552,79 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 		}
 	}
 	return meta, nil
+}
+
+// checkLabelSetTemporality refuses a source whose temporality differs from
+// another source that writes to the same series. It runs before the source
+// appends its first point of each kind. The generated le label replaces an
+// input attribute with that name on bucket series, so the bucket key leaves le
+// out. Count and sum series keep the input attribute.
+func (builder *postHogHistogramSeriesBuilder) checkLabelSetTemporality(source *postHogHistogramSourceSeries, suffix string, sample postHogHistogramSample) error {
+	key := labels.NewBuilder(labels.FromMap(source.labels))
+	kind := "totals"
+	if suffix == "_bucket" {
+		key.Del("le")
+		kind = suffix
+	}
+	id := kind + key.Labels().String()
+	if seen, exists := builder.temporality[id]; exists && seen != sample.temporality {
+		return postHogMixedTemporality(sample.metricName)
+	}
+	builder.temporality[id] = sample.temporality
+	return nil
+}
+
+// postHogMixedTemporality refuses a series with both delta and cumulative
+// points. A running total over such a series has no meaning.
+func postHogMixedTemporality(metricName string) error {
+	return invalidPostHogHistogram("histogram %q mixes delta and cumulative aggregation temporality in one series", metricName)
+}
+
+// finish sorts the samples of each series by time. A series built from delta
+// points becomes a running total. Counter functions such as rate and
+// increase then read it as a cumulative counter.
+func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
+	for _, meta := range builder.series {
+		sortSamples(meta.samples)
+		if meta.delta {
+			meta.samples = accumulatePostHogDeltaSamples(meta.samples)
+		}
+	}
+	return builder.series
+}
+
+// accumulatePostHogDeltaSamples turns time-sorted delta points into a running
+// total that starts at the first point. It sums points that share a
+// timestamp, such as points from several clients, into one point. A NaN or
+// infinite point does not change the total. When no finite point shares its
+// timestamp, it is returned as is. A stale marker stays only when no other
+// point shares its timestamp. The total does not reset after a stale marker.
+func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
+	out := samples[:0]
+	var total float64
+	for index := 0; index < len(samples); {
+		timestamp := samples[index].t
+		var sum float64
+		finite := false
+		value := math.Float64frombits(promvalue.StaleNaN)
+		for ; index < len(samples) && samples[index].t == timestamp; index++ {
+			point := samples[index].v
+			switch {
+			case isStaleSampleValue(point):
+			case math.IsNaN(point) || math.IsInf(point, 0):
+				value = point
+			default:
+				sum += point
+				finite = true
+			}
+		}
+		if finite {
+			total += sum
+			value = total
+		}
+		out = append(out, samplePoint{t: timestamp, v: value})
+	}
+	return out
 }
 
 func (builder *postHogHistogramSeriesBuilder) appendSample(meta *seriesMeta, timestamp int64, value float64) error {
@@ -586,10 +699,7 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	if err != nil {
 		return nil, err
 	}
-	for _, meta := range builder.series {
-		sortSamples(meta.samples)
-	}
-	return builder.series, nil
+	return builder.finish(), nil
 }
 
 func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*seriesMeta, mint, maxt int64, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {
@@ -604,7 +714,7 @@ func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*
 	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return mergePostHogHistogramSeries(series, virtual), nil
+	return mergePostHogHistogramSeries(series, virtual, false)
 }
 
 func (q *CHQuerier) postHogHistogramLabelValues(ctx context.Context, name string, matchers []*labels.Matcher) ([]string, error) {

@@ -373,6 +373,7 @@ type seriesMeta struct {
 	samples    []samplePoint
 	histograms []histogramPoint
 	exemplars  []exemplarPoint
+	delta      bool
 }
 
 type seriesJSONRow struct {
