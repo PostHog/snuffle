@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -64,7 +65,7 @@ func TestEvaluateLogQLVectorFunction(t *testing.T) {
 		t.Fatalf("vector result = %#v, want unlabeled value 1", vector[0])
 	}
 
-	matrix := evaluateLogQLRangeMetric(expr, nil, 0, int64(2*time.Second), time.Second)
+	matrix, _ := evaluateLogQLRangeMetric(context.Background(), expr, nil, 0, int64(2*time.Second), time.Second)
 	if len(matrix) != 1 {
 		t.Fatalf("matrix length = %d, want 1: %#v", len(matrix), matrix)
 	}
@@ -321,7 +322,7 @@ func TestApplyLogQLPipelineReferenceStages(t *testing.T) {
 		{tsNS: 3000, line: `{"http":{"status":503},"path":"/health"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
 	}
 
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 {
 		t.Fatalf("rows after selector = %d, want 1: %#v", len(got), got)
 	}
@@ -352,7 +353,7 @@ func TestApplyLogQLJSONPathExtractionCompatibility(t *testing.T) {
 		fields: map[string]string{},
 	}}
 
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 {
 		t.Fatalf("rows after selector = %d, want 1: %#v", len(got), got)
 	}
@@ -374,7 +375,7 @@ func TestApplyLogQLCommaSeparatedLabelFiltersCompatibility(t *testing.T) {
 		{tsNS: 4000, line: `{"foo":6,"bar":"10ms","size":"512B"}`, labels: map[string]string{"app": "api"}, fields: map[string]string{}},
 	}
 
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 || got[0].tsNS != 1000 {
 		t.Fatalf("rows after selector = %#v, want only first row", got)
 	}
@@ -420,7 +421,7 @@ func TestApplyLogQLRegexpAndPatternReferenceStages(t *testing.T) {
 		{tsNS: 1000, line: "abc123", labels: map[string]string{"app": "api"}, fields: map[string]string{}},
 		{tsNS: 2000, line: "abc099", labels: map[string]string{"app": "api"}, fields: map[string]string{}},
 	}
-	regexpGot := applyLogQLSelector(regexpRows, *regexpSelector)
+	regexpGot, _ := applyLogQLSelector(context.Background(), regexpRows, *regexpSelector)
 	if len(regexpGot) != 1 || regexpGot[0].labels["code"] != "123" {
 		t.Fatalf("regexp rows = %#v, want only code 123", regexpGot)
 	}
@@ -435,7 +436,7 @@ func TestApplyLogQLRegexpAndPatternReferenceStages(t *testing.T) {
 		labels: map[string]string{"app": "api"},
 		fields: map[string]string{},
 	}}
-	patternGot := applyLogQLSelector(patternRows, *patternSelector)
+	patternGot, _ := applyLogQLSelector(context.Background(), patternRows, *patternSelector)
 	if len(patternGot) != 1 {
 		t.Fatalf("pattern rows = %d, want 1: %#v", len(patternGot), patternGot)
 	}
@@ -860,7 +861,7 @@ func TestApplyLogQLPipelineParsersAndFilters(t *testing.T) {
 		labels: map[string]string{"service_name": "api"},
 		fields: map[string]string{},
 	}}
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 {
 		t.Fatalf("rows after selector = %d, want 1", len(got))
 	}
@@ -882,7 +883,7 @@ func TestApplyLogQLPipelineErrorsKeepDecolorizeAndPatternNot(t *testing.T) {
 		{tsNS: 2000, line: "x debug y", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
 		{tsNS: 3000, line: "{bad json", labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
 	}
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 {
 		t.Fatalf("rows after selector = %d, want 1: %#v", len(got), got)
 	}
@@ -904,7 +905,7 @@ func TestLogQLLabelFiltersSupportDurationAndBytes(t *testing.T) {
 		{tsNS: 2000, line: `duration=100ms bytes=1024`, labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
 		{tsNS: 3000, line: `duration=750ms bytes=4096`, labels: map[string]string{"service_name": "api"}, fields: map[string]string{}},
 	}
-	got := applyLogQLSelector(rows, *selector)
+	got, _ := applyLogQLSelector(context.Background(), rows, *selector)
 	if len(got) != 1 || got[0].tsNS != 1000 {
 		t.Fatalf("rows after selector = %#v, want only first row", got)
 	}
@@ -1293,5 +1294,52 @@ func TestLokiQueryRangeRejectsTooManyPoints(t *testing.T) {
 func TestParseLogQLRejectsLoneBangInLabelFilter(t *testing.T) {
 	if _, err := parseLogQL(`{app="api"} | json | !x="1"`); err == nil {
 		t.Fatal("parseLogQL accepted a lone '!' in a label filter")
+	}
+}
+
+func TestLogQLTemplatesCannotLoopOrRecurse(t *testing.T) {
+	for _, query := range []string{
+		`{a="b"} | line_format "{{range 100000}}x{{end}}"`,
+		`{a="b"} | line_format "{{with .a}}{{.}}{{end}}"`,
+		`{a="b"} | line_format "{{define \"t\"}}{{template \"t\"}}{{end}}{{template \"t\"}}"`,
+		`{a="b"} | label_format x="{{range 100000}}x{{end}}"`,
+	} {
+		if _, err := parseLogQLQuery(query); err == nil {
+			t.Errorf("%s parsed, want an error", query)
+		}
+	}
+	for _, query := range []string{
+		`{a="b"} | line_format "{{.a}} {{ if eq .a \"x\" }}y{{ else }}{{ upper .a }}{{ end }}"`,
+		`{a="b"} | label_format x="{{ replace \"a\" \"b\" .a }}"`,
+	} {
+		if _, err := parseLogQLQuery(query); err != nil {
+			t.Errorf("%s: %v", query, err)
+		}
+	}
+	row := &logRow{line: "abc", labels: map[string]string{"a": "abc"}}
+	nested := ".a"
+	for i := 0; i < 8; i++ {
+		nested = `(replace "" "0123456789" ` + nested + `)`
+	}
+	if got := renderLogQLTemplate("{{ "+nested+" }}", row); len(got) > logQLTemplateExtraBytes+4*len(row.line) {
+		t.Errorf("eight nested replaces rendered %d bytes", len(got))
+	}
+	if got := renderLogQLTemplate(`{{ printf "%01000000d" 0 }}`, row); len(got) > 0 {
+		t.Errorf("a million-wide printf rendered %d bytes", len(got))
+	}
+}
+
+func TestQuerySizeLimitsAllowLargeSelectors(t *testing.T) {
+	// A multi-value variable expands to a long alternation; ~800KB here.
+	values := make([]string, 50000)
+	for i := range values {
+		values[i] = fmt.Sprintf("service-%06d", i)
+	}
+	regex := strings.Join(values, "|")
+	if _, err := parseLogQLQuery(`sum(count_over_time({service_name=~"` + regex + `"}[5m]))`); err != nil {
+		t.Errorf("large LogQL selector: %v", err)
+	}
+	if err := checkPromQLShape(`sum(rate(m{job=~"` + regex + `"}[5m]))`); err != nil {
+		t.Errorf("large PromQL selector: %v", err)
 	}
 }

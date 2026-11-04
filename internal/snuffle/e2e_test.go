@@ -57,36 +57,7 @@ func TestEndToEndClickHouse(t *testing.T) {
 		_ = rootClient.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" SYNC")
 	}()
 
-	cfg := ConfigFromEnv()
-	cfg.CHAddr = chAddr
-	cfg.CHDatabase = dbName
-	if cfg.postHogSchemaLayout() {
-		cfg.SeriesTable = "metrics4_series"
-		cfg.SamplesTable = "metrics4_samples"
-		cfg.MetricsInputTable = "metrics4_input"
-		cfg.LabelIndexTable = ""
-		cfg.AttributeTable = "metrics4_attributes"
-		cfg.MetricNamesTable = "metrics4_names"
-		cfg.LabelPostingsTable = ""
-		cfg.ActivityTable = ""
-		cfg.MetricsTable = ""
-		cfg.HistogramsTable = ""
-		cfg.ExemplarsTable = ""
-		cfg.SampleAttributes = true
-	} else {
-		cfg.SeriesTable = "metrics_series"
-		cfg.SamplesTable = "metrics_samples"
-		cfg.LabelIndexTable = "metrics_label_index"
-		cfg.LabelPostingsTable = ""
-		cfg.ActivityTable = ""
-		cfg.MetricsTable = "metrics_metadata"
-		cfg.HistogramsTable = "metrics_histograms"
-		cfg.ExemplarsTable = "metrics_exemplars"
-	}
-	cfg.HTTPHost = "127.0.0.1"
-	cfg.CHTimeout = 10 * time.Second
-	cfg.QueryTimeout = 15 * time.Second
-
+	cfg := e2eConfig(chAddr, dbName)
 	client := NewClickHouseClient(cfg)
 	createMetricsSchema(t, ctx, client)
 	logSchema := "create_logs_snuffle_schema.sql"
@@ -140,6 +111,42 @@ func TestEndToEndClickHouse(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)
 		})
 	}
+}
+
+// e2eConfig points the configured schema layout at the e2e database.
+func e2eConfig(chAddr, dbName string) Config {
+	cfg := ConfigFromEnv()
+	cfg.CHAddr = chAddr
+	cfg.CHDatabase = dbName
+	if cfg.postHogSchemaLayout() {
+		cfg.SeriesTable = "metrics4_series"
+		cfg.SamplesTable = "metrics4_samples"
+		cfg.MetricsInputTable = "metrics4_input"
+		cfg.LabelIndexTable = ""
+		cfg.AttributeTable = "metrics4_attributes"
+		cfg.MetricNamesTable = "metrics4_names"
+		cfg.LabelPostingsTable = ""
+		cfg.ActivityTable = ""
+		cfg.MetricsTable = ""
+		cfg.HistogramsTable = ""
+		cfg.ExemplarsTable = ""
+		cfg.SampleAttributes = true
+	} else {
+		cfg.SeriesTable = "metrics_series"
+		cfg.SamplesTable = "metrics_samples"
+		cfg.LabelIndexTable = "metrics_label_index"
+		cfg.LabelPostingsTable = ""
+		cfg.ActivityTable = ""
+		cfg.MetricsTable = "metrics_metadata"
+		cfg.HistogramsTable = "metrics_histograms"
+		cfg.ExemplarsTable = "metrics_exemplars"
+	}
+	cfg.HTTPHost = "127.0.0.1"
+	cfg.CHTimeout = 10 * time.Second
+	cfg.QueryTimeout = 15 * time.Second
+	// Test requests carry no Basic credentials; Snuffle logs in as CH_USER.
+	cfg.AllowUnauthenticated = true
+	return cfg
 }
 
 func assertCounterQueryIntervals(t *testing.T, cfg Config, baseURL string) {

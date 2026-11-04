@@ -37,7 +37,7 @@ func (s *Server) handleRemoteWrite(w http.ResponseWriter, r *http.Request) {
 
 	decoded, compressedBytes, err := readSnappyBody(r, "remote write")
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		writeAPIError(w, requestBodyStatus(err), "bad_data", err)
 		return
 	}
 	decodedBytes = len(decoded)
@@ -96,7 +96,7 @@ func (s *Server) handleRemoteRead(w http.ResponseWriter, r *http.Request) {
 	var err error
 	decodedBytes, compressedBytes, err = readSnappyProto(r, &req, "remote read")
 	if err != nil {
-		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
+		writeAPIError(w, requestBodyStatus(err), "bad_data", err)
 		return
 	}
 	queryCount = len(req.GetQueries())
@@ -138,10 +138,27 @@ func readSnappyProto(r *http.Request, dst interface{ Unmarshal([]byte) error }, 
 	return len(decoded), compressedBytes, nil
 }
 
+// maxRequestBodyBytes bounds a write or read body after decompression, like
+// Loki's 100MB receive limit. Snappy and gzip let a small body claim far more.
+const maxRequestBodyBytes = 100 << 20
+
+// requestBodyStatus is 413 for a body over maxRequestBodyBytes, else 400.
+func requestBodyStatus(err error) int {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		return http.StatusRequestEntityTooLarge
+	}
+	return http.StatusBadRequest
+}
+
 func readSnappyBody(r *http.Request, name string) ([]byte, int, error) {
-	compressed, err := io.ReadAll(r.Body)
+	compressed, err := io.ReadAll(http.MaxBytesReader(nil, r.Body, maxRequestBodyBytes))
 	if err != nil {
 		return nil, 0, err
+	}
+	// snappy.Decode allocates the length the block header claims.
+	if n, err := snappy.DecodedLen(compressed); err == nil && n > maxRequestBodyBytes {
+		return nil, len(compressed), fmt.Errorf("decode snappy %s request: %w", name, &http.MaxBytesError{Limit: maxRequestBodyBytes})
 	}
 	decoded, err := snappy.Decode(nil, compressed)
 	if err != nil {

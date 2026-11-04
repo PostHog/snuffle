@@ -138,6 +138,7 @@ func TestQueryTagsReachEveryClickHouseStatement(t *testing.T) {
 			params := url.Values{"query": {tc.query}, "start": {"1700000000"}, "end": {"1700003600"}, "step": {"60"}}
 			req := httptest.NewRequest(http.MethodGet, tc.path+"?"+params.Encode(), nil)
 			req.Header.Set("X-Team-ID", "999")
+			req.SetBasicAuth("default", "")
 			req.Header.Set("X-PostHog-Query-Tags", `{"user_id": 7, "team_id": 999}`)
 			mux.ServeHTTP(httptest.NewRecorder(), req)
 			comments := recorder.recorded()

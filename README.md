@@ -188,10 +188,11 @@ Native connections use LZ4 compression to reduce network traffic.
 ClickHouse performs authentication and authorization; Snuffle does not
 maintain a user database or make authentication decisions.
 
-Requests without a decodable Basic Authorization header connect as
-ClickHouse's `default` user by default. During a staged rollout, set
-`SNUFFLE_ALLOW_UNAUTHENTICATED=true` to allow requests without credentials by
-using `CH_USER` and `CH_PASSWORD`. Credentials that are present—including a
+Query, read and write routes refuse requests without a decodable Basic
+Authorization header with 401, rather than connect as ClickHouse's
+passwordless `default` user. `/metrics` and the health checks stay open. During
+a staged rollout, set `SNUFFLE_ALLOW_UNAUTHENTICATED=true` to allow requests
+without credentials by using `CH_USER` and `CH_PASSWORD`. Credentials that are present—including a
 blank password—are always passed through unchanged and never replaced after
 ClickHouse rejects them.
 
@@ -233,7 +234,11 @@ Snuffle resolves a numeric team ID in this order:
 1. `/t/{team_id}/...` or `/team/{team_id}/...` in the request path;
 2. the configured tenant header, `X-Team-ID` by default;
 3. the configured query parameter, `team_id` by default; then
-4. `SNUFFLE_DEFAULT_TEAM_ID`, default `0`.
+4. `SNUFFLE_DEFAULT_TEAM_ID`, only when it is set.
+
+A request that names no team is refused with 400 unless
+`SNUFFLE_DEFAULT_TEAM_ID` is set. Team IDs must fit in a signed 32-bit integer,
+the type of `team_id` in the log and PostHog metrics tables.
 
 Examples:
 
@@ -663,7 +668,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SNUFFLE_DEFAULT_TEAM_ID` | `0` | Tenant used when no path, header, or query tenant is provided |
+| `SNUFFLE_DEFAULT_TEAM_ID` | unset | Tenant used when no path, header, or query tenant is provided; unset refuses such requests |
 | `SNUFFLE_TEAM_HEADER` | `X-Team-ID` | Tenant request header |
 | `SNUFFLE_TEAM_QUERY_PARAM` | `team_id` | Tenant query parameter |
 | `SNUFFLE_QUERY_TAGS_HEADER` | `X-PostHog-Query-Tags` | Request header with caller query tags for `log_comment`; empty ignores it |

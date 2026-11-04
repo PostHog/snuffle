@@ -54,6 +54,7 @@ type Config struct {
 	SampleAttributes            bool
 	TeamID                      uint64
 	DefaultTeamID               uint64
+	AllowDefaultTeam            bool // set by SNUFFLE_DEFAULT_TEAM_ID; otherwise a request must name its team
 	TeamHeader                  string
 	TeamQueryParam              string
 	QueryTagsHeader             string
@@ -163,6 +164,7 @@ func ConfigFromEnv() Config {
 		SampleAttributes:            envBool("SNUFFLE_SAMPLE_ATTRIBUTES", sampleAttributesDefault),
 		TeamID:                      defaultTeamID,
 		DefaultTeamID:               defaultTeamID,
+		AllowDefaultTeam:            os.Getenv("SNUFFLE_DEFAULT_TEAM_ID") != "",
 		TeamHeader:                  getenv("SNUFFLE_TEAM_HEADER", "X-Team-ID"),
 		TeamQueryParam:              getenv("SNUFFLE_TEAM_QUERY_PARAM", "team_id"),
 		QueryTagsHeader:             getenv("SNUFFLE_QUERY_TAGS_HEADER", "X-PostHog-Query-Tags"),

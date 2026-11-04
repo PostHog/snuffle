@@ -61,6 +61,8 @@ func TestRoutesRejectInvalidRequests(t *testing.T) {
 					}
 					req := httptest.NewRequest(method, test.path, bytes.NewReader(test.body))
 					req.Header.Set("Content-Type", test.contentType)
+					req.Header.Set("X-Team-ID", "1")
+					req.SetBasicAuth("default", "")
 					recorder := httptest.NewRecorder()
 					mux.ServeHTTP(recorder, req)
 					if recorder.Code != test.wantStatus {
