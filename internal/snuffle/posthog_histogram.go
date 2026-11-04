@@ -351,6 +351,7 @@ type postHogHistogramSeriesBuilder struct {
 	bySource       map[uint64]*postHogHistogramSourceSeries
 	previousBucket map[uint64]map[string]*seriesMeta
 	skipped        map[uint64]struct{}
+	delta          map[*seriesMeta]bool
 	samples        int
 }
 
@@ -374,8 +375,9 @@ type postHogHistogramSeriesKey struct {
 }
 
 type postHogHistogramSourceSeries struct {
-	labels map[string]string
-	series map[postHogHistogramSeriesKey]*seriesMeta
+	labels      map[string]string
+	series      map[postHogHistogramSeriesKey]*seriesMeta
+	temporality string
 }
 
 // newPostHogHistogramSeriesBuilder builds virtual series from stored
@@ -384,7 +386,7 @@ type postHogHistogramSourceSeries struct {
 // of the team, so one invalid histogram must not fail it; the builder skips
 // that source and logs it once.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{})}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), delta: make(map[*seriesMeta]bool)}
 }
 
 func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
@@ -489,8 +491,16 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			return nil, nil
 		}
 	}
-	if builder.withSamples && sample.temporality != "cumulative" {
-		return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative histograms; convert delta histograms to cumulative before ingestion", sample.metricName, sample.temporality)
+	if builder.withSamples {
+		if sample.temporality != "cumulative" && sample.temporality != "delta" {
+			return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative or delta histograms", sample.metricName, sample.temporality)
+		}
+		if source.temporality == "" {
+			source.temporality = sample.temporality
+		}
+		if source.temporality != sample.temporality {
+			return nil, postHogMixedTemporality(sample.metricName)
+		}
 	}
 	if meta == nil {
 		labelSet := labels.FromMap(labelMap)
@@ -504,6 +514,16 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			builder.byLabels[key] = meta
 			builder.series = append(builder.series, meta)
 		}
+		// The source check above keeps the temporality of a bound source
+		// fixed. The series therefore needs a check only when a source first
+		// binds to it.
+		if builder.withSamples {
+			delta := sample.temporality == "delta"
+			if seen, exists := builder.delta[meta]; exists && seen != delta {
+				return nil, postHogMixedTemporality(sample.metricName)
+			}
+			builder.delta[meta] = delta
+		}
 		source.series[seriesKey] = meta
 	}
 	if builder.withSamples {
@@ -512,6 +532,53 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 		}
 	}
 	return meta, nil
+}
+
+// postHogMixedTemporality refuses a series with both delta and cumulative
+// points. A running total over such a series has no meaning.
+func postHogMixedTemporality(metricName string) error {
+	return invalidPostHogHistogram("histogram %q mixes delta and cumulative aggregation temporality in one series", metricName)
+}
+
+// finish sorts the samples of each series by time. A series built from delta
+// points becomes a running total. Counter functions such as rate and
+// increase then read it as a cumulative counter.
+func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
+	for _, meta := range builder.series {
+		sortSamples(meta.samples)
+		if builder.delta[meta] {
+			meta.samples = accumulatePostHogDeltaSamples(meta.samples)
+		}
+	}
+	return builder.series
+}
+
+// accumulatePostHogDeltaSamples turns time-sorted delta points into a running
+// total that starts at the first point. It sums points that share a
+// timestamp, such as points from several clients, into one point. A stale
+// marker stays only when no point at its timestamp carries a value. The total
+// does not reset after a stale marker.
+func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
+	out := samples[:0]
+	var total float64
+	for index := 0; index < len(samples); {
+		timestamp := samples[index].t
+		var sum float64
+		stale := true
+		for ; index < len(samples) && samples[index].t == timestamp; index++ {
+			if !isStaleSampleValue(samples[index].v) {
+				sum += samples[index].v
+				stale = false
+			}
+		}
+		value := math.Float64frombits(promvalue.StaleNaN)
+		if !stale {
+			total += sum
+			value = total
+		}
+		out = append(out, samplePoint{t: timestamp, v: value})
+	}
+	return out
 }
 
 func (builder *postHogHistogramSeriesBuilder) appendSample(meta *seriesMeta, timestamp int64, value float64) error {
@@ -586,10 +653,7 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	if err != nil {
 		return nil, err
 	}
-	for _, meta := range builder.series {
-		sortSamples(meta.samples)
-	}
-	return builder.series, nil
+	return builder.finish(), nil
 }
 
 func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*seriesMeta, mint, maxt int64, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {

@@ -128,11 +128,11 @@ func TestPostHogHistogramMatchers(test *testing.T) {
 
 func TestPostHogHistogramTemporalityAndLimits(test *testing.T) {
 	exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_count")}
-	for _, temporality := range []string{"delta", "unspecified", ""} {
+	for _, temporality := range []string{"unspecified", ""} {
 		sample := histogramTestSample()
 		sample.temporality = temporality
 		builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
-		if err := builder.add(sample, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "require cumulative") {
+		if err := builder.add(sample, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "require cumulative or delta") {
 			test.Fatalf("unsupported temporality %q: %v", temporality, err)
 		}
 		builder = newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, false)
@@ -430,18 +430,18 @@ func TestPostHogHistogramInvalidSourcesSkippedForBroadSelectors(test *testing.T)
 	invalid.id = 2
 	invalid.metricName = "test_broken_seconds"
 	invalid.count = 11
-	delta := histogramTestSample()
-	delta.id = 3
-	delta.metricName = "test_delta_seconds"
-	delta.temporality = "delta"
+	unspecified := histogramTestSample()
+	unspecified.id = 3
+	unspecified.metricName = "test_unspecified_seconds"
+	unspecified.temporality = "unspecified"
 	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "test_.*")}, true)
-	for _, sample := range []postHogHistogramSample{invalid, delta, invalid, histogramTestSample()} {
+	for _, sample := range []postHogHistogramSample{invalid, unspecified, invalid, histogramTestSample()} {
 		if err := builder.add(sample, []string{"_bucket", "_count"}); err != nil {
 			test.Fatalf("broad selector must skip invalid histogram %q: %v", sample.metricName, err)
 		}
 	}
 	if len(builder.skipped) != 2 {
-		test.Fatalf("skipped sources = %d, want the invalid and the delta histogram", len(builder.skipped))
+		test.Fatalf("skipped sources = %d, want the invalid and the unspecified histogram", len(builder.skipped))
 	}
 	for _, meta := range builder.series {
 		if name := meta.labelMap[labels.MetricName]; !strings.HasPrefix(name, "test_duration_seconds") {
@@ -524,5 +524,109 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 	unsorted := mergeSamplesPreferFirst([]samplePoint{{t: 3000, v: 3}, {t: 1000, v: 1}}, []samplePoint{{t: 2000, v: 2}, {t: 1000, v: 9}})
 	if !reflect.DeepEqual(unsorted, []samplePoint{{t: 1000, v: 1}, {t: 2000, v: 2}, {t: 3000, v: 3}}) {
 		test.Fatalf("unsorted merge = %v", unsorted)
+	}
+}
+
+func deltaHistogramTestSample(id uint64, timestamp int64, counts ...uint64) postHogHistogramSample {
+	sample := histogramTestSample()
+	sample.id, sample.timestamp, sample.temporality = id, timestamp, "delta"
+	sample.counts = counts
+	sample.count = 0
+	for _, count := range counts {
+		sample.count += count
+	}
+	sample.sum = float64(sample.count) / 2
+	return sample
+}
+
+func histogramSeriesByName(series []*seriesMeta) map[string][]samplePoint {
+	result := make(map[string][]samplePoint, len(series))
+	for _, meta := range series {
+		result[meta.metricName+"|"+meta.labelMap["le"]] = meta.samples
+	}
+	return result
+}
+
+func TestPostHogHistogramDeltaRunningTotal(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	// Sources 1 and 2 carry the same labels, so they build the same series.
+	// Source 2 arrives after source 1, so its points arrive out of time
+	// order. Its first point shares a timestamp with source 1.
+	for _, sample := range []postHogHistogramSample{
+		deltaHistogramTestSample(1, 1000, 1, 1, 2),
+		deltaHistogramTestSample(1, 3000, 2, 0, 0),
+		deltaHistogramTestSample(2, 1000, 0, 1, 1),
+		deltaHistogramTestSample(2, 2000, 1, 2, 3),
+	} {
+		if err := builder.add(sample, postHogHistogramSuffixes); err != nil {
+			test.Fatal(err)
+		}
+	}
+	got := histogramSeriesByName(builder.finish())
+	want := map[string][]samplePoint{
+		"test_duration_seconds_bucket|0.5":  {{t: 1000, v: 1}, {t: 2000, v: 2}, {t: 3000, v: 4}},
+		"test_duration_seconds_bucket|1":    {{t: 1000, v: 3}, {t: 2000, v: 6}, {t: 3000, v: 8}},
+		"test_duration_seconds_bucket|+Inf": {{t: 1000, v: 6}, {t: 2000, v: 12}, {t: 3000, v: 14}},
+		"test_duration_seconds_count|":      {{t: 1000, v: 6}, {t: 2000, v: 12}, {t: 3000, v: 14}},
+		"test_duration_seconds_sum|":        {{t: 1000, v: 3}, {t: 2000, v: 6}, {t: 3000, v: 7}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		test.Fatalf("delta running totals = %v, want %v", got, want)
+	}
+}
+
+func TestPostHogHistogramDeltaBucketRemoval(test *testing.T) {
+	withoutHalf := func(timestamp int64) postHogHistogramSample {
+		sample := deltaHistogramTestSample(1, timestamp, 1, 1)
+		sample.bounds = []float64{1}
+		return sample
+	}
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	// Source 1 removes le="0.5" at 2000 and again at 5000. At 5000, source 2
+	// reports le="0.5" with the same labels, so that point keeps a value.
+	for _, sample := range []postHogHistogramSample{
+		deltaHistogramTestSample(1, 1000, 1, 1, 1),
+		withoutHalf(2000),
+		deltaHistogramTestSample(1, 4000, 2, 0, 0),
+		withoutHalf(5000),
+		deltaHistogramTestSample(2, 5000, 3, 0, 0),
+	} {
+		if err := builder.add(sample, []string{"_bucket"}); err != nil {
+			test.Fatal(err)
+		}
+	}
+	got := histogramSeriesByName(builder.finish())["test_duration_seconds_bucket|0.5"]
+	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 1}) || got[1].t != 2000 || !isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 4000, v: 3}) || got[3] != (samplePoint{t: 5000, v: 6}) {
+		test.Fatalf("removed delta bucket = %v", got)
+	}
+}
+
+func TestPostHogHistogramMixedTemporality(test *testing.T) {
+	exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_count")}
+	for _, testcase := range []struct {
+		name   string
+		second postHogHistogramSample
+	}{
+		{"one source", deltaHistogramTestSample(1, 2000, 2, 3, 5)},
+		{"two sources with one label set", deltaHistogramTestSample(2, 2000, 2, 3, 5)},
+	} {
+		test.Run(testcase.name, func(test *testing.T) {
+			strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			if err := strict.add(histogramTestSample(), []string{"_count"}); err != nil {
+				test.Fatal(err)
+			}
+			if err := strict.add(testcase.second, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
+				test.Fatalf("exact selector accepted mixed temporality: %v", err)
+			}
+			broad := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+			for _, sample := range []postHogHistogramSample{histogramTestSample(), testcase.second} {
+				if err := broad.add(sample, []string{"_count"}); err != nil {
+					test.Fatalf("broad selector must skip the mixed sample: %v", err)
+				}
+			}
+			if got := histogramSeriesByName(broad.finish())["test_duration_seconds_count|"]; !reflect.DeepEqual(got, []samplePoint{{t: 1000, v: 10}}) {
+				test.Fatalf("broad selector kept %v, want only the cumulative point", got)
+			}
+		})
 	}
 }

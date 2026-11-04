@@ -502,9 +502,19 @@ discovery also reads histogram names and types from the series table. Bucket
 label discovery reads the distinct stored bound sets within the requested time
 range, not the samples.
 
-Only cumulative histogram samples can be read as virtual counters. Delta or
-unspecified temporality returns an error rather than an incorrect counter or
-rate. Convert delta histograms to cumulative before ingestion. Exponential
+Cumulative and delta histogram samples can be read as virtual counters. For a
+delta histogram, Snuffle sorts the points of each virtual series by time, sums
+points that share a timestamp, such as points from several clients, and returns
+the running total of the points. The total starts at the first point in the
+query range, so the raw value of a delta series depends on the query range,
+while `rate`, `increase`, and `histogram_quantile` over them work as they do for
+a cumulative histogram. `increase` treats a series with no sample in
+`PROMQL_LOOKBACK_DELTA` before the window as a new counter, so for a delta series
+that pauses longer than that, it can count points from before the window or
+skip the first point in it. A series with both delta and cumulative points, or
+with unspecified temporality, returns an error rather than an incorrect counter
+or rate. The compact histogram path reads cumulative histograms only; a delta
+histogram uses the general engine. Exponential
 histograms expose `_count` and `_sum` only: the stored flattened arrays do not
 preserve enough information to reconstruct their bucket boundaries. Use explicit
 histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.

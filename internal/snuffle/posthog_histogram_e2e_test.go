@@ -471,16 +471,46 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			test.Fatalf("incomplete exponential bounds must not produce buckets: %v", result)
 		}
 	})
-	test.Run("delta rejection", func(test *testing.T) {
-		insertHistogram("test_delta_seconds", "delta", "histogram", e2eTeamID)
-		response, err := http.Get(api.URL + "/t/42/api/v1/query?" + url.Values{"query": {"test_delta_seconds_count"}, "time": {"1700000070"}}.Encode())
+	test.Run("delta counters", func(test *testing.T) {
+		const name = "test_delta_seconds"
+		insertHistogram(name, "delta", "histogram", e2eTeamID)
+		// A second client reports a point at the same time as the last one.
+		sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes) SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6)+INTERVAL 1 DAY, 'api', 'histogram', 'delta', 3, 3, [0.5, 1.0], [1,1,1], true, map('region','resource'), map('region','metric','status','200')", tableName(database, cfg.MetricsInputTable), e2eTeamID, sqlString(name), sqlString(name), chTimeMillis(e2eEndMS))
+		if err := client.Exec(ctx, sql); err != nil {
+			test.Fatal(err)
+		}
+		assertValue(test, "increase("+name+"_count[1m])", 53)
+		assertValue(test, "increase("+name+"_sum[1m])", 63)
+		assertValue(test, "histogram_quantile(0.5, sum by (le) (increase("+name+"_bucket[1m])))", 0.984375)
+		for _, testcase := range []struct {
+			expression string
+			want       []float64
+		}{
+			{"sum(increase(" + name + "_count[30s]))", []float64{20, 33}},
+			{"histogram_quantile(0.5, sum by (le) (rate(" + name + "_bucket[1m])))", []float64{1, 0.984375}},
+		} {
+			result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {testcase.expression}, "start": {"1700000040"}, "end": {"1700000070"}, "step": {"30"}})
+			if len(result.Result) != 1 || len(result.Result[0].Values) != len(testcase.want) {
+				test.Fatalf("%s: %+v", testcase.expression, result)
+			}
+			for index, point := range result.Result[0].Values {
+				got, err := strconv.ParseFloat(sampleString(point), 64)
+				if err != nil || math.Abs(got-testcase.want[index]) > 1e-9 {
+					test.Fatalf("%s sample %d = %v (%v), want %v", testcase.expression, index, got, err, testcase.want[index])
+				}
+			}
+		}
+	})
+	test.Run("unspecified temporality rejection", func(test *testing.T) {
+		insertHistogram("test_unspecified_seconds", "unspecified", "histogram", e2eTeamID)
+		response, err := http.Get(api.URL + "/t/42/api/v1/query?" + url.Values{"query": {"test_unspecified_seconds_count"}, "time": {"1700000070"}}.Encode())
 		if err != nil {
 			test.Fatal(err)
 		}
 		defer response.Body.Close()
 		body, _ := io.ReadAll(response.Body)
-		if response.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(body), "require cumulative") {
-			test.Fatalf("delta query: status %d: %s", response.StatusCode, body)
+		if response.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(body), "require cumulative or delta") {
+			test.Fatalf("unspecified temporality query: status %d: %s", response.StatusCode, body)
 		}
 	})
 	test.Run("invalid histograms fail only exact selectors", func(test *testing.T) {
@@ -490,8 +520,8 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			names = append(names, series.Metric[labels.MetricName])
 		}
 		sort.Strings(names)
-		if want := []string{"test_duration_seconds_count", "test_exponential_seconds_count", "test_mixed_seconds_count"}; !reflect.DeepEqual(names, want) {
-			test.Fatalf("broad selector over a delta histogram = %v, want %v", names, want)
+		if want := []string{"test_delta_seconds_count", "test_duration_seconds_count", "test_exponential_seconds_count", "test_mixed_seconds_count"}; !reflect.DeepEqual(names, want) {
+			test.Fatalf("broad selector over an unspecified histogram = %v, want %v", names, want)
 		}
 	})
 	test.Run("large fingerprint sets use an external table", func(test *testing.T) {
