@@ -376,9 +376,11 @@ type postHogHistogramSeriesKey struct {
 }
 
 type postHogHistogramSourceSeries struct {
-	labels      map[string]string
-	series      map[postHogHistogramSeriesKey]*seriesMeta
-	temporality string
+	labels         map[string]string
+	series         map[postHogHistogramSeriesKey]*seriesMeta
+	temporality    string
+	bucketsChecked bool
+	totalsChecked  bool
 }
 
 // newPostHogHistogramSeriesBuilder builds virtual series from stored
@@ -497,19 +499,20 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 			return nil, invalidPostHogHistogram("histogram %q has %q aggregation temporality; virtual Prometheus counters require cumulative or delta histograms", sample.metricName, sample.temporality)
 		}
 		if source.temporality == "" {
-			// Sources with one label set write to the same series. This check
-			// refuses a conflicting source before it appends any point. The
-			// key leaves out le because the generated le label replaces an
-			// input attribute with that name.
-			key := labels.NewBuilder(labels.FromMap(source.labels)).Del("le").Labels().String()
-			if seen, exists := builder.temporality[key]; exists && seen != sample.temporality {
-				return nil, postHogMixedTemporality(sample.metricName)
-			}
-			builder.temporality[key] = sample.temporality
 			source.temporality = sample.temporality
 		}
 		if source.temporality != sample.temporality {
 			return nil, postHogMixedTemporality(sample.metricName)
+		}
+		checked := &source.totalsChecked
+		if seriesKey.suffix == "_bucket" {
+			checked = &source.bucketsChecked
+		}
+		if !*checked {
+			if err := builder.checkLabelSetTemporality(source, seriesKey.suffix, sample); err != nil {
+				return nil, err
+			}
+			*checked = true
 		}
 	}
 	if meta == nil {
@@ -537,6 +540,26 @@ func (builder *postHogHistogramSeriesBuilder) addPoint(source *postHogHistogramS
 	return meta, nil
 }
 
+// checkLabelSetTemporality refuses a source whose temporality differs from
+// another source that writes to the same series. It runs before the source
+// appends its first point of each kind. The generated le label replaces an
+// input attribute with that name on bucket series, so the bucket key leaves le
+// out. Count and sum series keep the input attribute.
+func (builder *postHogHistogramSeriesBuilder) checkLabelSetTemporality(source *postHogHistogramSourceSeries, suffix string, sample postHogHistogramSample) error {
+	key := labels.NewBuilder(labels.FromMap(source.labels))
+	kind := "totals"
+	if suffix == "_bucket" {
+		key.Del("le")
+		kind = suffix
+	}
+	id := kind + key.Labels().String()
+	if seen, exists := builder.temporality[id]; exists && seen != sample.temporality {
+		return postHogMixedTemporality(sample.metricName)
+	}
+	builder.temporality[id] = sample.temporality
+	return nil
+}
+
 // postHogMixedTemporality refuses a series with both delta and cumulative
 // points. A running total over such a series has no meaning.
 func postHogMixedTemporality(metricName string) error {
@@ -558,24 +581,30 @@ func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
 
 // accumulatePostHogDeltaSamples turns time-sorted delta points into a running
 // total that starts at the first point. It sums points that share a
-// timestamp, such as points from several clients, into one point. A stale
-// marker stays only when no point at its timestamp carries a value. The total
-// does not reset after a stale marker.
+// timestamp, such as points from several clients, into one point. A NaN or
+// infinite point does not change the total. When no finite point shares its
+// timestamp, it is returned as is. A stale marker stays only when no other
+// point shares its timestamp. The total does not reset after a stale marker.
 func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 	out := samples[:0]
 	var total float64
 	for index := 0; index < len(samples); {
 		timestamp := samples[index].t
 		var sum float64
-		stale := true
+		finite := false
+		value := math.Float64frombits(promvalue.StaleNaN)
 		for ; index < len(samples) && samples[index].t == timestamp; index++ {
-			if !isStaleSampleValue(samples[index].v) {
-				sum += samples[index].v
-				stale = false
+			point := samples[index].v
+			switch {
+			case isStaleSampleValue(point):
+			case math.IsNaN(point) || math.IsInf(point, 0):
+				value = point
+			default:
+				sum += point
+				finite = true
 			}
 		}
-		value := math.Float64frombits(promvalue.StaleNaN)
-		if !stale {
+		if finite {
 			total += sum
 			value = total
 		}

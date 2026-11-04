@@ -657,5 +657,41 @@ func TestPostHogHistogramMixedTemporality(test *testing.T) {
 		if err := strict.add(second, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
 			test.Fatalf("exact selector accepted mixed temporality: %v", err)
 		}
+		// Count and sum series keep the input le attribute. These sources
+		// therefore build separate count series.
+		totals := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+		for _, sample := range []postHogHistogramSample{histogramTestSample(), second} {
+			if err := totals.add(sample, []string{"_count"}); err != nil {
+				test.Fatalf("separate count series refused: %v", err)
+			}
+		}
+		if series := totals.finish(); len(series) != 2 {
+			test.Fatalf("count series = %d, want one per source", len(series))
+		}
 	})
+}
+
+func TestPostHogHistogramDeltaNaNSum(test *testing.T) {
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	nan := deltaHistogramTestSample(1, 2000, 1, 1, 2)
+	nan.sum = math.NaN()
+	// Source 2 shares the labels of source 1. At 3000 its NaN sum shares a
+	// timestamp with a finite sum from source 1.
+	nanAtThree := deltaHistogramTestSample(2, 3000, 1, 1, 2)
+	nanAtThree.sum = math.NaN()
+	for _, sample := range []postHogHistogramSample{
+		deltaHistogramTestSample(1, 1000, 1, 1, 2),
+		nan,
+		deltaHistogramTestSample(1, 3000, 2, 0, 0),
+		nanAtThree,
+		deltaHistogramTestSample(1, 4000, 2, 0, 0),
+	} {
+		if err := builder.add(sample, []string{"_sum"}); err != nil {
+			test.Fatal(err)
+		}
+	}
+	got := histogramSeriesByName(builder.finish())["test_duration_seconds_sum|"]
+	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 2}) || got[1].t != 2000 || !math.IsNaN(got[1].v) || isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 3000, v: 3}) || got[3] != (samplePoint{t: 4000, v: 4}) {
+		test.Fatalf("delta sum with NaN = %v", got)
+	}
 }
