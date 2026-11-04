@@ -501,7 +501,10 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 		series("duration_bucket", "+Inf", samplePoint{t: 1000, v: 6}, samplePoint{t: 3000, v: 15}),
 		series("duration_sum", "", samplePoint{t: 1000, v: 3}, samplePoint{t: 3000, v: 9}),
 	}
-	merged := mergePostHogHistogramSeries(real, virtual)
+	merged, err := mergePostHogHistogramSeries(real, virtual, true)
+	if err != nil {
+		test.Fatal(err)
+	}
 	got := make(map[string][]samplePoint, len(merged))
 	for _, meta := range merged {
 		got[meta.labels.String()] = meta.samples
@@ -515,15 +518,44 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 	if len(merged) != len(want) || !reflect.DeepEqual(got, want) {
 		test.Fatalf("merged series = %v, want %v", got, want)
 	}
-	if only := mergePostHogHistogramSeries(nil, virtual); len(only) != len(virtual) {
+	if only, _ := mergePostHogHistogramSeries(nil, virtual, true); len(only) != len(virtual) {
 		test.Fatalf("virtual only = %d series", len(only))
 	}
-	if only := mergePostHogHistogramSeries(real, nil); len(only) != len(real) {
+	if only, _ := mergePostHogHistogramSeries(real, nil, true); len(only) != len(real) {
 		test.Fatalf("real only = %d series", len(only))
 	}
 	unsorted := mergeSamplesPreferFirst([]samplePoint{{t: 3000, v: 3}, {t: 1000, v: 1}}, []samplePoint{{t: 2000, v: 2}, {t: 1000, v: 9}})
 	if !reflect.DeepEqual(unsorted, []samplePoint{{t: 1000, v: 1}, {t: 2000, v: 2}, {t: 3000, v: 3}}) {
 		test.Fatalf("unsorted merge = %v", unsorted)
+	}
+}
+
+func TestMergePostHogHistogramSeriesDelta(test *testing.T) {
+	series := func(name string, delta bool, samples ...samplePoint) *seriesMeta {
+		labelMap := map[string]string{labels.MetricName: name, "service_name": "api"}
+		set := labels.FromMap(labelMap)
+		return &seriesMeta{id: set.Hash(), metricName: name, labelMap: labelMap, labels: set, samples: samples, delta: delta}
+	}
+	stored := func() []*seriesMeta {
+		return []*seriesMeta{series("duration_count", false, samplePoint{t: 2000, v: 100})}
+	}
+	virtual := func() []*seriesMeta {
+		return []*seriesMeta{series("duration_count", true, samplePoint{t: 1000, v: 10}, samplePoint{t: 3000, v: 20}), series("duration_sum", true, samplePoint{t: 1000, v: 5})}
+	}
+	if _, err := mergePostHogHistogramSeries(stored(), virtual(), true); err == nil || !strings.Contains(err.Error(), "stored series") {
+		test.Fatalf("exact selector merged a stored series into a delta series: %v", err)
+	}
+	merged, err := mergePostHogHistogramSeries(stored(), virtual(), false)
+	if err != nil {
+		test.Fatalf("broad selector must skip the delta series: %v", err)
+	}
+	got := make(map[string][]samplePoint, len(merged))
+	for _, meta := range merged {
+		got[meta.metricName] = meta.samples
+	}
+	want := map[string][]samplePoint{"duration_count": {{t: 2000, v: 100}}, "duration_sum": {{t: 1000, v: 5}}}
+	if !reflect.DeepEqual(got, want) {
+		test.Fatalf("broad selector kept %v, want %v", got, want)
 	}
 }
 
@@ -631,6 +663,19 @@ func TestPostHogHistogramMixedTemporality(test *testing.T) {
 			}
 		})
 	}
+	test.Run("skipped delta source keeps its later cumulative points", func(test *testing.T) {
+		later := histogramTestSample()
+		later.id, later.timestamp, later.count, later.counts = 2, 3000, 15, []uint64{3, 4, 8}
+		broad := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+		for _, sample := range []postHogHistogramSample{histogramTestSample(), deltaHistogramTestSample(2, 2000, 2, 3, 5), later} {
+			if err := broad.add(sample, []string{"_count"}); err != nil {
+				test.Fatalf("broad selector must skip the mixed sample: %v", err)
+			}
+		}
+		if got := histogramSeriesByName(broad.finish())["test_duration_seconds_count|"]; !reflect.DeepEqual(got, []samplePoint{{t: 1000, v: 10}, {t: 3000, v: 15}}) {
+			test.Fatalf("broad selector kept %v, want the cumulative points of both sources", got)
+		}
+	})
 	test.Run("bucket bound only the delta source has", func(test *testing.T) {
 		second := deltaHistogramTestSample(2, 2000, 1, 1)
 		second.bounds = []float64{2}
