@@ -77,6 +77,8 @@ func newServer(cfg Config) *Server {
 		LookbackDelta:        cfg.LookbackDelta,
 		EnableAtModifier:     true,
 		EnableNegativeOffset: true,
+		// Like VictoriaMetrics: sum by (x) (rate({__name__=~"a|b"}[5m])) works when a and b share labels.
+		EnableDelayedNameRemoval: true,
 		NoStepSubqueryIntervalFn: func(rangeMillis int64) int64 {
 			if rangeMillis <= 0 {
 				return int64(time.Minute / time.Millisecond)

@@ -114,6 +114,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 		assertQueryLogComments(t, ctx, rootClient, api.URL)
 	})
 
+	t.Run("shared label sets across metric names", func(t *testing.T) {
+		assertSharedLabelsetAcrossNames(t, cfg, api.URL)
+	})
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
 	assertUnionQueries(t, api.URL)
