@@ -338,6 +338,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	userQuery := query
 	query = prepared.query
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
@@ -379,7 +380,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	value := metricsQLValue(result.Value)
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, query))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, userQuery, query))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -426,6 +427,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	userQuery := query
 	query = prepared.query
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
@@ -481,14 +483,18 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, query))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, userQuery, query))
 }
 
 const maxQueryWarnings = 10
 
 // Info annotations are left out because rate() adds one for every counter
 // without a _total suffix, which is most stored metrics.
-func queryWarnings(annos annotations.Annotations, query string) []string {
+func queryWarnings(annos annotations.Annotations, userQuery, query string) []string {
+	// Positions in a MetricsQL rewrite point at text the user did not write.
+	if query != userQuery {
+		query = ""
+	}
 	warnings, _ := annos.AsStrings(query, 0, 0)
 	sort.Strings(warnings)
 	if omitted := len(warnings) - maxQueryWarnings; omitted > 0 {

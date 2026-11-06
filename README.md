@@ -523,7 +523,10 @@ Snuffle skips each invalid histogram sample, logs it, and adds a warning to the
 `warnings` field of the `/api/v1/query` and `/api/v1/query_range` response. The
 other samples and series are still returned, so one bad sample does not fail a
 dashboard panel or discovery. A partial result always has a warning, and Grafana
-shows it on the panel. Removed bucket boundaries produce stale markers.
+shows it on the panel. A selector that names the metric exactly still fails on
+a series with both delta and cumulative points, because the counter it would
+return depends on which source is read first. Removed bucket boundaries produce
+stale markers.
 
 Query fast paths stay available for exact `_bucket`, `_count`, and `_sum`
 names when the team stores no histogram with the base name inside the query

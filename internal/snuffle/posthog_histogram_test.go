@@ -512,7 +512,10 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 		series("duration_bucket", "+Inf", samplePoint{t: 1000, v: 6}, samplePoint{t: 3000, v: 15}),
 		series("duration_sum", "", samplePoint{t: 1000, v: 3}, samplePoint{t: 3000, v: 9}),
 	}
-	merged := mergePostHogHistogramSeries(context.Background(), real, virtual)
+	merged, err := mergePostHogHistogramSeries(context.Background(), real, virtual, true)
+	if err != nil {
+		test.Fatal(err)
+	}
 	got := make(map[string][]samplePoint, len(merged))
 	for _, meta := range merged {
 		got[meta.labels.String()] = meta.samples
@@ -526,10 +529,10 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 	if len(merged) != len(want) || !reflect.DeepEqual(got, want) {
 		test.Fatalf("merged series = %v, want %v", got, want)
 	}
-	if only := mergePostHogHistogramSeries(context.Background(), nil, virtual); len(only) != len(virtual) {
+	if only, _ := mergePostHogHistogramSeries(context.Background(), nil, virtual, true); len(only) != len(virtual) {
 		test.Fatalf("virtual only = %d series", len(only))
 	}
-	if only := mergePostHogHistogramSeries(context.Background(), real, nil); len(only) != len(real) {
+	if only, _ := mergePostHogHistogramSeries(context.Background(), real, nil, true); len(only) != len(real) {
 		test.Fatalf("real only = %d series", len(only))
 	}
 	unsorted := mergeSamplesPreferFirst([]samplePoint{{t: 3000, v: 3}, {t: 1000, v: 1}}, []samplePoint{{t: 2000, v: 2}, {t: 1000, v: 9}})
@@ -550,8 +553,14 @@ func TestMergePostHogHistogramSeriesDelta(test *testing.T) {
 	virtual := func() []*seriesMeta {
 		return []*seriesMeta{series("duration_count", true, samplePoint{t: 1000, v: 10}, samplePoint{t: 3000, v: 20}), series("duration_sum", true, samplePoint{t: 1000, v: 5})}
 	}
+	if _, err := mergePostHogHistogramSeries(context.Background(), stored(), virtual(), true); err == nil || !strings.Contains(err.Error(), "stored series") {
+		test.Fatalf("exact selector merged a stored series into a delta series: %v", err)
+	}
 	ctx, warnings := withSelectWarnings(context.Background())
-	merged := mergePostHogHistogramSeries(ctx, stored(), virtual())
+	merged, err := mergePostHogHistogramSeries(ctx, stored(), virtual(), false)
+	if err != nil {
+		test.Fatal(err)
+	}
 	if annos := warnings.annotations(); len(annos) != 1 || !strings.Contains(annos.AsErrors()[0].Error(), "stored series") {
 		test.Fatalf("skipped delta series must add one warning: %v", annos)
 	}
@@ -649,12 +658,12 @@ func TestPostHogHistogramMixedTemporality(test *testing.T) {
 		{"two sources with one label set", deltaHistogramTestSample(2, 2000, 2, 3, 5)},
 	} {
 		test.Run(testcase.name, func(test *testing.T) {
-			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
-			if err := builder.addSample(histogramTestSample(), []string{"_count"}); err != nil {
+			strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			if err := strict.add(histogramTestSample(), []string{"_count"}); err != nil {
 				test.Fatal(err)
 			}
-			if err := builder.addSample(testcase.second, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
-				test.Fatalf("mixed temporality not detected: %v", err)
+			if err := strict.add(testcase.second, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
+				test.Fatalf("exact selector accepted mixed temporality: %v", err)
 			}
 			later := histogramTestSample()
 			later.timestamp, later.count, later.counts = 3000, 15, []uint64{3, 4, 8}
@@ -701,12 +710,12 @@ func TestPostHogHistogramMixedTemporality(test *testing.T) {
 		second := deltaHistogramTestSample(2, 2000, 2, 3, 5)
 		second.attributes = map[string]string{"region": "metric", "le": "original"}
 		exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_bucket")}
-		builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
-		if err := builder.addSample(histogramTestSample(), []string{"_bucket"}); err != nil {
+		strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+		if err := strict.add(histogramTestSample(), []string{"_bucket"}); err != nil {
 			test.Fatal(err)
 		}
-		if err := builder.addSample(second, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
-			test.Fatalf("mixed temporality not detected: %v", err)
+		if err := strict.add(second, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "mixes delta and cumulative") {
+			test.Fatalf("exact selector accepted mixed temporality: %v", err)
 		}
 		// Count and sum series keep the input le attribute. These sources
 		// therefore build separate count series.
