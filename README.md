@@ -475,12 +475,12 @@ Snuffle exposes three virtual metrics for each stored PostHog explicit histogram
 - `<name>_sum` contains the observation sum, stored in the `value` column.
 
 These are read-time conversions of `histogram_bounds`, `histogram_counts`,
-`count`, and `value`. Trailing `+Inf` or NaN bounds are removed and their
-counts are added to the `le="+Inf"` bucket. A producer that declares an explicit
-`Infinity` bucket, as many prom-client histograms do, stores `+Inf` as its last
-bound, and Prometheus reads that layout as one `+Inf` bucket. They do not write new series or change the stored base
+`count`, and `value`. They do not write new series or change the stored base
 metric. Resource and metric labels are preserved. For buckets, the generated
 `le` label replaces any input attribute with that name. Units are not converted.
+A prom-client histogram that declares an explicit `Infinity` bucket stores
+`+Inf` as its last bound, followed by an empty overflow bucket. Snuffle drops
+that bound and reads the layout as one `le="+Inf"` bucket, as Prometheus does.
 
 Stored series with a generated name, such as classic Prometheus `_bucket`,
 `_count`, and `_sum` series written through remote write, are read together

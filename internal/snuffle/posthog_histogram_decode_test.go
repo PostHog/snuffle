@@ -72,7 +72,7 @@ func (row packedHistogramRow) Scan(dest ...any) error {
 	return nil
 }
 
-func TestScanPackedFoldsTrailingInfiniteBounds(test *testing.T) {
+func TestScanPackedDropsTrailingInfiniteBound(test *testing.T) {
 	for _, testcase := range []struct {
 		name       string
 		bounds     []float64
@@ -83,12 +83,12 @@ func TestScanPackedFoldsTrailingInfiniteBounds(test *testing.T) {
 	}{
 		{"prom-client explicit Infinity", []float64{16, 32, math.Inf(1)}, []uint64{1, 2, 3, 0}, 6, []float64{16, 32}, []uint64{1, 2, 3}},
 		{"repeated Infinity", []float64{16, math.Inf(1), math.Inf(1)}, []uint64{1, 2, 0, 0}, 3, []float64{16}, []uint64{1, 2}},
-		{"trailing NaN", []float64{16, math.NaN()}, []uint64{1, 2, 3}, 6, []float64{16}, []uint64{1, 5}},
 		{"only Infinity", []float64{math.Inf(1)}, []uint64{4, 0}, 4, []float64{}, []uint64{4}},
 		{"finite bounds unchanged", []float64{16, 32}, []uint64{1, 2, 3}, 6, []float64{16, 32}, []uint64{1, 2, 3}},
 		{"length mismatch unchanged", []float64{16, math.Inf(1)}, []uint64{1, 2}, 3, []float64{16, math.Inf(1)}, []uint64{1, 2}},
 		{"inner Infinity unchanged", []float64{math.Inf(1), 16}, []uint64{1, 2, 3}, 6, []float64{math.Inf(1), 16}, []uint64{1, 2, 3}},
-		{"overflow unchanged", []float64{16, math.Inf(1)}, []uint64{0, math.MaxUint64, 1}, 0, []float64{16, math.Inf(1)}, []uint64{0, math.MaxUint64, 1}},
+		{"trailing -Inf unchanged", []float64{16, math.Inf(-1)}, []uint64{1, 2, 0}, 3, []float64{16, math.Inf(-1)}, []uint64{1, 2, 0}},
+		{"count above Infinity unchanged", []float64{16, math.Inf(1)}, []uint64{1, 2, 5}, 8, []float64{16, math.Inf(1)}, []uint64{1, 2, 5}},
 	} {
 		test.Run(testcase.name, func(test *testing.T) {
 			var sample postHogHistogramSample

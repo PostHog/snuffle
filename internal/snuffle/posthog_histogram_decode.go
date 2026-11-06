@@ -21,21 +21,13 @@ func (sample *postHogHistogramSample) scanPacked(row clickHouseRow) error {
 }
 
 // prom-client histograms with an explicit Infinity bucket store +Inf as their
-// last bound. Prometheus reads that layout as one +Inf bucket.
+// last bound, followed by an empty overflow bucket. Prometheus reads that
+// layout as one +Inf bucket.
 func normalizePostHogHistogramBounds(bounds []float64, counts []uint64) ([]float64, []uint64) {
 	if len(counts) != len(bounds)+1 {
 		return bounds, counts
 	}
-	for len(bounds) > 0 {
-		last := bounds[len(bounds)-1]
-		if !math.IsInf(last, 1) && !math.IsNaN(last) {
-			break
-		}
-		overflow, previous := counts[len(counts)-1], counts[len(counts)-2]
-		if overflow > math.MaxUint64-previous {
-			break
-		}
-		counts[len(counts)-2] = previous + overflow
+	for len(bounds) > 0 && math.IsInf(bounds[len(bounds)-1], 1) && counts[len(counts)-1] == 0 {
 		bounds, counts = bounds[:len(bounds)-1], counts[:len(counts)-1]
 	}
 	return bounds, counts
