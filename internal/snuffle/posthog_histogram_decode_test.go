@@ -5,6 +5,8 @@ import (
 	"math"
 	"reflect"
 	"testing"
+
+	"github.com/prometheus/prometheus/model/labels"
 )
 
 func packedHistogramFixture(bounds []float64, counts []uint64) []byte {
@@ -53,4 +55,73 @@ func FuzzDecodePostHogHistogramArrays(fuzz *testing.F) {
 			test.Fatal("decoder allocated beyond input size")
 		}
 	})
+}
+
+type packedHistogramRow struct {
+	payload []byte
+	count   uint64
+}
+
+func (row packedHistogramRow) Scan(dest ...any) error {
+	*dest[0].(*uint64) = 1
+	*dest[1].(*int64) = 1000
+	*dest[2].(*float64) = 0
+	*dest[3].(*uint64) = row.count
+	*dest[4].(*[]byte) = row.payload
+	*dest[5].(*string) = "cumulative"
+	return nil
+}
+
+func TestScanPackedFoldsTrailingInfiniteBounds(test *testing.T) {
+	for _, testcase := range []struct {
+		name       string
+		bounds     []float64
+		counts     []uint64
+		count      uint64
+		wantBounds []float64
+		wantCounts []uint64
+	}{
+		{"prom-client explicit Infinity", []float64{16, 32, math.Inf(1)}, []uint64{1, 2, 3, 0}, 6, []float64{16, 32}, []uint64{1, 2, 3}},
+		{"repeated Infinity", []float64{16, math.Inf(1), math.Inf(1)}, []uint64{1, 2, 0, 0}, 3, []float64{16}, []uint64{1, 2}},
+		{"trailing NaN", []float64{16, math.NaN()}, []uint64{1, 2, 3}, 6, []float64{16}, []uint64{1, 5}},
+		{"only Infinity", []float64{math.Inf(1)}, []uint64{4, 0}, 4, []float64{}, []uint64{4}},
+		{"finite bounds unchanged", []float64{16, 32}, []uint64{1, 2, 3}, 6, []float64{16, 32}, []uint64{1, 2, 3}},
+		{"length mismatch unchanged", []float64{16, math.Inf(1)}, []uint64{1, 2}, 3, []float64{16, math.Inf(1)}, []uint64{1, 2}},
+		{"inner Infinity unchanged", []float64{math.Inf(1), 16}, []uint64{1, 2, 3}, 6, []float64{math.Inf(1), 16}, []uint64{1, 2, 3}},
+		{"overflow unchanged", []float64{16, math.Inf(1)}, []uint64{0, math.MaxUint64, 1}, 0, []float64{16, math.Inf(1)}, []uint64{0, math.MaxUint64, 1}},
+	} {
+		test.Run(testcase.name, func(test *testing.T) {
+			var sample postHogHistogramSample
+			if err := sample.scanPacked(packedHistogramRow{payload: packedHistogramFixture(testcase.bounds, testcase.counts), count: testcase.count}); err != nil {
+				test.Fatal(err)
+			}
+			if !reflect.DeepEqual(sample.bounds, testcase.wantBounds) || !reflect.DeepEqual(sample.counts, testcase.wantCounts) {
+				test.Fatalf("got %v %v, want %v %v", sample.bounds, sample.counts, testcase.wantBounds, testcase.wantCounts)
+			}
+		})
+	}
+}
+
+func TestPostHogHistogramSeriesAcceptsExplicitInfinityBucket(test *testing.T) {
+	var sample postHogHistogramSample
+	payload := packedHistogramFixture([]float64{16, 32, math.Inf(1)}, []uint64{1, 2, 3, 0})
+	if err := sample.scanPacked(packedHistogramRow{payload: payload, count: 6}); err != nil {
+		test.Fatal(err)
+	}
+	sample.metricName = "cdp_cyclotron_job_size_kb"
+	exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "cdp_cyclotron_job_size_kb_bucket")}
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+	if !builder.strict {
+		test.Fatal("an exact selector must be strict")
+	}
+	if err := builder.add(sample, []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	got := map[string]float64{}
+	for _, meta := range builder.finish() {
+		got[meta.labelMap["le"]] = meta.samples[0].v
+	}
+	if want := map[string]float64{"16": 1, "32": 3, "+Inf": 6}; !reflect.DeepEqual(got, want) {
+		test.Fatalf("buckets = %v, want %v", got, want)
+	}
 }

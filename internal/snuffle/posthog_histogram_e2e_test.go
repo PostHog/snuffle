@@ -513,6 +513,25 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			test.Fatalf("unspecified temporality query: status %d: %s", response.StatusCode, body)
 		}
 	})
+	test.Run("explicit Infinity bound folds into the +Inf bucket", func(test *testing.T) {
+		for index := int64(1); index <= 3; index++ {
+			sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes)
+				SELECT %d, 'inf_bound_test_kb', cityHash64('inf_bound_test_kb'), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'histogram', 'cumulative', %d, %d, [16, 32, inf], [%d, %d, %d, 0], true, map(), map()`,
+				tableName(database, cfg.MetricsInputTable), e2eTeamID, chTimeMillis(e2eStartMS+(index-1)*30000), index*100, index*6, index, index*2, index*3)
+			if err := client.Exec(ctx, sql); err != nil {
+				test.Fatal(err)
+			}
+		}
+		result := query(test, `sum by (le) (inf_bound_test_kb_bucket)`)
+		got := make(map[string]string, len(result.Result))
+		for _, series := range result.Result {
+			got[series.Metric["le"]] = sampleString(series.Value)
+		}
+		if want := map[string]string{"16": "3", "32": "9", "+Inf": "18"}; !reflect.DeepEqual(got, want) {
+			test.Fatalf("buckets = %v, want %v", got, want)
+		}
+		assertValue(test, `histogram_quantile(0.5, sum by (le) (inf_bound_test_kb_bucket))`, 32)
+	})
 	test.Run("invalid histograms fail only exact selectors", func(test *testing.T) {
 		result := query(test, `{__name__=~"test_.*_seconds_count"}`)
 		names := make([]string, 0, len(result.Result))
