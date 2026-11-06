@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 )
 
 type Server struct {
@@ -337,6 +338,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	userQuery := query
 	query = prepared.query
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
@@ -378,7 +380,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	value := metricsQLValue(result.Value)
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, userQuery, query))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -425,6 +427,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
+	userQuery := query
 	query = prepared.query
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
@@ -480,7 +483,30 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, userQuery, query))
+}
+
+const maxQueryWarnings = 10
+
+// Info annotations are left out because rate() adds one for every counter
+// without a _total suffix, which is most stored metrics.
+func queryWarnings(annos annotations.Annotations, userQuery, query string) []string {
+	// Positions in a MetricsQL rewrite point at text the user did not write.
+	if query != userQuery {
+		query = ""
+	}
+	warnings, _ := annos.AsStrings(query, 0, 0)
+	sort.Strings(warnings)
+	if omitted := len(warnings) - maxQueryWarnings; omitted > 0 {
+		warnings = append(warnings[:maxQueryWarnings], fmt.Sprintf("%d more warning annotations omitted", omitted))
+	}
+	return warnings
+}
+
+func writeAPISuccessWithWarnings(w http.ResponseWriter, data any, warnings []string) {
+	started := time.Now()
+	writeJSON(w, http.StatusOK, apiResponse{Status: "success", Data: data, Warnings: warnings})
+	recordQueryLogPhase(w, "encode", time.Since(started))
 }
 
 // writeAPISuccessTimed writes the API response and times its encoding phase.
@@ -848,10 +874,11 @@ func (s *Server) parseMatcherParams(r *http.Request) ([][]*labels.Matcher, error
 }
 
 type apiResponse struct {
-	Status    string `json:"status"`
-	Data      any    `json:"data,omitempty"`
-	ErrorType string `json:"errorType,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Status    string   `json:"status"`
+	Data      any      `json:"data,omitempty"`
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 type queryData struct {

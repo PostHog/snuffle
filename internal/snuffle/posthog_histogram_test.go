@@ -1,6 +1,7 @@
 package snuffle
 
 import (
+	"context"
 	"math"
 	"reflect"
 	"strconv"
@@ -132,7 +133,7 @@ func TestPostHogHistogramTemporalityAndLimits(test *testing.T) {
 		sample := histogramTestSample()
 		sample.temporality = temporality
 		builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
-		if err := builder.add(sample, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "require cumulative or delta") {
+		if err := builder.addSample(sample, []string{"_count"}); err == nil || !strings.Contains(err.Error(), "require cumulative or delta") {
 			test.Fatalf("unsupported temporality %q: %v", temporality, err)
 		}
 		builder = newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, false)
@@ -344,7 +345,7 @@ func TestPostHogHistogramRepeatedSampleChecks(test *testing.T) {
 				test.Fatal(err)
 			}
 			testcase.change(&sample)
-			if err := builder.add(sample, []string{"_bucket"}); err == nil {
+			if err := builder.addSample(sample, []string{"_bucket"}); err == nil {
 				test.Fatal("invalid repeated sample accepted")
 			}
 		})
@@ -451,9 +452,19 @@ func TestPostHogHistogramInvalidSourcesSkippedForBroadSelectors(test *testing.T)
 	if len(builder.series) != 4 {
 		test.Fatalf("valid histogram produced %d series, want three buckets and a count", len(builder.series))
 	}
-	strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_broken_seconds_bucket")}, true)
-	if err := strict.add(invalid, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "observation count") {
-		test.Fatalf("exact selector must report the invalid histogram: %v", err)
+	exact := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_broken_seconds_bucket")}, true)
+	var warnings []error
+	exact.warn = func(err error) { warnings = append(warnings, err) }
+	for range 2 {
+		if err := exact.add(invalid, []string{"_bucket"}); err != nil {
+			test.Fatalf("exact selector must skip the invalid histogram: %v", err)
+		}
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0].Error(), "observation count") {
+		test.Fatalf("exact selector must warn once about the invalid histogram: %v", warnings)
+	}
+	if len(exact.series) != 0 {
+		test.Fatalf("invalid histogram produced %d series", len(exact.series))
 	}
 }
 
@@ -501,7 +512,7 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 		series("duration_bucket", "+Inf", samplePoint{t: 1000, v: 6}, samplePoint{t: 3000, v: 15}),
 		series("duration_sum", "", samplePoint{t: 1000, v: 3}, samplePoint{t: 3000, v: 9}),
 	}
-	merged, err := mergePostHogHistogramSeries(real, virtual, true)
+	merged, err := mergePostHogHistogramSeries(context.Background(), real, virtual, true)
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -518,10 +529,10 @@ func TestMergePostHogHistogramSeries(test *testing.T) {
 	if len(merged) != len(want) || !reflect.DeepEqual(got, want) {
 		test.Fatalf("merged series = %v, want %v", got, want)
 	}
-	if only, _ := mergePostHogHistogramSeries(nil, virtual, true); len(only) != len(virtual) {
+	if only, _ := mergePostHogHistogramSeries(context.Background(), nil, virtual, true); len(only) != len(virtual) {
 		test.Fatalf("virtual only = %d series", len(only))
 	}
-	if only, _ := mergePostHogHistogramSeries(real, nil, true); len(only) != len(real) {
+	if only, _ := mergePostHogHistogramSeries(context.Background(), real, nil, true); len(only) != len(real) {
 		test.Fatalf("real only = %d series", len(only))
 	}
 	unsorted := mergeSamplesPreferFirst([]samplePoint{{t: 3000, v: 3}, {t: 1000, v: 1}}, []samplePoint{{t: 2000, v: 2}, {t: 1000, v: 9}})
@@ -542,12 +553,16 @@ func TestMergePostHogHistogramSeriesDelta(test *testing.T) {
 	virtual := func() []*seriesMeta {
 		return []*seriesMeta{series("duration_count", true, samplePoint{t: 1000, v: 10}, samplePoint{t: 3000, v: 20}), series("duration_sum", true, samplePoint{t: 1000, v: 5})}
 	}
-	if _, err := mergePostHogHistogramSeries(stored(), virtual(), true); err == nil || !strings.Contains(err.Error(), "stored series") {
+	if _, err := mergePostHogHistogramSeries(context.Background(), stored(), virtual(), true); err == nil || !strings.Contains(err.Error(), "stored series") {
 		test.Fatalf("exact selector merged a stored series into a delta series: %v", err)
 	}
-	merged, err := mergePostHogHistogramSeries(stored(), virtual(), false)
+	ctx, warnings := withSelectWarnings(context.Background())
+	merged, err := mergePostHogHistogramSeries(ctx, stored(), virtual(), false)
 	if err != nil {
-		test.Fatalf("broad selector must skip the delta series: %v", err)
+		test.Fatal(err)
+	}
+	if annos := warnings.annotations(); len(annos) != 1 || !strings.Contains(annos.AsErrors()[0].Error(), "stored series") {
+		test.Fatalf("skipped delta series must add one warning: %v", annos)
 	}
 	got := make(map[string][]samplePoint, len(merged))
 	for _, meta := range merged {
@@ -555,7 +570,7 @@ func TestMergePostHogHistogramSeriesDelta(test *testing.T) {
 	}
 	want := map[string][]samplePoint{"duration_count": {{t: 2000, v: 100}}, "duration_sum": {{t: 1000, v: 5}}}
 	if !reflect.DeepEqual(got, want) {
-		test.Fatalf("broad selector kept %v, want %v", got, want)
+		test.Fatalf("merge kept %v, want %v", got, want)
 	}
 }
 
