@@ -484,13 +484,10 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, query))
 }
 
-// maxQueryWarnings limits the warnings in one query response. Each skipped
-// histogram metric can add a warning, so a broad selector can make many.
 const maxQueryWarnings = 10
 
-// queryWarnings returns the warning annotations of a query result in a fixed
-// order. It leaves out info annotations, because rate() over a counter without
-// a _total suffix makes one, and most stored metrics have no such suffix.
+// Info annotations are left out because rate() adds one for every counter
+// without a _total suffix, which is most stored metrics.
 func queryWarnings(annos annotations.Annotations, query string) []string {
 	warnings, _ := annos.AsStrings(query, 0, 0)
 	sort.Strings(warnings)
@@ -500,8 +497,6 @@ func queryWarnings(annos annotations.Annotations, query string) []string {
 	return warnings
 }
 
-// writeAPISuccessWithWarnings writes the API response with its warnings and
-// times its encoding phase.
 func writeAPISuccessWithWarnings(w http.ResponseWriter, data any, warnings []string) {
 	started := time.Now()
 	writeJSON(w, http.StatusOK, apiResponse{Status: "success", Data: data, Warnings: warnings})

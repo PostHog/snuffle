@@ -215,7 +215,6 @@ func (s *futureSeriesSet) wait() {
 	}
 }
 
-// warningSeriesSet adds the warnings of a select to its series set.
 type warningSeriesSet struct {
 	storage.SeriesSet
 	warnings annotations.Annotations
@@ -227,8 +226,8 @@ func (s *warningSeriesSet) Warnings() annotations.Annotations {
 
 type selectWarningsKey struct{}
 
-// selectWarnings collects the warnings of one select. The engine reads them
-// from the series set and returns them with the query result.
+// selectWarnings collects the warnings of one Select. The engine reads them
+// through SeriesSet.Warnings and returns them with the query result.
 type selectWarnings struct {
 	mu       sync.Mutex
 	warnings annotations.Annotations
@@ -239,8 +238,6 @@ func withSelectWarnings(ctx context.Context) (context.Context, *selectWarnings) 
 	return context.WithValue(ctx, selectWarningsKey{}, warnings), warnings
 }
 
-// addSelectWarning adds a warning to the select that ctx belongs to. It does
-// nothing when ctx has no select.
 func addSelectWarning(ctx context.Context, err error) {
 	warnings, ok := ctx.Value(selectWarningsKey{}).(*selectWarnings)
 	if !ok {

@@ -121,8 +121,7 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 // a sample at one timestamp, the real sample wins, which removes the stale
 // marker the virtual builder writes for a bucket missing from a native row.
 // A delta virtual series holds a running total that starts at the query range,
-// so it cannot merge with a stored series. For that pair, the function keeps
-// the stored series, drops the delta series and adds a query warning.
+// so it cannot merge with a stored series and is dropped with a warning.
 func mergePostHogHistogramSeries(ctx context.Context, real, virtual []*seriesMeta) []*seriesMeta {
 	if len(real) == 0 {
 		return virtual
@@ -397,12 +396,8 @@ type postHogHistogramSourceSeries struct {
 	totalsChecked  bool
 }
 
-// newPostHogHistogramSeriesBuilder builds virtual series from stored
-// histogram samples. One invalid sample must not fail the query, because the
-// other samples and series can still give a result. The builder skips each
-// invalid sample. For each source with an invalid sample, the builder logs the
-// first error and gives it to warn. The query then returns a partial result
-// with a warning.
+// newPostHogHistogramSeriesBuilder skips invalid samples and reports each
+// affected source once through warn, so one bad sample cannot fail a query.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
 	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), temporality: make(map[string]string)}
 }
@@ -450,8 +445,6 @@ func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample,
 	return nil
 }
 
-// postHogSkippedHistogramWarning is the query warning for stored histogram
-// data that the query skipped.
 func postHogSkippedHistogramWarning(err error) error {
 	return fmt.Errorf("skipped invalid histogram samples, so the result can be incomplete: %w", err)
 }
