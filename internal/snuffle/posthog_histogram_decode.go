@@ -20,14 +20,8 @@ func (sample *postHogHistogramSample) scanPacked(row clickHouseRow) error {
 	return nil
 }
 
-// normalizePostHogHistogramBounds removes trailing non-finite bounds and adds
-// their bucket counts to the bucket before them. A producer that declares an
-// explicit Infinity bucket, such as a prom-client histogram, stores +Inf as
-// its last bound. The overflow bucket after that bound is always empty, so the
-// result is the histogram that Prometheus reads from the duplicate +Inf. The
-// function changes the slices in place. It does not change a histogram whose
-// counts do not match its bounds or whose fold overflows uint64, so that the
-// validation reports it.
+// prom-client histograms with an explicit Infinity bucket store +Inf as their
+// last bound. Prometheus reads that layout as one +Inf bucket.
 func normalizePostHogHistogramBounds(bounds []float64, counts []uint64) ([]float64, []uint64) {
 	if len(counts) != len(bounds)+1 {
 		return bounds, counts
