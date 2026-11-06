@@ -511,18 +511,19 @@ while `rate`, `increase`, and `histogram_quantile` over them work as they do for
 a cumulative histogram. `increase` treats a series with no sample in
 `PROMQL_LOOKBACK_DELTA` before the window as a new counter, so for a delta series
 that pauses longer than that, it can count points from before the window or
-skip the first point in it. A series with both delta and cumulative points, or
-with unspecified temporality, returns an error rather than an incorrect counter
-or rate. The compact histogram path reads cumulative histograms only; a delta
-histogram uses the general engine. Exponential
-histograms expose `_count` and `_sum` only: the stored flattened arrays do not
-preserve enough information to reconstruct their bucket boundaries. Use explicit
-histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
-These errors apply to selectors that name the metric exactly. A selector that
-can reach every histogram of a team, such as a regex on `__name__` or a label
-filter alone, skips an invalid histogram and logs a warning, so one bad
-histogram does not fail discovery or broad queries for the team.
-Removed bucket boundaries produce stale markers.
+skip the first point in it. Points with unspecified temporality, delta points
+in a series that also has cumulative points, and invalid explicit bucket arrays
+cannot become a correct counter or rate. The compact histogram path reads
+cumulative histograms only; a delta histogram uses the general engine.
+Exponential histograms expose `_count` and `_sum` only: the stored flattened
+arrays do not preserve enough information to reconstruct their bucket
+boundaries. Use explicit histograms for `_bucket` queries.
+
+Snuffle skips each invalid histogram sample, logs it, and adds a warning to the
+`warnings` field of the `/api/v1/query` and `/api/v1/query_range` response. The
+other samples and series are still returned, so one bad sample does not fail a
+dashboard panel or discovery. A partial result always has a warning, and Grafana
+shows it on the panel. Removed bucket boundaries produce stale markers.
 
 Query fast paths stay available for exact `_bucket`, `_count`, and `_sum`
 names when the team stores no histogram with the base name inside the query

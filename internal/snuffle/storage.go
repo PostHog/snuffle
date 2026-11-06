@@ -59,7 +59,9 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 	future := &selectFuture{done: make(chan struct{})}
 	q.selects[cacheKey] = future
 	go func() {
+		ctx, warnings := withSelectWarnings(ctx)
 		future.series, future.err = q.selectSeriesMeta(ctx, hints, matchers...)
+		future.warnings = warnings.annotations()
 		// The engine drops stale markers before a range function sees them.
 		// default_rollup needs them to end a series, so they become plain NaN.
 		if hints != nil && hints.Func == metricsQLDefaultRollupName {
@@ -186,9 +188,10 @@ func shouldSortSeries(sortSeries bool, hints *storage.SelectHints) bool {
 }
 
 type selectFuture struct {
-	done   chan struct{}
-	series []*seriesMeta
-	err    error
+	done     chan struct{}
+	series   []*seriesMeta
+	warnings annotations.Annotations
+	err      error
 }
 
 type futureSeriesSet struct {
@@ -207,6 +210,51 @@ func (s *futureSeriesSet) wait() {
 		return
 	}
 	s.set = seriesSetFromMeta(s.future.series, s.sortSeries)
+	if len(s.future.warnings) > 0 {
+		s.set = &warningSeriesSet{SeriesSet: s.set, warnings: s.future.warnings}
+	}
+}
+
+// warningSeriesSet adds the warnings of a select to its series set.
+type warningSeriesSet struct {
+	storage.SeriesSet
+	warnings annotations.Annotations
+}
+
+func (s *warningSeriesSet) Warnings() annotations.Annotations {
+	return s.warnings
+}
+
+type selectWarningsKey struct{}
+
+// selectWarnings collects the warnings of one select. The engine reads them
+// from the series set and returns them with the query result.
+type selectWarnings struct {
+	mu       sync.Mutex
+	warnings annotations.Annotations
+}
+
+func withSelectWarnings(ctx context.Context) (context.Context, *selectWarnings) {
+	warnings := &selectWarnings{}
+	return context.WithValue(ctx, selectWarningsKey{}, warnings), warnings
+}
+
+// addSelectWarning adds a warning to the select that ctx belongs to. It does
+// nothing when ctx has no select.
+func addSelectWarning(ctx context.Context, err error) {
+	warnings, ok := ctx.Value(selectWarningsKey{}).(*selectWarnings)
+	if !ok {
+		return
+	}
+	warnings.mu.Lock()
+	defer warnings.mu.Unlock()
+	warnings.warnings.Add(err)
+}
+
+func (w *selectWarnings) annotations() annotations.Annotations {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.warnings
 }
 
 func (s *futureSeriesSet) Next() bool {

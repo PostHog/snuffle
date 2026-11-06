@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/util/annotations"
 )
 
 type Server struct {
@@ -378,7 +379,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	value := metricsQLValue(result.Value)
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, query))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -480,7 +481,31 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	writeAPISuccessWithWarnings(w, responseDataFromValue(value), queryWarnings(result.Warnings, query))
+}
+
+// maxQueryWarnings limits the warnings in one query response. Each skipped
+// histogram metric can add a warning, so a broad selector can make many.
+const maxQueryWarnings = 10
+
+// queryWarnings returns the warning annotations of a query result in a fixed
+// order. It leaves out info annotations, because rate() over a counter without
+// a _total suffix makes one, and most stored metrics have no such suffix.
+func queryWarnings(annos annotations.Annotations, query string) []string {
+	warnings, _ := annos.AsStrings(query, 0, 0)
+	sort.Strings(warnings)
+	if omitted := len(warnings) - maxQueryWarnings; omitted > 0 {
+		warnings = append(warnings[:maxQueryWarnings], fmt.Sprintf("%d more warning annotations omitted", omitted))
+	}
+	return warnings
+}
+
+// writeAPISuccessWithWarnings writes the API response with its warnings and
+// times its encoding phase.
+func writeAPISuccessWithWarnings(w http.ResponseWriter, data any, warnings []string) {
+	started := time.Now()
+	writeJSON(w, http.StatusOK, apiResponse{Status: "success", Data: data, Warnings: warnings})
+	recordQueryLogPhase(w, "encode", time.Since(started))
 }
 
 // writeAPISuccessTimed writes the API response and times its encoding phase.
@@ -848,10 +873,11 @@ func (s *Server) parseMatcherParams(r *http.Request) ([][]*labels.Matcher, error
 }
 
 type apiResponse struct {
-	Status    string `json:"status"`
-	Data      any    `json:"data,omitempty"`
-	ErrorType string `json:"errorType,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Status    string   `json:"status"`
+	Data      any      `json:"data,omitempty"`
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 type queryData struct {

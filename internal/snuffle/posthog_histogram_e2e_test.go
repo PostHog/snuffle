@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"maps"
@@ -501,7 +502,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			}
 		}
 	})
-	test.Run("unspecified temporality rejection", func(test *testing.T) {
+	test.Run("unspecified temporality is skipped with a warning", func(test *testing.T) {
 		insertHistogram("test_unspecified_seconds", "unspecified", "histogram", e2eTeamID)
 		response, err := http.Get(api.URL + "/t/42/api/v1/query?" + url.Values{"query": {"test_unspecified_seconds_count"}, "time": {"1700000070"}}.Encode())
 		if err != nil {
@@ -509,11 +510,44 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		}
 		defer response.Body.Close()
 		body, _ := io.ReadAll(response.Body)
-		if response.StatusCode != http.StatusUnprocessableEntity || !strings.Contains(string(body), "require cumulative or delta") {
+		var decoded struct {
+			Status   string       `json:"status"`
+			Data     queryDataDTO `json:"data"`
+			Warnings []string     `json:"warnings"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			test.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK || decoded.Status != "success" || len(decoded.Data.Result) != 0 || len(decoded.Warnings) != 1 || !strings.Contains(decoded.Warnings[0], "require cumulative or delta") {
 			test.Fatalf("unspecified temporality query: status %d: %s", response.StatusCode, body)
 		}
 	})
-	test.Run("invalid histograms fail only exact selectors", func(test *testing.T) {
+	test.Run("exact selector returns valid sources and warns about invalid ones", func(test *testing.T) {
+		insertHistogram("partial_test_seconds", "cumulative", "histogram", e2eTeamID)
+		sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes)
+			SELECT %d, 'partial_test_seconds', cityHash64('partial_test_seconds|worker'), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'worker', 'histogram', 'unspecified', 1, 1, [0.5], [1, 0], true, map(), map()`,
+			tableName(database, cfg.MetricsInputTable), e2eTeamID, chTimeMillis(e2eStartMS))
+		if err := client.Exec(ctx, sql); err != nil {
+			test.Fatal(err)
+		}
+		response, err := http.Get(api.URL + "/t/42/api/v1/query?" + url.Values{"query": {"sum by (service_name) (partial_test_seconds_count)"}, "time": {"1700000070"}}.Encode())
+		if err != nil {
+			test.Fatal(err)
+		}
+		defer response.Body.Close()
+		body, _ := io.ReadAll(response.Body)
+		var decoded struct {
+			Data     queryDataDTO `json:"data"`
+			Warnings []string     `json:"warnings"`
+		}
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			test.Fatal(err)
+		}
+		if response.StatusCode != http.StatusOK || len(decoded.Data.Result) != 1 || decoded.Data.Result[0].Metric["service_name"] != "api" || len(decoded.Warnings) != 1 || !strings.Contains(decoded.Warnings[0], "partial_test_seconds") {
+			test.Fatalf("partial histogram query: status %d: %s", response.StatusCode, body)
+		}
+	})
+	test.Run("broad selectors skip invalid histograms", func(test *testing.T) {
 		result := query(test, `{__name__=~"test_.*_seconds_count"}`)
 		names := make([]string, 0, len(result.Result))
 		for _, series := range result.Result {
