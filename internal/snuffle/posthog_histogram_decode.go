@@ -13,7 +13,24 @@ func (sample *postHogHistogramSample) scanPacked(row clickHouseRow) error {
 	}
 	var err error
 	sample.bounds, sample.counts, err = decodePostHogHistogramArrays(payload, sample.bounds, sample.counts)
-	return err
+	if err != nil {
+		return err
+	}
+	sample.bounds, sample.counts = normalizePostHogHistogramBounds(sample.bounds, sample.counts)
+	return nil
+}
+
+// prom-client histograms with an explicit Infinity bucket store +Inf as their
+// last bound, followed by an empty overflow bucket. Prometheus reads that
+// layout as one +Inf bucket.
+func normalizePostHogHistogramBounds(bounds []float64, counts []uint64) ([]float64, []uint64) {
+	if len(counts) != len(bounds)+1 {
+		return bounds, counts
+	}
+	for len(bounds) > 0 && math.IsInf(bounds[len(bounds)-1], 1) && counts[len(counts)-1] == 0 {
+		bounds, counts = bounds[:len(bounds)-1], counts[:len(counts)-1]
+	}
+	return bounds, counts
 }
 
 func decodePostHogHistogramArrays(payload []byte, bounds []float64, counts []uint64) ([]float64, []uint64, error) {
