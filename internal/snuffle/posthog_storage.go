@@ -367,12 +367,21 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 		return "metric_name", true
 	case "service_name":
 		return "service_name", true
+	case postHogJobLabel:
+		return postHogJobExpr, true
 	case "":
 		return "", false
 	default:
 		return postHogLabelValueExpr(name), true
 	}
 }
+
+// PostHog capture stores a Prometheus job as service_name and drops the job
+// label, so job reads service_name unless the series carries its own job.
+const postHogJobLabel = "job"
+
+var postHogJobExpr = "if(mapContains(resource_attributes, 'job') OR mapContains(attributes, 'job'), " +
+	postHogLabelValueExpr(postHogJobLabel) + ", service_name)"
 
 // postHogLabelValueExpr reads a map label with the same precedence as
 // postHogLabelMap: a resource attribute wins over a metric attribute.
@@ -537,6 +546,9 @@ func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[st
 	}
 	if serviceName != "" {
 		out["service_name"] = serviceName
+		if _, ok := out[postHogJobLabel]; !ok {
+			out[postHogJobLabel] = serviceName
+		}
 	}
 	out[labels.MetricName] = metricName
 	return out
@@ -557,7 +569,7 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 		}
 		return sortedLimited(names, limit), nil
 	}
-	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}}
+	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}, postHogJobLabel: {}}
 	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, err
 	}
@@ -643,7 +655,7 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			strings.Join(where, " AND "),
 			sqlLimit(limit),
 		), true
-	case postHogSampleColumnLabel(name):
+	case postHogSampleColumnLabel(name) || name == postHogJobLabel:
 		if len(matchers) > 0 {
 			return "", false
 		}

@@ -423,6 +423,38 @@ func TestPostHogLoadSamplesSQLFiltersBySeriesFingerprint(t *testing.T) {
 	}
 }
 
+func TestPostHogJobReadsServiceNameUnlessTheSeriesCarriesJob(t *testing.T) {
+	cfg := Config{CHDatabase: "posthog", SchemaLayout: "posthog", SeriesTable: "metrics4_series", SamplesTable: "metrics4_samples", MaxSeries: 500}
+	matchers := []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "zk_up"),
+		labels.MustNewMatcher(labels.MatchEqual, "job", "zookeeper"),
+	}
+	seriesSQL := postHogSelectedSeriesSQL(cfg, matchers, 1000, 2000, cfg.MaxSeries, nil)
+	if !strings.Contains(seriesSQL, postHogJobExpr+" = 'zookeeper'") {
+		t.Fatalf("series SQL should match job on service_name: %s", seriesSQL)
+	}
+	// A series with its own job label can differ from its service_name, so only the series table decides.
+	samplesSQL := postHogLoadSamplesSQL(cfg, []uint64{7}, []string{"zk_up"}, matchers, 1000, 2000, false)
+	if strings.Contains(samplesSQL, "'zookeeper'") {
+		t.Fatalf("samples SQL must not filter on job: %s", samplesSQL)
+	}
+
+	for name, tc := range map[string]struct {
+		attrs map[string]string
+		want  string
+	}{
+		"from service_name": {attrs: map[string]string{"instance": "zk-0"}, want: "zookeeper"},
+		"own job wins":      {attrs: map[string]string{"job": "scraper"}, want: "scraper"},
+	} {
+		if got := postHogLabelMap("zk_up", "zookeeper", nil, tc.attrs)["job"]; got != tc.want {
+			t.Errorf("%s: job = %q, want %q", name, got, tc.want)
+		}
+	}
+	if _, ok := postHogLabelMap("zk_up", "", nil, nil)["job"]; ok {
+		t.Error("a series without a service_name should not get a job")
+	}
+}
+
 func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 	cfg := Config{
 		CHDatabase:                  "posthog",

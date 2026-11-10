@@ -279,6 +279,14 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		assertValue(test, `sum({__name__=~"test_duration_seconds_(count|sum)"})`, 66)
 		assertValue(test, "histogram_quantile(0.5, sum by (le) (rate("+metric+"_bucket[1m])))", 1)
 		assertValue(test, "median("+metric+"_count, "+metric+"_sum)", 33)
+		// Capture stores a Prometheus job as service_name, so job matches and groups on it.
+		assertValue(test, metric+`_count{job="api"}`, 30)
+		if result := query(test, metric+`_count{job="other"}`); len(result.Result) != 0 {
+			test.Fatalf("job matcher on another service = %v", result.Result)
+		}
+		if result := query(test, "sum by (job) ("+metric+"_count)"); len(result.Result) != 1 || result.Result[0].Metric["job"] != "api" {
+			test.Fatalf("job grouping = %v", result.Result)
+		}
 		quantiles := query(test, `histogram_quantiles("phi", 0.2, 0.5, 0.9, sum by (le) (rate(`+metric+`_bucket[1m])))`)
 		if len(quantiles.Result) != 3 {
 			test.Fatalf("multiple quantiles = %v", quantiles)
@@ -321,6 +329,8 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		if !reflect.DeepEqual(values, []string{"200"}) {
 			test.Fatalf("filtered attributes = %v", values)
 		}
+		jobs := apiGet[[]string](test, api.URL, "/api/v1/label/job/values", url.Values{"start": {"1700000010"}, "end": {"1700000070"}})
+		assertStringPresent(test, jobs, "api")
 	})
 	test.Run("remote read", func(test *testing.T) {
 		response, err := server.withTeamID(e2eTeamID).remoteReadSamples(ctx, &prompb.ReadRequest{Queries: []*prompb.Query{{StartTimestampMs: e2eStartMS, EndTimestampMs: e2eEndMS, Matchers: []*prompb.LabelMatcher{{Type: prompb.LabelMatcher_EQ, Name: "__name__", Value: metric + "_bucket"}, {Type: prompb.LabelMatcher_EQ, Name: "le", Value: "1"}}}}})

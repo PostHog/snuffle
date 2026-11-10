@@ -444,8 +444,10 @@ of one series and hour in parallel arrays (`timestamp_arr`, `value_arr`,
 series-hour exist until ClickHouse merges them, so every read combines the
 arrays of all rows. Snuffle selects series from `metrics4_series`, builds
 Prometheus labels from `metric_name`, `service_name`, `resource_attributes`,
-and `attributes`, and reads samples by fingerprint. Labels are read once per
-series, never per sample. `metrics4_series` keeps one label row for each
+and `attributes`, and reads samples by fingerprint. PostHog capture stores a
+Prometheus `job` label as `service_name` and keeps no `job` attribute, so a
+series without its own `job` gets `job` from `service_name`, and a `job`
+matcher reads it there. Labels are read once per series, never per sample. `metrics4_series` keeps one label row for each
 series and hour, so series selection filters on the hour buckets of the query
 window and collapses duplicates by fingerprint.
 
