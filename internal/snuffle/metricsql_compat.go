@@ -326,6 +326,12 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if e.Name == "histogram_quantiles" {
 		return r.rewriteHistogramQuantiles(e, step, instant)
 	}
+	if renamed, err := rewriteLabelFunction(e); renamed || err != nil {
+		if err != nil {
+			return err
+		}
+		return r.rewriteArgs(e.Args, step, instant)
+	}
 	if e.Name == "running_sum" {
 		return r.rewriteNestedRunningSum(e, step, instant)
 	}

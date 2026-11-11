@@ -1,0 +1,225 @@
+package snuffle
+
+import (
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/prometheus/prometheus/model/labels"
+	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
+)
+
+func labelsTestQueryable() storage.Queryable {
+	var series []*seriesMeta
+	for _, fixture := range []struct {
+		workload, cpu, node string
+		value               float64
+	}{
+		{"capture-abc", "0", "b", 1},
+		{"capture-def", "10", "a", 2},
+		{"ingestion-xyz", "2", "a", 3},
+		{"", "x", "c", 4},
+	} {
+		labelMap := map[string]string{"__name__": "labels_value", "cpu": fixture.cpu, "node": fixture.node}
+		if fixture.workload != "" {
+			labelMap["workload"] = fixture.workload
+		}
+		meta := &seriesMeta{labels: labels.FromMap(labelMap), labelMap: labelMap}
+		for index := range 3 {
+			meta.samples = append(meta.samples, samplePoint{t: 1700000010000 + int64(index)*30000, v: fixture.value})
+		}
+		series = append(series, meta)
+	}
+	return &storage.MockQueryable{MockQuerier: &storage.MockQuerier{SelectMockFunction: func(_ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+		var selected []storage.Series
+		for _, meta := range series {
+			if matchesAll(meta.labelMap, matchers) {
+				selected = append(selected, meta)
+			}
+		}
+		return &seriesSet{series: selected, idx: -1}
+	}}}
+}
+
+func evaluateMetricsQL(test *testing.T, queryable storage.Queryable, expression string, rangeQuery bool) parser.Value {
+	test.Helper()
+	start := time.Unix(1700000010, 0)
+	end := start.Add(time.Minute)
+	if !rangeQuery {
+		start = end
+	}
+	prepared, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, end)
+	if err != nil {
+		test.Fatal(err)
+	}
+	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: 100000, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true, EnableDelayedNameRemoval: true})
+	ctx := context.Background()
+	options := promql.NewPrometheusQueryOpts(false, 5*time.Minute)
+	var query promql.Query
+	if rangeQuery {
+		query, err = engine.NewRangeQuery(ctx, queryable, options, prepared.query, start, end, 30*time.Second)
+	} else {
+		query, err = engine.NewInstantQuery(ctx, queryable, options, prepared.query, end)
+	}
+	if err != nil {
+		test.Fatalf("parse %s: %v", prepared.query, err)
+	}
+	defer query.Close()
+	result := query.Exec(ctx)
+	if result.Err != nil {
+		test.Fatalf("execute %s: %v", prepared.query, result.Err)
+	}
+	return metricsQLValue(result.Value)
+}
+
+func vectorLabel(vector promql.Vector, label string) []string {
+	values := make([]string, 0, len(vector))
+	for _, sample := range vector {
+		values = append(values, sample.Metric.Get(label))
+	}
+	return values
+}
+
+func TestMetricsQLLabelMatch(test *testing.T) {
+	for _, testcase := range []struct {
+		query string
+		want  string
+	}{
+		{`label_match(labels_value, "workload", "capture.*")`, "capture-abc,capture-def"},
+		{`label_match(labels_value, "workload", "capture")`, ""},
+		{`label_match(labels_value, "workload", "")`, ""},
+		{`label_match(labels_value, "missing", "")`, "capture-abc,capture-def,ingestion-xyz,"},
+		{`label_mismatch(labels_value, "workload", "capture.*")`, "ingestion-xyz,"},
+		{`label_match(label_replace(labels_value, "owner", "$1", "workload", "(.+)-[a-z]+"), "owner", "capture")`, "capture-abc,capture-def"},
+		{`label_match(rate(labels_value[1m]), "__name__", "labels_value")`, ""},
+		{`label_match(labels_value, "__name__", "labels_value")`, "capture-abc,capture-def,ingestion-xyz,"},
+		{`sum(label_match(labels_value, "workload", "capture.*"))`, ""},
+	} {
+		test.Run(testcase.query, func(test *testing.T) {
+			result := evaluateMetricsQL(test, labelsTestQueryable(), testcase.query, false).(promql.Vector)
+			if strings.HasPrefix(testcase.query, "sum(") {
+				if len(result) != 1 || result[0].F != 3 {
+					test.Fatalf("result = %v", result)
+				}
+				return
+			}
+			got := vectorLabel(result, "workload")
+			if strings.Join(sortedStrings(got), ",") != testcase.want {
+				test.Fatalf("workloads = %v, want %s", got, testcase.want)
+			}
+		})
+	}
+	matrix := evaluateMetricsQL(test, labelsTestQueryable(), `label_match(labels_value, "workload", "capture.*")`, true).(promql.Matrix)
+	if len(matrix) != 2 || matrix[0].Metric.Get("__name__") != "labels_value" || len(matrix[0].Floats) != 3 {
+		test.Fatalf("range result = %v", matrix)
+	}
+}
+
+func sortedStrings(values []string) []string {
+	out := append([]string(nil), values...)
+	for i := range out {
+		for j := i + 1; j < len(out); j++ {
+			if out[j] < out[i] {
+				out[i], out[j] = out[j], out[i]
+			}
+		}
+	}
+	// Keep the empty value last so expectations read naturally.
+	if len(out) > 0 && out[0] == "" {
+		out = append(out[1:], "")
+	}
+	return out
+}
+
+func TestMetricsQLLabelValue(test *testing.T) {
+	result := evaluateMetricsQL(test, labelsTestQueryable(), `label_value(labels_value, "cpu")`, false).(promql.Vector)
+	got := map[string]float64{}
+	for _, sample := range result {
+		if sample.Metric.Has("__name__") {
+			test.Fatalf("label_value keeps the metric name: %v", sample.Metric)
+		}
+		got[sample.Metric.Get("cpu")] = sample.F
+	}
+	// The value "x" does not parse, so its series has no output.
+	if len(got) != 3 || got["0"] != 0 || got["10"] != 10 || got["2"] != 2 {
+		test.Fatalf("result = %v", result)
+	}
+	top := evaluateMetricsQL(test, labelsTestQueryable(), `topk(10, max by (node) (label_value(labels_value, "cpu")) + 1)`, false).(promql.Vector)
+	values := map[string]float64{}
+	for _, sample := range top {
+		values[sample.Metric.Get("node")] = sample.F
+	}
+	if len(values) != 2 || values["a"] != 11 || values["b"] != 1 {
+		test.Fatalf("topk result = %v", top)
+	}
+	matrix := evaluateMetricsQL(test, labelsTestQueryable(), `label_value(labels_value{cpu="10"}, "cpu")`, true).(promql.Matrix)
+	if len(matrix) != 1 || len(matrix[0].Floats) != 3 || matrix[0].Floats[2].F != 10 {
+		test.Fatalf("range result = %v", matrix)
+	}
+}
+
+func TestMetricsQLSortByLabel(test *testing.T) {
+	for _, testcase := range []struct {
+		query string
+		want  string
+	}{
+		// VictoriaMetrics compares label values as bytes, so "10" sorts before "2".
+		{`sort_by_label(labels_value, "cpu")`, "0,10,2,x"},
+		{`sort_by_label_desc(labels_value, "cpu")`, "x,2,10,0"},
+		{`sort_by_label_numeric(labels_value, "cpu")`, "0,2,10,x"},
+		{`sort_by_label_numeric_desc(labels_value, "cpu")`, "x,10,2,0"},
+		{`sort_by_label(labels_value, "node", "cpu")`, "10,2,0,x"},
+	} {
+		test.Run(testcase.query, func(test *testing.T) {
+			result := evaluateMetricsQL(test, labelsTestQueryable(), testcase.query, false).(promql.Vector)
+			if got := strings.Join(vectorLabel(result, "cpu"), ","); got != testcase.want {
+				test.Fatalf("order = %s, want %s", got, testcase.want)
+			}
+		})
+	}
+}
+
+func TestPrepareMetricsQLLabelFunctionErrors(test *testing.T) {
+	start := time.Unix(1700000010, 0)
+	for _, expression := range []string{
+		`label_match(m, "a")`,
+		`label_match(m, "a", "(")`,
+		`label_mismatch(m, "a", "b", "c")`,
+		`label_value(m)`,
+		`sort_by_label(m)`,
+		`__snuffle_label_match(m, "a", "b")`,
+	} {
+		test.Run(expression, func(test *testing.T) {
+			prepared, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, start)
+			if err == nil {
+				_, err = parser.NewParser(parser.Options{}).ParseExpr(prepared.query)
+			}
+			if err == nil {
+				test.Fatalf("expected an error, prepared %s", prepared.query)
+			}
+		})
+	}
+}
+
+func TestMetricsQLNumericLess(test *testing.T) {
+	for _, testcase := range []struct {
+		a, b string
+		want bool
+	}{
+		{"2", "10", true},
+		{"10", "2", false},
+		{"a2", "a10", true},
+		{"a", "1", false},
+		{"1", "a", true},
+		{"", "a", true},
+		{"1.5", "1.25", false},
+		{"x9", "x9y", true},
+	} {
+		if got := metricsQLNumericLess(testcase.a, testcase.b); got != testcase.want {
+			test.Errorf("numericLess(%q, %q) = %v, want %v", testcase.a, testcase.b, got, testcase.want)
+		}
+	}
+}
