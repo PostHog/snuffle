@@ -280,13 +280,11 @@ func logQLSQLPipeline(cfg Config, stages []logQLStage) ([]string, string, bool) 
 				return nil, "", false
 			}
 		case "label_filter":
-			condition, ok := logQLSQLLabelFiltersCondition(cfg, stage.labelFilters, parser)
+			condition, ok := logQLSQLLabelFilterExprCondition(cfg, stage.labelFilter, parser)
 			if !ok {
 				return nil, "", false
 			}
-			if condition != "" {
-				filters = append(filters, condition)
-			}
+			filters = append(filters, condition)
 		case "unwrap":
 			valueExpr, ok := logQLSQLPipelineLabelValueExpr(cfg, stage.unwrapLabel, parser, false)
 			if !ok {
@@ -303,27 +301,19 @@ func logQLSQLPipeline(cfg Config, stages []logQLStage) ([]string, string, bool) 
 	return filters, unwrapValueExpr, true
 }
 
-func logQLSQLLabelFiltersCondition(cfg Config, filters []logQLLabelFilter, parser logQLSQLParser) (string, bool) {
-	if len(filters) == 0 {
-		return "", true
+func logQLSQLLabelFilterExprCondition(cfg Config, expr *logQLLabelFilterExpr, parser logQLSQLParser) (string, bool) {
+	if expr.op == "" {
+		return logQLSQLLabelFilterCondition(cfg, *expr.filter, parser)
 	}
-	first, ok := logQLSQLLabelFilterCondition(cfg, filters[0], parser)
+	lhs, ok := logQLSQLLabelFilterExprCondition(cfg, expr.lhs, parser)
 	if !ok {
 		return "", false
 	}
-	condition := first
-	for i := 1; i < len(filters); i++ {
-		next, ok := logQLSQLLabelFilterCondition(cfg, filters[i], parser)
-		if !ok {
-			return "", false
-		}
-		connector := "AND"
-		if filters[i-1].connector == "or" {
-			connector = "OR"
-		}
-		condition = "(" + condition + " " + connector + " " + next + ")"
+	rhs, ok := logQLSQLLabelFilterExprCondition(cfg, expr.rhs, parser)
+	if !ok {
+		return "", false
 	}
-	return condition, true
+	return "(" + lhs + " " + strings.ToUpper(expr.op) + " " + rhs + ")", true
 }
 
 func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parser logQLSQLParser) (string, bool) {

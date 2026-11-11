@@ -113,13 +113,21 @@ type logQLLabelFilter struct {
 	numValue  float64
 	valueType string
 	re        *regexp.Regexp
-	connector string
+}
+
+// logQLLabelFilterExpr is a label filter stage: a single predicate (filter) or
+// two sub-expressions joined by op, "and" or "or".
+type logQLLabelFilterExpr struct {
+	op     string
+	lhs    *logQLLabelFilterExpr
+	rhs    *logQLLabelFilterExpr
+	filter *logQLLabelFilter
 }
 
 type logQLStage struct {
 	kind         string
 	lineFilter   *logQLLineFilter
-	labelFilters []logQLLabelFilter
+	labelFilter  *logQLLabelFilterExpr
 	parser       string
 	parserParam  string
 	lineFormat   string
@@ -839,11 +847,11 @@ func parseLogQLStage(segment string) (logQLStage, error) {
 		}
 		return logQLStage{kind: "unwrap", unwrapLabel: label}, nil
 	default:
-		filters, err := parseLogQLLabelFilterStage(segment)
+		filter, err := parseLogQLLabelFilterStage(segment)
 		if err != nil {
 			return logQLStage{}, err
 		}
-		return logQLStage{kind: "label_filter", labelFilters: filters}, nil
+		return logQLStage{kind: "label_filter", labelFilter: filter}, nil
 	}
 }
 
@@ -881,53 +889,143 @@ func parseLogQLLabelFormats(input string) ([]logQLLabelFormat, error) {
 	return formats, nil
 }
 
-func parseLogQLLabelFilterStage(input string) ([]logQLLabelFilter, error) {
+// parseLogQLLabelFilterStage parses a label filter stage the way Loki does:
+// predicates joined by "and", "," or whitespace bind tighter than "or", and
+// parentheses group.
+func parseLogQLLabelFilterStage(input string) (*logQLLabelFilterExpr, error) {
 	tokens, err := lexLogQLFilter(input)
 	if err != nil {
 		return nil, err
 	}
-	var filters []logQLLabelFilter
-	for len(tokens) > 0 {
-		if len(tokens) < 3 {
-			return nil, fmt.Errorf("invalid label filter %q", input)
-		}
-		f := logQLLabelFilter{name: tokens[0], op: tokens[1]}
-		raw := tokens[2]
-		if strings.HasPrefix(raw, `"`) || strings.HasPrefix(raw, "`") {
-			value, err := unquoteLogQLString(raw)
-			if err != nil {
-				return nil, err
-			}
-			f.value = value
-		} else if v, valueType, ok := parseLogQLNumericLiteral(raw); ok {
-			f.numeric = true
-			f.numValue = v
-			f.valueType = valueType
-			f.value = raw
-		} else {
-			f.value = raw
-		}
-		if f.op == "=~" || f.op == "!~" {
-			f.re, err = regexp.Compile("^(?:" + f.value + ")$")
-			if err != nil {
-				return nil, fmt.Errorf("invalid label filter regex %q: %w", f.value, err)
-			}
-		}
-		tokens = tokens[3:]
-		if len(tokens) > 0 {
-			connector := strings.ToLower(tokens[0])
-			if connector == "," {
-				connector = "and"
-			}
-			if connector != "and" && connector != "or" {
-				return nil, fmt.Errorf("invalid label filter connector %q", tokens[0])
-			}
-			f.connector = connector
-			tokens = tokens[1:]
-		}
-		filters = append(filters, f)
+	p := logQLLabelFilterParser{input: input, tokens: tokens}
+	expr, err := p.parseOr()
+	if err != nil {
+		return nil, err
 	}
-	return filters, nil
+	if p.pos < len(p.tokens) {
+		return nil, fmt.Errorf("unexpected %q in label filter %q", p.tokens[p.pos], input)
+	}
+	return expr, nil
+}
+
+type logQLLabelFilterParser struct {
+	input  string
+	tokens []string
+	pos    int
+}
+
+func (p *logQLLabelFilterParser) peek() string {
+	if p.pos < len(p.tokens) {
+		return p.tokens[p.pos]
+	}
+	return ""
+}
+
+func (p *logQLLabelFilterParser) parseOr() (*logQLLabelFilterExpr, error) {
+	lhs, err := p.parseAnd()
+	if err != nil {
+		return nil, err
+	}
+	for strings.EqualFold(p.peek(), "or") {
+		p.pos++
+		rhs, err := p.parseAnd()
+		if err != nil {
+			return nil, err
+		}
+		lhs = &logQLLabelFilterExpr{op: "or", lhs: lhs, rhs: rhs}
+	}
+	return lhs, nil
+}
+
+func (p *logQLLabelFilterParser) parseAnd() (*logQLLabelFilterExpr, error) {
+	lhs, err := p.parsePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		tok := p.peek()
+		switch {
+		case tok == "" || tok == ")" || strings.EqualFold(tok, "or"):
+			return lhs, nil
+		case tok == "," || strings.EqualFold(tok, "and"):
+			p.pos++
+		}
+		// Loki also reads predicates separated only by whitespace as "and".
+		rhs, err := p.parsePrimary()
+		if err != nil {
+			return nil, err
+		}
+		lhs = &logQLLabelFilterExpr{op: "and", lhs: lhs, rhs: rhs}
+	}
+}
+
+func (p *logQLLabelFilterParser) parsePrimary() (*logQLLabelFilterExpr, error) {
+	if p.peek() == "(" {
+		p.pos++
+		expr, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		if p.peek() != ")" {
+			return nil, fmt.Errorf("missing ')' in label filter %q", p.input)
+		}
+		p.pos++
+		return expr, nil
+	}
+	if p.pos+3 > len(p.tokens) {
+		return nil, fmt.Errorf("invalid label filter %q", p.input)
+	}
+	name, op, raw := p.tokens[p.pos], p.tokens[p.pos+1], p.tokens[p.pos+2]
+	if !isLogQLLabelFilterOp(op) || isLogQLLabelFilterPunct(name) || isLogQLLabelFilterPunct(raw) {
+		return nil, fmt.Errorf("invalid label filter %q", p.input)
+	}
+	p.pos += 3
+	f := logQLLabelFilter{name: name, op: op}
+	if strings.HasPrefix(raw, `"`) || strings.HasPrefix(raw, "`") {
+		value, err := unquoteLogQLString(raw)
+		if err != nil {
+			return nil, err
+		}
+		f.value = value
+	} else if v, valueType, ok := parseLogQLNumericLiteral(raw); ok {
+		f.numeric = true
+		f.numValue = v
+		f.valueType = valueType
+		f.value = raw
+	} else {
+		f.value = raw
+	}
+	if f.op == "=~" || f.op == "!~" {
+		var err error
+		f.re, err = regexp.Compile("^(?:" + f.value + ")$")
+		if err != nil {
+			return nil, fmt.Errorf("invalid label filter regex %q: %w", f.value, err)
+		}
+	}
+	return &logQLLabelFilterExpr{filter: &f}, nil
+}
+
+func isLogQLLabelFilterOp(tok string) bool {
+	switch tok {
+	case ">=", "<=", "==", "!=", "=~", "!~", "=", ">", "<":
+		return true
+	}
+	return false
+}
+
+func isLogQLLabelFilterPunct(tok string) bool {
+	return tok == "(" || tok == ")" || tok == "," || isLogQLLabelFilterOp(tok)
+}
+
+func (e *logQLLabelFilterExpr) matches(row *logRow) bool {
+	switch e.op {
+	case "and":
+		return e.lhs.matches(row) && e.rhs.matches(row)
+	case "or":
+		return e.lhs.matches(row) || e.rhs.matches(row)
+	default:
+		return e.filter.matches(row)
+	}
 }
 
 func (m logQLLabelMatcher) matches(labels map[string]string) bool {
@@ -1070,7 +1168,7 @@ func (s logQLSelector) apply(row *logRow) bool {
 		case "parser":
 			stage.applyParser(row)
 		case "label_filter":
-			if !matchesLogQLLabelFilters(stage.labelFilters, row) {
+			if !stage.labelFilter.matches(row) {
 				return false
 			}
 		case "line_format":
@@ -1192,22 +1290,6 @@ func setLogQLParserError(row *logRow, value string) {
 	if row.fields["__error__"] == "" {
 		row.fields["__error__"] = value
 	}
-}
-
-func matchesLogQLLabelFilters(filters []logQLLabelFilter, row *logRow) bool {
-	if len(filters) == 0 {
-		return true
-	}
-	result := filters[0].matches(row)
-	for i := 1; i < len(filters); i++ {
-		switch filters[i-1].connector {
-		case "or":
-			result = result || filters[i].matches(row)
-		default:
-			result = result && filters[i].matches(row)
-		}
-	}
-	return result
 }
 
 func (r *logRow) value(name string) string {
@@ -3291,8 +3373,8 @@ func lexLogQLFilter(input string) ([]string, error) {
 			i += consumed
 			continue
 		}
-		if input[i] == ',' {
-			tokens = append(tokens, ",")
+		if input[i] == ',' || input[i] == '(' || input[i] == ')' {
+			tokens = append(tokens, input[i:i+1])
 			i++
 			continue
 		}
@@ -3305,7 +3387,7 @@ func lexLogQLFilter(input string) ([]string, error) {
 		}
 		{
 			start := i
-			for i < len(input) && !unicode.IsSpace(rune(input[i])) && !strings.ContainsRune("=!<>,", rune(input[i])) {
+			for i < len(input) && !unicode.IsSpace(rune(input[i])) && !strings.ContainsRune("=!<>,()", rune(input[i])) {
 				i++
 			}
 			if i == start {
