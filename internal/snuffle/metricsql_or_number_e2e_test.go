@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"net/url"
+	"reflect"
 	"strconv"
 	"testing"
 )
@@ -15,13 +16,20 @@ func assertOrWithNumber(t *testing.T, baseURL string) {
 	for _, c := range []struct {
 		query string
 		want  float64
+		// same, when set, is a query whose result c.query must match point for
+		// point instead of the constant want.
+		same string
 	}{
-		{`sum(` + missing + `) or 0`, 0},
-		{running + ` or 0`, 7},
-		{`0 or ` + running, 0},
-		{running + ` / ((sum(` + missing + `) or 0) + ` + running + `)`, 1},
+		{query: `sum(` + missing + `) or 0`, want: 0},
+		{query: running + ` or 0`, same: running},
+		{query: `0 or ` + running, want: 0},
+		{query: running + ` / ((sum(` + missing + `) or 0) + ` + running + `)`, want: 1},
 	} {
 		t.Run(c.query, func(t *testing.T) {
+			if c.same != "" {
+				assertSameResult(t, baseURL, c.query, c.same)
+				return
+			}
 			instant, errText := queryOrError(t, baseURL, "/api/v1/query", url.Values{"query": {c.query}, "time": {"1700000070"}})
 			if errText != "" {
 				t.Fatalf("instant: %s", errText)
@@ -45,5 +53,39 @@ func assertOrWithNumber(t *testing.T, baseURL string) {
 				}
 			}
 		})
+	}
+}
+
+// assertSameResult checks that query returns the same single series values as
+// reference, both instant and over a range.
+func assertSameResult(t *testing.T, baseURL, query, reference string) {
+	t.Helper()
+	instantParams := func(q string) url.Values { return url.Values{"query": {q}, "time": {"1700000070"}} }
+	rangeParams := func(q string) url.Values {
+		return url.Values{"query": {q}, "start": {"1700000040"}, "end": {"1700000070"}, "step": {"10"}}
+	}
+	for _, kind := range []struct {
+		path   string
+		params func(string) url.Values
+		points func(sampleResultDTO) [][]any
+	}{
+		{"/api/v1/query", instantParams, func(r sampleResultDTO) [][]any { return [][]any{r.Value} }},
+		{"/api/v1/query_range", rangeParams, func(r sampleResultDTO) [][]any { return r.Values }},
+	} {
+		got, errText := queryOrError(t, baseURL, kind.path, kind.params(query))
+		if errText != "" {
+			t.Fatalf("%s %s: %s", kind.path, query, errText)
+		}
+		want, errText := queryOrError(t, baseURL, kind.path, kind.params(reference))
+		if errText != "" {
+			t.Fatalf("%s %s: %s", kind.path, reference, errText)
+		}
+		if len(got.Result) != 1 || len(want.Result) != 1 {
+			t.Fatalf("%s: want one series each, got %#v and %#v", kind.path, got.Result, want.Result)
+		}
+		gotPoints, wantPoints := kind.points(got.Result[0]), kind.points(want.Result[0])
+		if len(gotPoints) == 0 || !reflect.DeepEqual(gotPoints, wantPoints) {
+			t.Errorf("%s: %s = %v, want %v (from %s)", kind.path, query, gotPoints, wantPoints, reference)
+		}
 	}
 }
