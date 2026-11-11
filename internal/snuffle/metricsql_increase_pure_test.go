@@ -73,14 +73,13 @@ func TestMetricsQLIncreasePure(test *testing.T) {
 		// A sample before the window is the baseline.
 		{`increase_pure(new_counter[30s])`, 1},
 		{`increase_pure(reset_counter[5m])`, 107},
+		// keep_metric_names is supported since #37.
+		{`increase_pure(new_counter[5m]) keep_metric_names`, 102},
 	} {
 		test.Run(testcase.query, func(test *testing.T) {
 			if got := evaluateIncreasePure(test, testcase.query); got != testcase.want {
 				test.Fatalf("result = %v, want %v", got, testcase.want)
 			}
 		})
-	}
-	if _, err := prepareMetricsQLQuery(`increase_pure(m[5m]) keep_metric_names`, time.Minute, 5*time.Minute, time.Unix(0, 0), time.Unix(0, 0)); err == nil {
-		test.Fatal("keep_metric_names must be rejected until it is supported")
 	}
 }
