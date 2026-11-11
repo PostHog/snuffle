@@ -290,6 +290,9 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
 	case *metricsql.FuncExpr:
+		if e.KeepMetricNames && e.Name != "histogram_quantiles" && e.Name != "running_sum" {
+			return r.rewriteKeepMetricNames(expr, e, step, instant)
+		}
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
 		if e.Name == "median" {
