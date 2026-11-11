@@ -358,6 +358,7 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"if(mapContains(resource_attributes, 'status'), resource_attributes['status'], attributes['status']) = '200'",
+		postHogServiceNameExprSQL() + " = 'checkout'",
 		"LIMIT 1 BY series_id LIMIT 500",
 	} {
 		if !strings.Contains(seriesSQL, want) {
@@ -373,7 +374,6 @@ func TestPostHogSeriesAndSampleReadsSplitLabelsFromSamples(t *testing.T) {
 		"arraySort(groupArrayArray(arrayFilter(p -> p.1 >= 1000 AND p.1 <= 2000, arrayZip(arrayMap(t -> toUnixTimestamp64Milli(t), timestamp_arr), value_arr)))) AS points FROM `posthog`.`metrics4_samples` WHERE",
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
-		"service_name = 'checkout'",
 		"metric_name = 'http_requests_total'",
 		"series_fingerprint IN (7,9)",
 		"indexHint(arrayMin(timestamp_arr) <= fromUnixTimestamp64Milli(2000, 'UTC') AND arrayMax(timestamp_arr) >= fromUnixTimestamp64Milli(1000, 'UTC'))",
@@ -449,7 +449,11 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"metric_name = 'http_requests_total'",
-		"service_name = 'checkout'",
+		// A rollup group can hold the service as its column or as a scraped
+		// service_name attribute.
+		"(service_name = 'checkout' OR (metric_name, service_name) IN (SELECT metric_name, service_name FROM `posthog`.`metrics4_attributes` WHERE",
+		// The lookup reads only the requested metric.
+		"metric_name = 'http_requests_total' AND attribute_key = 'service_name' AND attribute_value = 'checkout'",
 		"ORDER BY attribute_key" + sqlLimit(100),
 	} {
 		if !strings.Contains(sql, want) {
@@ -464,7 +468,9 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		"map label":     {labels.MustNewMatcher(labels.MatchEqual, "status", "200")},
 		"regexp metric": {labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")},
 		"empty service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", "")},
-		"not equal":     {labels.MustNewMatcher(labels.MatchNotEqual, labels.MetricName, "up")},
+		// The rollup drops values this long, so only the series table has them.
+		"long service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", strings.Repeat("s", postHogAttributeMaxLen))},
+		"not equal":    {labels.MustNewMatcher(labels.MatchNotEqual, labels.MetricName, "up")},
 	} {
 		if _, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers); ok {
 			t.Fatalf("%s matcher should fall back to the series table", name)
@@ -537,6 +543,9 @@ func TestPostHogLabelValuesSQLReadsMetricNameAndAttributeRollups(t *testing.T) {
 	if !ok || !strings.Contains(sql, "`posthog`.`metrics4_series`") || !strings.Contains(sql, "time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))") {
 		t.Fatalf("service names should read the series table: %s", sql)
 	}
+	if !strings.Contains(sql, postHogServiceNameExprSQL()+" AS label_value") {
+		t.Fatalf("service names should prefer a scraped service_name attribute: %s", sql)
+	}
 
 	sql, ok = postHogLabelValuesSQL(cfg, labels.MetricName, 1000, 2000, 1000, []*labels.Matcher{
 		labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, ".*env.*"),
@@ -608,5 +617,19 @@ func TestPostHogLoadSamplesSQLReadsExternalSeriesIDs(t *testing.T) {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
 		}
+	}
+}
+
+func TestPostHogLabelMapPrefersScrapedServiceName(t *testing.T) {
+	// Capture moves a scraped job into the service_name column and keeps a
+	// scraped service_name label as an attribute.
+	got := postHogLabelMap("m", "kubernetes-pods", map[string]string{"service.name": "kubernetes-pods"}, map[string]string{"service_name": "temporal-core-sdk"})
+	if got["service_name"] != "temporal-core-sdk" {
+		t.Fatalf("scraped service_name = %q, want temporal-core-sdk", got["service_name"])
+	}
+	// OTLP series have no service_name attribute and read the column.
+	got = postHogLabelMap("m", "checkout", map[string]string{"service.name": "checkout"}, map[string]string{"status": "200"})
+	if got["service_name"] != "checkout" {
+		t.Fatalf("OTLP service_name = %q, want checkout", got["service_name"])
 	}
 }

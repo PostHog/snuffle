@@ -594,15 +594,29 @@ func TestPostHogQueryPlanReadsSeriesTableOnlyForMapLabels(t *testing.T) {
 	cfg := Config{CHDatabase: "default", SchemaLayout: "posthog", SeriesTable: "metrics4_series", SamplesTable: "metrics4_samples", MaxSeries: 10}
 	nameMatchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up")}
 
-	plan := newPostHogQueryPlan(cfg, nameMatchers, []string{"service_name", "__name__"}, 1000, 2000, false)
+	plan := newPostHogQueryPlan(cfg, nameMatchers, []string{"__name__"}, 1000, 2000, false)
 	if plan.useSeries {
 		t.Fatal("physical grouping labels must not read the series table")
 	}
-	if got := strings.Join(plan.perSeriesGroupSelects(), ", "); got != "any(service_name) AS `__group_0`, any(metric_name) AS `__group_1`" {
+	if got := strings.Join(plan.perSeriesGroupSelects(), ", "); got != "any(metric_name) AS `__group_0`" {
 		t.Fatalf("per-series group selects = %s", got)
 	}
 	if got := strings.Join(plan.sampleWhere(), " AND "); strings.Contains(got, "selected_series") {
 		t.Fatalf("samples filter must not reference selected_series: %s", got)
+	}
+
+	// A scraped service_name attribute overrides the service_name column, so
+	// service_name grouping and matchers read the series table.
+	for _, plan := range []*postHogQueryPlan{
+		newPostHogQueryPlan(cfg, nameMatchers, []string{"service_name"}, 1000, 2000, false),
+		newPostHogQueryPlan(cfg, append(nameMatchers[:1:1], labels.MustNewMatcher(labels.MatchEqual, "service_name", "api")), nil, 1000, 2000, false),
+	} {
+		if !plan.useSeries || !strings.Contains(plan.seriesSQL, postHogServiceNameExprSQL()) {
+			t.Fatalf("service_name must be read from the series table with the attribute first: %s", plan.seriesSQL)
+		}
+		if where := strings.Join(plan.sampleWhere(), " AND "); strings.Contains(where, "service_name") {
+			t.Fatalf("samples filter must not use the service_name column: %s", where)
+		}
 	}
 
 	plan = newPostHogQueryPlan(cfg, nameMatchers, []string{"region"}, 1000, 2000, false)

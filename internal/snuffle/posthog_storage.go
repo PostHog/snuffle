@@ -277,9 +277,9 @@ func postHogSeriesFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int
 	return filters
 }
 
-// postHogSampleFilters filters the samples table. Only metric_name and
-// service_name exist there; other label matchers go through the series
-// table.
+// postHogSampleFilters filters the samples table. Only metric_name is a
+// label there; other label matchers, service_name included, go through the
+// series table.
 func postHogSampleFilters(cfg Config, matchers []*labels.Matcher, mint, maxt int64) []string {
 	return append(postHogSampleRowFilters(cfg, matchers, mint, maxt), postHogSamplePointFilters(mint, maxt)...)
 }
@@ -330,7 +330,7 @@ func postHogMatcherCondition(matcher *labels.Matcher) (string, bool) {
 }
 
 // postHogSampleMatcherCondition builds a condition against the samples table,
-// which only carries metric_name and service_name.
+// which only answers metric_name.
 func postHogSampleMatcherCondition(matcher *labels.Matcher) (string, bool) {
 	return postHogMatcherConditionWith(matcher, postHogSampleLabelExpr)
 }
@@ -346,16 +346,17 @@ func postHogMatcherConditionWith(matcher *labels.Matcher, labelExpr func(string)
 	return stringColumnMatcherCondition(expr, matcher)
 }
 
+// postHogSampleColumnLabel reports whether a label is a samples column. The
+// samples table has a service_name column, but the service_name label can
+// come from a series attribute instead, so only the series table answers it.
 func postHogSampleColumnLabel(name string) bool {
-	return name == labels.MetricName || name == "service_name"
+	return name == labels.MetricName
 }
 
 func postHogSampleLabelExpr(name string) (string, bool) {
 	switch name {
 	case labels.MetricName:
 		return "metric_name", true
-	case "service_name":
-		return "service_name", true
 	default:
 		return "", false
 	}
@@ -365,8 +366,8 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 	switch name {
 	case labels.MetricName:
 		return "metric_name", true
-	case "service_name":
-		return "service_name", true
+	case postHogServiceNameLabel:
+		return postHogServiceNameExprSQL(), true
 	case postHogJobLabel:
 		return postHogJobExprSQL(), true
 	case "":
@@ -374,6 +375,19 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 	default:
 		return postHogLabelValueExpr(name), true
 	}
+}
+
+// postHogServiceNameLabel is the service_name label. PostHog capture writes a
+// remote-written job to the service_name column and keeps a scraped
+// service_name label in attributes, so the column is only the fallback.
+const postHogServiceNameLabel = "service_name"
+
+// postHogServiceNameExprSQL reads service_name with the precedence of
+// postHogLabelMap: a service_name attribute wins, then the column. OTLP
+// series have no such attribute and read the column.
+func postHogServiceNameExprSQL() string {
+	key := sqlString(postHogServiceNameLabel)
+	return "if(mapContains(resource_attributes, " + key + "), resource_attributes[" + key + "], if(mapContains(attributes, " + key + "), attributes[" + key + "], service_name))"
 }
 
 // postHogJobLabel is the Prometheus job label. PostHog capture moves job into
@@ -540,6 +554,13 @@ func (p *postHogQueryPlan) joinSeries(inner string) string {
 
 func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[string]string) map[string]string {
 	out := make(map[string]string, len(resourceAttrs)+len(attrs)+2)
+	// The service_name column is the fallback for the service_name label. A
+	// series that carries its own service_name attribute keeps it: capture
+	// moves a scraped job into the column and keeps a scraped service_name
+	// label as an attribute.
+	if serviceName != "" {
+		out[postHogServiceNameLabel] = serviceName
+	}
 	for key, value := range attrs {
 		if key == "" || key == labels.MetricName {
 			continue
@@ -552,11 +573,8 @@ func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[st
 		}
 		out[key] = value
 	}
-	if serviceName != "" {
-		out["service_name"] = serviceName
-		if _, ok := out[postHogJobLabel]; !ok {
-			out[postHogJobLabel] = serviceName
-		}
+	if _, ok := out[postHogJobLabel]; !ok && serviceName != "" {
+		out[postHogJobLabel] = serviceName
 	}
 	out[labels.MetricName] = metricName
 	return out
@@ -677,6 +695,17 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
 			sqlLimit(limit),
 		), true
+	case name == postHogServiceNameLabel:
+		if len(matchers) > 0 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s AND label_value != '' ORDER BY label_value%s",
+			postHogServiceNameExprSQL(),
+			postHogSeriesTable(cfg),
+			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
+			sqlLimit(limit),
+		), true
 	case cfg.AttributeTable != "":
 		where, ok := postHogAttributeFilters(cfg, mint, maxt, matchers)
 		if !ok {
@@ -765,10 +794,15 @@ func postHogMetricNameFilters(cfg Config, mint, maxt int64, matchers []*labels.M
 // matchers it can answer. The rollup keys on metric_name and service_name, so
 // only exact matchers on those labels are accepted; any other matcher reports
 // false and needs the series table. A metric_name filter also needs a table
-// that has the column.
+// that has the column. The rollup has no series, so a service_name matcher
+// keeps every rollup group that can hold a matching series: groups whose
+// service_name column matches, and groups with a matching service_name
+// attribute.
 func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
 	filters := []string{teamFilter(cfg)}
 	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	var metricFilters []string
+	var serviceNames []string
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) {
 			continue
@@ -779,13 +813,49 @@ func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Ma
 		if matcher.Name == labels.MetricName && !cfg.AttributeTableHasMetricName {
 			return nil, false
 		}
+		if matcher.Name == postHogServiceNameLabel {
+			// The rollup drops attribute values of postHogAttributeMaxLen
+			// bytes or more, so a long scraped service_name is only on the
+			// series table.
+			if len(matcher.Value) >= postHogAttributeMaxLen {
+				return nil, false
+			}
+			serviceNames = append(serviceNames, matcher.Value)
+			continue
+		}
 		column, ok := postHogSampleLabelExpr(matcher.Name)
 		if !ok {
 			return nil, false
 		}
-		filters = append(filters, column+" = "+sqlString(matcher.Value))
+		metricFilters = append(metricFilters, column+" = "+sqlString(matcher.Value))
+	}
+	filters = append(filters, metricFilters...)
+	for _, value := range serviceNames {
+		filters = append(filters, postHogAttributeServiceNameFilter(cfg, mint, maxt, metricFilters, value))
 	}
 	return filters, true
+}
+
+// postHogAttributeMaxLen is the length at which the attribute rollup drops a
+// key or value (see scripts/create_metrics_posthog_schema.sql).
+const postHogAttributeMaxLen = 256
+
+// postHogAttributeServiceNameFilter matches the rollup groups that can hold a
+// series whose service_name label is value. metricFilters are the outer
+// metric_name filters, repeated so the lookup reads only those metrics.
+func postHogAttributeServiceNameFilter(cfg Config, mint, maxt int64, metricFilters []string, value string) string {
+	key := "service_name"
+	if cfg.AttributeTableHasMetricName {
+		key = "(metric_name, service_name)"
+	}
+	where := []string{teamFilter(cfg)}
+	where = append(where, postHogAttributeTimeFilters(mint, maxt)...)
+	where = append(where, metricFilters...)
+	where = append(where, "attribute_key = "+sqlString(postHogServiceNameLabel), "attribute_value = "+sqlString(value))
+	return fmt.Sprintf(
+		"(service_name = %s OR %s IN (SELECT %s FROM %s WHERE %s))",
+		sqlString(value), key, strings.Trim(key, "()"), postHogAttributeTable(cfg), strings.Join(where, " AND "),
+	)
 }
 
 // postHogAttributeTimeFilters bounds the attribute and metric name rollups,

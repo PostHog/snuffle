@@ -57,7 +57,7 @@ func TestPostHogExactHistogramMetadataSQL(test *testing.T) {
 			if len(branches) != 2 || !strings.Contains(branches[0], "['le']") || strings.Contains(branches[1], "['le']") {
 				test.Fatalf("le must filter real labels only: %s", sql)
 			}
-			if strings.Count(sql, "service_name = 'api'") != 2 {
+			if strings.Count(sql, postHogServiceNameExprSQL()+" = 'api'") != 2 {
 				test.Fatalf("both branches must filter service names: %s", sql)
 			}
 			typeFilter := postHogHistogramTypeFilter

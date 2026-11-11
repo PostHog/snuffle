@@ -54,7 +54,6 @@ func TestPostHogLoadSamplesSQLCombinesPointArrays(t *testing.T) {
 		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1000, 'UTC'))",
 		"time_bucket <= toStartOfHour(fromUnixTimestamp64Milli(2000, 'UTC'))",
 		"metric_name = 'http_requests_total'",
-		"service_name = 'checkout'",
 		"series_fingerprint IN (7,9)",
 		"GROUP BY series_id HAVING notEmpty(points)",
 		"SETTINGS max_threads = 4",
