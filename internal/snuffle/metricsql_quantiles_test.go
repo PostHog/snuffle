@@ -1,6 +1,8 @@
 package snuffle
 
 import (
+	"context"
+	"errors"
 	"math"
 	"testing"
 	"time"
@@ -76,5 +78,31 @@ func TestMetricsQLQuantiles(test *testing.T) {
 	}
 	if _, err := prepareMetricsQLQuery(`quantiles("p", 0.5, statistics_value) by (group) limit 1`, 30*time.Second, 5*time.Minute, start, start.Add(time.Minute)); err == nil {
 		test.Fatal("range queries must not apply a different group limit at each step")
+	}
+}
+
+func TestMetricsQLQuantilesSampleBudget(test *testing.T) {
+	// Two groups times two phis is four samples, over a budget of three.
+	metricsQLMaxOutputSamples.Store(3)
+	defer metricsQLMaxOutputSamples.Store(0)
+	at := time.Unix(1700000070, 0)
+	prepared, err := prepareMetricsQLQuery(`quantiles("p", 0.9, 0.1, statistics_value) by (group)`, 30*time.Second, 5*time.Minute, at, at)
+	if err != nil {
+		test.Fatal(err)
+	}
+	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: 100000, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute})
+	query, err := engine.NewInstantQuery(context.Background(), statisticsTestQueryable(), promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, at)
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer query.Close()
+	result := query.Exec(context.Background())
+	var tooMany promql.ErrTooManySamples
+	if !errors.As(result.Err, &tooMany) {
+		test.Fatalf("err = %v, want ErrTooManySamples", result.Err)
+	}
+	metricsQLMaxOutputSamples.Store(4)
+	if got := evaluateStatistics(test, `quantiles("p", 0.9, 0.1, statistics_value) by (group)`, false).(promql.Vector); len(got) != 4 {
+		test.Fatalf("within budget: %v", got)
 	}
 }

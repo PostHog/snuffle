@@ -6,6 +6,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"sync/atomic"
 	"time"
 
 	"github.com/VictoriaMetrics/metricsql"
@@ -15,6 +16,12 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/util/annotations"
 )
+
+// metricsQLMaxOutputSamples bounds the samples a MetricsQL function that
+// expands its input may produce in one step. The engine checks MaxSamples only
+// after the function returns, so quantiles checks it before allocating.
+// Zero means no limit.
+var metricsQLMaxOutputSamples atomic.Int64
 
 func init() {
 	upstream, ok := parser.Functions["histogram_quantiles"]
@@ -264,6 +271,9 @@ func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Ex
 	})
 	if grouping.Limit > 0 && len(order) > grouping.Limit {
 		order = order[:grouping.Limit]
+	}
+	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 && len(phis) > 0 && int64(len(order)) > limit/int64(len(phis)) {
+		panic(promql.ErrTooManySamples("quantiles"))
 	}
 	for _, group := range order {
 		sort.Float64s(group.values)

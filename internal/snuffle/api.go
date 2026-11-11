@@ -71,6 +71,7 @@ func newServer(cfg Config) *Server {
 	client := NewClickHouseClient(cfg, metrics)
 	queryable := NewCHQueryable(client, cfg)
 	promQLParser := newBoundLabelParser()
+	metricsQLMaxOutputSamples.Store(int64(cfg.MaxSamples))
 	engine := promql.NewEngine(promql.EngineOpts{
 		Parser:               promQLParser,
 		Logger:               slog.Default(),
