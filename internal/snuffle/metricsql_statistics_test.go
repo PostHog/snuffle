@@ -26,6 +26,7 @@ func TestPrepareMetricsQLStatistics(test *testing.T) {
 		`median(value) without (instance)`,
 		`median(value, value + 1) by (group)`,
 		`median(1, 3, 7)`,
+		`median(value[5m])`,
 		`sum(median(value))`,
 		`rate(median(value)[5m:1m])`,
 		`max_over_time(median(value)[5m:1m])`,
@@ -51,7 +52,6 @@ func TestPrepareMetricsQLStatistics(test *testing.T) {
 		`histogram_quantiles("phi", 0.5, bucket) keep_metric_names`,
 		`median()`,
 		`median("not a vector")`,
-		`median(value[5m])`,
 		`__snuffle_median("{}", value)`,
 		`__snuffle_histogram_quantiles(bucket, "phi", 0.5)`,
 	} {

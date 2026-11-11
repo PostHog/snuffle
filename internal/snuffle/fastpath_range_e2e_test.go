@@ -189,6 +189,9 @@ func TestRangePushdownMatchesEngine(test *testing.T) {
 		rangeCase{"sum(increase(M[1m])) offset 10m", 45 * time.Second, false},
 		rangeCase{"max(rate(M[2m])) by (cluster) offset 4m", 90 * time.Second, false},
 		rangeCase{"sum(M) by (code) offset 3m", 2 * time.Minute, false},
+		// A range selector in an aggregate is default_rollup over its window.
+		rangeCase{"sum(M[5m]) by (code)", time.Minute, false},
+		rangeCase{"max(M[30s]) by (cluster)", time.Minute, false},
 	)
 	start := time.UnixMilli(base + 5*time.Minute.Milliseconds())
 	end := time.UnixMilli(base + 40*time.Minute.Milliseconds())
