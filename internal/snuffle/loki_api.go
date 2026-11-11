@@ -406,34 +406,32 @@ func collectLogQLSelectors(expr *logQLExpr) []logQLSelector {
 
 func logQLSelectorKey(selector logQLSelector) string {
 	var b strings.Builder
-	for _, matcher := range selector.matchers {
-		b.WriteString(matcher.name)
-		b.WriteByte('\x00')
-		b.WriteString(matcher.op)
-		b.WriteByte('\x00')
-		b.WriteString(matcher.value)
-		b.WriteByte('\x00')
+	// Every value is length-prefixed, so no value can imitate a delimiter.
+	write := func(v string) {
+		b.WriteString(strconv.Itoa(len(v)))
+		b.WriteByte(':')
+		b.WriteString(v)
 	}
-	b.WriteByte('\xff')
+	for _, matcher := range selector.matchers {
+		write(matcher.name)
+		write(matcher.op)
+		write(matcher.value)
+	}
+	b.WriteByte('|')
 	for _, stage := range selector.stages {
-		b.WriteString(stage.kind)
-		b.WriteByte('\x00')
+		write(stage.kind)
 		if stage.lineFilter != nil {
-			b.WriteString(stage.lineFilter.op)
-			b.WriteByte('\x00')
-			b.WriteString(stage.lineFilter.value)
+			write(stage.lineFilter.op)
+			write(stage.lineFilter.value)
+			write(strconv.Itoa(len(stage.lineFilter.or)))
 			for _, alt := range stage.lineFilter.or {
-				b.WriteByte('\x01')
-				b.WriteString(alt.value)
+				write(alt.value)
 			}
 		}
-		b.WriteByte('\x00')
-		b.WriteString(stage.parser)
-		b.WriteByte('\x00')
-		b.WriteString(stage.parserParam)
-		b.WriteByte('\x00')
-		b.WriteString(stage.lineFormat)
-		b.WriteByte('\xff')
+		write(stage.parser)
+		write(stage.parserParam)
+		write(stage.lineFormat)
+		b.WriteByte('|')
 	}
 	return b.String()
 }

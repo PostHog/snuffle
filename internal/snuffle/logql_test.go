@@ -547,6 +547,10 @@ func TestLogQLLineFilterAlternativesSQL(t *testing.T) {
 	if logQLSelectorKey(*one) == logQLSelectorKey(*two) {
 		t.Fatal("selectors with and without alternatives share a fetch key")
 	}
+	joined, _ := parseLogQLSelector("{app=\"api\"} |= \"a\\x01b\"")
+	if logQLSelectorKey(*joined) == logQLSelectorKey(*two) {
+		t.Fatal("a value containing the separator collides with alternatives")
+	}
 }
 
 func TestParseLogQLRejectsDanglingLineFilterOr(t *testing.T) {
