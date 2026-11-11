@@ -65,6 +65,18 @@ func rewriteLabelFunction(e *metricsql.FuncExpr) (bool, error) {
 			return true, fmt.Errorf("%s: cannot compile regexp %q: %w", e.Name, pattern.S, err)
 		}
 	}
+	if len(e.Args) == 0 {
+		return true, fmt.Errorf("%s requires a series argument", e.Name)
+	}
+	for _, arg := range e.Args[1:] {
+		if _, ok := arg.(*metricsql.StringExpr); !ok {
+			return true, fmt.Errorf("%s requires constant string arguments after the series", e.Name)
+		}
+	}
+	// MetricsQL accepts a number as the series, as other functions do.
+	if _, numeric := e.Args[0].(*metricsql.NumberExpr); numeric {
+		e.Args[0] = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{e.Args[0]}}
+	}
 	e.Name = metricsQLInternalPrefix + e.Name
 	return true, nil
 }

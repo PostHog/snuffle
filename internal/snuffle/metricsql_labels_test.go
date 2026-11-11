@@ -190,6 +190,8 @@ func TestPrepareMetricsQLLabelFunctionErrors(test *testing.T) {
 		`label_mismatch(m, "a", "b", "c")`,
 		`label_value(m)`,
 		`sort_by_label(m)`,
+		`label_value()`,
+		`sort_by_label(m, 123)`,
 		`__snuffle_label_match(m, "a", "b")`,
 	} {
 		test.Run(expression, func(test *testing.T) {
@@ -261,5 +263,26 @@ func TestMetricsQLSortByLabelRangeSkipsSort(test *testing.T) {
 	matrix := evaluateMetricsQL(test, labelsTestQueryable(), `sort_by_label(labels_value, "cpu")`, true).(promql.Matrix)
 	if len(matrix) != 4 {
 		test.Fatalf("series = %d, want 4", len(matrix))
+	}
+}
+
+func TestPrepareMetricsQLLabelFunctionRangeErrors(test *testing.T) {
+	start := time.Unix(1700000010, 0)
+	// A range query drops sort_by_label, so it must still reject bad arguments.
+	for _, expression := range []string{`sort_by_label(m, 123)`, `sort_by_label_desc(m)`} {
+		if _, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, start.Add(time.Hour)); err == nil {
+			test.Fatalf("%s: expected an error", expression)
+		}
+	}
+}
+
+func TestMetricsQLLabelFunctionsAcceptNumbers(test *testing.T) {
+	result := evaluateMetricsQL(test, labelsTestQueryable(), `label_match(1, "missing", "")`, false).(promql.Vector)
+	if len(result) != 1 || result[0].F != 1 {
+		test.Fatalf("label_match result = %v", result)
+	}
+	result = evaluateMetricsQL(test, labelsTestQueryable(), `sort_by_label(1, "job")`, false).(promql.Vector)
+	if len(result) != 1 || result[0].F != 1 {
+		test.Fatalf("sort_by_label result = %v", result)
 	}
 }
