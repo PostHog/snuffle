@@ -223,3 +223,43 @@ func TestMetricsQLNumericLess(test *testing.T) {
 		}
 	}
 }
+
+func TestMetricsQLLabelValueEdgeCases(test *testing.T) {
+	scalar := func(query string) (float64, int) {
+		result := evaluateMetricsQL(test, labelsTestQueryable(), query, false).(promql.Vector)
+		total := 0.0
+		for _, sample := range result {
+			total += sample.F
+		}
+		return total, len(result)
+	}
+	// Unparseable label values are dropped before the parent aggregate.
+	if got, _ := scalar(`sum(label_value(labels_value, "cpu"))`); got != 12 {
+		test.Fatalf("sum = %v, want 12", got)
+	}
+	if got, _ := scalar(`count(label_value(labels_value, "cpu"))`); got != 3 {
+		test.Fatalf("count = %v, want 3", got)
+	}
+	// NaN input points stay missing.
+	if _, count := scalar(`label_value(labels_value / 0 * 0, "cpu")`); count != 0 {
+		test.Fatalf("NaN input gave %d samples", count)
+	}
+	// __name__ is reset before the lookup.
+	if _, count := scalar(`label_value(label_replace(labels_value, "__name__", "42", "", ""), "__name__")`); count != 0 {
+		test.Fatalf("__name__ gave %d samples", count)
+	}
+}
+
+func TestMetricsQLSortByLabelTiesKeepInputOrder(test *testing.T) {
+	result := evaluateMetricsQL(test, labelsTestQueryable(), `sort_by_label(sort_by_label_desc(labels_value, "cpu"), "node")`, false).(promql.Vector)
+	if got := strings.Join(vectorLabel(result, "cpu"), ","); got != "2,10,0,x" {
+		test.Fatalf("order = %s", got)
+	}
+}
+
+func TestMetricsQLSortByLabelRangeSkipsSort(test *testing.T) {
+	matrix := evaluateMetricsQL(test, labelsTestQueryable(), `sort_by_label(labels_value, "cpu")`, true).(promql.Matrix)
+	if len(matrix) != 4 {
+		test.Fatalf("series = %d, want 4", len(matrix))
+	}
+}

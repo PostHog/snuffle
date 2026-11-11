@@ -98,21 +98,30 @@ func metricsQLLabelMatch(keepMatches bool) promql.FunctionCall {
 }
 
 // metricsQLLabelValue replaces each sample with the numeric value of a label.
-// A value that does not parse gives NaN, which the response omits.
+// A sample whose label does not parse, or whose input is NaN, gives no output,
+// so parent aggregates ignore it as they do in VictoriaMetrics.
 func metricsQLLabelValue(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
 	label := args[1].(*parser.StringLiteral).Val
 	for _, sample := range vectors[0] {
-		value, err := strconv.ParseFloat(metricsQLLabelString(sample, label), 64)
+		if math.IsNaN(sample.F) {
+			continue
+		}
+		// VictoriaMetrics resets the metric name before the lookup.
+		text := ""
+		if label != labels.MetricName {
+			text = sample.Metric.Get(label)
+		}
+		value, err := strconv.ParseFloat(text, 64)
 		if err != nil {
-			value = math.NaN()
+			continue
 		}
 		enh.Out = append(enh.Out, promql.Sample{Metric: sample.Metric, F: value, DropName: true})
 	}
 	return enh.Out, nil
 }
 
-// metricsQLSortByLabel orders an instant vector by label values. Equal label
-// values keep a stable order by the full label set. Range results keep the
+// metricsQLSortByLabel orders an instant vector by label values. Series that
+// tie on every label keep their input order. Range results keep the
 // engine's label order, as they do for the Prometheus sort functions.
 func metricsQLSortByLabel(less func(a, b string) bool, descending bool) promql.FunctionCall {
 	return func(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, _ *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
@@ -134,7 +143,7 @@ func metricsQLSortByLabel(less func(a, b string) bool, descending bool) promql.F
 				}
 				return 1
 			}
-			return labels.Compare(a.Metric, b.Metric)
+			return 0
 		})
 		return vectors[0], nil
 	}

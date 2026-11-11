@@ -290,6 +290,15 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
 	case *metricsql.FuncExpr:
+		if !instant && strings.HasPrefix(e.Name, "sort_by_label") {
+			// Range results keep label order, so sorting at every step is
+			// wasted work. Validate the call, then drop it.
+			if _, err := rewriteLabelFunction(e); err != nil {
+				return err
+			}
+			*expr = e.Args[0]
+			return r.rewrite(expr, step, instant)
+		}
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
 		if e.Name == "median" {
