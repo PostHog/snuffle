@@ -103,6 +103,10 @@ type logQLLineFilter struct {
 	op    string
 	value string
 	re    *regexp.Regexp
+	// or holds the alternatives of `|= "a" or "b"`, all with op. A line
+	// passes a positive filter when it matches any value and a negative one
+	// when it matches none.
+	or []*logQLLineFilter
 }
 
 type logQLLabelFilter struct {
@@ -701,6 +705,21 @@ func parseLogQLPipeline(input string) ([]logQLStage, error) {
 				if err != nil {
 					return nil, err
 				}
+				for {
+					next, ok := cutLogQLLineFilterOr(rest)
+					if !ok {
+						break
+					}
+					value, rest, err = consumeQuoted(next)
+					if err != nil {
+						return nil, err
+					}
+					alt, err := newLogQLLineFilter(op, value)
+					if err != nil {
+						return nil, err
+					}
+					filter.or = append(filter.or, alt)
+				}
 				stages = append(stages, logQLStage{kind: "line_filter", lineFilter: filter})
 				input = strings.TrimSpace(rest)
 				matchedLineFilter = true
@@ -727,6 +746,24 @@ func parseLogQLPipeline(input string) ([]logQLStage, error) {
 		input = strings.TrimSpace(rest)
 	}
 	return stages, nil
+}
+
+// cutLogQLLineFilterOr returns what follows a leading `or` when the next
+// token is a quoted line filter alternative.
+func cutLogQLLineFilterOr(input string) (string, bool) {
+	input = strings.TrimSpace(input)
+	if len(input) < 3 || !strings.EqualFold(input[:2], "or") {
+		return "", false
+	}
+	rest := input[2:]
+	if !unicode.IsSpace(rune(rest[0])) && rest[0] != '"' && rest[0] != '`' {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" || (rest[0] != '"' && rest[0] != '`') {
+		return "", false
+	}
+	return rest, true
 }
 
 func newLogQLLineFilter(op, value string) (*logQLLineFilter, error) {
@@ -1108,6 +1145,18 @@ func logQLMatcherLabelValue(labels map[string]string, name string) string {
 }
 
 func (f logQLLineFilter) matches(line string) bool {
+	positive := f.op == "|=" || f.op == "|~" || f.op == "|>"
+	result := f.matchesOne(line)
+	for _, alt := range f.or {
+		if result == positive {
+			break
+		}
+		result = alt.matchesOne(line)
+	}
+	return result
+}
+
+func (f logQLLineFilter) matchesOne(line string) bool {
 	switch f.op {
 	case "|=":
 		return strings.Contains(line, f.value)
@@ -1804,6 +1853,21 @@ func logQLMatcherCondition(cfg Config, m logQLLabelMatcher) string {
 }
 
 func logQLLineFilterCondition(f logQLLineFilter) string {
+	if len(f.or) == 0 {
+		return logQLLineFilterOneCondition(f)
+	}
+	connector := " OR "
+	if f.op == "!=" || f.op == "!~" || f.op == "!>" {
+		connector = " AND "
+	}
+	conditions := []string{logQLLineFilterOneCondition(f)}
+	for _, alt := range f.or {
+		conditions = append(conditions, logQLLineFilterOneCondition(*alt))
+	}
+	return "(" + strings.Join(conditions, connector) + ")"
+}
+
+func logQLLineFilterOneCondition(f logQLLineFilter) string {
 	switch f.op {
 	case "|=":
 		return "position(body, " + sqlString(f.value) + ") > 0"

@@ -218,7 +218,6 @@ func TestParseLogQLKnownUnsupportedLokiCompatibilityGaps(t *testing.T) {
 		{"rate counter", `rate_counter({app="api"} | unwrap value [5m])`},
 		{"unpack parser", `sum(count_over_time({app="api"} | unpack | json [5m]))`},
 		{"line filter ip matcher", `{app="api"} |= ip("127.0.0.1")`},
-		{"line filter or chain", `{app="api"} |= "500" or "200"`},
 		{"parenthesized log range selector", `bytes_over_time(({app="api"} |= "error")[5m])`},
 		{"negative offset", `count_over_time({app="api"}[5m] offset -1m)`},
 		{"variants expression", `variants(count_over_time({app="api"}[5m])) of ({app="api"}[5m])`},
@@ -607,6 +606,98 @@ func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
+		}
+	}
+}
+
+// ENG-023: Loki 3 accepts any-of line filters, `|= "a" or "b"`. A negative
+// filter with alternatives drops lines that contain any of them.
+func TestApplyLogQLLineFilterAlternatives(t *testing.T) {
+	rows := []logRow{
+		{tsNS: 1, line: "goroutine panic here"},
+		{tsNS: 2, line: "panic: runtime error"},
+		{tsNS: 3, line: "level=error msg=boom"},
+		{tsNS: 4, line: "level=info msg=ok"},
+	}
+	for _, tt := range []struct {
+		query string
+		want  []int64
+	}{
+		{`{k8s.namespace.name=~"ns"} |= " panic " or "panic:" or "level=error"`, []int64{1, 2, 3}},
+		{"{app=\"api\"} |= `panic:` or `level=info`", []int64{2, 4}},
+		{`{app="api"} |~ "pan.c:" or "msg=o."`, []int64{2, 4}},
+		{`{app="api"} != "panic" or "level=info"`, []int64{3}},
+		{`{app="api"} !~ "panic" or "info"`, []int64{3}},
+		{`{app="api"} |= "level=" or "panic:" != "info"`, []int64{2, 3}},
+		{`{app="api"} |= "level=" or "runtime" | logfmt | level="error"`, []int64{3}},
+	} {
+		t.Run(tt.query, func(t *testing.T) {
+			selector, err := parseLogQLSelector(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQLSelector returned error: %v", err)
+			}
+			in := make([]logRow, len(rows))
+			for i, r := range rows {
+				in[i] = logRow{tsNS: r.tsNS, line: r.line, labels: map[string]string{"app": "api", "k8s.namespace.name": "ns"}, fields: map[string]string{}}
+			}
+			var got []int64
+			for _, r := range applyLogQLSelector(in, *selector) {
+				got = append(got, r.tsNS)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("rows = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLogQLLineFilterAlternativesSQL(t *testing.T) {
+	cfg := Config{CHDatabase: "posthog", LogSchemaLayout: "posthog", LogsTable: "logs34", LogQueryMaxRows: 1000}
+	for _, tt := range []struct {
+		query string
+		want  string
+	}{
+		{`{app="api"} |= "a" or "b"`, "(position(body, 'a') > 0 OR position(body, 'b') > 0)"},
+		{`{app="api"} != "a" or "b"`, "(position(body, 'a') = 0 AND position(body, 'b') = 0)"},
+	} {
+		selector, err := parseLogQLSelector(tt.query)
+		if err != nil {
+			t.Fatalf("parseLogQLSelector(%q) returned error: %v", tt.query, err)
+		}
+		if sql := logQLSelectSQL(cfg, *selector, 1000, 2000, 50, "backward"); !strings.Contains(sql, tt.want) {
+			t.Fatalf("SQL %q does not contain %q", sql, tt.want)
+		}
+	}
+	expr, err := parseLogQL(`sum(count_over_time({app="api"} |= "a" or "b" [5m]))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := buildLogQLMetricSQLPlan(cfg, expr)
+	if !ok {
+		t.Fatal("line filter alternatives were not pushed to SQL")
+	}
+	if sql := strings.Join(plan.selectorFilters, " "); !strings.Contains(sql, "(position(body, 'a') > 0 OR position(body, 'b') > 0)") {
+		t.Fatalf("metric SQL %s lacks the alternatives", sql)
+	}
+
+	one, _ := parseLogQLSelector(`{app="api"} |= "a"`)
+	two, _ := parseLogQLSelector(`{app="api"} |= "a" or "b"`)
+	if logQLSelectorKey(*one) == logQLSelectorKey(*two) {
+		t.Fatal("selectors with and without alternatives share a fetch key")
+	}
+	joined, _ := parseLogQLSelector("{app=\"api\"} |= \"a\\x01b\"")
+	if logQLSelectorKey(*joined) == logQLSelectorKey(*two) {
+		t.Fatal("a value containing the separator collides with alternatives")
+	}
+}
+
+func TestParseLogQLRejectsDanglingLineFilterOr(t *testing.T) {
+	for _, query := range []string{
+		`{app="api"} |= "a" or`,
+		`{app="api"} |= "a" or | json`,
+	} {
+		if _, err := parseLogQL(query); err == nil {
+			t.Errorf("parseLogQL accepted %q", query)
 		}
 	}
 }

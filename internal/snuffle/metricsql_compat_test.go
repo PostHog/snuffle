@@ -37,6 +37,10 @@ func TestPrepareMetricsQLQueryRewrites(t *testing.T) {
 		{name: "subquery uses its own step", query: "rate(sum(m)[5m:1m])", want: "__snuffle_rate(sum(__snuffle_default_rollup(m[360000ms], 0, 60000, 300000, 0))[600000ms:60000ms], 300000, 15000, 300000, 0)"},
 		{name: "subquery step units resolve against the subquery step", query: "max_over_time(rate(m)[1h:1m])", instant: true, want: "max_over_time(__snuffle_rate(m[360000ms], 0, 60000, 300000, 0)[3600000ms:60000ms])"},
 		{name: "numeric argument becomes a vector", query: "abs(-1)", want: "abs(vector(-1))"},
+		{name: "or with a number uses a vector", query: "sum(m) or 0", instant: true, want: "sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)"},
+		{name: "number or a vector", query: "-1 or m", instant: true, want: "vector(-1) or __snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)"},
+		{name: "NaN or a vector is the vector", query: "(0/0) or sum(m)", instant: true, want: "(vector(0) < 0) or sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1))"},
+		{name: "or with a number inside arithmetic", query: "1 / ((sum(m) or 0) + 1)", instant: true, want: "1 / ((sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)) + 1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			queryEnd := end
@@ -164,6 +168,8 @@ func TestUnwrapInstantDefaultRollups(t *testing.T) {
 		{query: "sum(__snuffle_default_rollup(m[300000ms], 0, 300000, 300000, 1)) by (a)", want: "sum by (a) (m)", ok: true},
 		{query: "topk(3, __snuffle_default_rollup(m[300000ms] offset 60000ms, 0, 300000, 300000, 1))", want: "topk(3, m offset 1m)", ok: true},
 		{query: "sum(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0))"},
+		// An explicit window differs from the lookback the selector would read.
+		{query: "sum(__snuffle_default_rollup(m[3900000ms], 3600000, 300000, 300000, 1))"},
 		{query: "sum(__snuffle_rate(m[600000ms], 300000, 300000, 300000, 1))"},
 		{query: "last_over_time(m[5m])", want: "last_over_time(m[5m])", ok: true},
 	} {
