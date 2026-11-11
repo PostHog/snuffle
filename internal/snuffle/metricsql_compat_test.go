@@ -37,6 +37,9 @@ func TestPrepareMetricsQLQueryRewrites(t *testing.T) {
 		{name: "subquery uses its own step", query: "rate(sum(m)[5m:1m])", want: "__snuffle_rate(sum(__snuffle_default_rollup(m[360000ms], 0, 60000, 300000, 0))[600000ms:60000ms], 300000, 15000, 300000, 0)"},
 		{name: "subquery step units resolve against the subquery step", query: "max_over_time(rate(m)[1h:1m])", instant: true, want: "max_over_time(__snuffle_rate(m[360000ms], 0, 60000, 300000, 0)[3600000ms:60000ms])"},
 		{name: "numeric argument becomes a vector", query: "abs(-1)", want: "abs(vector(-1))"},
+		{name: "or with a number uses a vector", query: "sum(m) or 0", instant: true, want: "sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)"},
+		{name: "number or a vector", query: "-1 or m", instant: true, want: "vector(-1) or __snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)"},
+		{name: "or with a number inside arithmetic", query: "1 / ((sum(m) or 0) + 1)", instant: true, want: "1 / ((sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)) + 1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			queryEnd := end

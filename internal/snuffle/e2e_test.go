@@ -141,6 +141,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("counter query intervals", func(t *testing.T) {
 		assertCounterQueryIntervals(t, cfg, api.URL)
 	})
+	t.Run("or with a number", func(t *testing.T) {
+		assertOrWithNumber(t, api.URL)
+	})
 	if cfg.postHogSchemaLayout() {
 		t.Run("filtered label discovery", func(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)

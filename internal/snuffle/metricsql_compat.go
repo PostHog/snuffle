@@ -302,12 +302,24 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewriteArgs(e.Args, step, instant)
 	case *metricsql.BinaryOpExpr:
+		if strings.EqualFold(e.Op, "or") {
+			// MetricsQL reads a number in `x or 0` as a series without
+			// labels. Prometheus only accepts set operators between vectors.
+			e.Left, e.Right = numberAsVector(e.Left), numberAsVector(e.Right)
+		}
 		if err := r.rewrite(&e.Left, step, instant); err != nil {
 			return err
 		}
 		return r.rewrite(&e.Right, step, instant)
 	}
 	return nil
+}
+
+func numberAsVector(expr metricsql.Expr) metricsql.Expr {
+	if _, ok := expr.(*metricsql.NumberExpr); ok {
+		return &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{expr}}
+	}
+	return expr
 }
 
 func (r metricsQLRewriter) rewriteArgs(args []metricsql.Expr, step time.Duration, instant bool) error {
