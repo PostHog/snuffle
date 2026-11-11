@@ -36,7 +36,7 @@ type rangeRollupCall struct {
 	window   int64 // Zero selects the MetricsQL automatic window.
 	step     int64
 	lookback int64
-	matrix   int64 // History before each step: window or step, plus lookback.
+	matrix   int64 // History before each step: window plus lookback, or step plus two lookbacks for a bare selector.
 	offset   int64 // Selector offset: samples are read this long before each step.
 }
 
@@ -212,13 +212,26 @@ func rangeOffsetSubqueryRollup(groups []rangeAggregateGroup, subquery rangeOffse
 	return out
 }
 
+// bareSelector reports whether this is the default_rollup of a bare selector.
+// Its matrix holds a second lookback of history for the sample interval only.
+func (c rangeRollupCall) bareSelector() bool {
+	return c.name == "default_rollup" && c.window == 0
+}
+
+// span returns how long after its timestamp a sample can apply to a step.
+func (c rangeRollupCall) span() int64 {
+	switch {
+	case c.bareSelector():
+		return c.step + c.lookback
+	case c.name == "default_rollup":
+		return c.matrix
+	}
+	return c.window
+}
+
 // expansion returns the maximum number of steps that can use one sample.
 func (c rangeRollupCall) expansion() int64 {
-	span := c.window
-	if c.name == "default_rollup" {
-		span = c.matrix
-	}
-	return (span+c.step-1)/c.step + 1
+	return (c.span()+c.step-1)/c.step + 1
 }
 
 // parseRangeRollupCall parses this rewritten form:
@@ -262,11 +275,11 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 		return rangeRollupCall{}, false
 	}
 	out.matrix = matrix.Range.Milliseconds()
-	explicit := out.window
-	if explicit == 0 {
-		explicit = out.step
+	want := out.window + out.lookback
+	if out.bareSelector() {
+		want = defaultRollupHistory(step, lookback).Milliseconds()
 	}
-	if out.matrix != explicit+out.lookback {
+	if out.matrix != want {
 		return rangeRollupCall{}, false
 	}
 	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
@@ -287,10 +300,12 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 //     It removes stale markers for counters but keeps them for default_rollup.
 //  2. series sorts each series into arrays.
 //     It adds the previous and next sample for each sample.
-//     metricsQLSampleInterval estimates one interval across the complete range.
+//     metricsQLSampleInterval estimates one interval from the last 20 intervals
+//     of the series, so the estimate does not depend on where the range starts.
 //     VictoriaMetrics also estimates one interval for each series.
 //     The engine estimates an interval for each step.
 //     Thus, irregular series can produce different results.
+//     A bare selector with a lone sample uses the lookback, as the engine does.
 //  3. steps joins each sample to its applicable steps.
 //     Counters use the window.
 //     default_rollup stops using a sample when the next sample arrives.
@@ -319,14 +334,18 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 	if call.window == 0 {
 		windowExpr = "least(greatest(" + step + ", max_prev), " + lookback + ")"
 	}
+	fallback := step
+	if call.bareSelector() {
+		fallback = lookback
+	}
 	series := fmt.Sprintf(
 		"SELECT series_id, arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
 			"arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), tss)), NULL) AS prev_tss, arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), vs)), NULL) AS prev_vs, "+
 			"arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), tss)), NULL) AS next_tss, arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), vs)), NULL) AS next_vs, "+
-			"toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayPopFront(arrayDifference(tss))))) AS series_gap, "+
+			"toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arraySlice(arrayPopFront(arrayDifference(tss)), -20)))) AS series_gap, "+
 			"least(if(series_gap <= 0, toInt64(%s), %s), %s) AS max_prev, toInt64(%s) AS window_ms "+
 			"FROM (%s) GROUP BY series_id HAVING notEmpty(pts)",
-		step, metricsQLSampleIntervalMarginSQL("series_gap"), lookback, windowExpr, samples,
+		fallback, metricsQLSampleIntervalMarginSQL("series_gap"), lookback, windowExpr, samples,
 	)
 	neighbours := fmt.Sprintf(
 		"SELECT series_id, max_prev, window_ms, ts, v, prev_ts, prev_v, next_ts, next_v FROM (%s) "+
@@ -337,7 +356,8 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 	// A sample applies when ts <= t_i and t_i < ts + span.
 	span := "window_ms"
 	if defaultRollup {
-		span = "least(" + matrix + ", ifNull(next_ts - ts, " + matrix + "))"
+		applies := strconv.FormatInt(call.span(), 10)
+		span = "least(" + applies + ", ifNull(next_ts - ts, " + applies + "))"
 	}
 	steps := fmt.Sprintf(
 		"SELECT series_id, max_prev, window_ms, ts, v, prev_ts, prev_v, next_ts, next_v, idx, %[1]s + (toInt64(idx) - 1) * %[2]s AS t_i "+
