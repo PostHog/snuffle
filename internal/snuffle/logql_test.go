@@ -437,6 +437,63 @@ func TestParseLogQLRejectsUnbalancedLabelFilterGroups(t *testing.T) {
 	}
 }
 
+func nestedLabelFilterQuery(depth int) string {
+	return `{app="api"} | ` + strings.Repeat("(", depth) + `a="1"` + strings.Repeat(")", depth)
+}
+
+func TestParseLogQLLabelFilterNestingLimit(t *testing.T) {
+	if _, err := parseLogQL(nestedLabelFilterQuery(maxLogQLLabelFilterDepth)); err != nil {
+		t.Fatalf("parseLogQL rejected nesting at the limit: %v", err)
+	}
+	for _, depth := range []int{maxLogQLLabelFilterDepth + 1, 1_600_000} {
+		_, err := parseLogQL(nestedLabelFilterQuery(depth))
+		if err == nil || !strings.Contains(err.Error(), "nests parentheses deeper than") {
+			t.Fatalf("depth %d: err = %v, want nesting limit error", depth, err)
+		}
+	}
+}
+
+func TestLokiQueryRejectsDeepLabelFilterNesting(t *testing.T) {
+	server := &Server{cfg: Config{QueryTimeout: time.Second}}
+	form := url.Values{"query": {nestedLabelFilterQuery(1_600_000)}}
+	req := httptest.NewRequest(http.MethodPost, "/loki/api/v1/query", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	server.handleLokiQuery(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body %.200s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "nests parentheses deeper than") {
+		t.Fatalf("body %.200s does not report the nesting limit", rec.Body.String())
+	}
+}
+
+// Long ungrouped and/or chains stay flat, so evaluation and SQL translation do
+// not recurse once per predicate.
+func TestLogQLLongLabelFilterChainIsFlat(t *testing.T) {
+	const n = 100_000
+	preds := make([]string, n)
+	for i := range preds {
+		preds[i] = fmt.Sprintf(`a="%d"`, i)
+	}
+	expr, err := parseLogQLLabelFilterStage(strings.Join(preds, " or "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expr.op != "or" || len(expr.children) != n {
+		t.Fatalf("op = %q with %d children, want flat or of %d", expr.op, len(expr.children), n)
+	}
+	row := logRow{labels: map[string]string{"a": fmt.Sprint(n - 1)}, fields: map[string]string{}}
+	if !expr.matches(&row) {
+		t.Fatal("last predicate in the chain did not match")
+	}
+	if _, ok := logQLSQLLabelFilterExprCondition(Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}, expr, logQLSQLParser{}); !ok {
+		t.Fatal("flat chain was not translated to SQL")
+	}
+}
+
 func TestLogQLSQLGroupedLabelFilters(t *testing.T) {
 	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
 	expr, err := parseLogQL(`sum(count_over_time({k8s.namespace.name="ns"} | a="1" and (b="2" or c="3") [5m]))`)

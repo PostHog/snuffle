@@ -116,13 +116,17 @@ type logQLLabelFilter struct {
 }
 
 // logQLLabelFilterExpr is a label filter stage: a single predicate (filter) or
-// two sub-expressions joined by op, "and" or "or".
+// sub-expressions joined by op, "and" or "or". And/or chains are flat, so the
+// tree is only as deep as the parentheses nest.
 type logQLLabelFilterExpr struct {
-	op     string
-	lhs    *logQLLabelFilterExpr
-	rhs    *logQLLabelFilterExpr
-	filter *logQLLabelFilter
+	op       string
+	children []*logQLLabelFilterExpr
+	filter   *logQLLabelFilter
 }
+
+// maxLogQLLabelFilterDepth bounds parenthesis nesting in a label filter stage
+// so a crafted query cannot exhaust the stack while parsing or evaluating.
+const maxLogQLLabelFilterDepth = 64
 
 type logQLStage struct {
 	kind         string
@@ -912,6 +916,7 @@ type logQLLabelFilterParser struct {
 	input  string
 	tokens []string
 	pos    int
+	depth  int
 }
 
 func (p *logQLLabelFilterParser) peek() string {
@@ -922,47 +927,60 @@ func (p *logQLLabelFilterParser) peek() string {
 }
 
 func (p *logQLLabelFilterParser) parseOr() (*logQLLabelFilterExpr, error) {
-	lhs, err := p.parseAnd()
+	first, err := p.parseAnd()
 	if err != nil {
 		return nil, err
 	}
+	children := []*logQLLabelFilterExpr{first}
 	for strings.EqualFold(p.peek(), "or") {
 		p.pos++
-		rhs, err := p.parseAnd()
+		next, err := p.parseAnd()
 		if err != nil {
 			return nil, err
 		}
-		lhs = &logQLLabelFilterExpr{op: "or", lhs: lhs, rhs: rhs}
+		children = append(children, next)
 	}
-	return lhs, nil
+	if len(children) == 1 {
+		return first, nil
+	}
+	return &logQLLabelFilterExpr{op: "or", children: children}, nil
 }
 
 func (p *logQLLabelFilterParser) parseAnd() (*logQLLabelFilterExpr, error) {
-	lhs, err := p.parsePrimary()
+	first, err := p.parsePrimary()
 	if err != nil {
 		return nil, err
 	}
+	children := []*logQLLabelFilterExpr{first}
 	for {
 		tok := p.peek()
 		switch {
 		case tok == "" || tok == ")" || strings.EqualFold(tok, "or"):
-			return lhs, nil
+			if len(children) == 1 {
+				return first, nil
+			}
+			return &logQLLabelFilterExpr{op: "and", children: children}, nil
 		case tok == "," || strings.EqualFold(tok, "and"):
 			p.pos++
 		}
 		// Loki also reads predicates separated only by whitespace as "and".
-		rhs, err := p.parsePrimary()
+		next, err := p.parsePrimary()
 		if err != nil {
 			return nil, err
 		}
-		lhs = &logQLLabelFilterExpr{op: "and", lhs: lhs, rhs: rhs}
+		children = append(children, next)
 	}
 }
 
 func (p *logQLLabelFilterParser) parsePrimary() (*logQLLabelFilterExpr, error) {
 	if p.peek() == "(" {
+		if p.depth >= maxLogQLLabelFilterDepth {
+			return nil, fmt.Errorf("label filter nests parentheses deeper than %d", maxLogQLLabelFilterDepth)
+		}
 		p.pos++
+		p.depth++
 		expr, err := p.parseOr()
+		p.depth--
 		if err != nil {
 			return nil, err
 		}
@@ -1020,9 +1038,19 @@ func isLogQLLabelFilterPunct(tok string) bool {
 func (e *logQLLabelFilterExpr) matches(row *logRow) bool {
 	switch e.op {
 	case "and":
-		return e.lhs.matches(row) && e.rhs.matches(row)
+		for _, child := range e.children {
+			if !child.matches(row) {
+				return false
+			}
+		}
+		return true
 	case "or":
-		return e.lhs.matches(row) || e.rhs.matches(row)
+		for _, child := range e.children {
+			if child.matches(row) {
+				return true
+			}
+		}
+		return false
 	default:
 		return e.filter.matches(row)
 	}

@@ -305,15 +305,15 @@ func logQLSQLLabelFilterExprCondition(cfg Config, expr *logQLLabelFilterExpr, pa
 	if expr.op == "" {
 		return logQLSQLLabelFilterCondition(cfg, *expr.filter, parser)
 	}
-	lhs, ok := logQLSQLLabelFilterExprCondition(cfg, expr.lhs, parser)
-	if !ok {
-		return "", false
+	conditions := make([]string, 0, len(expr.children))
+	for _, child := range expr.children {
+		condition, ok := logQLSQLLabelFilterExprCondition(cfg, child, parser)
+		if !ok {
+			return "", false
+		}
+		conditions = append(conditions, condition)
 	}
-	rhs, ok := logQLSQLLabelFilterExprCondition(cfg, expr.rhs, parser)
-	if !ok {
-		return "", false
-	}
-	return "(" + lhs + " " + strings.ToUpper(expr.op) + " " + rhs + ")", true
+	return "(" + strings.Join(conditions, " "+strings.ToUpper(expr.op)+" ") + ")", true
 }
 
 func logQLSQLLabelFilterCondition(cfg Config, filter logQLLabelFilter, parser logQLSQLParser) (string, bool) {
