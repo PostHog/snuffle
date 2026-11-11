@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -104,5 +105,49 @@ func TestMetricsQLQuantilesSampleBudget(test *testing.T) {
 	metricsQLMaxOutputSamples.Store(4)
 	if got := evaluateStatistics(test, `quantiles("p", 0.9, 0.1, statistics_value) by (group)`, false).(promql.Vector); len(got) != 4 {
 		test.Fatalf("within budget: %v", got)
+	}
+
+	// A range query over three steps preallocates three points for each of
+	// the four series, so it needs a budget of twelve.
+	start := time.Unix(1700000010, 0)
+	end := start.Add(time.Minute)
+	prepared, err = prepareMetricsQLQuery(`quantiles("p", 0.9, 0.1, statistics_value) by (group)`, 30*time.Second, 5*time.Minute, start, end)
+	if err != nil {
+		test.Fatal(err)
+	}
+	metricsQLMaxOutputSamples.Store(11)
+	rangeQuery, err := engine.NewRangeQuery(context.Background(), statisticsTestQueryable(), promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, start, end, 30*time.Second)
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer rangeQuery.Close()
+	if result := rangeQuery.Exec(context.Background()); !errors.As(result.Err, &tooMany) {
+		test.Fatalf("range err = %v, want ErrTooManySamples", result.Err)
+	}
+	metricsQLMaxOutputSamples.Store(12)
+	if got := evaluateStatistics(test, `quantiles("p", 0.9, 0.1, statistics_value) by (group)`, true).(promql.Matrix); len(got) != 4 {
+		test.Fatalf("range within budget: %v", got)
+	}
+}
+
+func TestMetricsQLQuantilesPointsPerSeries(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	for _, testcase := range []struct {
+		query string
+		end   time.Time
+		want  string
+	}{
+		{`quantiles("p", 0.5, x)`, start, `"points":1`},
+		{`quantiles("p", 0.5, x)`, start.Add(time.Hour), `"points":121`},
+		{`quantiles("p", 0.5, x)`, start.Add(30 * 24 * time.Hour), `"points":5000`},
+		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start, `"points":5000`},
+	} {
+		prepared, err := prepareMetricsQLQuery(testcase.query, 30*time.Second, 5*time.Minute, start, testcase.end)
+		if err != nil {
+			test.Fatal(err)
+		}
+		if !strings.Contains(prepared.query, strings.ReplaceAll(testcase.want, `"`, `\"`)) {
+			test.Fatalf("%s (end %v) = %s, want %s", testcase.query, testcase.end, prepared.query, testcase.want)
+		}
 	}
 }

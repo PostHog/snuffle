@@ -272,6 +272,15 @@ type metricsQLRewriter struct {
 	lookback time.Duration
 	start    time.Time
 	end      time.Time
+	// subquery is set inside a subquery, where the number of steps the
+	// engine evaluates is not known here.
+	subquery bool
+}
+
+// inSubquery returns a copy of the rewriter for the expression inside a subquery.
+func (r metricsQLRewriter) inSubquery() metricsQLRewriter {
+	r.subquery = true
+	return r
 }
 
 func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, instant bool) error {
@@ -288,7 +297,10 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		if err != nil {
 			return err
 		}
-		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
+		if e.Step != nil {
+			return r.inSubquery().rewrite(&e.Expr, childStep, false)
+		}
+		return r.rewrite(&e.Expr, childStep, instant)
 	case *metricsql.FuncExpr:
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
@@ -381,7 +393,7 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if window <= 0 {
 		return fmt.Errorf("the query window must be at least 1ms")
 	}
-	if err := r.rewrite(&roll.Expr, childStep, false); err != nil {
+	if err := r.inSubquery().rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
 	if e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
@@ -440,7 +452,7 @@ func (r metricsQLRewriter) rewriteNestedRunningSum(e *metricsql.FuncExpr, step t
 		return fmt.Errorf("the running_sum range is too large")
 	}
 	inner := e.Args[0]
-	if err := r.rewrite(&inner, step, false); err != nil {
+	if err := r.inSubquery().rewrite(&inner, step, false); err != nil {
 		return err
 	}
 	e.Name = metricsQLInternalPrefix + "running_sum"

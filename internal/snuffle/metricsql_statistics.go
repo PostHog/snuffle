@@ -17,10 +17,11 @@ import (
 	"github.com/prometheus/prometheus/util/annotations"
 )
 
-// metricsQLMaxOutputSamples bounds the samples a MetricsQL function that
-// expands its input may produce in one step. The engine checks MaxSamples only
-// after the function returns, so quantiles checks it before allocating.
-// Zero means no limit.
+// metricsQLMaxOutputSamples bounds the points a MetricsQL function that
+// expands its input may cause the engine to allocate. The engine checks
+// MaxSamples only after the function returns, and in a range query it then
+// preallocates a point slice for each new output series before its next
+// check, so quantiles checks the budget before expanding. Zero means no limit.
 var metricsQLMaxOutputSamples atomic.Int64
 
 func init() {
@@ -96,6 +97,10 @@ type metricsQLMedianGrouping struct {
 	Labels  []string `json:"labels,omitempty"`
 	Without bool     `json:"without,omitempty"`
 	Limit   int      `json:"limit,omitempty"`
+	// Points is how many points the engine may allocate for each output
+	// series: 1 for an instant query, the step count for a range query, and
+	// the engine's slice cap inside a subquery.
+	Points int `json:"points,omitempty"`
 }
 
 // metric returns the labels of the group that a series belongs to.
@@ -220,7 +225,7 @@ func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr,
 	if _, numeric := series.(*metricsql.NumberExpr); numeric {
 		series = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{series}}
 	}
-	grouping := metricsQLMedianGrouping{Labels: expr.Modifier.Args, Without: expr.Modifier.Op == "without", Limit: expr.Limit}
+	grouping := metricsQLMedianGrouping{Labels: expr.Modifier.Args, Without: expr.Modifier.Op == "without", Limit: expr.Limit, Points: rewriter.pointsPerSeries(step, instant)}
 	encoded, err := json.Marshal(grouping)
 	if err != nil {
 		return nil, err
@@ -228,6 +233,23 @@ func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr,
 	args := []metricsql.Expr{&metricsql.StringExpr{S: string(encoded)}, label, series}
 	args = append(args, phis...)
 	return &metricsql.FuncExpr{Name: metricsQLInternalPrefix + "quantiles", Args: args}, nil
+}
+
+// metricsQLMaxPointsPerSeries is the engine's cap on the point slice it
+// preallocates for a new range series (maxPointsSliceSize in promql/engine.go).
+const metricsQLMaxPointsPerSeries = 5000
+
+// pointsPerSeries returns how many points the engine may preallocate for each
+// series an expression outputs.
+func (rewriter metricsQLRewriter) pointsPerSeries(step time.Duration, instant bool) int {
+	if instant {
+		return 1
+	}
+	if rewriter.subquery || step <= 0 {
+		return metricsQLMaxPointsPerSeries
+	}
+	steps := int64(rewriter.end.Sub(rewriter.start)/step) + 1
+	return int(min(max(steps, 1), metricsQLMaxPointsPerSeries))
 }
 
 func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, helper *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
@@ -272,7 +294,7 @@ func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Ex
 	if grouping.Limit > 0 && len(order) > grouping.Limit {
 		order = order[:grouping.Limit]
 	}
-	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 && len(phis) > 0 && int64(len(order)) > limit/int64(len(phis)) {
+	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 && len(phis) > 0 && int64(len(order)) > limit/int64(max(grouping.Points, 1))/int64(len(phis)) {
 		panic(promql.ErrTooManySamples("quantiles"))
 	}
 	for _, group := range order {
