@@ -164,6 +164,8 @@ func TestUnwrapInstantDefaultRollups(t *testing.T) {
 		{query: "sum(__snuffle_default_rollup(m[300000ms], 0, 300000, 300000, 1)) by (a)", want: "sum by (a) (m)", ok: true},
 		{query: "topk(3, __snuffle_default_rollup(m[300000ms] offset 60000ms, 0, 300000, 300000, 1))", want: "topk(3, m offset 1m)", ok: true},
 		{query: "sum(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0))"},
+		// An explicit window differs from the lookback the selector would read.
+		{query: "sum(__snuffle_default_rollup(m[3900000ms], 3600000, 300000, 300000, 1))"},
 		{query: "sum(__snuffle_rate(m[600000ms], 300000, 300000, 300000, 1))"},
 		{query: "last_over_time(m[5m])", want: "last_over_time(m[5m])", ok: true},
 	} {

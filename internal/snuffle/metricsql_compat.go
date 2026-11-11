@@ -746,6 +746,9 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 	case *metricsql.FuncExpr:
 		if !metricsql.IsRollupFunc(e.Name) && !metricsQLSelectorFunctions[e.Name] {
 			for i, arg := range e.Args {
+				if !prometheusMatrixArg(e.Name, i) {
+					arg = metricsQLImplicitRollup(arg)
+				}
 				e.Args[i] = metricsQLDefaultSelectors(arg)
 			}
 			return expr
@@ -767,13 +770,34 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 		}
 	case *metricsql.AggrFuncExpr:
 		for i, arg := range e.Args {
-			e.Args[i] = metricsQLDefaultSelectors(arg)
+			e.Args[i] = metricsQLDefaultSelectors(metricsQLImplicitRollup(arg))
 		}
 	case *metricsql.BinaryOpExpr:
-		e.Left = metricsQLDefaultSelectors(e.Left)
-		e.Right = metricsQLDefaultSelectors(e.Right)
+		e.Left = metricsQLDefaultSelectors(metricsQLImplicitRollup(e.Left))
+		e.Right = metricsQLDefaultSelectors(metricsQLImplicitRollup(e.Right))
 	}
 	return expr
+}
+
+// metricsQLImplicitRollup wraps a range selector or subquery that is not the
+// argument of a rollup function in default_rollup, as VictoriaMetrics does:
+// sum(m[5m]) is sum(default_rollup(m[5m])), the last sample in the window.
+func metricsQLImplicitRollup(expr metricsql.Expr) metricsql.Expr {
+	if e, ok := expr.(*metricsql.RollupExpr); ok && e.Window != nil {
+		return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
+	}
+	return expr
+}
+
+// prometheusMatrixArg reports whether a Prometheus function that MetricsQL
+// does not know as a rollup takes a range vector at the argument index.
+func prometheusMatrixArg(name string, index int) bool {
+	function := parser.Functions[name]
+	if function == nil || len(function.ArgTypes) == 0 {
+		return false
+	}
+	index = min(index, len(function.ArgTypes)-1)
+	return function.ArgTypes[index] == parser.ValueTypeMatrix
 }
 
 // unwrapInstantDefaultRollups replaces the internal default_rollup calls of an
@@ -791,6 +815,10 @@ func unwrapInstantDefaultRollups(expr parser.Expr) (parser.Expr, bool) {
 			selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
 			instant, isNumber := e.Args[4].(*parser.NumberLiteral)
 			if !ok || !isNumber || instant.Val != 1 {
+				return nil, false
+			}
+			// An explicit window such as sum(m[1h]) is not the lookback.
+			if window, isNumber := e.Args[1].(*parser.NumberLiteral); !isNumber || window.Val != 0 {
 				return nil, false
 			}
 			return selector, true
