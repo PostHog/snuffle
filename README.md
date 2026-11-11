@@ -471,6 +471,14 @@ Label discovery reads the hourly rollups instead of the series table:
 table. Remote write inserts into `metrics4_input`; its materialized views fan
 each row out to the samples, series, attribute, and name tables.
 
+PostHog capture moves the Prometheus `job` label of a remote-written series
+into `service_name` and the `service.name` resource attribute, so the stored
+series has no `job` attribute. For a series without a `job` attribute, Snuffle
+reads `job` from `service_name`: matchers, `by (job)`, returned label sets,
+label names, label values, and series all see it. A series with its own `job`
+attribute keeps that value. `job` values from the attribute rollup list a
+service name only for a metric and service pair without a `job` attribute.
+
 #### OpenTelemetry histogram queries
 
 Snuffle exposes three virtual metrics for each stored PostHog explicit histogram:

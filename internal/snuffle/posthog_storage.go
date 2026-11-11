@@ -367,11 +367,28 @@ func postHogSeriesLabelExpr(name string) (string, bool) {
 		return "metric_name", true
 	case "service_name":
 		return "service_name", true
+	case postHogJobLabel:
+		return postHogJobExprSQL(), true
 	case "":
 		return "", false
 	default:
 		return postHogLabelValueExpr(name), true
 	}
+}
+
+// postHogJobLabel is the Prometheus job label. PostHog capture moves job into
+// service_name (and the service.name resource attribute) instead of keeping
+// it as an attribute, so a remote-written series has no job attribute.
+// Queries read job from service_name for series without a job attribute.
+// Reading it on the query side keeps series fingerprints unchanged and covers
+// data written before any capture change.
+const postHogJobLabel = "job"
+
+// postHogJobExprSQL reads job with the precedence of postHogLabelMap: a job
+// attribute wins, then service_name.
+func postHogJobExprSQL() string {
+	key := sqlString(postHogJobLabel)
+	return "if(mapContains(resource_attributes, " + key + "), resource_attributes[" + key + "], if(mapContains(attributes, " + key + "), attributes[" + key + "], service_name))"
 }
 
 // postHogLabelValueExpr reads a map label with the same precedence as
@@ -537,6 +554,9 @@ func postHogLabelMap(metricName, serviceName string, resourceAttrs, attrs map[st
 	}
 	if serviceName != "" {
 		out["service_name"] = serviceName
+		if _, ok := out[postHogJobLabel]; !ok {
+			out[postHogJobLabel] = serviceName
+		}
 	}
 	out[labels.MetricName] = metricName
 	return out
@@ -557,7 +577,7 @@ func (q *CHQuerier) postHogLabelNames(ctx context.Context, limit int, matchers .
 		}
 		return sortedLimited(names, limit), nil
 	}
-	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}}
+	names := map[string]struct{}{labels.MetricName: {}, "service_name": {}, postHogJobLabel: {}}
 	if err := q.addStringRows(ctx, names, sql); err != nil {
 		return nil, err
 	}
@@ -643,6 +663,8 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			strings.Join(where, " AND "),
 			sqlLimit(limit),
 		), true
+	case name == postHogJobLabel:
+		return postHogJobLabelValuesSQL(cfg, mint, maxt, limit, matchers)
 	case postHogSampleColumnLabel(name):
 		if len(matchers) > 0 {
 			return "", false
@@ -679,6 +701,41 @@ func postHogLabelValuesSQL(cfg Config, name string, mint, maxt int64, limit int,
 			sqlLimit(limit),
 		), true
 	}
+}
+
+// postHogJobLabelValuesSQL lists job values: job attributes, and the service
+// names of series without one. The attribute rollup has no series, so a
+// metric and service pair with any job attribute lists only its job values.
+func postHogJobLabelValuesSQL(cfg Config, mint, maxt int64, limit int, matchers []*labels.Matcher) (string, bool) {
+	if cfg.AttributeTable == "" {
+		if len(matchers) > 0 {
+			return "", false
+		}
+		return fmt.Sprintf(
+			"SELECT DISTINCT %s AS label_value FROM %s WHERE %s AND label_value != '' ORDER BY label_value%s",
+			postHogJobExprSQL(),
+			postHogSeriesTable(cfg),
+			strings.Join(postHogSeriesFilters(cfg, nil, mint, maxt), " AND "),
+			sqlLimit(limit),
+		), true
+	}
+	where, ok := postHogAttributeFilters(cfg, mint, maxt, matchers)
+	if !ok {
+		return "", false
+	}
+	table := postHogAttributeTable(cfg)
+	filters := strings.Join(where, " AND ")
+	jobFilters := filters + " AND attribute_key = " + sqlString(postHogJobLabel)
+	key := "service_name"
+	if cfg.AttributeTableHasMetricName {
+		key = "(metric_name, service_name)"
+	}
+	return fmt.Sprintf(
+		"SELECT DISTINCT label_value FROM (SELECT attribute_value AS label_value FROM %s WHERE %s UNION ALL SELECT DISTINCT service_name AS label_value FROM %s WHERE %s AND %s NOT IN (SELECT %s FROM %s WHERE %s)) WHERE label_value != '' ORDER BY label_value%s",
+		table, jobFilters,
+		table, filters, key, strings.Trim(key, "()"), table, jobFilters,
+		sqlLimit(limit),
+	), true
 }
 
 // postHogMetricNameFilters filters the metric name rollup by team, time and
