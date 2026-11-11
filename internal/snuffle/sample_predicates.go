@@ -35,7 +35,9 @@ func postHogServiceNameFilters(cfg Config, matchers []*labels.Matcher) []string 
 		return nil
 	}
 	for _, matcher := range matchers {
-		if matcher.Name != "service.name" && matcher.Name != "service_name" {
+		// service_name is not filtered here: the label can come from a
+		// series attribute rather than the service_name column.
+		if matcher.Name != "service.name" {
 			continue
 		}
 		switch matcher.Type {

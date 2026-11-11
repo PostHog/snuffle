@@ -450,7 +450,11 @@ of one series and hour in parallel arrays (`timestamp_arr`, `value_arr`,
 series-hour exist until ClickHouse merges them, so every read combines the
 arrays of all rows. Snuffle selects series from `metrics4_series`, builds
 Prometheus labels from `metric_name`, `service_name`, `resource_attributes`,
-and `attributes`, and reads samples by fingerprint. Labels are read once per
+and `attributes`, and reads samples by fingerprint. The `service_name` label
+is the `service_name` attribute when a series has one, otherwise the
+`service_name` column: capture moves a remote-written `job` into the column
+and keeps a scraped `service_name` label as an attribute, so `service_name`
+matchers and grouping read the series table. Labels are read once per
 series, never per sample. `metrics4_series` keeps one label row for each
 series and hour, so series selection filters on the hour buckets of the query
 window and collapses duplicates by fingerprint.
@@ -467,8 +471,9 @@ window. The hint takes part in index analysis only and filters no rows.
 Label discovery reads the hourly rollups instead of the series table:
 `metrics4_names` lists metric names, filtered by any `__name__` matcher, and
 `metrics4_attributes` lists attribute keys and values, filtered by exact
-`__name__` and `service_name` matchers. Other matchers fall back to the series
-table. Remote write inserts into `metrics4_input`; its materialized views fan
+`__name__` and `service_name` matchers. A `service_name` matcher keeps the
+rollup groups whose column matches or that hold a matching `service_name`
+attribute. Other matchers fall back to the series table. Remote write inserts into `metrics4_input`; its materialized views fan
 each row out to the samples, series, attribute, and name tables.
 
 PostHog capture moves the Prometheus `job` label of a remote-written series
