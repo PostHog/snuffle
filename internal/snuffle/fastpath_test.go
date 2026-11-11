@@ -674,3 +674,26 @@ func TestNestedCountBitmapRangeSQLUsesPostingBitmaps(t *testing.T) {
 		}
 	}
 }
+
+func TestGroupedAggregateTailDropsEmptyInputRow(t *testing.T) {
+	if got := groupedAggregateTail(nil); got != " HAVING count() > 0" {
+		t.Fatalf("ungrouped tail = %q, want HAVING count() > 0", got)
+	}
+	got := groupedAggregateTail([]string{"g0", "g1"})
+	if got != " GROUP BY g0, g1 ORDER BY g0, g1" {
+		t.Fatalf("grouped tail = %q", got)
+	}
+}
+
+func TestNestedCountInstantSQLDropsEmptyInputRow(t *testing.T) {
+	cfg := Config{CHDatabase: "default", SamplesTable: "samples", LabelIndexTable: "label_index", TeamID: 42}
+	sql, ok := nestedCountSamplesInstantSQL(cfg, []*labels.Matcher{
+		labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "up"),
+	}, []string{"job"}, 0, 1000, 1000)
+	if !ok {
+		t.Fatal("nestedCountSamplesInstantSQL returned ok=false")
+	}
+	if !strings.HasSuffix(sql, emptyInputHaving) {
+		t.Fatalf("nested count SQL does not drop the empty-input row:\n%s", sql)
+	}
+}

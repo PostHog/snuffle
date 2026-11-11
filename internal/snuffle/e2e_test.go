@@ -120,6 +120,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	assertInstantQuery(t, api.URL)
 	assertRangeQuery(t, api.URL)
 	assertUnionQueries(t, api.URL)
+	t.Run("aggregates over an empty vector", func(t *testing.T) {
+		assertEmptyAggregates(t, api.URL)
+	})
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
@@ -531,6 +534,77 @@ func assertUnionQueries(t *testing.T, baseURL string) {
 		t.Fatalf("instant union query result = %#v", fastInstant)
 	}
 	assertSameSampleValues(t, "instant union", [][]any{fastInstant.Result[0].Value}, [][]any{engineInstant.Result[0].Value})
+}
+
+// assertEmptyAggregates checks that an aggregate over no series returns no
+// series, as in Prometheus, instead of the one row ClickHouse returns for an
+// aggregate without GROUP BY over zero rows.
+func assertEmptyAggregates(t *testing.T, baseURL string) {
+	t.Helper()
+	const missing = "snuffle_e2e_does_not_exist"
+	queries := []string{
+		`sum(` + missing + `)`,
+		`max(` + missing + `)`,
+		`min(` + missing + `)`,
+		`count(` + missing + `)`,
+		`avg(` + missing + `)`,
+		`group(` + missing + `)`,
+		`quantile(0.9, ` + missing + `)`,
+		`sum(` + e2eCounterMetric + `{job="none"})`,
+		`count(count by (job) (` + missing + `))`,
+		`count(count by (job) (` + e2eCounterMetric + `{job="none"}))`,
+		`sum(rate(` + missing + `[5m]))`,
+		`sum(` + missing + `{job="a"} / 5 or ` + missing + `{job="b"} / 5)`,
+	}
+	for _, query := range queries {
+		instant := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", url.Values{
+			"query": {query},
+			"time":  {"1700000070"},
+		})
+		if len(instant.Result) != 0 {
+			t.Errorf("instant %s = %#v, want no series", query, instant.Result)
+		}
+		ranged := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", url.Values{
+			"query": {query},
+			"start": {"1700000010"},
+			"end":   {"1700000130"},
+			"step":  {"10s"},
+		})
+		if len(ranged.Result) != 0 {
+			t.Errorf("range %s = %#v, want no series", query, ranged.Result)
+		}
+	}
+
+	// Data exists until 1700000070 and the lookback is 5m, so steps after
+	// 1700000370 have no input and must not have points.
+	for _, query := range []string{
+		`sum(` + e2eCounterMetric + `)`,
+		`count(` + e2eCounterMetric + `)`,
+		`sum(increase(` + e2eCounterMetric + `[1m]))`,
+	} {
+		ranged := apiGet[queryDataDTO](t, baseURL, "/api/v1/query_range", url.Values{
+			"query": {query},
+			"start": {"1700000070"},
+			"end":   {"1700001070"},
+			"step":  {"60s"},
+		})
+		if len(ranged.Result) != 1 || len(ranged.Result[0].Values) == 0 {
+			t.Errorf("range %s = %#v, want one series", query, ranged.Result)
+			continue
+		}
+		for _, point := range ranged.Result[0].Values {
+			if ts, _ := point[0].(float64); ts > 1700000370 {
+				t.Errorf("range %s has a point at %v after its input ended", query, ts)
+			}
+		}
+		instant := apiGet[queryDataDTO](t, baseURL, "/api/v1/query", url.Values{
+			"query": {query},
+			"time":  {"1700001070"},
+		})
+		if len(instant.Result) != 0 {
+			t.Errorf("instant %s after its input ended = %#v, want no series", query, instant.Result)
+		}
+	}
 }
 
 func assertSameSampleValues(t *testing.T, name string, got, want [][]any) {
