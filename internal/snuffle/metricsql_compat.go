@@ -28,6 +28,10 @@ const metricsQLDefaultRollupName = "last_over_time"
 
 var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "idelta"}
 
+// metricsQLPureCounterFunctions are counter functions that only the engine
+// evaluates. increase_pure is increase where a new counter starts from 0.
+var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase"}
+
 // metricsQLSelectorFunctions inspect their selector argument in the engine.
 // Their selector arguments keep the Prometheus lookback.
 var metricsQLSelectorFunctions = map[string]bool{"absent": true, "timestamp": true}
@@ -38,6 +42,11 @@ func init() {
 		internalName := metricsQLInternalPrefix + name
 		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
+	}
+	for name, histogramName := range metricsQLPureCounterFunctions {
+		internalName := metricsQLInternalPrefix + name
+		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
+		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[histogramName])
 	}
 	runningSum := metricsQLInternalPrefix + "running_sum"
 	parser.Functions[runningSum] = &parser.Function{Name: runningSum, ArgTypes: []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar}, ReturnType: parser.ValueTypeVector}
@@ -302,6 +311,9 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewrite(&e.Expr, childStep, instant)
 	case *metricsql.FuncExpr:
+		if e.KeepMetricNames && e.Name != "histogram_quantiles" && e.Name != "running_sum" {
+			return r.rewriteKeepMetricNames(expr, e, step, instant)
+		}
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
 		if e.Name == "quantiles" {
@@ -322,12 +334,33 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewriteArgs(e.Args, step, instant)
 	case *metricsql.BinaryOpExpr:
+		if strings.EqualFold(e.Op, "or") {
+			// MetricsQL reads a number in `x or 0` as a series without
+			// labels. Prometheus only accepts set operators between vectors.
+			e.Left, e.Right = numberAsVector(e.Left), numberAsVector(e.Right)
+		}
 		if err := r.rewrite(&e.Left, step, instant); err != nil {
 			return err
 		}
 		return r.rewrite(&e.Right, step, instant)
 	}
 	return nil
+}
+
+func numberAsVector(expr metricsql.Expr) metricsql.Expr {
+	number, ok := expr.(*metricsql.NumberExpr)
+	if !ok {
+		return expr
+	}
+	vector := &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{number}}
+	if math.IsNaN(number.N) {
+		// MetricsQL treats NaN as no data, so `NaN or x` is x. vector(NaN)
+		// would be a present series in Prometheus and hide x; use an empty
+		// vector instead.
+		vector.Args = []metricsql.Expr{&metricsql.NumberExpr{N: 0}}
+		return &metricsql.BinaryOpExpr{Op: "<", Left: vector, Right: &metricsql.NumberExpr{N: 0}}
+	}
+	return vector
 }
 
 func (r metricsQLRewriter) rewriteArgs(args []metricsql.Expr, step time.Duration, instant bool) error {
@@ -396,19 +429,26 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if err := r.inSubquery().rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
-	if e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
+	if _, pure := metricsQLPureCounterFunctions[e.Name]; !pure && e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
 		return nil
 	}
 	if len(e.Args) != 1 || e.KeepMetricNames {
 		return fmt.Errorf("%s requires one series argument; keep_metric_names is not supported", e.Name)
 	}
-	if window > time.Duration(math.MaxInt64)-r.lookback {
+	if window > time.Duration(math.MaxInt64)-2*r.lookback {
 		return fmt.Errorf("the query window is too large")
 	}
+	_, raw := roll.Expr.(*metricsql.MetricExpr)
 	switch {
 	case e.Name == "default_rollup" && instant && implicit:
 		// A bare selector in an instant query reads only the lookback window.
 		roll.Window = metricsQLDuration(r.lookback)
+	case e.Name == "default_rollup" && implicit && raw:
+		// A bare selector in a range query keeps its last sample for the
+		// sample interval, up to the lookback. Fetch a second lookback of
+		// history so the interval of a series sampled about once per
+		// lookback has two samples to estimate from at every step.
+		roll.Window = metricsQLDuration(defaultRollupHistory(window, r.lookback))
 	default:
 		// Fetch history before the window for the previous sample and
 		// the sample interval. Explicit windows keep their original size.
@@ -486,6 +526,12 @@ func (r metricsQLRewriter) resolveRollupDurations(e *metricsql.RollupExpr, step 
 	return childStep, nil
 }
 
+// defaultRollupHistory is the matrix range of a bare selector in a range
+// query: the step and two lookbacks.
+func defaultRollupHistory(step, lookback time.Duration) time.Duration {
+	return step + 2*lookback
+}
+
 func metricsQLDuration(d time.Duration) *metricsql.DurationExpr {
 	// DurationExpr has no public constructor. Parse only our generated duration.
 	e, err := metricsql.Parse("m offset " + fmt.Sprintf("%dms", d.Milliseconds()))
@@ -517,7 +563,15 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 		points := matrix[0].Floats
 		maxPrev := step
 		if !instant {
-			maxPrev = metricsQLSampleInterval(points, step)
+			fallback := step
+			if name == "default_rollup" && window == 0 && ms.Range.Milliseconds() == step+2*lookback {
+				// A bare selector's matrix holds two lookbacks before the
+				// step (defaultRollupHistory). A lone sample in it is more
+				// than a lookback after the one before, so its interval is
+				// at least the lookback.
+				fallback = lookback
+			}
+			maxPrev = metricsQLSampleInterval(points, fallback)
 		}
 		maxPrev = min(maxPrev, lookback)
 		if window == 0 {
@@ -643,7 +697,8 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 	if first == len(points) {
 		return math.NaN()
 	}
-	if !havePrev && (name == "increase" || name == "delta") && prev >= 0 && points[first].T-points[prev].T < lookback {
+	isIncrease := name == "increase" || name == "increase_pure"
+	if !havePrev && (isIncrease || name == "delta") && prev >= 0 && points[first].T-points[prev].T < lookback {
 		havePrev = true
 	}
 	begin := first
@@ -651,6 +706,8 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 	if havePrev {
 		begin = prev
 		baseline = points[prev].F
+	} else if name == "increase_pure" {
+		baseline = 0
 	} else if !isRate {
 		var delta float64
 		if first+1 < len(points) {
@@ -671,7 +728,7 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 		return math.NaN()
 	}
 	value := points[len(points)-1].F - baseline
-	if name == "increase" || isRate {
+	if isIncrease || isRate {
 		previous := baseline
 		for _, point := range points[begin:] {
 			if point.F < previous {
@@ -766,6 +823,9 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 	case *metricsql.FuncExpr:
 		if !metricsql.IsRollupFunc(e.Name) && !metricsQLSelectorFunctions[e.Name] {
 			for i, arg := range e.Args {
+				if !prometheusMatrixArg(e.Name, i) {
+					arg = metricsQLImplicitRollup(arg)
+				}
 				e.Args[i] = metricsQLDefaultSelectors(arg)
 			}
 			return expr
@@ -787,13 +847,34 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 		}
 	case *metricsql.AggrFuncExpr:
 		for i, arg := range e.Args {
-			e.Args[i] = metricsQLDefaultSelectors(arg)
+			e.Args[i] = metricsQLDefaultSelectors(metricsQLImplicitRollup(arg))
 		}
 	case *metricsql.BinaryOpExpr:
-		e.Left = metricsQLDefaultSelectors(e.Left)
-		e.Right = metricsQLDefaultSelectors(e.Right)
+		e.Left = metricsQLDefaultSelectors(metricsQLImplicitRollup(e.Left))
+		e.Right = metricsQLDefaultSelectors(metricsQLImplicitRollup(e.Right))
 	}
 	return expr
+}
+
+// metricsQLImplicitRollup wraps a range selector or subquery that is not the
+// argument of a rollup function in default_rollup, as VictoriaMetrics does:
+// sum(m[5m]) is sum(default_rollup(m[5m])), the last sample in the window.
+func metricsQLImplicitRollup(expr metricsql.Expr) metricsql.Expr {
+	if e, ok := expr.(*metricsql.RollupExpr); ok && e.Window != nil {
+		return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
+	}
+	return expr
+}
+
+// prometheusMatrixArg reports whether a Prometheus function that MetricsQL
+// does not know as a rollup takes a range vector at the argument index.
+func prometheusMatrixArg(name string, index int) bool {
+	function := parser.Functions[name]
+	if function == nil || len(function.ArgTypes) == 0 {
+		return false
+	}
+	index = min(index, len(function.ArgTypes)-1)
+	return function.ArgTypes[index] == parser.ValueTypeMatrix
 }
 
 // unwrapInstantDefaultRollups replaces the internal default_rollup calls of an
@@ -811,6 +892,10 @@ func unwrapInstantDefaultRollups(expr parser.Expr) (parser.Expr, bool) {
 			selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
 			instant, isNumber := e.Args[4].(*parser.NumberLiteral)
 			if !ok || !isNumber || instant.Val != 1 {
+				return nil, false
+			}
+			// An explicit window such as sum(m[1h]) is not the lookback.
+			if window, isNumber := e.Args[1].(*parser.NumberLiteral); !isNumber || window.Val != 0 {
 				return nil, false
 			}
 			return selector, true

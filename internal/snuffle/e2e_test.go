@@ -123,6 +123,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("aggregates over an empty vector", func(t *testing.T) {
 		assertEmptyAggregates(t, api.URL)
 	})
+	t.Run("sparse series keep the lookback", func(t *testing.T) {
+		assertSparseSeriesLookback(t, cfg, api.URL)
+	})
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
@@ -140,6 +143,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	}
 	t.Run("counter query intervals", func(t *testing.T) {
 		assertCounterQueryIntervals(t, cfg, api.URL)
+	})
+	t.Run("or with a number", func(t *testing.T) {
+		assertOrWithNumber(t, api.URL)
 	})
 	if cfg.postHogSchemaLayout() {
 		t.Run("filtered label discovery", func(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -737,29 +738,9 @@ func metricMatcherCondition(m *labels.Matcher) (string, bool) {
 	case labels.MatchNotEqual:
 		return "metric_name != " + sqlString(m.Value), true
 	case labels.MatchRegexp:
-		if values := m.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return "metric_name IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := m.Prefix(); prefix != "" {
-			return "startsWith(metric_name, " + sqlString(prefix) + ")", true
-		}
-		return "match(metric_name, " + sqlString(promRegexToCH(m.Value)) + ")", true
+		return regexMatcherCondition("metric_name", m, false), true
 	case labels.MatchNotRegexp:
-		if values := m.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return "metric_name NOT IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := m.Prefix(); prefix != "" {
-			return "NOT startsWith(metric_name, " + sqlString(prefix) + ")", true
-		}
-		return "NOT match(metric_name, " + sqlString(promRegexToCH(m.Value)) + ")", true
+		return regexMatcherCondition("metric_name", m, true), true
 	default:
 		return "", false
 	}
@@ -803,17 +784,7 @@ func positiveLabelIndexMembershipCondition(m *labels.Matcher) (string, string, b
 	case labels.MatchEqual:
 		return "IN", "label_value = " + sqlString(m.Value), true
 	case labels.MatchRegexp:
-		if values := m.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return "IN", "label_value IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := m.Prefix(); prefix != "" {
-			return "IN", "startsWith(label_value, " + sqlString(prefix) + ")", true
-		}
-		return "IN", "match(label_value, " + sqlString(promRegexToCH(m.Value)) + ")", true
+		return "IN", regexMatcherCondition("label_value", m, false), true
 	default:
 		return "", "", false
 	}
@@ -824,20 +795,42 @@ func negativeLabelIndexCondition(m *labels.Matcher) (string, bool) {
 	case labels.MatchNotEqual:
 		return "label_value = " + sqlString(m.Value), true
 	case labels.MatchNotRegexp:
-		if values := m.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return "label_value IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := m.Prefix(); prefix != "" {
-			return "startsWith(label_value, " + sqlString(prefix) + ")", true
-		}
-		return "match(label_value, " + sqlString(promRegexToCH(m.Value)) + ")", true
+		// The caller excludes the series that match, so this is the positive form.
+		return regexMatcherCondition("label_value", m, false), true
 	default:
 		return "", false
 	}
+}
+
+// regexMatcherCondition renders a =~ matcher (or its negation, for !~) on
+// column. A literal prefix is only a necessary condition for a match, so
+// startsWith prunes and match() still checks the whole pattern, except when
+// the pattern is the prefix followed by .* (dot matches newline in PromQL).
+func regexMatcherCondition(column string, m *labels.Matcher, negate bool) string {
+	if values := m.SetMatches(); len(values) > 0 {
+		quoted := make([]string, 0, len(values))
+		for _, value := range values {
+			quoted = append(quoted, sqlString(value))
+		}
+		membership := " IN ("
+		if negate {
+			membership = " NOT IN ("
+		}
+		return column + membership + strings.Join(quoted, ",") + ")"
+	}
+	condition := "match(" + column + ", " + sqlString(promRegexToCH(m.Value)) + ")"
+	if prefix := m.Prefix(); prefix != "" {
+		startsWith := "startsWith(" + column + ", " + sqlString(prefix) + ")"
+		if m.Value == regexp.QuoteMeta(prefix)+".*" {
+			condition = startsWith
+		} else {
+			condition = "(" + startsWith + " AND " + condition + ")"
+		}
+	}
+	if negate {
+		return "NOT " + condition
+	}
+	return condition
 }
 
 func promRegexToCH(value string) string {
