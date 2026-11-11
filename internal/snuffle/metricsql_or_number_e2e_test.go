@@ -23,6 +23,7 @@ func assertOrWithNumber(t *testing.T, baseURL string) {
 		{query: `sum(` + missing + `) or 0`, want: 0},
 		{query: running + ` or 0`, same: running},
 		{query: `0 or ` + running, want: 0},
+		{query: `(0/0) or ` + running, same: running},
 		{query: running + ` / ((sum(` + missing + `) or 0) + ` + running + `)`, want: 1},
 	} {
 		t.Run(c.query, func(t *testing.T) {

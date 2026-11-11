@@ -39,6 +39,7 @@ func TestPrepareMetricsQLQueryRewrites(t *testing.T) {
 		{name: "numeric argument becomes a vector", query: "abs(-1)", want: "abs(vector(-1))"},
 		{name: "or with a number uses a vector", query: "sum(m) or 0", instant: true, want: "sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)"},
 		{name: "number or a vector", query: "-1 or m", instant: true, want: "vector(-1) or __snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)"},
+		{name: "NaN or a vector is the vector", query: "(0/0) or sum(m)", instant: true, want: "(vector(0) < 0) or sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1))"},
 		{name: "or with a number inside arithmetic", query: "1 / ((sum(m) or 0) + 1)", instant: true, want: "1 / ((sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)) + 1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
