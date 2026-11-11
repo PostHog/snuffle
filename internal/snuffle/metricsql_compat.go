@@ -299,7 +299,17 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
 	case *metricsql.FuncExpr:
-		if e.KeepMetricNames && e.Name != "histogram_quantiles" && e.Name != "running_sum" {
+		if !instant && strings.HasPrefix(e.Name, "sort_by_label") {
+			// Range results keep label order, so sorting at every step is
+			// wasted work. Validate the call, then drop it.
+			if _, err := rewriteLabelFunction(e); err != nil {
+				return err
+			}
+			*expr = e.Args[0]
+			return r.rewrite(expr, step, instant)
+		}
+		// Label functions reject keep_metric_names in rewriteLabelFunction.
+		if _, label := metricsQLLabelFunctions[e.Name]; !label && e.KeepMetricNames && e.Name != "histogram_quantiles" && e.Name != "running_sum" {
 			return r.rewriteKeepMetricNames(expr, e, step, instant)
 		}
 		return r.rewriteFunc(e, step, instant)
@@ -358,6 +368,12 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	}
 	if e.Name == "histogram_quantiles" {
 		return r.rewriteHistogramQuantiles(e, step, instant)
+	}
+	if renamed, err := rewriteLabelFunction(e); renamed || err != nil {
+		if err != nil {
+			return err
+		}
+		return r.rewriteArgs(e.Args, step, instant)
 	}
 	if e.Name == "running_sum" {
 		return r.rewriteNestedRunningSum(e, step, instant)
