@@ -2,7 +2,9 @@ package snuffle
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"math/rand/v2"
 	"regexp"
 	"strconv"
 	"strings"
@@ -204,7 +206,7 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 	if err != nil {
 		return fmt.Errorf("connect clickhouse: %w", err)
 	}
-	result, err := conn.Query(ctx, sql)
+	result, err := queryWhenNotBusy(ctx, conn, sql)
 	if err != nil {
 		return fmt.Errorf("start clickhouse query: %w", err)
 	}
@@ -220,6 +222,35 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		return fmt.Errorf("read clickhouse query result after %d rows: %w", rowCount, err)
 	}
 	return nil
+}
+
+// clickHouseBusyBackoff is the wait before each retry of a query that
+// ClickHouse rejected with TOO_MANY_SIMULTANEOUS_QUERIES.
+var clickHouseBusyBackoff = []time.Duration{50 * time.Millisecond, 200 * time.Millisecond, 800 * time.Millisecond}
+
+const clickHouseTooManySimultaneousQueries = 202
+
+// queryWhenNotBusy starts a query, retrying while ClickHouse rejects it for
+// too many simultaneous queries for the user. ClickHouse refuses such a query
+// before it runs, so a retry repeats no work. A dashboard renders many panels
+// at once, and the limit is shared with every other client of the same user.
+func queryWhenNotBusy(ctx context.Context, conn clickhouse.Conn, sql string) (driver.Rows, error) {
+	for attempt := 0; ; attempt++ {
+		rows, err := conn.Query(ctx, sql)
+		var exception *clickhouse.Exception
+		if err == nil || attempt >= len(clickHouseBusyBackoff) || !errors.As(err, &exception) || exception.Code != clickHouseTooManySimultaneousQueries {
+			return rows, err
+		}
+		wait := clickHouseBusyBackoff[attempt]
+		wait += time.Duration(rand.Int64N(int64(wait)/2 + 1))
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		case <-timer.C:
+		}
+	}
 }
 
 func (c *ClickHouseClient) Exec(ctx context.Context, sql string) error {
