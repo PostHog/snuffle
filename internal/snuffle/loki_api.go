@@ -422,6 +422,10 @@ func logQLSelectorKey(selector logQLSelector) string {
 			b.WriteString(stage.lineFilter.op)
 			b.WriteByte('\x00')
 			b.WriteString(stage.lineFilter.value)
+			for _, alt := range stage.lineFilter.or {
+				b.WriteByte('\x01')
+				b.WriteString(alt.value)
+			}
 		}
 		b.WriteByte('\x00')
 		b.WriteString(stage.parser)
