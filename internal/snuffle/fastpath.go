@@ -159,10 +159,7 @@ func (s *Server) tryPostHogInstantAggregate(ctx context.Context, expr *parser.Ag
 	selectParts = append(selectParts, aggSQL+" AS value")
 
 	sql := fmt.Sprintf("SELECT %s FROM %s", strings.Join(selectParts, ", "), plan.joinSeries(perID))
-	if len(groupBy) > 0 {
-		sql += " GROUP BY " + strings.Join(groupBy, ", ")
-		sql += " ORDER BY " + strings.Join(groupBy, ", ")
-	}
+	sql += groupedAggregateTail(groupBy)
 	sql = withMaxThreads(plan.withSelectedSeries(sql), s.cfg.AggregateThreads)
 
 	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
@@ -505,10 +502,7 @@ func (s *Server) queryInstantSeriesAggregate(ctx context.Context, expr *parser.A
 		strings.Join(selectParts, ", "),
 		source,
 	)
-	if len(groupBy) > 0 {
-		sql += " GROUP BY " + strings.Join(groupBy, ", ")
-		sql += " ORDER BY " + strings.Join(groupBy, ", ")
-	}
+	sql += groupedAggregateTail(groupBy)
 	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 
 	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
@@ -558,10 +552,7 @@ func (s *Server) trySampleLabelIndexInstantAggregate(ctx context.Context, expr *
 		strings.Join(selectParts, ", "),
 		groupJoin,
 	)
-	if len(groupBy) > 0 {
-		sql += " GROUP BY " + strings.Join(groupBy, ", ")
-		sql += " ORDER BY " + strings.Join(groupBy, ", ")
-	}
+	sql += groupedAggregateTail(groupBy)
 	sql = withMaxThreads(sql, s.cfg.AggregateThreads)
 
 	results, err := s.queryInstantAggregateResults(ctx, sql, expr.Grouping)
@@ -613,7 +604,7 @@ func (s *Server) tryPostHogNestedCountInstantQuery(ctx context.Context, expr *pa
 		postHogSampleRowsFrom(s.cfg, plan.sampleWhere(), false),
 	)
 	sql := fmt.Sprintf(
-		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s",
+		"SELECT toInt64(%d) AS ts, toFloat64(uniq(%s)) AS count_value FROM %s WHERE %s"+emptyInputHaving,
 		evalTime.UnixMilli(),
 		postHogUniqGroupExpr(plan.groupAliases()),
 		plan.joinSeries(perSeries),
@@ -660,7 +651,7 @@ func nestedCountSamplesInstantSQL(cfg Config, matchers []*labels.Matcher, groupi
 
 	groupColumn, groupLabels := nestedCountGroupLabelsSQL(cfg, metric, grouping[0])
 	return fmt.Sprintf(
-		"WITH group_labels AS (%s), active_ids AS (SELECT id FROM (SELECT id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY id) WHERE %s) SELECT toInt64(%d) AS ts, %s AS value FROM active_ids ANY LEFT JOIN group_labels USING id",
+		"WITH group_labels AS (%s), active_ids AS (SELECT id FROM (SELECT id, argMax(value, timestamp) AS value FROM %s WHERE %s GROUP BY id) WHERE %s) SELECT toInt64(%d) AS ts, %s AS value FROM active_ids ANY LEFT JOIN group_labels USING id"+emptyInputHaving,
 		groupLabels,
 		tableName(cfg.CHDatabase, cfg.SamplesTable),
 		strings.Join(sampleWhere, " AND "),
@@ -921,6 +912,20 @@ func lastGridExpr(start, end time.Time, step, lookback time.Duration) string {
 		formatDurationSeconds(lookback),
 	)
 	return staleAwareNullableGridSQL(grid)
+}
+
+// emptyInputHaving drops the single row ClickHouse returns for an aggregate
+// without GROUP BY over zero input rows. PromQL aggregates over an empty
+// vector return an empty vector, not sum=0, count=0 or avg=NaN.
+const emptyInputHaving = " HAVING count() > 0"
+
+// groupedAggregateTail closes an instant aggregate: GROUP BY and ORDER BY for
+// grouped aggregates, and emptyInputHaving when there is no grouping.
+func groupedAggregateTail(groupBy []string) string {
+	if len(groupBy) == 0 {
+		return emptyInputHaving
+	}
+	return " GROUP BY " + strings.Join(groupBy, ", ") + " ORDER BY " + strings.Join(groupBy, ", ")
 }
 
 func (s *Server) queryInstantAggregateResults(ctx context.Context, sql string, grouping []string) ([]sampleResult, error) {
