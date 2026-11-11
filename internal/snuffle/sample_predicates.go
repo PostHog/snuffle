@@ -1,8 +1,6 @@
 package snuffle
 
 import (
-	"strings"
-
 	"github.com/prometheus/prometheus/model/labels"
 )
 
@@ -60,29 +58,9 @@ func stringColumnMatcherCondition(column string, matcher *labels.Matcher) (strin
 	case labels.MatchNotEqual:
 		return column + " != " + sqlString(matcher.Value), true
 	case labels.MatchRegexp:
-		if values := matcher.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return column + " IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := matcher.Prefix(); prefix != "" {
-			return "startsWith(" + column + ", " + sqlString(prefix) + ")", true
-		}
-		return "match(" + column + ", " + sqlString(promRegexToCH(matcher.Value)) + ")", true
+		return regexMatcherCondition(column, matcher, false), true
 	case labels.MatchNotRegexp:
-		if values := matcher.SetMatches(); len(values) > 0 {
-			quoted := make([]string, 0, len(values))
-			for _, value := range values {
-				quoted = append(quoted, sqlString(value))
-			}
-			return column + " NOT IN (" + strings.Join(quoted, ",") + ")", true
-		}
-		if prefix := matcher.Prefix(); prefix != "" {
-			return "NOT startsWith(" + column + ", " + sqlString(prefix) + ")", true
-		}
-		return "NOT match(" + column + ", " + sqlString(promRegexToCH(matcher.Value)) + ")", true
+		return regexMatcherCondition(column, matcher, true), true
 	default:
 		return "", false
 	}
