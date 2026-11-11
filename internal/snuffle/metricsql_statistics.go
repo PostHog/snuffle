@@ -33,6 +33,12 @@ func init() {
 		Name: medianName, ArgTypes: []parser.ValueType{parser.ValueTypeString, parser.ValueTypeVector, parser.ValueTypeVector}, Variadic: -1, ReturnType: parser.ValueTypeVector,
 	}
 	promql.FunctionCalls[medianName] = metricsQLMedian
+
+	quantilesName := metricsQLInternalPrefix + "quantiles"
+	parser.Functions[quantilesName] = &parser.Function{
+		Name: quantilesName, ArgTypes: []parser.ValueType{parser.ValueTypeString, parser.ValueTypeString, parser.ValueTypeVector, parser.ValueTypeScalar}, Variadic: -1, ReturnType: parser.ValueTypeVector,
+	}
+	promql.FunctionCalls[quantilesName] = metricsQLQuantiles
 }
 
 func (rewriter metricsQLRewriter) rewriteHistogramQuantiles(expr *metricsql.FuncExpr, step time.Duration, instant bool) error {
@@ -85,6 +91,18 @@ type metricsQLMedianGrouping struct {
 	Limit   int      `json:"limit,omitempty"`
 }
 
+// metric returns the labels of the group that a series belongs to.
+func (grouping metricsQLMedianGrouping) metric(builder *labels.Builder, metric labels.Labels) labels.Labels {
+	builder.Reset(metric)
+	if grouping.Without {
+		builder.Del(grouping.Labels...)
+		builder.Del(labels.MetricName)
+	} else {
+		builder.Keep(grouping.Labels...)
+	}
+	return builder.Labels()
+}
+
 func (rewriter metricsQLRewriter) rewriteMedian(expr *metricsql.AggrFuncExpr, step time.Duration, instant bool) (metricsql.Expr, error) {
 	if len(expr.Args) == 0 {
 		return nil, fmt.Errorf("median requires at least one vector argument")
@@ -135,14 +153,7 @@ func metricsQLMedian(vectors []promql.Vector, _ promql.Matrix, args parser.Expre
 			if math.IsNaN(sample.F) {
 				continue
 			}
-			builder.Reset(sample.Metric)
-			if grouping.Without {
-				builder.Del(grouping.Labels...)
-				builder.Del(labels.MetricName)
-			} else {
-				builder.Keep(grouping.Labels...)
-			}
-			metric := builder.Labels()
+			metric := grouping.metric(builder, sample.Metric)
 			key := metric.String()
 			group := groups[key]
 			if group == nil {
@@ -172,4 +183,113 @@ func metricsQLMedian(vectors []promql.Vector, _ promql.Matrix, args parser.Expre
 		helper.Out = helper.Out[:grouping.Limit]
 	}
 	return helper.Out, warnings
+}
+
+// rewriteQuantiles rewrites quantiles("label", phi1, ..., phiN, q) by (...)
+// into an internal function that evaluates q once and returns one series for
+// each phi and group, labelled with the phi.
+// Reference: aggrFuncQuantiles in VictoriaMetrics app/vmselect/promql/aggr.go.
+func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr, step time.Duration, instant bool) (metricsql.Expr, error) {
+	if len(expr.Args) < 3 {
+		return nil, fmt.Errorf("quantiles requires a label name, at least one phi, and a series argument")
+	}
+	label, ok := expr.Args[0].(*metricsql.StringExpr)
+	if !ok || !model.LabelName(label.S).IsValid() {
+		return nil, fmt.Errorf("quantiles requires a valid, non-empty label name as its first argument")
+	}
+	phis := expr.Args[1 : len(expr.Args)-1]
+	for _, phi := range phis {
+		if _, ok := phi.(*metricsql.NumberExpr); !ok {
+			return nil, fmt.Errorf("quantiles requires constant numeric phis")
+		}
+	}
+	if expr.Limit > 0 && !instant {
+		return nil, fmt.Errorf("quantiles limit is supported only for instant queries outside subqueries")
+	}
+	series := expr.Args[len(expr.Args)-1]
+	if err := rewriter.rewrite(&series, step, instant); err != nil {
+		return nil, err
+	}
+	if _, numeric := series.(*metricsql.NumberExpr); numeric {
+		series = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{series}}
+	}
+	grouping := metricsQLMedianGrouping{Labels: expr.Modifier.Args, Without: expr.Modifier.Op == "without", Limit: expr.Limit}
+	encoded, err := json.Marshal(grouping)
+	if err != nil {
+		return nil, err
+	}
+	args := []metricsql.Expr{&metricsql.StringExpr{S: string(encoded)}, label, series}
+	args = append(args, phis...)
+	return &metricsql.FuncExpr{Name: metricsQLInternalPrefix + "quantiles", Args: args}, nil
+}
+
+func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, helper *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+	var grouping metricsQLMedianGrouping
+	if err := json.Unmarshal([]byte(args[0].(*parser.StringLiteral).Val), &grouping); err != nil {
+		panic(fmt.Errorf("invalid internal quantiles grouping: %w", err))
+	}
+	label := args[1].(*parser.StringLiteral).Val
+	phis := make([]float64, 0, len(vectors)-3)
+	for _, vector := range vectors[3:] {
+		phis = append(phis, vector[0].F)
+	}
+	type quantilesGroup struct {
+		metric labels.Labels
+		values []float64
+	}
+	groups := make(map[string]*quantilesGroup)
+	var order []*quantilesGroup
+	builder := labels.NewBuilder(labels.EmptyLabels())
+	var warnings annotations.Annotations
+	for _, sample := range vectors[2] {
+		if sample.H != nil {
+			warnings.Add(annotations.NewHistogramIgnoredInAggregationInfo("quantiles", args[2].PositionRange()))
+			continue
+		}
+		if math.IsNaN(sample.F) {
+			continue
+		}
+		metric := grouping.metric(builder, sample.Metric)
+		key := metric.String()
+		group := groups[key]
+		if group == nil {
+			group = &quantilesGroup{metric: metric}
+			groups[key] = group
+			order = append(order, group)
+		}
+		group.values = append(group.values, sample.F)
+	}
+	sort.Slice(order, func(first, second int) bool {
+		return labels.Compare(order[first].metric, order[second].metric) < 0
+	})
+	if grouping.Limit > 0 && len(order) > grouping.Limit {
+		order = order[:grouping.Limit]
+	}
+	for _, group := range order {
+		sort.Float64s(group.values)
+		for _, phi := range phis {
+			builder.Reset(group.metric)
+			builder.Set(label, fmt.Sprintf("%g", phi))
+			helper.Out = append(helper.Out, promql.Sample{Metric: builder.Labels(), F: metricsQLQuantileSorted(phi, group.values)})
+		}
+	}
+	return helper.Out, warnings
+}
+
+// metricsQLQuantileSorted interpolates a quantile over sorted values, as
+// Prometheus and VictoriaMetrics do.
+func metricsQLQuantileSorted(phi float64, values []float64) float64 {
+	switch {
+	case len(values) == 0 || math.IsNaN(phi):
+		return math.NaN()
+	case phi < 0:
+		return math.Inf(-1)
+	case phi > 1:
+		return math.Inf(1)
+	}
+	rank := phi * float64(len(values)-1)
+	lower := math.Max(0, math.Floor(rank))
+	upper := math.Min(float64(len(values)-1), lower+1)
+	weight := rank - math.Floor(rank)
+	return values[int(lower)]*(1-weight) + values[int(upper)]*weight
 }

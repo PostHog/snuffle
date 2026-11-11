@@ -292,6 +292,14 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 	case *metricsql.FuncExpr:
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
+		if e.Name == "quantiles" {
+			replacement, err := r.rewriteQuantiles(e, step, instant)
+			if err != nil {
+				return err
+			}
+			*expr = replacement
+			return nil
+		}
 		if e.Name == "median" {
 			replacement, err := r.rewriteMedian(e, step, instant)
 			if err != nil {
