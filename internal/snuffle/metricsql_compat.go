@@ -28,6 +28,10 @@ const metricsQLDefaultRollupName = "last_over_time"
 
 var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "idelta"}
 
+// metricsQLPureCounterFunctions are counter functions that only the engine
+// evaluates. increase_pure is increase where a new counter starts from 0.
+var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase"}
+
 // metricsQLSelectorFunctions inspect their selector argument in the engine.
 // Their selector arguments keep the Prometheus lookback.
 var metricsQLSelectorFunctions = map[string]bool{"absent": true, "timestamp": true}
@@ -38,6 +42,11 @@ func init() {
 		internalName := metricsQLInternalPrefix + name
 		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
+	}
+	for name, histogramName := range metricsQLPureCounterFunctions {
+		internalName := metricsQLInternalPrefix + name
+		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
+		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[histogramName])
 	}
 	runningSum := metricsQLInternalPrefix + "running_sum"
 	parser.Functions[runningSum] = &parser.Function{Name: runningSum, ArgTypes: []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar}, ReturnType: parser.ValueTypeVector}
@@ -400,7 +409,7 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if err := r.rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
-	if e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
+	if _, pure := metricsQLPureCounterFunctions[e.Name]; !pure && e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
 		return nil
 	}
 	if len(e.Args) != 1 || e.KeepMetricNames {
@@ -647,7 +656,8 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 	if first == len(points) {
 		return math.NaN()
 	}
-	if !havePrev && (name == "increase" || name == "delta") && prev >= 0 && points[first].T-points[prev].T < lookback {
+	isIncrease := name == "increase" || name == "increase_pure"
+	if !havePrev && (isIncrease || name == "delta") && prev >= 0 && points[first].T-points[prev].T < lookback {
 		havePrev = true
 	}
 	begin := first
@@ -655,6 +665,8 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 	if havePrev {
 		begin = prev
 		baseline = points[prev].F
+	} else if name == "increase_pure" {
+		baseline = 0
 	} else if !isRate {
 		var delta float64
 		if first+1 < len(points) {
@@ -675,7 +687,7 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 		return math.NaN()
 	}
 	value := points[len(points)-1].F - baseline
-	if name == "increase" || isRate {
+	if isIncrease || isRate {
 		previous := baseline
 		for _, point := range points[begin:] {
 			if point.F < previous {
