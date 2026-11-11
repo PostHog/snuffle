@@ -452,7 +452,8 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		// A rollup group can hold the service as its column or as a scraped
 		// service_name attribute.
 		"(service_name = 'checkout' OR (metric_name, service_name) IN (SELECT metric_name, service_name FROM `posthog`.`metrics4_attributes` WHERE",
-		"attribute_key = 'service_name' AND attribute_value = 'checkout'",
+		// The lookup reads only the requested metric.
+		"metric_name = 'http_requests_total' AND attribute_key = 'service_name' AND attribute_value = 'checkout'",
 		"ORDER BY attribute_key" + sqlLimit(100),
 	} {
 		if !strings.Contains(sql, want) {
@@ -467,7 +468,9 @@ func TestPostHogLabelNamesSQLReadsAttributeRollupForExactMetric(t *testing.T) {
 		"map label":     {labels.MustNewMatcher(labels.MatchEqual, "status", "200")},
 		"regexp metric": {labels.MustNewMatcher(labels.MatchRegexp, labels.MetricName, "http_.*")},
 		"empty service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", "")},
-		"not equal":     {labels.MustNewMatcher(labels.MatchNotEqual, labels.MetricName, "up")},
+		// The rollup drops values this long, so only the series table has them.
+		"long service": {labels.MustNewMatcher(labels.MatchEqual, "service_name", strings.Repeat("s", postHogAttributeMaxLen))},
+		"not equal":    {labels.MustNewMatcher(labels.MatchNotEqual, labels.MetricName, "up")},
 	} {
 		if _, ok := postHogLabelNamesSQL(cfg, 1000, 2000, 100, matchers); ok {
 			t.Fatalf("%s matcher should fall back to the series table", name)

@@ -801,6 +801,8 @@ func postHogMetricNameFilters(cfg Config, mint, maxt int64, matchers []*labels.M
 func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Matcher) ([]string, bool) {
 	filters := []string{teamFilter(cfg)}
 	filters = append(filters, postHogAttributeTimeFilters(mint, maxt)...)
+	var metricFilters []string
+	var serviceNames []string
 	for _, matcher := range matchers {
 		if matcherIsNoop(matcher) {
 			continue
@@ -812,27 +814,43 @@ func postHogAttributeFilters(cfg Config, mint, maxt int64, matchers []*labels.Ma
 			return nil, false
 		}
 		if matcher.Name == postHogServiceNameLabel {
-			filters = append(filters, postHogAttributeServiceNameFilter(cfg, mint, maxt, matcher.Value))
+			// The rollup drops attribute values of postHogAttributeMaxLen
+			// bytes or more, so a long scraped service_name is only on the
+			// series table.
+			if len(matcher.Value) >= postHogAttributeMaxLen {
+				return nil, false
+			}
+			serviceNames = append(serviceNames, matcher.Value)
 			continue
 		}
 		column, ok := postHogSampleLabelExpr(matcher.Name)
 		if !ok {
 			return nil, false
 		}
-		filters = append(filters, column+" = "+sqlString(matcher.Value))
+		metricFilters = append(metricFilters, column+" = "+sqlString(matcher.Value))
+	}
+	filters = append(filters, metricFilters...)
+	for _, value := range serviceNames {
+		filters = append(filters, postHogAttributeServiceNameFilter(cfg, mint, maxt, metricFilters, value))
 	}
 	return filters, true
 }
 
+// postHogAttributeMaxLen is the length at which the attribute rollup drops a
+// key or value (see scripts/create_metrics_posthog_schema.sql).
+const postHogAttributeMaxLen = 256
+
 // postHogAttributeServiceNameFilter matches the rollup groups that can hold a
-// series whose service_name label is value.
-func postHogAttributeServiceNameFilter(cfg Config, mint, maxt int64, value string) string {
+// series whose service_name label is value. metricFilters are the outer
+// metric_name filters, repeated so the lookup reads only those metrics.
+func postHogAttributeServiceNameFilter(cfg Config, mint, maxt int64, metricFilters []string, value string) string {
 	key := "service_name"
 	if cfg.AttributeTableHasMetricName {
 		key = "(metric_name, service_name)"
 	}
 	where := []string{teamFilter(cfg)}
 	where = append(where, postHogAttributeTimeFilters(mint, maxt)...)
+	where = append(where, metricFilters...)
 	where = append(where, "attribute_key = "+sqlString(postHogServiceNameLabel), "attribute_value = "+sqlString(value))
 	return fmt.Sprintf(
 		"(service_name = %s OR %s IN (SELECT %s FROM %s WHERE %s))",
