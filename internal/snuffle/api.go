@@ -70,7 +70,9 @@ func newServer(cfg Config) *Server {
 	metrics := newBridgeMetrics()
 	client := NewClickHouseClient(cfg, metrics)
 	queryable := NewCHQueryable(client, cfg)
+	promQLParser := newBoundLabelParser()
 	engine := promql.NewEngine(promql.EngineOpts{
+		Parser:               promQLParser,
 		Logger:               slog.Default(),
 		MaxSamples:           cfg.MaxSamples,
 		Timeout:              cfg.QueryTimeout,
@@ -96,7 +98,7 @@ func newServer(cfg Config) *Server {
 		client:      client,
 		queryable:   queryable,
 		engine:      engine,
-		parser:      parser.NewParser(parser.Options{}),
+		parser:      promQLParser,
 		seriesMu:    &sync.Mutex{},
 		knownSeries: &knownSeriesCache{ids: make(map[remoteWriteSeriesKey]struct{})},
 		metrics:     metrics,

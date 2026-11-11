@@ -335,6 +335,12 @@ It can return an increase when only one sample is inside the window.
 `rate` divides the counter change by the elapsed time between samples.
 A window with no samples returns no data.
 
+`=` and `!=` matchers on `le` and `quantile` compare bounds, not spellings:
+`le="1.0"` also selects `le="1"`, and `le!="1"` drops both. Clients write the
+same bound as `1` or `1.0`, and PostHog stores classic histogram bounds as
+floats, so a bucket scraped as `le="1.0"` reads back as `le="1"`. Returned
+labels keep the stored spelling. Regexp matchers compare spellings.
+
 Other functions retain Prometheus behavior, including metric-name removal and
 native histogram calculations. Functions that MetricsQL does not define, such
 as `histogram_count`, are still available. `timestamp` and `absent` read their

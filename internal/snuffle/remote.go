@@ -1220,7 +1220,7 @@ func remoteReadMatchers(input []*prompb.LabelMatcher) ([]*labels.Matcher, error)
 		}
 		result = append(result, converted)
 	}
-	return result, nil
+	return canonicalBoundMatchers(result), nil
 }
 
 func remoteReadMatcherType(input prompb.LabelMatcher_Type) (labels.MatchType, error) {
