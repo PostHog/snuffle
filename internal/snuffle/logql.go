@@ -3470,6 +3470,9 @@ func splitCSVTrim(input string) []string {
 
 func lexLogQLFilter(input string) ([]string, error) {
 	var tokens []string
+	// Enforce the nesting limit here, before a deeply nested filter allocates
+	// a token per parenthesis. The parser checks it again for the tree it builds.
+	depth := 0
 	for i := 0; i < len(input); {
 		for i < len(input) && unicode.IsSpace(rune(input[i])) {
 			i++
@@ -3488,6 +3491,17 @@ func lexLogQLFilter(input string) ([]string, error) {
 			continue
 		}
 		if input[i] == ',' || input[i] == '(' || input[i] == ')' {
+			switch input[i] {
+			case '(':
+				depth++
+				if depth > maxLogQLLabelFilterDepth {
+					return nil, fmt.Errorf("label filter nests parentheses deeper than %d", maxLogQLLabelFilterDepth)
+				}
+			case ')':
+				if depth > 0 {
+					depth--
+				}
+			}
 			tokens = append(tokens, input[i:i+1])
 			i++
 			continue

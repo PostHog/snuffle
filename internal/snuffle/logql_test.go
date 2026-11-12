@@ -456,6 +456,22 @@ func TestParseLogQLLabelFilterNestingLimit(t *testing.T) {
 	}
 }
 
+func TestLexLogQLFilterStopsAtNestingLimit(t *testing.T) {
+	deep := strings.Repeat("(", maxLogQLLabelFilterDepth+1) + `a="1"` + strings.Repeat(")", maxLogQLLabelFilterDepth+1)
+	tokens, err := lexLogQLFilter(deep)
+	if err == nil || !strings.Contains(err.Error(), "nests parentheses deeper than") {
+		t.Fatalf("err = %v, want nesting limit error", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("lexer returned %d tokens alongside the error", len(tokens))
+	}
+	// Sequential groups are not nested, so they stay under the limit.
+	flat := strings.Repeat(`(a="1") or `, 1000) + `b="2"`
+	if _, err := lexLogQLFilter(flat); err != nil {
+		t.Fatalf("lexer rejected sequential groups: %v", err)
+	}
+}
+
 func TestLokiQueryRejectsDeepLabelFilterNesting(t *testing.T) {
 	server := &Server{cfg: Config{QueryTimeout: time.Second}}
 	form := url.Values{"query": {nestedLabelFilterQuery(1_600_000)}}
