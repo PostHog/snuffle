@@ -931,15 +931,16 @@ func parseLogQLLabelFormats(input string) ([]logQLLabelFormat, error) {
 }
 
 // parseLogQLLabelFilterStage parses a label filter stage the way Loki does:
-// predicates joined by "and", "," or whitespace bind tighter than "or", and
-// parentheses group.
+// an explicit "and" binds tighter than "or", which binds tighter than the
+// implicit conjunction written as "," or whitespace, and parentheses group.
+// So `a b or c` is `a and (b or c)`.
 func parseLogQLLabelFilterStage(input string) (*logQLLabelFilterExpr, error) {
 	tokens, err := lexLogQLFilter(input)
 	if err != nil {
 		return nil, err
 	}
 	p := logQLLabelFilterParser{input: input, tokens: tokens}
-	expr, err := p.parseOr()
+	expr, err := p.parseConj()
 	if err != nil {
 		return nil, err
 	}
@@ -961,6 +962,33 @@ func (p *logQLLabelFilterParser) peek() string {
 		return p.tokens[p.pos]
 	}
 	return ""
+}
+
+// parseConj reads predicates joined by "," or whitespace, the loosest binding.
+func (p *logQLLabelFilterParser) parseConj() (*logQLLabelFilterExpr, error) {
+	first, err := p.parseOr()
+	if err != nil {
+		return nil, err
+	}
+	children := []*logQLLabelFilterExpr{first}
+	for {
+		tok := p.peek()
+		if tok == "" || tok == ")" {
+			break
+		}
+		if tok == "," {
+			p.pos++
+		}
+		next, err := p.parseOr()
+		if err != nil {
+			return nil, err
+		}
+		children = append(children, next)
+	}
+	if len(children) == 1 {
+		return first, nil
+	}
+	return &logQLLabelFilterExpr{op: "and", children: children}, nil
 }
 
 func (p *logQLLabelFilterParser) parseOr() (*logQLLabelFilterExpr, error) {
@@ -989,24 +1017,18 @@ func (p *logQLLabelFilterParser) parseAnd() (*logQLLabelFilterExpr, error) {
 		return nil, err
 	}
 	children := []*logQLLabelFilterExpr{first}
-	for {
-		tok := p.peek()
-		switch {
-		case tok == "" || tok == ")" || strings.EqualFold(tok, "or"):
-			if len(children) == 1 {
-				return first, nil
-			}
-			return &logQLLabelFilterExpr{op: "and", children: children}, nil
-		case tok == "," || strings.EqualFold(tok, "and"):
-			p.pos++
-		}
-		// Loki also reads predicates separated only by whitespace as "and".
+	for strings.EqualFold(p.peek(), "and") {
+		p.pos++
 		next, err := p.parsePrimary()
 		if err != nil {
 			return nil, err
 		}
 		children = append(children, next)
 	}
+	if len(children) == 1 {
+		return first, nil
+	}
+	return &logQLLabelFilterExpr{op: "and", children: children}, nil
 }
 
 func (p *logQLLabelFilterParser) parsePrimary() (*logQLLabelFilterExpr, error) {
@@ -1016,7 +1038,7 @@ func (p *logQLLabelFilterParser) parsePrimary() (*logQLLabelFilterExpr, error) {
 		}
 		p.pos++
 		p.depth++
-		expr, err := p.parseOr()
+		expr, err := p.parseConj()
 		p.depth--
 		if err != nil {
 			return nil, err

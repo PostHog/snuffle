@@ -399,6 +399,10 @@ func TestApplyLogQLGroupedLabelFilters(t *testing.T) {
 		{`{app="api"} | json | (status="500" or (name="DeleteTrail" and (src="s3.amazonaws.com")))`, []int64{4}},
 		{`{app="api"} | json | name="StopLogging" or name="DeleteTrail" and src="s3.amazonaws.com"`, []int64{1, 4}},
 		{`{app="api"} | json | name="CreateTrail" or name="StopLogging", src="cloudtrail.amazonaws.com"`, []int64{1, 3}},
+		// Loki reads whitespace and "," as a conjunction that binds looser than "or".
+		{`{app="api"} | json | src="s3.amazonaws.com" name="StopLogging" or name="DeleteTrail"`, []int64{4}},
+		{`{app="api"} | json | src="s3.amazonaws.com", name="StopLogging" or name="DeleteTrail"`, []int64{4}},
+		{`{app="api"} | json | src="s3.amazonaws.com" and name="StopLogging" or name="DeleteTrail"`, []int64{2, 4}},
 	} {
 		t.Run(tt.query, func(t *testing.T) {
 			selector, err := parseLogQLSelector(tt.query)
