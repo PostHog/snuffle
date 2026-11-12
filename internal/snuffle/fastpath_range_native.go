@@ -301,13 +301,7 @@ func (p *nativeRangePlan) rollupValues(source string, call rangeRollupCall) stri
 			window = fmt.Sprintf("least(%s, %d)", window, call.lookback)
 		}
 	}
-	// As in metricsQLRollup, a lone sample of a bare selector is at least a
-	// lookback after the one before it.
-	fallback := p.step
-	if call.bareSelector() {
-		fallback = call.lookback
-	}
-	prepared := p.add(fmt.Sprintf("SELECT *, least(if(sample_gap <= 0 OR empty(gaps), toInt64(%d), %s), toInt64(%d)) AS max_prev, toInt64(%s) AS window_ms, arrayFilter(x -> x.1 > eval_ts-window_ms, points) AS current, length(points)-length(current) AS before FROM %s", fallback, metricsQLSampleIntervalMarginSQL("sample_gap"), call.lookback, window, interval))
+	prepared := p.add(fmt.Sprintf("SELECT *, least(if(sample_gap <= 0 OR empty(gaps), toInt64(%d), %s), toInt64(%d)) AS max_prev, toInt64(%s) AS window_ms, arrayFilter(x -> x.1 > eval_ts-window_ms, points) AS current, length(points)-length(current) AS before FROM %s", p.step, metricsQLSampleIntervalMarginSQL("sample_gap"), call.lookback, window, interval))
 	if call.name == "default_rollup" {
 		return p.add("SELECT id, ts, current[-1].2 AS value FROM " + prepared + " WHERE NOT empty(current) AND " + nonStaleSampleSQL("current[-1].2"))
 	}

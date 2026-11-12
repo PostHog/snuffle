@@ -431,20 +431,13 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if len(e.Args) != 1 || e.KeepMetricNames {
 		return fmt.Errorf("%s requires one series argument; keep_metric_names is not supported", e.Name)
 	}
-	if window > time.Duration(math.MaxInt64)-2*r.lookback {
+	if window > time.Duration(math.MaxInt64)-r.lookback {
 		return fmt.Errorf("the query window is too large")
 	}
-	_, raw := roll.Expr.(*metricsql.MetricExpr)
 	switch {
 	case e.Name == "default_rollup" && instant && implicit:
 		// A bare selector in an instant query reads only the lookback window.
 		roll.Window = metricsQLDuration(r.lookback)
-	case e.Name == "default_rollup" && implicit && raw:
-		// A bare selector in a range query keeps its last sample for the
-		// sample interval, up to the lookback. Fetch a second lookback of
-		// history so the interval of a series sampled about once per
-		// lookback has two samples to estimate from at every step.
-		roll.Window = metricsQLDuration(defaultRollupHistory(window, r.lookback))
 	default:
 		// Fetch history before the window for the previous sample and
 		// the sample interval. Explicit windows keep their original size.
@@ -522,12 +515,6 @@ func (r metricsQLRewriter) resolveRollupDurations(e *metricsql.RollupExpr, step 
 	return childStep, nil
 }
 
-// defaultRollupHistory is the matrix range of a bare selector in a range
-// query: the step and two lookbacks.
-func defaultRollupHistory(step, lookback time.Duration) time.Duration {
-	return step + 2*lookback
-}
-
 func metricsQLDuration(d time.Duration) *metricsql.DurationExpr {
 	// DurationExpr has no public constructor. Parse only our generated duration.
 	e, err := metricsql.Parse("m offset " + fmt.Sprintf("%dms", d.Milliseconds()))
@@ -559,15 +546,7 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 		points := matrix[0].Floats
 		maxPrev := step
 		if !instant {
-			fallback := step
-			if name == "default_rollup" && window == 0 && ms.Range.Milliseconds() == step+2*lookback {
-				// A bare selector's matrix holds two lookbacks before the
-				// step (defaultRollupHistory). A lone sample in it is more
-				// than a lookback after the one before, so its interval is
-				// at least the lookback.
-				fallback = lookback
-			}
-			maxPrev = metricsQLSampleInterval(points, fallback)
+			maxPrev = metricsQLSampleInterval(points, step)
 		}
 		maxPrev = min(maxPrev, lookback)
 		if window == 0 {
