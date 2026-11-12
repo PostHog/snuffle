@@ -445,10 +445,18 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if window <= 0 {
 		return fmt.Errorf("the query window must be at least 1ms")
 	}
-	if err := r.inSubquery(window, childStep).rewrite(&roll.Expr, childStep, false); err != nil {
+	_, pure := metricsQLPureCounterFunctions[e.Name]
+	counter := pure || e.Name == "default_rollup" || slices.Contains(metricsQLCounterFunctions, e.Name)
+	// Counter rollups fetch a lookback of history before the window below, and
+	// the engine evaluates the subquery over that larger window.
+	budgetWindow := window
+	if counter && window <= time.Duration(math.MaxInt64)-r.lookback {
+		budgetWindow += r.lookback
+	}
+	if err := r.inSubquery(budgetWindow, childStep).rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
-	if _, pure := metricsQLPureCounterFunctions[e.Name]; !pure && e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
+	if !counter {
 		return nil
 	}
 	if len(e.Args) != 1 || e.KeepMetricNames {

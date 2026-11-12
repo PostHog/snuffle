@@ -147,6 +147,9 @@ func TestMetricsQLQuantilesPointsPerSeries(test *testing.T) {
 		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start.Add(time.Hour), `"points":71`},
 		{`max_over_time(quantiles("p", 0.5, x)[1s:1s])`, start.Add(time.Hour), `"points":3602`},
 		{`max_over_time(max_over_time(quantiles("p", 0.5, x)[1m:1m])[10m:1m])`, start.Add(time.Hour), `"points":72`},
+		// Counter rollups add the lookback to the window: (10m + 5m)/1m + 1.
+		{`rate(quantiles("p", 0.5, x)[10m:1m])`, start, `"points":16`},
+		{`rate(quantiles("p", 0.1, 0.9, time())[1s:1s])`, start, `"points":302`},
 		{`max_over_time(quantiles("p", 0.5, x)[100d:1s])`, start, `"points":5000`},
 	} {
 		prepared, err := prepareMetricsQLQuery(testcase.query, 30*time.Second, 5*time.Minute, start, testcase.end)
