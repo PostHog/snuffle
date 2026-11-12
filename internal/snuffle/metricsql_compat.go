@@ -281,14 +281,19 @@ type metricsQLRewriter struct {
 	lookback time.Duration
 	start    time.Time
 	end      time.Time
-	// subquery is set inside a subquery, where the number of steps the
-	// engine evaluates is not known here.
-	subquery bool
+	// subquerySteps is the most steps the engine evaluates inside the
+	// enclosing subquery, or 0 outside a subquery.
+	subquerySteps int64
 }
 
-// inSubquery returns a copy of the rewriter for the expression inside a subquery.
-func (r metricsQLRewriter) inSubquery() metricsQLRewriter {
-	r.subquery = true
+// inSubquery returns a copy of the rewriter for the expression inside a
+// subquery over window at step. Prometheus aligns subquery steps to multiples
+// of the step, so it evaluates at most window/step + 1 of them.
+func (r metricsQLRewriter) inSubquery(window, step time.Duration) metricsQLRewriter {
+	r.subquerySteps = metricsQLMaxPointsPerSeries
+	if window > 0 && step > 0 {
+		r.subquerySteps = min(int64(window/step)+1, metricsQLMaxPointsPerSeries)
+	}
 	return r
 }
 
@@ -307,7 +312,11 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 			return err
 		}
 		if e.Step != nil {
-			return r.inSubquery().rewrite(&e.Expr, childStep, false)
+			var window time.Duration
+			if e.Window != nil {
+				window = time.Duration(e.Window.Duration(step.Milliseconds())) * time.Millisecond
+			}
+			return r.inSubquery(window, childStep).rewrite(&e.Expr, childStep, false)
 		}
 		return r.rewrite(&e.Expr, childStep, instant)
 	case *metricsql.FuncExpr:
@@ -426,7 +435,7 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if window <= 0 {
 		return fmt.Errorf("the query window must be at least 1ms")
 	}
-	if err := r.inSubquery().rewrite(&roll.Expr, childStep, false); err != nil {
+	if err := r.inSubquery(window, childStep).rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
 	if _, pure := metricsQLPureCounterFunctions[e.Name]; !pure && e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
@@ -492,7 +501,7 @@ func (r metricsQLRewriter) rewriteNestedRunningSum(e *metricsql.FuncExpr, step t
 		return fmt.Errorf("the running_sum range is too large")
 	}
 	inner := e.Args[0]
-	if err := r.inSubquery().rewrite(&inner, step, false); err != nil {
+	if err := r.inSubquery(span+step, step).rewrite(&inner, step, false); err != nil {
 		return err
 	}
 	e.Name = metricsQLInternalPrefix + "running_sum"

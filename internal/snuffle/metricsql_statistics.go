@@ -222,7 +222,11 @@ func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr,
 	if err := rewriter.rewrite(&series, step, instant); err != nil {
 		return nil, err
 	}
-	if _, numeric := series.(*metricsql.NumberExpr); numeric {
+	parsed, err := parser.NewParser(parser.Options{}).ParseExpr(string(series.AppendString(nil)))
+	if err != nil {
+		return nil, fmt.Errorf("quantiles series argument: %w", err)
+	}
+	if parsed.Type() == parser.ValueTypeScalar {
 		series = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{series}}
 	}
 	grouping := metricsQLMedianGrouping{Labels: expr.Modifier.Args, Without: expr.Modifier.Op == "without", Limit: expr.Limit, Points: rewriter.pointsPerSeries(step, instant)}
@@ -245,7 +249,10 @@ func (rewriter metricsQLRewriter) pointsPerSeries(step time.Duration, instant bo
 	if instant {
 		return 1
 	}
-	if rewriter.subquery || step <= 0 {
+	if rewriter.subquerySteps > 0 {
+		return int(rewriter.subquerySteps)
+	}
+	if step <= 0 {
 		return metricsQLMaxPointsPerSeries
 	}
 	steps := int64(rewriter.end.Sub(rewriter.start)/step) + 1

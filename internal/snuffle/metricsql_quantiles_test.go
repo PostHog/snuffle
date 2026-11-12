@@ -34,6 +34,8 @@ func TestMetricsQLQuantiles(test *testing.T) {
 		{`quantiles("p", -1, 2, statistics_value)`, map[string]float64{"/-1": math.Inf(-1), "/2": math.Inf(1)}},
 		{`quantiles("p", 0.5, avg_over_time(statistics_value[1m]))`, map[string]float64{"/0.5": 5.5}},
 		{`quantiles("p", 0.5, missing_metric)`, map[string]float64{}},
+		{`quantiles("p", 0.5, 1, time())`, map[string]float64{"/0.5": 1700000070, "/1": 1700000070}},
+		{`quantiles("p", 0.5, time() - 70)`, map[string]float64{"/0.5": 1700000000}},
 	} {
 		test.Run(testcase.query, func(test *testing.T) {
 			got := byPhi(evaluateStatistics(test, testcase.query, false))
@@ -140,7 +142,9 @@ func TestMetricsQLQuantilesPointsPerSeries(test *testing.T) {
 		{`quantiles("p", 0.5, x)`, start, `"points":1`},
 		{`quantiles("p", 0.5, x)`, start.Add(time.Hour), `"points":121`},
 		{`quantiles("p", 0.5, x)`, start.Add(30 * 24 * time.Hour), `"points":5000`},
-		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start, `"points":5000`},
+		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start, `"points":11`},
+		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start.Add(time.Hour), `"points":11`},
+		{`max_over_time(quantiles("p", 0.5, x)[100d:1s])`, start, `"points":5000`},
 	} {
 		prepared, err := prepareMetricsQLQuery(testcase.query, 30*time.Second, 5*time.Minute, start, testcase.end)
 		if err != nil {
@@ -149,5 +153,32 @@ func TestMetricsQLQuantilesPointsPerSeries(test *testing.T) {
 		if !strings.Contains(prepared.query, strings.ReplaceAll(testcase.want, `"`, `\"`)) {
 			test.Fatalf("%s (end %v) = %s, want %s", testcase.query, testcase.end, prepared.query, testcase.want)
 		}
+	}
+}
+
+func TestMetricsQLQuantilesSubqueryBudget(test *testing.T) {
+	// The subquery evaluates 11 steps over 2 groups, so 22 points fit a
+	// budget of 22 even though the engine could allocate 5000 per series.
+	query := `max_over_time(quantiles("p", 0.5, statistics_value) by (group)[10m:1m])`
+	metricsQLMaxOutputSamples.Store(22)
+	defer metricsQLMaxOutputSamples.Store(0)
+	if got := evaluateStatistics(test, query, false).(promql.Vector); len(got) != 2 {
+		test.Fatalf("within budget: %v", got)
+	}
+	metricsQLMaxOutputSamples.Store(21)
+	at := time.Unix(1700000070, 0)
+	prepared, err := prepareMetricsQLQuery(query, 30*time.Second, 5*time.Minute, at, at)
+	if err != nil {
+		test.Fatal(err)
+	}
+	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: 100000, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute})
+	instant, err := engine.NewInstantQuery(context.Background(), statisticsTestQueryable(), promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, at)
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer instant.Close()
+	var tooMany promql.ErrTooManySamples
+	if result := instant.Exec(context.Background()); !errors.As(result.Err, &tooMany) {
+		test.Fatalf("err = %v, want ErrTooManySamples", result.Err)
 	}
 }
