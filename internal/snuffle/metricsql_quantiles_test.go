@@ -143,7 +143,10 @@ func TestMetricsQLQuantilesPointsPerSeries(test *testing.T) {
 		{`quantiles("p", 0.5, x)`, start.Add(time.Hour), `"points":121`},
 		{`quantiles("p", 0.5, x)`, start.Add(30 * 24 * time.Hour), `"points":5000`},
 		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start, `"points":11`},
-		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start.Add(time.Hour), `"points":11`},
+		// An hour-long range query evaluates the subquery across the whole range.
+		{`max_over_time(quantiles("p", 0.5, x)[10m:1m])`, start.Add(time.Hour), `"points":71`},
+		{`max_over_time(quantiles("p", 0.5, x)[1s:1s])`, start.Add(time.Hour), `"points":3602`},
+		{`max_over_time(max_over_time(quantiles("p", 0.5, x)[1m:1m])[10m:1m])`, start.Add(time.Hour), `"points":72`},
 		{`max_over_time(quantiles("p", 0.5, x)[100d:1s])`, start, `"points":5000`},
 	} {
 		prepared, err := prepareMetricsQLQuery(testcase.query, 30*time.Second, 5*time.Minute, start, testcase.end)

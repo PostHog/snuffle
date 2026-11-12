@@ -282,17 +282,27 @@ type metricsQLRewriter struct {
 	start    time.Time
 	end      time.Time
 	// subquerySteps is the most steps the engine evaluates inside the
-	// enclosing subquery, or 0 outside a subquery.
+	// enclosing subquery, or 0 outside a subquery. span is the time range
+	// that evaluation covers.
 	subquerySteps int64
+	span          time.Duration
 }
 
 // inSubquery returns a copy of the rewriter for the expression inside a
-// subquery over window at step. Prometheus aligns subquery steps to multiples
-// of the step, so it evaluates at most window/step + 1 of them.
+// subquery over window at step. The engine evaluates a subquery once across
+// the whole enclosing range extended back by the window, at multiples of the
+// step, so it takes at most (span + window)/step + 1 steps. Nested subqueries
+// extend the span again.
 func (r metricsQLRewriter) inSubquery(window, step time.Duration) metricsQLRewriter {
+	span := r.end.Sub(r.start)
+	if r.subquerySteps > 0 {
+		span = r.span
+	}
 	r.subquerySteps = metricsQLMaxPointsPerSeries
-	if window > 0 && step > 0 {
-		r.subquerySteps = min(int64(window/step)+1, metricsQLMaxPointsPerSeries)
+	r.span = span
+	if window > 0 && step > 0 && span <= time.Duration(math.MaxInt64)-window {
+		r.span = span + window
+		r.subquerySteps = min(int64(r.span/step)+1, metricsQLMaxPointsPerSeries)
 	}
 	return r
 }
