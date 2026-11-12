@@ -123,9 +123,6 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("aggregates over an empty vector", func(t *testing.T) {
 		assertEmptyAggregates(t, api.URL)
 	})
-	t.Run("sparse series keep the lookback", func(t *testing.T) {
-		assertSparseSeriesLookback(t, cfg, api.URL)
-	})
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)

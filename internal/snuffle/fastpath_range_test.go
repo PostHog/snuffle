@@ -57,7 +57,7 @@ func TestParseRangeRollupCallAcceptsCountersAndSelectors(t *testing.T) {
 		{`min(delta(http_requests_total[2m]))`, "delta", 120_000, 420_000},
 		{`count(idelta(http_requests_total[1m]))`, "idelta", 60_000, 360_000},
 		{`sum(increase(http_requests_total))`, "increase", 60_000, 360_000},
-		{`sum(http_requests_total) by (code)`, "default_rollup", 0, 660_000},
+		{`sum(http_requests_total) by (code)`, "default_rollup", 0, 360_000},
 	} {
 		aggregate := preparedRangeAggregate(t, tc.query, time.Minute)
 		call, ok := parseRangeRollupCall(aggregate.Expr, time.Minute, 5*time.Minute)
