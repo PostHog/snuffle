@@ -72,6 +72,7 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 				}
 			}
 		}
+		future.delta = newDeltaSeriesIndex(future.series)
 		close(future.done)
 	}()
 	return &futureSeriesSet{future: future, sortSeries: sortResult}
@@ -189,6 +190,7 @@ func shouldSortSeries(sortSeries bool, hints *storage.SelectHints) bool {
 type selectFuture struct {
 	done   chan struct{}
 	series []*seriesMeta
+	delta  deltaSeriesIndex
 	err    error
 }
 
@@ -208,6 +210,11 @@ func (s *futureSeriesSet) wait() {
 		return
 	}
 	s.set = seriesSetFromMeta(s.future.series, s.sortSeries)
+}
+
+func (s *futureSeriesSet) deltaSeries() deltaSeriesIndex {
+	<-s.future.done
+	return s.future.delta
 }
 
 func (s *futureSeriesSet) Next() bool {
@@ -375,6 +382,9 @@ type seriesMeta struct {
 	histograms []histogramPoint
 	exemplars  []exemplarPoint
 	delta      bool
+	// deltaTotals holds the finite points of a delta series' running total.
+	// It shares samples' backing array when every point is finite.
+	deltaTotals []samplePoint
 }
 
 type seriesJSONRow struct {

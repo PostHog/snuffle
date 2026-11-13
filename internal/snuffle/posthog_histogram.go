@@ -9,6 +9,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -581,13 +582,14 @@ func postHogMixedTemporality(metricName string) error {
 }
 
 // finish sorts the samples of each series by time. A series built from delta
-// points becomes a running total. Counter functions such as rate and
-// increase then read it as a cumulative counter.
+// points becomes a running total. rate and increase read window sums from
+// it. irate and idelta read it as a cumulative counter.
 func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
 	for _, meta := range builder.series {
 		sortSamples(meta.samples)
 		if meta.delta {
 			meta.samples = accumulatePostHogDeltaSamples(meta.samples)
+			meta.deltaTotals = finitePostHogDeltaTotals(meta.samples)
 		}
 	}
 	return builder.series
@@ -611,7 +613,7 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 			point := samples[index].v
 			switch {
 			case isStaleSampleValue(point):
-			case math.IsNaN(point) || math.IsInf(point, 0):
+			case !isFiniteSampleValue(point):
 				value = point
 			default:
 				sum += point
@@ -625,6 +627,72 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 		out = append(out, samplePoint{t: timestamp, v: value})
 	}
 	return out
+}
+
+// finitePostHogDeltaTotals returns the finite points of a running total.
+func finitePostHogDeltaTotals(totals []samplePoint) []samplePoint {
+	notFinite := func(point samplePoint) bool { return !isFiniteSampleValue(point.v) }
+	if !slices.ContainsFunc(totals, notFinite) {
+		return totals
+	}
+	return slices.DeleteFunc(slices.Clone(totals), notFinite)
+}
+
+// deltaWindowSum returns the sum of the delta points of a delta series in the
+// window (start, end]. The finite totals are prefix sums. The window sum is the
+// last total in the window minus the last total at or before start. It reports
+// false when no finite point is in the window.
+func (meta *seriesMeta) deltaWindowSum(start, end int64) (float64, bool) {
+	totals := meta.deltaTotals
+	first := sort.Search(len(totals), func(i int) bool { return totals[i].t > start })
+	last := sort.Search(len(totals), func(i int) bool { return totals[i].t > end }) - 1
+	if last < first {
+		return 0, false
+	}
+	sum := totals[last].v
+	if first > 0 {
+		sum -= totals[first-1].v
+	}
+	return sum, true
+}
+
+func isFiniteSampleValue(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+// deltaSeriesIndex finds the delta series of a select result by their labels.
+// The engine passes a counter rollup only the labels and points of a series.
+// The rollup therefore looks the series up here through its selector's series
+// set.
+type deltaSeriesIndex map[uint64][]*seriesMeta
+
+func newDeltaSeriesIndex(series []*seriesMeta) deltaSeriesIndex {
+	var index deltaSeriesIndex
+	for _, meta := range series {
+		if !meta.delta {
+			continue
+		}
+		if index == nil {
+			index = make(deltaSeriesIndex)
+		}
+		hash := meta.labels.Hash()
+		index[hash] = append(index[hash], meta)
+	}
+	return index
+}
+
+func (index deltaSeriesIndex) find(lset labels.Labels) *seriesMeta {
+	// Most selectors read no delta series. This skips hashing their labels at
+	// every step.
+	if len(index) == 0 {
+		return nil
+	}
+	for _, meta := range index[lset.Hash()] {
+		if labels.Equal(meta.labels, lset) {
+			return meta
+		}
+	}
+	return nil
 }
 
 func (builder *postHogHistogramSeriesBuilder) appendSample(meta *seriesMeta, timestamp int64, value float64) error {

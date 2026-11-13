@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/metricsql"
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/util/annotations"
@@ -31,6 +32,25 @@ var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "
 // metricsQLPureCounterFunctions are counter functions that only the engine
 // evaluates. increase_pure is increase where a new counter starts from 0.
 var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase"}
+
+// metricsQLDeltaWindowFunctions return the sum of the points in the window for
+// a delta histogram series. rate divides that sum by the window. The running
+// total of a delta series starts at the query range. The MetricsQL baseline
+// rules therefore miscount a series with no point shortly before the window.
+var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_pure": true, "delta": true, "rate": true}
+
+// deltaSeriesOf returns the delta histogram series that the selector read with
+// these labels. It returns nil for a subquery, which has no storage series set.
+// It reads the series set that the engine leaves on the selector after it
+// expands the series. If the engine stops keeping it, delta series fall back
+// to MetricsQL counter rules, and the delta window tests fail.
+func deltaSeriesOf(vs *parser.VectorSelector, lset labels.Labels) *seriesMeta {
+	set, ok := vs.UnexpandedSeriesSet.(*futureSeriesSet)
+	if !ok {
+		return nil
+	}
+	return set.deltaSeries().find(lset)
+}
 
 // metricsQLSelectorFunctions inspect their selector argument in the engine.
 // Their selector arguments keep the Prometheus lookback.
@@ -612,6 +632,18 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 			end = *vs.Timestamp - vs.OriginalOffset.Milliseconds()
 		}
 		start := end - window
+		if metricsQLDeltaWindowFunctions[name] {
+			if meta := deltaSeriesOf(vs, matrix[0].Metric); meta != nil {
+				value, ok := meta.deltaWindowSum(start, end)
+				if !ok {
+					return enh.Out, nil
+				}
+				if name == "rate" {
+					value /= float64(window) / 1000
+				}
+				return append(enh.Out, promql.Sample{F: value}), nil
+			}
+		}
 		series := seriesAfter(matrix[0], start)
 		if name == "default_rollup" {
 			if len(series.Floats)+len(series.Histograms) == 0 || endsWithStaleMarker(series) {

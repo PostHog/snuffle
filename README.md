@@ -528,15 +528,25 @@ Cumulative and delta histogram samples can be read as virtual counters. For a
 delta histogram, Snuffle sorts the points of each virtual series by time, sums
 points that share a timestamp, such as points from several clients, and returns
 the running total of the points. The total starts at the first point in the
-query range, so the raw value of a delta series depends on the query range,
-while `rate`, `increase`, and `histogram_quantile` over them work as they do for
-a cumulative histogram. `increase` treats a series with no sample in
-`PROMQL_LOOKBACK_DELTA` before the window as a new counter, so for a delta series
-that pauses longer than that, it can count points from before the window or
-skip the first point in it. A series with both delta and cumulative points, or
-with unspecified temporality, returns an error rather than an incorrect counter
-or rate. The compact histogram path reads cumulative histograms only; a delta
-histogram uses the general engine. Exponential
+query range, so the raw value of a delta series, such as a bare selector,
+depends on the query range. `increase`, `increase_pure`, and `delta` over a
+delta series return the sum of its points in the window `(t-w, t]`, and `rate`
+returns that sum divided by `w`. A series with one point in the window, or with
+a pause before it longer than `PROMQL_LOOKBACK_DELTA`, therefore counts each of
+its points once, and `histogram_quantile` over `sum by (le) (rate(...))` weights
+each series by its observations in the window. Snuffle computes the window sum
+as the difference of two running totals, which are 64-bit floats. Once a `_sum`
+total passes about 2^53 (9e15) within the query range, adding a small point no
+longer changes it, so the window sum can miss small points. Bucket and count
+totals stay exact below 2^53 observations. A window with no point returns no
+value. Stale markers, such as those for a removed bucket bound, do not count as
+points. `irate` and `idelta` read the last two points of the running total. A
+counter function over a subquery, such as `rate(x_bucket[5m:1m])`, reads the
+running total with MetricsQL counter rules. Cumulative histograms and other
+counters keep MetricsQL counter rules. A series with both delta and cumulative
+points, or with unspecified temporality, returns an error rather than an
+incorrect counter or rate. The compact histogram path reads cumulative
+histograms only; a delta histogram uses the general engine. Exponential
 histograms expose `_count` and `_sum` only: the stored flattened arrays do not
 preserve enough information to reconstruct their bucket boundaries. Use explicit
 histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
