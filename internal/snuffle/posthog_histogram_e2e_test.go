@@ -153,16 +153,11 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		teamCfg := cfg
 		teamCfg.TeamID = e2eTeamID
 		teamCfg.PostHogCompactHistograms = true
-		compactServer := newServer(teamCfg)
 		start, end, step := time.UnixMilli(e2eStartMS), time.UnixMilli(e2eEndMS), 30*time.Second
-		for _, expression := range []string{
-			`histogram_quantiles("p", 0.5, 0.9, sum by(le)(irate(` + metric + `_bucket)))`,
-			`histogram_quantile(0.5, sum by(le)(irate(` + metric + `_bucket[1m])))`,
-			`histogram_quantile(0.9, sum by(le)(rate(` + metric + `_bucket)))`,
-			`histogram_quantiles("p", 0.5, 0.99, sum by(le)(rate(` + metric + `_bucket[2m])))`,
-			`histogram_quantile(0.5, sum by(le)(increase(` + metric + `_bucket[1m])))`,
-		} {
-			prepared, err := prepareMetricsQLQuery(expression, step, teamCfg.LookbackDelta, start, end)
+		assertMatchesEngine := func(serverCfg Config, expression string, start, end time.Time) {
+			test.Helper()
+			compactServer := newServer(serverCfg)
+			prepared, err := prepareMetricsQLQuery(expression, step, serverCfg.LookbackDelta, start, end)
 			if err != nil {
 				test.Fatal(err)
 			}
@@ -171,20 +166,34 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			if err != nil || !handled || stats.clickHouseQueries.Load() != 2 {
 				test.Fatalf("compact query: handled=%v queries=%d error=%v", handled, stats.clickHouseQueries.Load(), err)
 			}
-			engineQuery, err := compactServer.engine.NewRangeQuery(ctx, compactServer.queryable, promql.NewPrometheusQueryOpts(false, teamCfg.LookbackDelta), prepared.query, start, end, step)
+			engineQuery, err := compactServer.engine.NewRangeQuery(ctx, compactServer.queryable, promql.NewPrometheusQueryOpts(false, serverCfg.LookbackDelta), prepared.query, start, end, step)
 			if err != nil {
 				test.Fatal(err)
 			}
+			defer engineQuery.Close()
 			response := engineQuery.Exec(ctx)
 			if response.Err != nil {
 				test.Fatal(response.Err)
 			}
 			expected := responseDataFromValue(metricsQLValue(response.Value))
 			if !reflect.DeepEqual(responseDataFromValue(actual), expected) {
-				test.Fatalf("compact output differs from engine: %v != %v", responseDataFromValue(actual), expected)
+				test.Fatalf("%s: compact output differs from engine: %v != %v", expression, responseDataFromValue(actual), expected)
 			}
-			engineQuery.Close()
 		}
+		for _, expression := range []string{
+			`histogram_quantiles("p", 0.5, 0.9, sum by(le)(irate(` + metric + `_bucket)))`,
+			`histogram_quantile(0.5, sum by(le)(irate(` + metric + `_bucket[1m])))`,
+			`histogram_quantile(0.9, sum by(le)(rate(` + metric + `_bucket)))`,
+			`histogram_quantiles("p", 0.5, 0.99, sum by(le)(rate(` + metric + `_bucket[2m])))`,
+			`histogram_quantile(0.5, sum by(le)(increase(` + metric + `_bucket[1m])))`,
+		} {
+			assertMatchesEngine(teamCfg, expression, start, end)
+		}
+		// A rate without a window reads one step of history before the lookback.
+		// With this short lookback, the first step needs a sample from that step of history.
+		shortLookback := teamCfg
+		shortLookback.LookbackDelta = 20 * time.Second
+		assertMatchesEngine(shortLookback, `histogram_quantile(0.9, sum by(le)(rate(`+metric+`_bucket)))`, end, end.Add(time.Minute))
 		teamCfg.PostHogCompactHistograms = false
 		disabled := newServer(teamCfg)
 		if _, handled, err := disabled.tryCompactHistogramRange(ctx, "", start, end, step); handled || err != nil {

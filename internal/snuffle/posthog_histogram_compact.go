@@ -706,7 +706,9 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 // grid. It reports false when the data needs the general evaluation path.
 func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHistogramPlan) (*compactHistogramEvaluator, bool, error) {
 	querier := &CHQuerier{queryable: server.queryable}
-	mint := plan.start - plan.window - plan.lookback + 1
+	// The first step reads the range of the selector, as the engine does. A
+	// rate without a window has a range of one step plus the lookback.
+	mint := plan.start - plan.selectorRange + 1
 	real, sources, ids, err := querier.selectPostHogExactHistogramMetadata(ctx, mint, plan.end, plan.alias, plan.selector.LabelMatchers)
 	if err != nil {
 		return nil, true, err
