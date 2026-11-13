@@ -72,6 +72,7 @@ func (q *CHQuerier) Select(ctx context.Context, sortSeries bool, hints *storage.
 				}
 			}
 		}
+		future.delta = newDeltaSeriesIndex(future.series)
 		close(future.done)
 	}()
 	return &futureSeriesSet{future: future, sortSeries: sortResult}
@@ -189,6 +190,7 @@ func shouldSortSeries(sortSeries bool, hints *storage.SelectHints) bool {
 type selectFuture struct {
 	done   chan struct{}
 	series []*seriesMeta
+	delta  deltaSeriesIndex
 	err    error
 }
 
@@ -211,11 +213,8 @@ func (s *futureSeriesSet) wait() {
 }
 
 func (s *futureSeriesSet) deltaSeries() deltaSeriesIndex {
-	s.wait()
-	if set, ok := s.set.(deltaSeriesSet); ok {
-		return set.deltaSeries()
-	}
-	return nil
+	<-s.future.done
+	return s.future.delta
 }
 
 func (s *futureSeriesSet) Next() bool {
@@ -252,7 +251,7 @@ func seriesSetFromMeta(series []*seriesMeta, sortSeries bool) storage.SeriesSet 
 	for i := range series {
 		result[i] = series[i]
 	}
-	return &seriesSet{series: result, idx: -1, delta: newDeltaSeriesIndex(series)}
+	return &seriesSet{series: result, idx: -1}
 }
 
 func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
@@ -1203,11 +1202,6 @@ type seriesSet struct {
 	series []storage.Series
 	idx    int
 	err    error
-	delta  deltaSeriesIndex
-}
-
-func (s *seriesSet) deltaSeries() deltaSeriesIndex {
-	return s.delta
 }
 
 func (s *seriesSet) Next() bool {

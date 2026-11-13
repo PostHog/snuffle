@@ -84,7 +84,7 @@ func deltaWindowQueryable(test *testing.T, samples []postHogHistogramSample, ext
 				selected = append(selected, meta)
 			}
 		}
-		future := &selectFuture{done: make(chan struct{}), series: selected}
+		future := &selectFuture{done: make(chan struct{}), series: selected, delta: newDeltaSeriesIndex(selected)}
 		close(future.done)
 		return &futureSeriesSet{future: future}
 	}}}

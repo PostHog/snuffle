@@ -612,7 +612,7 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 			point := samples[index].v
 			switch {
 			case isStaleSampleValue(point):
-			case math.IsNaN(point) || math.IsInf(point, 0):
+			case !isFiniteSampleValue(point):
 				value = point
 			default:
 				sum += point
@@ -635,19 +635,19 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 // window.
 func (meta *seriesMeta) deltaWindowSum(start, end int64) (float64, bool) {
 	samples := meta.samples
-	last := sort.Search(len(samples), func(i int) bool { return samples[i].t > end }) - 1
-	for last >= 0 && samples[last].t > start && !isFiniteSampleValue(samples[last].v) {
-		last--
+	lastFinite := func(t int64) int {
+		i := sort.Search(len(samples), func(i int) bool { return samples[i].t > t }) - 1
+		for i >= 0 && !isFiniteSampleValue(samples[i].v) {
+			i--
+		}
+		return i
 	}
+	last := lastFinite(end)
 	if last < 0 || samples[last].t <= start {
 		return 0, false
 	}
 	sum := samples[last].v
-	before := sort.Search(last, func(i int) bool { return samples[i].t > start }) - 1
-	for before >= 0 && !isFiniteSampleValue(samples[before].v) {
-		before--
-	}
-	if before >= 0 {
+	if before := lastFinite(start); before >= 0 {
 		sum -= samples[before].v
 	}
 	return sum, true
@@ -657,16 +657,11 @@ func isFiniteSampleValue(value float64) bool {
 	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
-// deltaSeriesIndex finds the delta series of a series set by their labels.
+// deltaSeriesIndex finds the delta series of a select result by their labels.
 // The engine passes a counter rollup only the labels and points of a series.
 // The rollup therefore looks the series up here through its selector's series
 // set.
 type deltaSeriesIndex map[uint64][]*seriesMeta
-
-// deltaSeriesSet is a series set that indexes its delta series.
-type deltaSeriesSet interface {
-	deltaSeries() deltaSeriesIndex
-}
 
 func newDeltaSeriesIndex(series []*seriesMeta) deltaSeriesIndex {
 	var index deltaSeriesIndex

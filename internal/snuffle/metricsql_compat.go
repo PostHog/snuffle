@@ -42,7 +42,7 @@ var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_
 // deltaSeriesOf returns the delta histogram series that the selector read with
 // these labels. It returns nil for a subquery, which has no storage series set.
 func deltaSeriesOf(vs *parser.VectorSelector, lset labels.Labels) *seriesMeta {
-	set, ok := vs.UnexpandedSeriesSet.(deltaSeriesSet)
+	set, ok := vs.UnexpandedSeriesSet.(*futureSeriesSet)
 	if !ok {
 		return nil
 	}
