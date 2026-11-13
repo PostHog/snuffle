@@ -4,9 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
+	"weak"
 
 	"github.com/VictoriaMetrics/metricsql"
 	"github.com/prometheus/common/model"
@@ -15,6 +20,72 @@ import (
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/util/annotations"
 )
+
+// metricsQLMaxOutputSamples bounds the points a MetricsQL function that
+// expands its input may cause the engine to allocate. The engine checks
+// MaxSamples only after the function returns, and in a range query it then
+// preallocates a point slice for each new output series before its next
+// check, so quantiles checks the budget before expanding. Zero means no limit.
+var metricsQLMaxOutputSamples atomic.Int64
+
+// quantilesSeries counts the distinct output series a quantiles call has
+// emitted across the steps of one query. The engine keeps a point slice for
+// each of them until the query ends, so the budget is cumulative.
+type quantilesSeries struct {
+	mutex sync.Mutex
+	owner weak.Pointer[parser.StringLiteral]
+	seen  map[uint64]struct{}
+}
+
+// quantilesSeriesByCall maps a call node, identified by its address, to its
+// tracker. Entries are removed when the parsed query is garbage collected.
+var quantilesSeriesByCall sync.Map
+
+func quantilesSeriesFor(call *parser.StringLiteral) *quantilesSeries {
+	key := uintptr(unsafe.Pointer(call))
+	if existing, ok := quantilesSeriesByCall.Load(key); ok {
+		if tracker := existing.(*quantilesSeries); tracker.owner.Value() == call {
+			return tracker
+		}
+	}
+	tracker := &quantilesSeries{owner: weak.Make(call), seen: map[uint64]struct{}{}}
+	quantilesSeriesByCall.Store(key, tracker)
+	runtime.AddCleanup(call, func(key uintptr) {
+		if current, ok := quantilesSeriesByCall.Load(key); ok && current.(*quantilesSeries).owner.Value() == nil {
+			quantilesSeriesByCall.Delete(key)
+		}
+	}, key)
+	return tracker
+}
+
+// admit records the series for the given groups and phis and reports whether
+// the distinct series so far, each holding points, stay within limit.
+func (tracker *quantilesSeries) admit(groups []labels.Labels, phis []float64, points int, limit int64) bool {
+	// The output loop allocates a sample for every phi argument, repeated or
+	// not, so bound one step's expansion before tracking distinct series.
+	if limit > 0 && int64(len(groups))*int64(len(phis)) > limit/int64(max(points, 1)) {
+		return false
+	}
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+	added := make(map[uint64]struct{})
+	for _, group := range groups {
+		base := group.Hash()
+		for _, phi := range phis {
+			key := base ^ (math.Float64bits(phi)+1)*0x9E3779B97F4A7C15
+			if _, ok := tracker.seen[key]; !ok {
+				added[key] = struct{}{}
+			}
+			if limit > 0 && int64(len(tracker.seen)+len(added)) > limit/int64(max(points, 1)) {
+				return false
+			}
+		}
+	}
+	for key := range added {
+		tracker.seen[key] = struct{}{}
+	}
+	return true
+}
 
 func init() {
 	upstream, ok := parser.Functions["histogram_quantiles"]
@@ -33,6 +104,12 @@ func init() {
 		Name: medianName, ArgTypes: []parser.ValueType{parser.ValueTypeString, parser.ValueTypeVector, parser.ValueTypeVector}, Variadic: -1, ReturnType: parser.ValueTypeVector,
 	}
 	promql.FunctionCalls[medianName] = metricsQLMedian
+
+	quantilesName := metricsQLInternalPrefix + "quantiles"
+	parser.Functions[quantilesName] = &parser.Function{
+		Name: quantilesName, ArgTypes: []parser.ValueType{parser.ValueTypeString, parser.ValueTypeString, parser.ValueTypeVector, parser.ValueTypeScalar}, Variadic: -1, ReturnType: parser.ValueTypeVector,
+	}
+	promql.FunctionCalls[quantilesName] = metricsQLQuantiles
 }
 
 func (rewriter metricsQLRewriter) rewriteHistogramQuantiles(expr *metricsql.FuncExpr, step time.Duration, instant bool) error {
@@ -83,6 +160,22 @@ type metricsQLMedianGrouping struct {
 	Labels  []string `json:"labels,omitempty"`
 	Without bool     `json:"without,omitempty"`
 	Limit   int      `json:"limit,omitempty"`
+	// Points is how many points the engine may allocate for each output
+	// series: 1 for an instant query, the step count for a range query, and
+	// the engine's slice cap inside a subquery.
+	Points int `json:"points,omitempty"`
+}
+
+// metric returns the labels of the group that a series belongs to.
+func (grouping metricsQLMedianGrouping) metric(builder *labels.Builder, metric labels.Labels) labels.Labels {
+	builder.Reset(metric)
+	if grouping.Without {
+		builder.Del(grouping.Labels...)
+		builder.Del(labels.MetricName)
+	} else {
+		builder.Keep(grouping.Labels...)
+	}
+	return builder.Labels()
 }
 
 func (rewriter metricsQLRewriter) rewriteMedian(expr *metricsql.AggrFuncExpr, step time.Duration, instant bool) (metricsql.Expr, error) {
@@ -102,7 +195,7 @@ func (rewriter metricsQLRewriter) rewriteMedian(expr *metricsql.AggrFuncExpr, st
 	}
 	args := []metricsql.Expr{&metricsql.StringExpr{S: string(encoded)}}
 	for index, arg := range expr.Args {
-		parsed, err := parser.NewParser(parser.Options{}).ParseExpr(string(arg.AppendString(nil)))
+		parsed, err := parser.NewParser(parser.Options{}).ParseExpr(quoteDottedIdents(string(arg.AppendString(nil))))
 		if err != nil {
 			return nil, fmt.Errorf("median argument %d: %w", index+1, err)
 		}
@@ -135,14 +228,7 @@ func metricsQLMedian(vectors []promql.Vector, _ promql.Matrix, args parser.Expre
 			if math.IsNaN(sample.F) {
 				continue
 			}
-			builder.Reset(sample.Metric)
-			if grouping.Without {
-				builder.Del(grouping.Labels...)
-				builder.Del(labels.MetricName)
-			} else {
-				builder.Keep(grouping.Labels...)
-			}
-			metric := builder.Labels()
+			metric := grouping.metric(builder, sample.Metric)
 			key := metric.String()
 			group := groups[key]
 			if group == nil {
@@ -172,4 +258,154 @@ func metricsQLMedian(vectors []promql.Vector, _ promql.Matrix, args parser.Expre
 		helper.Out = helper.Out[:grouping.Limit]
 	}
 	return helper.Out, warnings
+}
+
+// rewriteQuantiles rewrites quantiles("label", phi1, ..., phiN, q) by (...)
+// into an internal function that evaluates q once and returns one series for
+// each phi and group, labelled with the phi.
+// Reference: aggrFuncQuantiles in VictoriaMetrics app/vmselect/promql/aggr.go.
+func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr, step time.Duration, instant bool) (metricsql.Expr, error) {
+	if len(expr.Args) < 3 {
+		return nil, fmt.Errorf("quantiles requires a label name, at least one phi, and a series argument")
+	}
+	label, ok := expr.Args[0].(*metricsql.StringExpr)
+	if !ok || !model.LabelName(label.S).IsValid() {
+		return nil, fmt.Errorf("quantiles requires a valid, non-empty label name as its first argument")
+	}
+	phis := expr.Args[1 : len(expr.Args)-1]
+	seenPhis := make(map[float64]bool, len(phis))
+	for _, phi := range phis {
+		number, ok := phi.(*metricsql.NumberExpr)
+		if !ok {
+			return nil, fmt.Errorf("quantiles requires constant numeric phis")
+		}
+		// Repeated phis would give two series the same labels, which the
+		// engine rejects after the output is built.
+		if seenPhis[number.N] {
+			return nil, fmt.Errorf("quantiles phis must be distinct; %g is repeated", number.N)
+		}
+		seenPhis[number.N] = true
+	}
+	if expr.Limit > 0 && !instant {
+		return nil, fmt.Errorf("quantiles limit is supported only for instant queries outside subqueries")
+	}
+	series := expr.Args[len(expr.Args)-1]
+	if err := rewriter.rewrite(&series, step, instant); err != nil {
+		return nil, err
+	}
+	parsed, err := parser.NewParser(parser.Options{}).ParseExpr(quoteDottedIdents(string(series.AppendString(nil))))
+	if err != nil {
+		return nil, fmt.Errorf("quantiles series argument: %w", err)
+	}
+	if parsed.Type() == parser.ValueTypeScalar {
+		series = &metricsql.FuncExpr{Name: "vector", Args: []metricsql.Expr{series}}
+	}
+	grouping := metricsQLMedianGrouping{Labels: expr.Modifier.Args, Without: expr.Modifier.Op == "without", Limit: expr.Limit, Points: rewriter.pointsPerSeries(step, instant)}
+	encoded, err := json.Marshal(grouping)
+	if err != nil {
+		return nil, err
+	}
+	args := []metricsql.Expr{&metricsql.StringExpr{S: string(encoded)}, label, series}
+	args = append(args, phis...)
+	return &metricsql.FuncExpr{Name: metricsQLInternalPrefix + "quantiles", Args: args}, nil
+}
+
+// metricsQLMaxPointsPerSeries is the engine's cap on the point slice it
+// preallocates for a new range series (maxPointsSliceSize in promql/engine.go).
+const metricsQLMaxPointsPerSeries = 5000
+
+// pointsPerSeries returns how many points the engine may preallocate for each
+// series an expression outputs.
+func (rewriter metricsQLRewriter) pointsPerSeries(step time.Duration, instant bool) int {
+	if instant {
+		return 1
+	}
+	if rewriter.subquerySteps > 0 {
+		return int(rewriter.subquerySteps)
+	}
+	if step <= 0 {
+		return metricsQLMaxPointsPerSeries
+	}
+	steps := int64(rewriter.end.Sub(rewriter.start)/step) + 1
+	return int(min(max(steps, 1), metricsQLMaxPointsPerSeries))
+}
+
+func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, helper *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+	var grouping metricsQLMedianGrouping
+	if err := json.Unmarshal([]byte(args[0].(*parser.StringLiteral).Val), &grouping); err != nil {
+		panic(fmt.Errorf("invalid internal quantiles grouping: %w", err))
+	}
+	label := args[1].(*parser.StringLiteral).Val
+	phis := make([]float64, 0, len(vectors)-3)
+	for _, vector := range vectors[3:] {
+		phis = append(phis, vector[0].F)
+	}
+	type quantilesGroup struct {
+		metric labels.Labels
+		values []float64
+	}
+	groups := make(map[string]*quantilesGroup)
+	var order []*quantilesGroup
+	builder := labels.NewBuilder(labels.EmptyLabels())
+	var warnings annotations.Annotations
+	for _, sample := range vectors[2] {
+		if sample.H != nil {
+			warnings.Add(annotations.NewHistogramIgnoredInAggregationInfo("quantiles", args[2].PositionRange()))
+			continue
+		}
+		if math.IsNaN(sample.F) {
+			continue
+		}
+		metric := grouping.metric(builder, sample.Metric)
+		key := metric.String()
+		group := groups[key]
+		if group == nil {
+			group = &quantilesGroup{metric: metric}
+			groups[key] = group
+			order = append(order, group)
+		}
+		group.values = append(group.values, sample.F)
+	}
+	sort.Slice(order, func(first, second int) bool {
+		return labels.Compare(order[first].metric, order[second].metric) < 0
+	})
+	if grouping.Limit > 0 && len(order) > grouping.Limit {
+		order = order[:grouping.Limit]
+	}
+	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 {
+		metrics := make([]labels.Labels, len(order))
+		for index, group := range order {
+			metrics[index] = group.metric
+		}
+		if !quantilesSeriesFor(args[0].(*parser.StringLiteral)).admit(metrics, phis, grouping.Points, limit) {
+			panic(promql.ErrTooManySamples("quantiles"))
+		}
+	}
+	for _, group := range order {
+		sort.Float64s(group.values)
+		for _, phi := range phis {
+			builder.Reset(group.metric)
+			builder.Set(label, fmt.Sprintf("%g", phi))
+			helper.Out = append(helper.Out, promql.Sample{Metric: builder.Labels(), F: metricsQLQuantileSorted(phi, group.values)})
+		}
+	}
+	return helper.Out, warnings
+}
+
+// metricsQLQuantileSorted interpolates a quantile over sorted values, as
+// Prometheus and VictoriaMetrics do.
+func metricsQLQuantileSorted(phi float64, values []float64) float64 {
+	switch {
+	case len(values) == 0 || math.IsNaN(phi):
+		return math.NaN()
+	case phi < 0:
+		return math.Inf(-1)
+	case phi > 1:
+		return math.Inf(1)
+	}
+	rank := phi * float64(len(values)-1)
+	lower := math.Max(0, math.Floor(rank))
+	upper := math.Min(float64(len(values)-1), lower+1)
+	weight := rank - math.Floor(rank)
+	return values[int(lower)]*(1-weight) + values[int(upper)]*weight
 }

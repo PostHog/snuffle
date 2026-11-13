@@ -281,6 +281,30 @@ type metricsQLRewriter struct {
 	lookback time.Duration
 	start    time.Time
 	end      time.Time
+	// subquerySteps is the most steps the engine evaluates inside the
+	// enclosing subquery, or 0 outside a subquery. span is the time range
+	// that evaluation covers.
+	subquerySteps int64
+	span          time.Duration
+}
+
+// inSubquery returns a copy of the rewriter for the expression inside a
+// subquery over window at step. The engine evaluates a subquery once across
+// the whole enclosing range extended back by the window, at multiples of the
+// step, so it takes at most (span + window)/step + 1 steps. Nested subqueries
+// extend the span again.
+func (r metricsQLRewriter) inSubquery(window, step time.Duration) metricsQLRewriter {
+	span := r.end.Sub(r.start)
+	if r.subquerySteps > 0 {
+		span = r.span
+	}
+	r.subquerySteps = metricsQLMaxPointsPerSeries
+	r.span = span
+	if window > 0 && step > 0 && span <= time.Duration(math.MaxInt64)-window {
+		r.span = span + window
+		r.subquerySteps = min(int64(r.span/step)+1, metricsQLMaxPointsPerSeries)
+	}
+	return r
 }
 
 func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, instant bool) error {
@@ -297,7 +321,14 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		if err != nil {
 			return err
 		}
-		return r.rewrite(&e.Expr, childStep, instant && e.Step == nil)
+		if e.Step != nil {
+			var window time.Duration
+			if e.Window != nil {
+				window = time.Duration(e.Window.Duration(step.Milliseconds())) * time.Millisecond
+			}
+			return r.inSubquery(window, childStep).rewrite(&e.Expr, childStep, false)
+		}
+		return r.rewrite(&e.Expr, childStep, instant)
 	case *metricsql.FuncExpr:
 		if !instant && strings.HasPrefix(e.Name, "sort_by_label") {
 			// Range results keep label order, so sorting at every step is
@@ -314,6 +345,14 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
+		if e.Name == "quantiles" {
+			replacement, err := r.rewriteQuantiles(e, step, instant)
+			if err != nil {
+				return err
+			}
+			*expr = replacement
+			return nil
+		}
 		if e.Name == "median" {
 			replacement, err := r.rewriteMedian(e, step, instant)
 			if err != nil {
@@ -422,10 +461,18 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if window <= 0 {
 		return fmt.Errorf("the query window must be at least 1ms")
 	}
-	if err := r.rewrite(&roll.Expr, childStep, false); err != nil {
+	_, pure := metricsQLPureCounterFunctions[e.Name]
+	counter := pure || e.Name == "default_rollup" || slices.Contains(metricsQLCounterFunctions, e.Name)
+	// Counter rollups fetch a lookback of history before the window below, and
+	// the engine evaluates the subquery over that larger window.
+	budgetWindow := window
+	if counter && window <= time.Duration(math.MaxInt64)-r.lookback {
+		budgetWindow += r.lookback
+	}
+	if err := r.inSubquery(budgetWindow, childStep).rewrite(&roll.Expr, childStep, false); err != nil {
 		return err
 	}
-	if _, pure := metricsQLPureCounterFunctions[e.Name]; !pure && e.Name != "default_rollup" && !slices.Contains(metricsQLCounterFunctions, e.Name) {
+	if !counter {
 		return nil
 	}
 	if len(e.Args) != 1 || e.KeepMetricNames {
@@ -481,7 +528,7 @@ func (r metricsQLRewriter) rewriteNestedRunningSum(e *metricsql.FuncExpr, step t
 		return fmt.Errorf("the running_sum range is too large")
 	}
 	inner := e.Args[0]
-	if err := r.rewrite(&inner, step, false); err != nil {
+	if err := r.inSubquery(span+step, step).rewrite(&inner, step, false); err != nil {
 		return err
 	}
 	e.Name = metricsQLInternalPrefix + "running_sum"
