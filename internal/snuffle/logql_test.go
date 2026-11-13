@@ -218,7 +218,6 @@ func TestParseLogQLKnownUnsupportedLokiCompatibilityGaps(t *testing.T) {
 		{"rate counter", `rate_counter({app="api"} | unwrap value [5m])`},
 		{"unpack parser", `sum(count_over_time({app="api"} | unpack | json [5m]))`},
 		{"line filter ip matcher", `{app="api"} |= ip("127.0.0.1")`},
-		{"parenthesized label filters", `{app="api"} | logfmt | (status="500" or status="503")`},
 		{"parenthesized log range selector", `bytes_over_time(({app="api"} |= "error")[5m])`},
 		{"negative offset", `count_over_time({app="api"}[5m] offset -1m)`},
 		{"variants expression", `variants(count_over_time({app="api"}[5m])) of ({app="api"}[5m])`},
@@ -376,6 +375,165 @@ func TestApplyLogQLCommaSeparatedLabelFiltersCompatibility(t *testing.T) {
 	got := applyLogQLSelector(rows, *selector)
 	if len(got) != 1 || got[0].tsNS != 1000 {
 		t.Fatalf("rows after selector = %#v, want only first row", got)
+	}
+}
+
+// ENG-022: Loki accepts parenthesised label filter expressions, and `and`
+// binds tighter than `or`.
+func TestApplyLogQLGroupedLabelFilters(t *testing.T) {
+	row := func(ts int64, line string) logRow {
+		return logRow{tsNS: ts, line: line, labels: map[string]string{"app": "api"}, fields: map[string]string{}}
+	}
+	rows := []logRow{
+		row(1, `{"src":"cloudtrail.amazonaws.com","name":"StopLogging"}`),
+		row(2, `{"src":"cloudtrail.amazonaws.com","name":"DeleteTrail"}`),
+		row(3, `{"src":"cloudtrail.amazonaws.com","name":"CreateTrail"}`),
+		row(4, `{"src":"s3.amazonaws.com","name":"DeleteTrail"}`),
+	}
+	for _, tt := range []struct {
+		query string
+		want  []int64
+	}{
+		{"{app=\"api\"} | json | src=`cloudtrail.amazonaws.com` and (name=`StopLogging` or name=`DeleteTrail`)", []int64{1, 2}},
+		{`{app="api"} | json | (name="StopLogging" or name="DeleteTrail") and src="cloudtrail.amazonaws.com"`, []int64{1, 2}},
+		{`{app="api"} | json | (status="500" or (name="DeleteTrail" and (src="s3.amazonaws.com")))`, []int64{4}},
+		{`{app="api"} | json | name="StopLogging" or name="DeleteTrail" and src="s3.amazonaws.com"`, []int64{1, 4}},
+		{`{app="api"} | json | name="CreateTrail" or name="StopLogging", src="cloudtrail.amazonaws.com"`, []int64{1, 3}},
+		// Loki reads whitespace and "," as a conjunction that binds looser than "or".
+		{`{app="api"} | json | src="s3.amazonaws.com" name="StopLogging" or name="DeleteTrail"`, []int64{4}},
+		{`{app="api"} | json | src="s3.amazonaws.com", name="StopLogging" or name="DeleteTrail"`, []int64{4}},
+		{`{app="api"} | json | src="s3.amazonaws.com" and name="StopLogging" or name="DeleteTrail"`, []int64{2, 4}},
+	} {
+		t.Run(tt.query, func(t *testing.T) {
+			selector, err := parseLogQLSelector(tt.query)
+			if err != nil {
+				t.Fatalf("parseLogQLSelector returned error: %v", err)
+			}
+			in := make([]logRow, len(rows))
+			copy(in, rows)
+			for i := range in {
+				in[i].fields = map[string]string{}
+				in[i].labels = map[string]string{"app": "api"}
+			}
+			var got []int64
+			for _, r := range applyLogQLSelector(in, *selector) {
+				got = append(got, r.tsNS)
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.want) {
+				t.Fatalf("rows = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseLogQLRejectsUnbalancedLabelFilterGroups(t *testing.T) {
+	for _, query := range []string{
+		`{app="api"} | json | (a="1" or b="2"`,
+		`{app="api"} | json | a="1" or b="2")`,
+		`{app="api"} | json | ()`,
+		`{app="api"} | json | a="1" and`,
+		`{app="api"} | json | (a="1") b`,
+	} {
+		if _, err := parseLogQL(query); err == nil {
+			t.Errorf("parseLogQL accepted %q", query)
+		}
+	}
+}
+
+func nestedLabelFilterQuery(depth int) string {
+	return `{app="api"} | ` + strings.Repeat("(", depth) + `a="1"` + strings.Repeat(")", depth)
+}
+
+func TestParseLogQLLabelFilterNestingLimit(t *testing.T) {
+	if _, err := parseLogQL(nestedLabelFilterQuery(maxLogQLLabelFilterDepth)); err != nil {
+		t.Fatalf("parseLogQL rejected nesting at the limit: %v", err)
+	}
+	for _, depth := range []int{maxLogQLLabelFilterDepth + 1, 1_600_000} {
+		_, err := parseLogQL(nestedLabelFilterQuery(depth))
+		if err == nil || !strings.Contains(err.Error(), "nests parentheses deeper than") {
+			t.Fatalf("depth %d: err = %v, want nesting limit error", depth, err)
+		}
+	}
+}
+
+func TestLexLogQLFilterStopsAtNestingLimit(t *testing.T) {
+	deep := strings.Repeat("(", maxLogQLLabelFilterDepth+1) + `a="1"` + strings.Repeat(")", maxLogQLLabelFilterDepth+1)
+	tokens, err := lexLogQLFilter(deep)
+	if err == nil || !strings.Contains(err.Error(), "nests parentheses deeper than") {
+		t.Fatalf("err = %v, want nesting limit error", err)
+	}
+	if len(tokens) != 0 {
+		t.Fatalf("lexer returned %d tokens alongside the error", len(tokens))
+	}
+	// Sequential groups are not nested, so they stay under the limit.
+	flat := strings.Repeat(`(a="1") or `, 1000) + `b="2"`
+	if _, err := lexLogQLFilter(flat); err != nil {
+		t.Fatalf("lexer rejected sequential groups: %v", err)
+	}
+}
+
+func TestLokiQueryRejectsDeepLabelFilterNesting(t *testing.T) {
+	server := &Server{cfg: Config{QueryTimeout: time.Second}}
+	form := url.Values{"query": {nestedLabelFilterQuery(1_600_000)}}
+	req := httptest.NewRequest(http.MethodPost, "/loki/api/v1/query", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+
+	server.handleLokiQuery(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body %.200s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "nests parentheses deeper than") {
+		t.Fatalf("body %.200s does not report the nesting limit", rec.Body.String())
+	}
+}
+
+// Long ungrouped and/or chains stay flat, so evaluation and SQL translation do
+// not recurse once per predicate.
+func TestLogQLLongLabelFilterChainIsFlat(t *testing.T) {
+	const n = 100_000
+	preds := make([]string, n)
+	for i := range preds {
+		preds[i] = fmt.Sprintf(`a="%d"`, i)
+	}
+	expr, err := parseLogQLLabelFilterStage(strings.Join(preds, " or "))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expr.op != "or" || len(expr.children) != n {
+		t.Fatalf("op = %q with %d children, want flat or of %d", expr.op, len(expr.children), n)
+	}
+	row := logRow{labels: map[string]string{"a": fmt.Sprint(n - 1)}, fields: map[string]string{}}
+	if !expr.matches(&row) {
+		t.Fatal("last predicate in the chain did not match")
+	}
+	if _, ok := logQLSQLLabelFilterExprCondition(Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}, expr, logQLSQLParser{}); !ok {
+		t.Fatal("flat chain was not translated to SQL")
+	}
+}
+
+func TestLogQLSQLGroupedLabelFilters(t *testing.T) {
+	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
+	expr, err := parseLogQL(`sum(count_over_time({k8s.namespace.name="ns"} | a="1" and (b="2" or c="3") [5m]))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, ok := buildLogQLMetricSQLPlan(cfg, expr)
+	if !ok {
+		t.Fatal("grouped label filters were not pushed to SQL")
+	}
+	sql := strings.Join(plan.selectorFilters, " ")
+	leaf := func(name, value string) string {
+		cond, ok := logQLSQLLabelFilterCondition(cfg, logQLLabelFilter{name: name, op: "=", value: value}, logQLSQLParser{})
+		if !ok {
+			t.Fatalf("no SQL for %s=%q", name, value)
+		}
+		return cond
+	}
+	want := "(" + leaf("a", "1") + " AND (" + leaf("b", "2") + " OR " + leaf("c", "3") + "))"
+	if !strings.Contains(sql, want) {
+		t.Fatalf("SQL %s does not contain %s", sql, want)
 	}
 }
 
