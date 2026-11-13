@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
+	promvalue "github.com/prometheus/prometheus/model/value"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
 )
@@ -291,5 +292,36 @@ func TestDeltaWindowSum(test *testing.T) {
 		if ok != testcase.ok || got != testcase.want {
 			test.Fatalf("%s (%d, %d] = %v (ok %v), want %v (ok %v)", testcase.name, testcase.start, testcase.end, got, ok, testcase.want, testcase.ok)
 		}
+	}
+}
+
+// The window sum binary-searches the finite totals. A long run of NaN points
+// therefore adds no work per step.
+func TestFinitePostHogDeltaTotals(test *testing.T) {
+	finite := []samplePoint{{t: 1000, v: 1}, {t: 2000, v: 3}}
+	if got := finitePostHogDeltaTotals(finite); len(got) != len(finite) || &got[0] != &finite[0] {
+		test.Fatalf("all-finite totals = %v, want the same slice", got)
+	}
+	stale := math.Float64frombits(promvalue.StaleNaN)
+	mixed := []samplePoint{{t: 1000, v: 1}, {t: 2000, v: math.NaN()}, {t: 3000, v: stale}, {t: 4000, v: math.Inf(1)}, {t: 5000, v: 4}}
+	if got := finitePostHogDeltaTotals(mixed); len(got) != 2 || got[0] != mixed[0] || got[1] != mixed[4] {
+		test.Fatalf("mixed totals = %v, want only the finite points", got)
+	}
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
+	for timestamp := int64(1000); timestamp <= 500000; timestamp += 1000 {
+		sample := deltaHistogramTestSample(1, timestamp, 1, 0, 0)
+		if timestamp > 1000 && timestamp < 500000 {
+			sample.sum = math.NaN()
+		}
+		if err := builder.add(sample, []string{"_sum"}); err != nil {
+			test.Fatal(err)
+		}
+	}
+	meta := builder.finish()[0]
+	if len(meta.deltaTotals) != 2 {
+		test.Fatalf("delta totals = %d points, want the 2 finite ones", len(meta.deltaTotals))
+	}
+	if got, ok := meta.deltaWindowSum(400000, 500000); !ok || got != 0.5 {
+		test.Fatalf("window sum after a NaN run = %v (ok %v), want 0.5", got, ok)
 	}
 }

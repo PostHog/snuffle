@@ -382,6 +382,9 @@ type seriesMeta struct {
 	histograms []histogramPoint
 	exemplars  []exemplarPoint
 	delta      bool
+	// deltaTotals holds the finite points of a delta series' running total.
+	// It shares samples' backing array when every point is finite.
+	deltaTotals []samplePoint
 }
 
 type seriesJSONRow struct {

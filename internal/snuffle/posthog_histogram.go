@@ -589,6 +589,7 @@ func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
 		sortSamples(meta.samples)
 		if meta.delta {
 			meta.samples = accumulatePostHogDeltaSamples(meta.samples)
+			meta.deltaTotals = finitePostHogDeltaTotals(meta.samples)
 		}
 	}
 	return builder.series
@@ -628,27 +629,36 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 	return out
 }
 
-// deltaWindowSum returns the sum of the delta points of a delta series in the
-// window (start, end]. The finite points of the running total are prefix sums.
-// The window sum is the last finite total in the window minus the last finite
-// total at or before start. It reports false when no finite point is in the
-// window.
-func (meta *seriesMeta) deltaWindowSum(start, end int64) (float64, bool) {
-	samples := meta.samples
-	lastFinite := func(t int64) int {
-		i := sort.Search(len(samples), func(i int) bool { return samples[i].t > t }) - 1
-		for i >= 0 && !isFiniteSampleValue(samples[i].v) {
-			i--
-		}
-		return i
+// finitePostHogDeltaTotals returns the finite points of a running total. It
+// returns the input slice when every point is finite.
+func finitePostHogDeltaTotals(totals []samplePoint) []samplePoint {
+	first := slices.IndexFunc(totals, func(point samplePoint) bool { return !isFiniteSampleValue(point.v) })
+	if first < 0 {
+		return totals
 	}
-	last := lastFinite(end)
-	if last < 0 || samples[last].t <= start {
+	finite := slices.Clip(totals[:first:first])
+	for _, point := range totals[first+1:] {
+		if isFiniteSampleValue(point.v) {
+			finite = append(finite, point)
+		}
+	}
+	return finite
+}
+
+// deltaWindowSum returns the sum of the delta points of a delta series in the
+// window (start, end]. The finite totals are prefix sums. The window sum is the
+// last total in the window minus the last total at or before start. It reports
+// false when no finite point is in the window.
+func (meta *seriesMeta) deltaWindowSum(start, end int64) (float64, bool) {
+	totals := meta.deltaTotals
+	first := sort.Search(len(totals), func(i int) bool { return totals[i].t > start })
+	last := sort.Search(len(totals), func(i int) bool { return totals[i].t > end }) - 1
+	if last < first {
 		return 0, false
 	}
-	sum := samples[last].v
-	if before := lastFinite(start); before >= 0 {
-		sum -= samples[before].v
+	sum := totals[last].v
+	if first > 0 {
+		sum -= totals[first-1].v
 	}
 	return sum, true
 }
