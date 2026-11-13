@@ -4,10 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"runtime"
 	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
+	"weak"
 
 	"github.com/VictoriaMetrics/metricsql"
 	"github.com/prometheus/common/model"
@@ -23,6 +27,60 @@ import (
 // preallocates a point slice for each new output series before its next
 // check, so quantiles checks the budget before expanding. Zero means no limit.
 var metricsQLMaxOutputSamples atomic.Int64
+
+// quantilesSeries counts the distinct output series a quantiles call has
+// emitted across the steps of one query. The engine keeps a point slice for
+// each of them until the query ends, so the budget is cumulative.
+type quantilesSeries struct {
+	mutex sync.Mutex
+	owner weak.Pointer[parser.StringLiteral]
+	seen  map[uint64]struct{}
+}
+
+// quantilesSeriesByCall maps a call node, identified by its address, to its
+// tracker. Entries are removed when the parsed query is garbage collected.
+var quantilesSeriesByCall sync.Map
+
+func quantilesSeriesFor(call *parser.StringLiteral) *quantilesSeries {
+	key := uintptr(unsafe.Pointer(call))
+	if existing, ok := quantilesSeriesByCall.Load(key); ok {
+		if tracker := existing.(*quantilesSeries); tracker.owner.Value() == call {
+			return tracker
+		}
+	}
+	tracker := &quantilesSeries{owner: weak.Make(call), seen: map[uint64]struct{}{}}
+	quantilesSeriesByCall.Store(key, tracker)
+	runtime.AddCleanup(call, func(key uintptr) {
+		if current, ok := quantilesSeriesByCall.Load(key); ok && current.(*quantilesSeries).owner.Value() == nil {
+			quantilesSeriesByCall.Delete(key)
+		}
+	}, key)
+	return tracker
+}
+
+// admit records the series for the given groups and phis and reports whether
+// the distinct series so far, each holding points, stay within limit.
+func (tracker *quantilesSeries) admit(groups []labels.Labels, phis []float64, points int, limit int64) bool {
+	tracker.mutex.Lock()
+	defer tracker.mutex.Unlock()
+	added := make(map[uint64]struct{})
+	for _, group := range groups {
+		base := group.Hash()
+		for _, phi := range phis {
+			key := base ^ (math.Float64bits(phi)+1)*0x9E3779B97F4A7C15
+			if _, ok := tracker.seen[key]; !ok {
+				added[key] = struct{}{}
+			}
+			if limit > 0 && int64(len(tracker.seen)+len(added)) > limit/int64(max(points, 1)) {
+				return false
+			}
+		}
+	}
+	for key := range added {
+		tracker.seen[key] = struct{}{}
+	}
+	return true
+}
 
 func init() {
 	upstream, ok := parser.Functions["histogram_quantiles"]
@@ -132,7 +190,7 @@ func (rewriter metricsQLRewriter) rewriteMedian(expr *metricsql.AggrFuncExpr, st
 	}
 	args := []metricsql.Expr{&metricsql.StringExpr{S: string(encoded)}}
 	for index, arg := range expr.Args {
-		parsed, err := parser.NewParser(parser.Options{}).ParseExpr(string(arg.AppendString(nil)))
+		parsed, err := parser.NewParser(parser.Options{}).ParseExpr(quoteDottedIdents(string(arg.AppendString(nil))))
 		if err != nil {
 			return nil, fmt.Errorf("median argument %d: %w", index+1, err)
 		}
@@ -222,7 +280,7 @@ func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr,
 	if err := rewriter.rewrite(&series, step, instant); err != nil {
 		return nil, err
 	}
-	parsed, err := parser.NewParser(parser.Options{}).ParseExpr(string(series.AppendString(nil)))
+	parsed, err := parser.NewParser(parser.Options{}).ParseExpr(quoteDottedIdents(string(series.AppendString(nil))))
 	if err != nil {
 		return nil, fmt.Errorf("quantiles series argument: %w", err)
 	}
@@ -301,8 +359,14 @@ func metricsQLQuantiles(vectors []promql.Vector, _ promql.Matrix, args parser.Ex
 	if grouping.Limit > 0 && len(order) > grouping.Limit {
 		order = order[:grouping.Limit]
 	}
-	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 && len(phis) > 0 && int64(len(order)) > limit/int64(max(grouping.Points, 1))/int64(len(phis)) {
-		panic(promql.ErrTooManySamples("quantiles"))
+	if limit := metricsQLMaxOutputSamples.Load(); limit > 0 {
+		metrics := make([]labels.Labels, len(order))
+		for index, group := range order {
+			metrics[index] = group.metric
+		}
+		if !quantilesSeriesFor(args[0].(*parser.StringLiteral)).admit(metrics, phis, grouping.Points, limit) {
+			panic(promql.ErrTooManySamples("quantiles"))
+		}
 	}
 	for _, group := range order {
 		sort.Float64s(group.values)

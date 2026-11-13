@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -186,5 +187,49 @@ func TestMetricsQLQuantilesSubqueryBudget(test *testing.T) {
 	var tooMany promql.ErrTooManySamples
 	if result := instant.Exec(context.Background()); !errors.As(result.Err, &tooMany) {
 		test.Fatalf("err = %v, want ErrTooManySamples", result.Err)
+	}
+}
+
+func TestMetricsQLQuantilesDottedNames(test *testing.T) {
+	at := time.Unix(1700000070, 0)
+	for _, query := range []string{
+		`quantiles("p", 0.5, {"http.server.duration"})`,
+		`quantiles("p", 0.5, statistics_value{"http.method"="GET"}) by ("http.method")`,
+		`median({"http.server.duration"})`,
+	} {
+		if _, err := prepareMetricsQLQuery(query, 30*time.Second, 5*time.Minute, at, at); err != nil {
+			test.Fatalf("%s: %v", query, err)
+		}
+	}
+}
+
+func TestMetricsQLQuantilesSeriesBudgetIsCumulative(test *testing.T) {
+	call := &parser.StringLiteral{Val: "call"}
+	other := &parser.StringLiteral{Val: "other"}
+	group := func(value string) labels.Labels { return labels.FromStrings("group", value) }
+	phis := []float64{0.1, 0.9}
+	// A budget of 6 points at 1 point per series allows 6 distinct series.
+	tracker := quantilesSeriesFor(call)
+	if !tracker.admit([]labels.Labels{group("a"), group("b")}, phis, 1, 6) {
+		test.Fatal("four series fit a budget of six")
+	}
+	// The same groups again add nothing.
+	if !tracker.admit([]labels.Labels{group("a"), group("b")}, phis, 1, 6) {
+		test.Fatal("repeated groups must not count twice")
+	}
+	// A different group at the next step brings the total to six.
+	if !tracker.admit([]labels.Labels{group("c")}, phis, 1, 6) {
+		test.Fatal("six series fit a budget of six")
+	}
+	// Another new group would make eight, over the budget, though each step is small.
+	if tracker.admit([]labels.Labels{group("d")}, phis, 1, 6) {
+		test.Fatal("groups that change between steps must count cumulatively")
+	}
+	// Points per series scale the budget, and trackers are per call.
+	if quantilesSeriesFor(other).admit([]labels.Labels{group("a")}, phis, 4, 6) {
+		test.Fatal("two series at four points exceed a budget of six")
+	}
+	if quantilesSeriesFor(call) != tracker {
+		test.Fatal("the tracker must be stable for a call")
 	}
 }
