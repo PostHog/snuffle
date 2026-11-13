@@ -51,6 +51,15 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 	client := NewClickHouseClient(cfg)
 	loadE2ESchema(test, ctx, client, filepath.Join(repoRoot(test), "scripts", metricsSchemaFile(cfg.storageSchemaLayout())))
 	const metric = "test_duration_seconds"
+	insertHistogramRow := func(name, temporality, metricType string, team uint64, timestamp int64, sum, count int, bounds string, counts [3]int) {
+		test.Helper()
+		sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes)
+			SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', %s, %s, %d, %d, %s, [%d, %d, %d], true, map('region', 'resource'), map('region', 'metric', 'status', '200')`,
+			tableName(database, cfg.MetricsInputTable), team, sqlString(name), sqlString(name), chTimeMillis(timestamp), sqlString(metricType), sqlString(temporality), sum, count, bounds, counts[0], counts[1], counts[2])
+		if err := client.Exec(ctx, sql); err != nil {
+			test.Fatal(err)
+		}
+	}
 	insertHistogram := func(name, temporality, metricType string, team uint64) {
 		test.Helper()
 		bounds := "[0.5, 1.0]"
@@ -58,12 +67,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			bounds = "[0.5, 1.0, 2.0]"
 		}
 		for index := 1; index <= 3; index++ {
-			sql := fmt.Sprintf(`INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes)
-				SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', %s, %s, %d, %d, %s, [%d, %d, %d], true, map('region', 'resource'), map('region', 'metric', 'status', '200')`,
-				tableName(database, cfg.MetricsInputTable), team, sqlString(name), sqlString(name), chTimeMillis(e2eStartMS+int64(index-1)*30000), sqlString(metricType), sqlString(temporality), index*12, index*10, bounds, index*2, index*3, index*5)
-			if err := client.Exec(ctx, sql); err != nil {
-				test.Fatal(err)
-			}
+			insertHistogramRow(name, temporality, metricType, team, e2eStartMS+int64(index-1)*30000, index*12, index*10, bounds, [3]int{index * 2, index * 3, index * 5})
 		}
 	}
 	insertReal := func(name string, team uint64, timestamp int64) {
@@ -109,6 +113,19 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		got, err := strconv.ParseFloat(sampleString(result.Result[0].Value), 64)
 		if err != nil || math.Abs(got-want) > 1e-9 {
 			test.Fatalf("%s = %v (%v), want %v", expression, got, err, want)
+		}
+	}
+	assertRangeValues := func(test *testing.T, expression, start, end, step string, want []float64) {
+		test.Helper()
+		result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {expression}, "start": {start}, "end": {end}, "step": {step}})
+		if len(result.Result) != 1 || len(result.Result[0].Values) != len(want) {
+			test.Fatalf("%s: %+v", expression, result)
+		}
+		for index, point := range result.Result[0].Values {
+			got, err := strconv.ParseFloat(sampleString(point), 64)
+			if err != nil || math.Abs(got-want[index]) > 1e-9 {
+				test.Fatalf("%s sample %d = %v (%v), want %v", expression, index, got, err, want[index])
+			}
 		}
 	}
 	test.Run("combined metadata matches general path", func(test *testing.T) {
@@ -475,10 +492,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 		const name = "test_delta_seconds"
 		insertHistogram(name, "delta", "histogram", e2eTeamID)
 		// A second client reports a point at the same time as the last one.
-		sql := fmt.Sprintf("INSERT INTO %s (team_id, metric_name, series_fingerprint, timestamp, observed_timestamp, original_expiry_timestamp, service_name, metric_type, aggregation_temporality, value, count, histogram_bounds, histogram_counts, has_labels, resource_attributes, attributes) SELECT %d, %s, cityHash64(%s), %s, now64(6), now64(6)+INTERVAL 1 DAY, 'api', 'histogram', 'delta', 3, 3, [0.5, 1.0], [1,1,1], true, map('region','resource'), map('region','metric','status','200')", tableName(database, cfg.MetricsInputTable), e2eTeamID, sqlString(name), sqlString(name), chTimeMillis(e2eEndMS))
-		if err := client.Exec(ctx, sql); err != nil {
-			test.Fatal(err)
-		}
+		insertHistogramRow(name, "delta", "histogram", e2eTeamID, e2eEndMS, 3, 3, "[0.5, 1.0]", [3]int{1, 1, 1})
 		assertValue(test, "increase("+name+"_count[1m])", 53)
 		assertValue(test, "increase("+name+"_sum[1m])", 63)
 		assertValue(test, "histogram_quantile(0.5, sum by (le) (increase("+name+"_bucket[1m])))", 0.984375)
@@ -489,16 +503,39 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			{"sum(increase(" + name + "_count[30s]))", []float64{20, 33}},
 			{"histogram_quantile(0.5, sum by (le) (rate(" + name + "_bucket[1m])))", []float64{1, 0.984375}},
 		} {
-			result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {testcase.expression}, "start": {"1700000040"}, "end": {"1700000070"}, "step": {"30"}})
-			if len(result.Result) != 1 || len(result.Result[0].Values) != len(testcase.want) {
-				test.Fatalf("%s: %+v", testcase.expression, result)
-			}
-			for index, point := range result.Result[0].Values {
-				got, err := strconv.ParseFloat(sampleString(point), 64)
-				if err != nil || math.Abs(got-testcase.want[index]) > 1e-9 {
-					test.Fatalf("%s sample %d = %v (%v), want %v", testcase.expression, index, got, err, testcase.want[index])
-				}
-			}
+			assertRangeValues(test, testcase.expression, "1700000040", "1700000070", "30", testcase.want)
+		}
+	})
+	test.Run("sparse delta counters sum the points in the window", func(test *testing.T) {
+		insertPoint := func(name, temporality string, secondsBeforeEnd int64, lowCount int) {
+			test.Helper()
+			insertHistogramRow(name, temporality, "histogram", e2eTeamID, e2eEndMS-secondsBeforeEnd*1000, lowCount, lowCount, "[0.5, 1.0]", [3]int{lowCount, 0, 0})
+		}
+		// The delta histogram has a point 1000s before end and two points 4s
+		// apart in the last window. The range query loads the first point but
+		// its last window does not include it. The cumulative histogram stores
+		// the running total of the delta points.
+		const deltaName, cumulativeName = "sparse_delta_seconds", "sparse_cumulative_seconds"
+		for _, point := range []struct {
+			secondsBeforeEnd  int64
+			delta, cumulative int
+		}{{1000, 50, 50}, {100, 1, 51}, {96, 1, 52}} {
+			insertPoint(deltaName, "delta", point.secondsBeforeEnd, point.delta)
+			insertPoint(cumulativeName, "cumulative", point.secondsBeforeEnd, point.cumulative)
+		}
+		for _, testcase := range []struct {
+			expression string
+			want       float64
+		}{
+			{"increase(" + deltaName + "_count[5m])", 2},
+			{"rate(" + deltaName + "_count[5m])", 2.0 / 300},
+			{"sum by (le) (rate(" + deltaName + `_bucket{le="0.5"}[5m]))`, 2.0 / 300},
+			// The cumulative histogram keeps MetricsQL counter semantics.
+			{"increase(" + cumulativeName + "_count[5m])", 1},
+			{"rate(" + cumulativeName + "_count[5m])", 0.25},
+		} {
+			assertValue(test, testcase.expression, testcase.want)
+			assertRangeValues(test, testcase.expression, "1699999470", "1700000070", "300", []float64{testcase.want})
 		}
 	})
 	test.Run("unspecified temporality rejection", func(test *testing.T) {

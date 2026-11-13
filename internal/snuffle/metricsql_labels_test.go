@@ -51,7 +51,14 @@ func evaluateMetricsQL(test *testing.T, queryable storage.Queryable, expression 
 	if !rangeQuery {
 		start = end
 	}
-	prepared, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, end)
+	return evaluateMetricsQLBetween(test, queryable, expression, start, end, 30*time.Second)
+}
+
+// evaluateMetricsQLBetween runs an expression through the engine as the API
+// handlers do. It runs an instant query when start equals end.
+func evaluateMetricsQLBetween(test *testing.T, queryable storage.Queryable, expression string, start, end time.Time, step time.Duration) parser.Value {
+	test.Helper()
+	prepared, err := prepareMetricsQLQuery(expression, step, 5*time.Minute, start, end)
 	if err != nil {
 		test.Fatal(err)
 	}
@@ -59,10 +66,10 @@ func evaluateMetricsQL(test *testing.T, queryable storage.Queryable, expression 
 	ctx := context.Background()
 	options := promql.NewPrometheusQueryOpts(false, 5*time.Minute)
 	var query promql.Query
-	if rangeQuery {
-		query, err = engine.NewRangeQuery(ctx, queryable, options, prepared.query, start, end, 30*time.Second)
-	} else {
+	if start.Equal(end) {
 		query, err = engine.NewInstantQuery(ctx, queryable, options, prepared.query, end)
+	} else {
+		query, err = engine.NewRangeQuery(ctx, queryable, options, prepared.query, start, end, step)
 	}
 	if err != nil {
 		test.Fatalf("parse %s: %v", prepared.query, err)

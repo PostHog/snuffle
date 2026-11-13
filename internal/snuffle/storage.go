@@ -210,6 +210,14 @@ func (s *futureSeriesSet) wait() {
 	s.set = seriesSetFromMeta(s.future.series, s.sortSeries)
 }
 
+func (s *futureSeriesSet) deltaSeries() deltaSeriesIndex {
+	s.wait()
+	if set, ok := s.set.(deltaSeriesSet); ok {
+		return set.deltaSeries()
+	}
+	return nil
+}
+
 func (s *futureSeriesSet) Next() bool {
 	s.wait()
 	return s.set.Next()
@@ -244,7 +252,7 @@ func seriesSetFromMeta(series []*seriesMeta, sortSeries bool) storage.SeriesSet 
 	for i := range series {
 		result[i] = series[i]
 	}
-	return &seriesSet{series: result, idx: -1}
+	return &seriesSet{series: result, idx: -1, delta: newDeltaSeriesIndex(series)}
 }
 
 func (q *CHQuerier) LabelNames(ctx context.Context, hints *storage.LabelHints, matchers ...*labels.Matcher) ([]string, annotations.Annotations, error) {
@@ -1195,6 +1203,11 @@ type seriesSet struct {
 	series []storage.Series
 	idx    int
 	err    error
+	delta  deltaSeriesIndex
+}
+
+func (s *seriesSet) deltaSeries() deltaSeriesIndex {
+	return s.delta
 }
 
 func (s *seriesSet) Next() bool {
