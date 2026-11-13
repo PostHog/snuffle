@@ -233,3 +233,19 @@ func TestMetricsQLQuantilesSeriesBudgetIsCumulative(test *testing.T) {
 		test.Fatal("the tracker must be stable for a call")
 	}
 }
+
+func TestMetricsQLQuantilesRepeatedPhis(test *testing.T) {
+	at := time.Unix(1700000070, 0)
+	for _, query := range []string{`quantiles("p", 0.5, 0.50, x)`, `quantiles("p", 1, 1, 1, x)`} {
+		if _, err := prepareMetricsQLQuery(query, 30*time.Second, 5*time.Minute, at, at); err == nil {
+			test.Fatalf("%s must be rejected", query)
+		}
+	}
+	// A guard against repeated phis that bypass rewriting: one step's output
+	// is counted in full, whatever the distinct series are.
+	groups := []labels.Labels{labels.FromStrings("group", "a")}
+	repeated := make([]float64, 100)
+	if quantilesSeriesFor(&parser.StringLiteral{Val: "repeated"}).admit(groups, repeated, 1, 10) {
+		test.Fatal("a hundred outputs exceed a budget of ten")
+	}
+}

@@ -61,6 +61,11 @@ func quantilesSeriesFor(call *parser.StringLiteral) *quantilesSeries {
 // admit records the series for the given groups and phis and reports whether
 // the distinct series so far, each holding points, stay within limit.
 func (tracker *quantilesSeries) admit(groups []labels.Labels, phis []float64, points int, limit int64) bool {
+	// The output loop allocates a sample for every phi argument, repeated or
+	// not, so bound one step's expansion before tracking distinct series.
+	if limit > 0 && int64(len(groups))*int64(len(phis)) > limit/int64(max(points, 1)) {
+		return false
+	}
 	tracker.mutex.Lock()
 	defer tracker.mutex.Unlock()
 	added := make(map[uint64]struct{})
@@ -268,10 +273,18 @@ func (rewriter metricsQLRewriter) rewriteQuantiles(expr *metricsql.AggrFuncExpr,
 		return nil, fmt.Errorf("quantiles requires a valid, non-empty label name as its first argument")
 	}
 	phis := expr.Args[1 : len(expr.Args)-1]
+	seenPhis := make(map[float64]bool, len(phis))
 	for _, phi := range phis {
-		if _, ok := phi.(*metricsql.NumberExpr); !ok {
+		number, ok := phi.(*metricsql.NumberExpr)
+		if !ok {
 			return nil, fmt.Errorf("quantiles requires constant numeric phis")
 		}
+		// Repeated phis would give two series the same labels, which the
+		// engine rejects after the output is built.
+		if seenPhis[number.N] {
+			return nil, fmt.Errorf("quantiles phis must be distinct; %g is repeated", number.N)
+		}
+		seenPhis[number.N] = true
 	}
 	if expr.Limit > 0 && !instant {
 		return nil, fmt.Errorf("quantiles limit is supported only for instant queries outside subqueries")
