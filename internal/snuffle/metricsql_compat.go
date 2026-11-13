@@ -41,6 +41,9 @@ var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_
 
 // deltaSeriesOf returns the delta histogram series that the selector read with
 // these labels. It returns nil for a subquery, which has no storage series set.
+// It reads the series set that the engine leaves on the selector after it
+// expands the series. If the engine stops keeping it, delta series fall back
+// to MetricsQL counter rules, and the delta window tests fail.
 func deltaSeriesOf(vs *parser.VectorSelector, lset labels.Labels) *seriesMeta {
 	set, ok := vs.UnexpandedSeriesSet.(*futureSeriesSet)
 	if !ok {

@@ -136,6 +136,9 @@ func TestDeltaHistogramCounterWindowSum(test *testing.T) {
 		{`increase(sparse_seconds_sum[5m])`, 1, true},
 		{`increase(sparse_seconds_count[5m]) keep_metric_names`, 2, true},
 		{`sum(rate(sparse_seconds_count[5m]))`, 2.0 / 300, true},
+		// Without a window, the window is the 5m step of the instant query.
+		{`rate(sparse_seconds_count)`, 2.0 / 300, true},
+		{`increase(sparse_seconds_count)`, 2, true},
 		{`increase(sparse_seconds_count[3h])`, 52, true},
 		// A window with one point keeps the series.
 		{`increase(single_seconds_count[5m])`, 1, true},
