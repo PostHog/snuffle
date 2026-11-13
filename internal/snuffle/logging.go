@@ -36,16 +36,17 @@ type queryLogPhase struct {
 var failedQueryLogger = slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
 type queryLogMetadata struct {
-	language  string
-	queryType string
-	query     string
-	backend   string
-	time      string
-	start     string
-	end       string
-	step      string
-	limit     string
-	direction string
+	language         string
+	queryType        string
+	query            string
+	backend          string
+	time             string
+	start            string
+	end              string
+	step             string
+	limit            string
+	direction        string
+	rangeCacheStatus string
 }
 
 func withPromRequestStats(ctx context.Context, stats *promRequestStats) context.Context {
@@ -130,6 +131,13 @@ func (w *loggingResponseWriter) recordQueryLogBackend(backend string) {
 	w.queryMeta.backend = backend
 }
 
+func (w *loggingResponseWriter) recordQueryLogCache(status string) {
+	if w.queryMeta == nil {
+		w.queryMeta = &queryLogMetadata{}
+	}
+	w.queryMeta.rangeCacheStatus = status
+}
+
 func (w *loggingResponseWriter) recordQueryLogPhase(name string, duration time.Duration) {
 	w.phases = append(w.phases, queryLogPhase{name: name, duration: duration})
 }
@@ -163,6 +171,14 @@ func recordQueryLogBackend(w http.ResponseWriter, backend string) {
 		recordQueryLogBackend(string)
 	}); ok {
 		recorder.recordQueryLogBackend(backend)
+	}
+}
+
+func recordQueryLogCache(w http.ResponseWriter, status string) {
+	if recorder, ok := w.(interface {
+		recordQueryLogCache(string)
+	}); ok {
+		recorder.recordQueryLogCache(status)
 	}
 }
 
@@ -204,6 +220,9 @@ func logPromRequestCompleted(r *http.Request, w *loggingResponseWriter, stats *p
 	)
 	if w.queryMeta != nil && w.queryMeta.backend != "" {
 		attrs = append(attrs, slog.String("query_backend", w.queryMeta.backend))
+	}
+	if w.queryMeta != nil && w.queryMeta.rangeCacheStatus != "" {
+		attrs = append(attrs, slog.String("range_cache", w.queryMeta.rangeCacheStatus))
 	}
 	for _, phase := range w.phases {
 		attrs = append(attrs, slog.Int64(phase.name+"_ms", phase.duration.Milliseconds()))

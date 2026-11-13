@@ -128,6 +128,13 @@ func (c *ClickHouseClient) connection(ctx context.Context) (clickhouse.Conn, err
 	return requestConn.conn, requestConn.err
 }
 
+func (c *ClickHouseClient) requestCredentials(ctx context.Context) (string, string) {
+	if requestConn, ok := ctx.Value(requestClickHouseConnectionKey{}).(*requestClickHouseConnection); ok {
+		return requestConn.username, requestConn.password
+	}
+	return c.cfg.CHUser, c.cfg.CHPassword
+}
+
 // withLogCommentSetting sends the request's query tags as log_comment.
 // clickhouse.WithSettings replaces the whole settings map, so every per-query
 // setting has to be added here.

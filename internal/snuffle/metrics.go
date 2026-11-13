@@ -34,6 +34,11 @@ type bridgeMetrics struct {
 	promQLResultSamples    *prometheus.CounterVec
 	promQLResultHistograms *prometheus.CounterVec
 
+	rangeCacheRequests  *prometheus.CounterVec
+	rangeCacheEvictions prometheus.Counter
+	rangeCacheEntries   prometheus.Gauge
+	rangeCacheBytes     prometheus.Gauge
+
 	remoteWriteRequests        *prometheus.CounterVec
 	remoteWriteDuration        *prometheus.HistogramVec
 	remoteWriteCompressedBytes prometheus.Counter
@@ -121,6 +126,27 @@ func newBridgeMetrics() *bridgeMetrics {
 			Name:      "promql_result_histograms_total",
 			Help:      "Total histogram samples returned by PromQL queries.",
 		}, []string{"type", "engine"}),
+
+		rangeCacheRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "snuffle",
+			Name:      "range_cache_requests_total",
+			Help:      "Total range queries by range result cache status.",
+		}, []string{"status"}),
+		rangeCacheEvictions: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "snuffle",
+			Name:      "range_cache_evictions_total",
+			Help:      "Total entries the range result cache removed to stay in its size limit.",
+		}),
+		rangeCacheEntries: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "snuffle",
+			Name:      "range_cache_entries",
+			Help:      "Entries in the range result cache.",
+		}),
+		rangeCacheBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Namespace: "snuffle",
+			Name:      "range_cache_bytes",
+			Help:      "Estimated memory the range result cache uses, in bytes.",
+		}),
 
 		remoteWriteRequests: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "snuffle",
@@ -286,6 +312,10 @@ func newBridgeMetrics() *bridgeMetrics {
 		m.promQLResultSeries,
 		m.promQLResultSamples,
 		m.promQLResultHistograms,
+		m.rangeCacheRequests,
+		m.rangeCacheEvictions,
+		m.rangeCacheEntries,
+		m.rangeCacheBytes,
 		m.remoteWriteRequests,
 		m.remoteWriteDuration,
 		m.remoteWriteCompressedBytes,
@@ -356,6 +386,28 @@ func (m *bridgeMetrics) observePromQLQuery(queryType, engine, status string, dur
 		m.promQLResultSamples.WithLabelValues(queryType, engine).Add(float64(samples))
 		m.promQLResultHistograms.WithLabelValues(queryType, engine).Add(float64(histograms))
 	}
+}
+
+func (m *bridgeMetrics) observeRangeCacheRequest(status string) {
+	if m == nil {
+		return
+	}
+	m.rangeCacheRequests.WithLabelValues(status).Inc()
+}
+
+func (m *bridgeMetrics) observeRangeCacheEviction() {
+	if m == nil {
+		return
+	}
+	m.rangeCacheEvictions.Inc()
+}
+
+func (m *bridgeMetrics) setRangeCacheSize(entries int, bytes int64) {
+	if m == nil {
+		return
+	}
+	m.rangeCacheEntries.Set(float64(entries))
+	m.rangeCacheBytes.Set(float64(bytes))
 }
 
 func (m *bridgeMetrics) observeRemoteWrite(status string, duration time.Duration, compressedBytes, decodedBytes int, batch remoteWriteBatch) {
