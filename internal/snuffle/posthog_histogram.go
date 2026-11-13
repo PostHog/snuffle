@@ -636,7 +636,8 @@ func finitePostHogDeltaTotals(totals []samplePoint) []samplePoint {
 	if first < 0 {
 		return totals
 	}
-	finite := slices.Clip(totals[:first:first])
+	finite := make([]samplePoint, 0, len(totals)-1)
+	finite = append(finite, totals[:first]...)
 	for _, point := range totals[first+1:] {
 		if isFiniteSampleValue(point.v) {
 			finite = append(finite, point)
