@@ -3,6 +3,8 @@ package snuffle
 import (
 	"container/list"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"sort"
 	"sync"
 	"time"
@@ -46,11 +48,18 @@ const rangeCacheMaxSteps = maxRangePushdownPoints
 // so one large result cannot remove most of the other entries.
 const rangeCacheMaxEntryFraction = 4
 
-// rangeCacheKey identifies the results that one entry can hold.
+// rangeCacheKey identifies the results that one entry can hold. The tenant is
+// outside the hash, so a hash collision cannot give one tenant the result of another.
 type rangeCacheKey struct {
 	teamID uint64
-	// The password is not part of the key. Instead, query uses or stores cached
-	// steps only after ClickHouse accepted a query with the request credentials.
+	hash   [sha256.Size]byte
+}
+
+// rangeCacheKeyParts are the request properties, other than the tenant, that
+// two requests must share to use one entry.
+type rangeCacheKeyParts struct {
+	// The password is not a part. Instead, query uses or stores cached steps
+	// only after ClickHouse accepted a query with the request credentials.
 	username string
 	// query is the prepared query, because it holds the durations that the
 	// preparation resolves from the step and the lookback.
@@ -60,6 +69,29 @@ type rangeCacheKey struct {
 	// phase is the start time modulo the step. Steps of requests with the same
 	// phase are on the same grid.
 	phase int64
+}
+
+// key hashes the parts, so an entry does not keep the query text.
+func (p rangeCacheKeyParts) key(teamID uint64) rangeCacheKey {
+	hash := sha256.New()
+	var buf [8]byte
+	writeUint := func(value uint64) {
+		binary.BigEndian.PutUint64(buf[:], value)
+		hash.Write(buf[:])
+	}
+	// Each string has a length prefix, so two different part lists cannot hash the same bytes.
+	writeString := func(value string) {
+		writeUint(uint64(len(value)))
+		hash.Write([]byte(value))
+	}
+	writeString(p.username)
+	writeString(p.query)
+	writeUint(uint64(p.step))
+	writeUint(uint64(p.lookback))
+	writeUint(uint64(p.phase))
+	key := rangeCacheKey{teamID: teamID}
+	hash.Sum(key.hash[:0])
+	return key
 }
 
 // The cache never changes the points or the metric of a series after it
@@ -270,7 +302,7 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	if len(stored.series) == 0 {
 		return result, status, nil
 	}
-	stored.bytes = rangeCacheEntryBytes(stored.series) + int64(len(key.query)+len(key.username))
+	stored.bytes = rangeCacheEntryBytes(stored.series)
 	c.put(key, stored, usable)
 	return result, status, nil
 }

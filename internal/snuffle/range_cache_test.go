@@ -97,7 +97,7 @@ func TestRangeCacheEvaluatesOnlyUnsettledStepsOfAMovingWindow(t *testing.T) {
 		{name: "stopped", first: 0, last: base - minutes(20), value: stepValue},
 	}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKey{query: "q"}
+	key := rangeCacheKeyParts{query: "q"}.key(0)
 
 	first, status, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval)
 	if err != nil || status != rangeCacheMiss {
@@ -135,7 +135,7 @@ func TestRangeCacheEvaluatesStepsInTheOffsetAgain(t *testing.T) {
 		return stepValue(t)
 	}}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKey{query: "q"}
+	key := rangeCacheKeyParts{query: "q"}.key(0)
 	if _, _, err := cache.query(context.Background(), key, base-minutes(30), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestRangeCacheGivesNoCachedStepToARequestThatClickHouseDidNotConfirm(t *tes
 	value := func(t int64) float64 { return stepValue(t) + generation }
 	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(60), value: value}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKey{query: "q"}
+	key := rangeCacheKeyParts{query: "q"}.key(0)
 	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestRangeCacheAsksClickHouseOnlyWhenTheEvaluationDidNot(t *testing.T) {
 			base := now.UnixMilli()
 			source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(60), value: stepValue}}}
 			cache := newTestRangeCache(&now)
-			key := rangeCacheKey{query: "q"}
+			key := rangeCacheKeyParts{query: "q"}.key(0)
 			if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 				t.Fatal(err)
 			}
@@ -267,7 +267,7 @@ func TestRangeCacheEvaluatesEveryStepWhenTheEntryCannotAnswer(t *testing.T) {
 			base := now.UnixMilli()
 			source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(600), value: stepValue}}}
 			cache := newTestRangeCache(&now)
-			key := rangeCacheKey{query: "q"}
+			key := rangeCacheKeyParts{query: "q"}.key(0)
 			if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 				t.Fatal(err)
 			}
@@ -313,7 +313,7 @@ func TestRangeCacheDoesNotStoreResultsItCannotJoin(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := newTestRangeCache(&now)
-			key := rangeCacheKey{query: "q"}
+			key := rangeCacheKeyParts{query: "q"}.key(0)
 			var starts []int64
 			eval := func(_ context.Context, start, _ time.Time) (rangeQueryResult, *rangeQueryError) {
 				starts = append(starts, start.UnixMilli())
@@ -345,7 +345,7 @@ func TestRangeCacheAnswersConcurrentRequestsForOneQuery(t *testing.T) {
 	var elapsed atomic.Int64
 	cache := newRangeResultCache(Config{RangeCacheMaxBytes: 1 << 20, RangeCacheOffset: testRangeOffset, RangeCacheTTL: 20 * time.Minute}, nil)
 	cache.now = func() time.Time { return testRangeNow.Add(time.Duration(elapsed.Load()) * time.Minute) }
-	key := rangeCacheKey{query: "q"}
+	key := rangeCacheKeyParts{query: "q"}.key(0)
 
 	var group sync.WaitGroup
 	failures := make(chan string, 8)
@@ -384,7 +384,7 @@ func TestRangeCacheKeepsARefreshWhenAnOlderRequestFinishesLater(t *testing.T) {
 		return stepValue(t)
 	}}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKey{query: "q"}
+	key := rangeCacheKeyParts{query: "q"}.key(0)
 	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
@@ -442,7 +442,7 @@ func TestRangeCacheRemovesTheLeastRecentlyUsedEntryAtTheSizeLimit(t *testing.T) 
 	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base, value: stepValue}}}
 	cache := newTestRangeCache(&now)
 	query := func(name string) string {
-		_, status, err := cache.query(context.Background(), rangeCacheKey{query: name}, base-minutes(60), base-minutes(10), testRangeStep, false, verified, source.eval)
+		_, status, err := cache.query(context.Background(), rangeCacheKeyParts{query: name}.key(0), base-minutes(60), base-minutes(10), testRangeStep, false, verified, source.eval)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -462,6 +462,29 @@ func TestRangeCacheRemovesTheLeastRecentlyUsedEntryAtTheSizeLimit(t *testing.T) 
 	}
 	if cache.bytes > cache.maxBytes {
 		t.Fatalf("cache holds %d bytes, limit %d", cache.bytes, cache.maxBytes)
+	}
+}
+
+// Each key part separates results that must not answer each other.
+func TestRangeCacheKeySeparatesRequests(t *testing.T) {
+	base := rangeCacheKeyParts{username: "user", query: "sum(m)", step: 60_000, lookback: 300_000, phase: 0}
+	if base.key(1) == base.key(2) {
+		t.Error("two tenants have the same key")
+	}
+	for name, change := range map[string]func(*rangeCacheKeyParts){
+		"user":     func(p *rangeCacheKeyParts) { p.username = "other" },
+		"query":    func(p *rangeCacheKeyParts) { p.query = "sum(n)" },
+		"step":     func(p *rangeCacheKeyParts) { p.step = 30_000 },
+		"lookback": func(p *rangeCacheKeyParts) { p.lookback = 60_000 },
+		"phase":    func(p *rangeCacheKeyParts) { p.phase = 15_000 },
+		// A text boundary that moves between two parts must change the key.
+		"user and query boundary": func(p *rangeCacheKeyParts) { p.username, p.query = "users", "um(m)" },
+	} {
+		changed := base
+		change(&changed)
+		if changed.key(1) == base.key(1) {
+			t.Errorf("a different %s has the same key", name)
+		}
 	}
 }
 

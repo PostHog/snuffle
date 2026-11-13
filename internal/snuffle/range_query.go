@@ -152,14 +152,13 @@ func (s *Server) cachedRangeQuery(ctx context.Context, query string, prepared me
 		return result, rangeCacheBypass, err
 	}
 	stepMillis := step.Milliseconds()
-	key := rangeCacheKey{
-		teamID:   s.cfg.TeamID,
+	key := rangeCacheKeyParts{
 		username: s.client.requestUsername(ctx),
 		query:    prepared.query,
 		step:     stepMillis,
 		lookback: s.cfg.LookbackDelta.Milliseconds(),
 		phase:    start.UnixMilli() % stepMillis,
-	}
+	}.key(s.cfg.TeamID)
 	eval := func(ctx context.Context, start, end time.Time) (rangeQueryResult, *rangeQueryError) {
 		return s.evalRangeQuery(ctx, prepared, start, end, step)
 	}
