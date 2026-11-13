@@ -534,7 +534,11 @@ delta series return the sum of its points in the window `(t-w, t]`, and `rate`
 returns that sum divided by `w`. A series with one point in the window, or with
 a pause before it longer than `PROMQL_LOOKBACK_DELTA`, therefore counts each of
 its points once, and `histogram_quantile` over `sum by (le) (rate(...))` weights
-each series by its observations in the window. A window with no point returns no
+each series by its observations in the window. Snuffle computes the window sum
+as the difference of two running totals, which are 64-bit floats. Once a `_sum`
+total passes about 2^53 (9e15) within the query range, adding a small point no
+longer changes it, so the window sum can miss small points. Bucket and count
+totals stay exact below 2^53 observations. A window with no point returns no
 value. Stale markers, such as those for a removed bucket bound, do not count as
 points. `irate` and `idelta` read the last two points of the running total. A
 counter function over a subquery, such as `rate(x_bucket[5m:1m])`, reads the
