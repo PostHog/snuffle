@@ -358,6 +358,12 @@ func rangeCacheMergeSeries(cached, fresh []rangeCacheSeries, start, split, end i
 		}
 	}
 	sort.Slice(merged, func(i, j int) bool { return labels.Compare(merged[i].labels, merged[j].labels) < 0 })
+	// An entry keeps this slice, and the size estimate counts only the series in
+	// it. Without the copy, the space of the series that were left out would
+	// stay in the entry and would not count against the size limit.
+	if cap(merged) > len(merged) {
+		merged = append(make([]rangeCacheSeries, 0, len(merged)), merged...)
+	}
 	return merged
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -432,6 +433,26 @@ func TestRangeQueryResultCopiesHistogramPointsOfTheEngineValue(t *testing.T) {
 	}
 	if got := string(encoded); !strings.Contains(got, `"count":"3"`) || strings.Contains(got, "777") || !strings.Contains(got, "[60,") {
 		t.Fatalf("result changed with the engine value: %s", got)
+	}
+}
+
+// The size limit counts the series that an entry keeps. A series with points
+// only in the offset is left out, and must leave no unused memory in the entry.
+func TestRangeCacheEntryHoldsNoMemoryForSeriesItLeftOut(t *testing.T) {
+	now := testRangeNow
+	base := now.UnixMilli()
+	source := &rangeSource{series: []rangeSourceSeries{{name: "settled", first: 0, last: base, value: stepValue}}}
+	for index := range 50 {
+		source.series = append(source.series, rangeSourceSeries{name: fmt.Sprintf("new-%02d", index), first: base - minutes(2), last: base, value: stepValue})
+	}
+	cache := newTestRangeCache(&now)
+	key := rangeCacheKeyParts{query: "q"}.key(0)
+	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
+		t.Fatal(err)
+	}
+	entry := cache.get(key)
+	if entry == nil || len(entry.series) != 1 || cap(entry.series) != 1 {
+		t.Fatalf("entry = %+v, want one series in a slice with space for one series", entry)
 	}
 }
 
