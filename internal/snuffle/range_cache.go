@@ -3,9 +3,6 @@ package snuffle
 import (
 	"container/list"
 	"context"
-	"crypto/sha256"
-	"encoding/binary"
-	"net/http"
 	"sort"
 	"sync"
 	"time"
@@ -49,14 +46,12 @@ const rangeCacheMaxSteps = maxRangePushdownPoints
 // so one large result cannot remove most of the other entries.
 const rangeCacheMaxEntryFraction = 4
 
-type rangeCacheKey [sha256.Size]byte
-
-type rangeCacheKeyParts struct {
+// rangeCacheKey identifies the results that one entry can hold.
+type rangeCacheKey struct {
 	teamID uint64
-	// The credentials are part of the key, so a request can only read results
-	// that ClickHouse returned for the same user and password.
+	// The password is not part of the key. Instead, query uses or stores cached
+	// steps only after ClickHouse accepted a query with the request credentials.
 	username string
-	password string
 	// query is the prepared query, because it holds the durations that the
 	// preparation resolves from the step and the lookback.
 	query    string
@@ -65,31 +60,6 @@ type rangeCacheKeyParts struct {
 	// phase is the start time modulo the step. Steps of requests with the same
 	// phase are on the same grid.
 	phase int64
-}
-
-// key hashes the parts, so the cache does not keep the password.
-func (p rangeCacheKeyParts) key() rangeCacheKey {
-	hash := sha256.New()
-	var buf [8]byte
-	writeUint := func(value uint64) {
-		binary.BigEndian.PutUint64(buf[:], value)
-		hash.Write(buf[:])
-	}
-	// Each string has a length prefix, so two different part lists cannot hash the same bytes.
-	writeString := func(value string) {
-		writeUint(uint64(len(value)))
-		hash.Write([]byte(value))
-	}
-	writeUint(p.teamID)
-	writeString(p.username)
-	writeString(p.password)
-	writeString(p.query)
-	writeUint(uint64(p.step))
-	writeUint(uint64(p.lookback))
-	writeUint(uint64(p.phase))
-	var key rangeCacheKey
-	hash.Sum(key[:0])
-	return key
 }
 
 // The cache never changes the points or the metric of a series after it
@@ -220,11 +190,18 @@ type rangeEvalFunc func(ctx context.Context, start, end time.Time) (rangeQueryRe
 // query returns the result for the steps start, start+step, ... up to end.
 // It evaluates only the steps that the cache does not hold. All times are in milliseconds.
 //
-// verify runs when no step is evaluated. A request that reads ClickHouse proves
-// its credentials there; verify gives the same proof for a request that does not.
+// The key holds the user but not the password, so cached steps are used or
+// stored only for a request that ClickHouse confirmed. An evaluation that read
+// ClickHouse is such a confirmation. For every other request, verify asks
+// ClickHouse. A request without a confirmation gets the result of a complete
+// evaluation, and the entry of the key stays as it is.
 // noCache evaluates every step and replaces the cached entry.
 func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, end, step int64, noCache bool, verify func(context.Context) error, eval rangeEvalFunc) (rangeQueryResult, string, *rangeQueryError) {
 	lastStep := start + (end-start)/step*step
+	evalAll := func() (rangeQueryResult, string, *rangeQueryError) {
+		result, err := eval(ctx, time.UnixMilli(start).UTC(), time.UnixMilli(end).UTC())
+		return result, rangeCacheBypass, err
+	}
 	entry := c.get(key)
 	usable := entry
 	// The entry must hold the first step. A gap before the cached steps would
@@ -234,8 +211,8 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	}
 
 	if usable != nil && usable.end >= lastStep {
-		if err := verify(ctx); err != nil {
-			return rangeQueryResult{backend: rangeCacheBackend}, rangeCacheHit, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
+		if verify(ctx) != nil {
+			return evalAll()
 		}
 		groups := rangeCacheGroups(usable.series, nil, start, lastStep+step, lastStep)
 		return rangeQueryResult{backend: rangeCacheBackend, floats: true, groups: groups}, rangeCacheHit, nil
@@ -249,6 +226,12 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	if queryErr != nil {
 		return fresh, status, queryErr
 	}
+	if !fresh.clickHouseAccepted && verify(ctx) != nil {
+		if usable == nil {
+			return fresh, rangeCacheBypass, nil
+		}
+		return evalAll()
+	}
 	freshSeries, ok := rangeCacheSeriesFromGroups(fresh.groups)
 	if !fresh.floats || fresh.rangeDependent || !ok {
 		if usable == nil {
@@ -257,8 +240,7 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 		// The new steps cannot join the cached steps. Evaluate every step, and
 		// remove the entry so the next request does not evaluate twice.
 		c.remove(key, usable)
-		fresh, queryErr = eval(ctx, time.UnixMilli(start).UTC(), time.UnixMilli(end).UTC())
-		return fresh, rangeCacheBypass, queryErr
+		return evalAll()
 	}
 
 	var cached []rangeCacheSeries
@@ -288,7 +270,7 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	if len(stored.series) == 0 {
 		return result, status, nil
 	}
-	stored.bytes = rangeCacheEntryBytes(stored.series)
+	stored.bytes = rangeCacheEntryBytes(stored.series) + int64(len(key.query)+len(key.username))
 	c.put(key, stored, usable)
 	return result, status, nil
 }

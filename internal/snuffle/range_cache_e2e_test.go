@@ -73,8 +73,8 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 				values.Set("query", query)
 				// The request arrives just after its last step, as a live dashboard request does.
 				clock = time.UnixMilli(rangeCacheE2EBase + int64(endMinutes)*time.Minute.Milliseconds()).Add(30 * time.Second)
-				want, _, _ := rangeCacheE2EGet(t, uncached.URL, values, "", "")
-				got, status, _ := rangeCacheE2EGet(t, cached.URL, values, "", "")
+				want, _, _ := rangeCacheE2EGet(t, uncached.URL, e2eTeamID, values, "", "")
+				got, status, _ := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, "", "")
 				wantStatus := rangeCachePartial
 				if index == 0 {
 					wantStatus = rangeCacheMiss
@@ -91,8 +91,8 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 			// Every step of this earlier window is settled, so the cache answers it without an evaluation.
 			values := window(70)
 			values.Set("query", query)
-			want, _, _ := rangeCacheE2EGet(t, uncached.URL, values, "", "")
-			got, status, _ := rangeCacheE2EGet(t, cached.URL, values, "", "")
+			want, _, _ := rangeCacheE2EGet(t, uncached.URL, e2eTeamID, values, "", "")
+			got, status, _ := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, "", "")
 			if status != rangeCacheHit {
 				t.Fatalf("settled window: cache status %q, want %q", status, rangeCacheHit)
 			}
@@ -100,12 +100,25 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 		})
 	}
 
+	t.Run("a cached result answers only its tenant", func(t *testing.T) {
+		values := window(70)
+		values.Set("query", "sum("+rangeCacheE2EMetric+") by (code)")
+		for range 2 {
+			if got, _, _ := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, "", ""); len(got.Result) == 0 {
+				t.Fatal("the tenant that owns the samples got no series")
+			}
+		}
+		if got, status, _ := rangeCacheE2EGet(t, cached.URL, e2eTeamID+1, values, "", ""); len(got.Result) != 0 || status == rangeCacheHit {
+			t.Fatalf("another tenant got %d series with cache status %q", len(got.Result), status)
+		}
+	})
+
 	t.Run("a query that depends on the range is not cached", func(t *testing.T) {
 		values := window(60)
 		values.Set("query", rangeCacheE2EMetric+" @ end()")
 		for range 2 {
-			want, _, _ := rangeCacheE2EGet(t, uncached.URL, values, "", "")
-			got, status, _ := rangeCacheE2EGet(t, cached.URL, values, "", "")
+			want, _, _ := rangeCacheE2EGet(t, uncached.URL, e2eTeamID, values, "", "")
+			got, status, _ := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, "", "")
 			if status != rangeCacheBypass {
 				t.Fatalf("cache status %q, want %q", status, rangeCacheBypass)
 			}
@@ -129,25 +142,25 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 
 		values := window(70)
 		values.Set("query", "sum("+rangeCacheE2EMetric+") by (code)")
-		if _, status, code := rangeCacheE2EGet(t, cached.URL, values, user, password); code != http.StatusOK || status != rangeCacheMiss {
+		if _, status, code := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, user, password); code != http.StatusOK || status != rangeCacheMiss {
 			t.Fatalf("first request: HTTP %d with cache status %q, want a miss", code, status)
 		}
-		if _, status, code := rangeCacheE2EGet(t, cached.URL, values, user, password); code != http.StatusOK || status != rangeCacheHit {
+		if _, status, code := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, user, password); code != http.StatusOK || status != rangeCacheHit {
 			t.Fatalf("second request: HTTP %d with cache status %q, want a hit", code, status)
 		}
-		if _, _, code := rangeCacheE2EGet(t, cached.URL, values, user, "wrong-password"); code == http.StatusOK {
+		if _, _, code := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, user, "wrong-password"); code == http.StatusOK {
 			t.Fatal("a request with a wrong password read the cached result")
 		}
 		if err := root.Exec(ctx, "REVOKE ALL ON "+quoteIdent(cfg.CHDatabase)+".* FROM "+quoteIdent(user)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, code := rangeCacheE2EGet(t, cached.URL, values, user, password); code == http.StatusOK {
+		if _, _, code := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, user, password); code == http.StatusOK {
 			t.Fatal("a user without a grant on the samples read the cached result")
 		}
 		if err := root.Exec(ctx, "DROP USER "+quoteIdent(user)); err != nil {
 			t.Fatal(err)
 		}
-		if _, _, code := rangeCacheE2EGet(t, cached.URL, values, user, password); code == http.StatusOK {
+		if _, _, code := rangeCacheE2EGet(t, cached.URL, e2eTeamID, values, user, password); code == http.StatusOK {
 			t.Fatal("a dropped user read the cached result")
 		}
 	})
@@ -156,9 +169,9 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 // rangeCacheE2EGet returns the result, the cache status header and the HTTP
 // status of a range query. A request without a user must succeed. A request
 // with a user returns its HTTP status, so the caller can expect a refusal.
-func rangeCacheE2EGet(t *testing.T, baseURL string, values url.Values, user, password string) (queryDataDTO, string, int) {
+func rangeCacheE2EGet(t *testing.T, baseURL string, teamID uint64, values url.Values, user, password string) (queryDataDTO, string, int) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/t/%d/api/v1/query_range?%s", baseURL, e2eTeamID, values.Encode()), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/t/%d/api/v1/query_range?%s", baseURL, teamID, values.Encode()), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

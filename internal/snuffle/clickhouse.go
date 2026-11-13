@@ -128,11 +128,11 @@ func (c *ClickHouseClient) connection(ctx context.Context) (clickhouse.Conn, err
 	return requestConn.conn, requestConn.err
 }
 
-func (c *ClickHouseClient) requestCredentials(ctx context.Context) (string, string) {
+func (c *ClickHouseClient) requestUsername(ctx context.Context) string {
 	if requestConn, ok := ctx.Value(requestClickHouseConnectionKey{}).(*requestClickHouseConnection); ok {
-		return requestConn.username, requestConn.password
+		return requestConn.username
 	}
-	return c.cfg.CHUser, c.cfg.CHPassword
+	return c.cfg.CHUser
 }
 
 // withLogCommentSetting sends the request's query tags as log_comment.
@@ -197,6 +197,8 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		status := "ok"
 		if err != nil {
 			status = "error"
+		} else {
+			markClickHouseAccepted(ctx)
 		}
 		scanned := int64(scannedRows.Load())
 		read := int64(readBytes.Load())

@@ -625,12 +625,15 @@ The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
 - **Step grid.** Two requests share cached steps only when their `start` times
   are on the same step grid: `start` modulo `step` must be equal. Clients that
   align `start` to the step, as Grafana does, get this without more work.
-- **Scope.** An entry belongs to one tenant, one ClickHouse user and password,
-  one query, one step and one lookback. When Snuffle evaluates no step, it
-  still sends ClickHouse a query that reads no rows, so ClickHouse checks the
-  user, the password and the grant to read samples on every request. A change
-  to a row policy or to the grant on another table reaches fully cached
-  requests when the entry expires.
+- **Scope.** An entry belongs to one tenant, one ClickHouse user, one query,
+  one step and one lookback. The password is not part of an entry. Snuffle
+  uses or stores cached steps only after ClickHouse accepted a query with the
+  request credentials. When the request evaluates nothing in ClickHouse,
+  Snuffle sends a query that reads no rows, which checks the user, the
+  password and the grant to read samples. A request that ClickHouse does not
+  accept is evaluated in full, as without the cache. A change to a row policy
+  or to the grant on another table reaches fully cached requests when the
+  entry expires.
 - **Queries that are not cached.** A step must have the same value in every
   request range. Snuffle evaluates these queries in full: `@` modifiers,
   negative offsets, `running_sum`, `quantiles`, native histogram results,

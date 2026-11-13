@@ -28,9 +28,12 @@ var testRangeNow = time.UnixMilli(1_700_000_040_000).UTC()
 // at every step in its life, and the source records the ranges it evaluates.
 type rangeSource struct {
 	series []rangeSourceSeries
-	mu     sync.Mutex
-	calls  [][2]int64
-	err    *rangeQueryError
+	// unconfirmed makes the source evaluate without a ClickHouse query, as a
+	// query without a selector does. Such an evaluation does not prove the credentials.
+	unconfirmed bool
+	mu          sync.Mutex
+	calls       [][2]int64
+	err         *rangeQueryError
 }
 
 type rangeSourceSeries struct {
@@ -47,7 +50,7 @@ func (source *rangeSource) eval(_ context.Context, start, end time.Time) (rangeQ
 	if source.err != nil {
 		return rangeQueryResult{backend: "test"}, source.err
 	}
-	return rangeQueryResult{backend: "test", floats: true, groups: source.groups(start.UnixMilli(), end.UnixMilli())}, nil
+	return rangeQueryResult{backend: "test", floats: true, clickHouseAccepted: !source.unconfirmed, groups: source.groups(start.UnixMilli(), end.UnixMilli())}, nil
 }
 
 // groups returns what an evaluation without a cache returns.
@@ -94,7 +97,7 @@ func TestRangeCacheEvaluatesOnlyUnsettledStepsOfAMovingWindow(t *testing.T) {
 		{name: "stopped", first: 0, last: base - minutes(20), value: stepValue},
 	}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKeyParts{query: "q"}.key()
+	key := rangeCacheKey{query: "q"}
 
 	first, status, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval)
 	if err != nil || status != rangeCacheMiss {
@@ -132,7 +135,7 @@ func TestRangeCacheEvaluatesStepsInTheOffsetAgain(t *testing.T) {
 		return stepValue(t)
 	}}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKeyParts{query: "q"}.key()
+	key := rangeCacheKey{query: "q"}
 	if _, _, err := cache.query(context.Background(), key, base-minutes(30), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
@@ -148,35 +151,100 @@ func TestRangeCacheEvaluatesStepsInTheOffsetAgain(t *testing.T) {
 	}
 }
 
-// A request for settled steps reads nothing from ClickHouse, so ClickHouse does
-// not check its credentials. The cache must run the credential check instead.
-func TestRangeCacheChecksCredentialsWhenNoStepIsEvaluated(t *testing.T) {
+func refused(context.Context) error { return errors.New("authentication failed") }
+
+// The cache key holds the user but not the password. A request with the user of
+// a cached entry and a wrong password must get no cached step and must not
+// change the entry. The evaluation of the request is its only answer.
+func TestRangeCacheGivesNoCachedStepToARequestThatClickHouseDidNotConfirm(t *testing.T) {
 	now := testRangeNow
 	base := now.UnixMilli()
-	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base, value: stepValue}}}
+	// The values change after the entry is stored, so a cached step differs from an evaluated step.
+	generation := 0.0
+	value := func(t int64) float64 { return stepValue(t) + generation }
+	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(60), value: value}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKeyParts{query: "q"}.key()
+	key := rangeCacheKey{query: "q"}
 	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
+	cachedSteps := source.groups(base-minutes(50), base-minutes(10))
+	generation = 1000
+	now = now.Add(10 * time.Minute)
+
+	for _, tc := range []struct {
+		name        string
+		start, end  int64
+		unconfirmed bool
+		noCache     bool
+	}{
+		{name: "every step is cached", start: -50, end: -10},
+		// This evaluation reads nothing from ClickHouse, so it does not confirm the request.
+		{name: "the first steps are cached", start: -50, end: 10, unconfirmed: true},
+		{name: "the request replaces the entry", start: -50, end: 10, unconfirmed: true, noCache: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source.unconfirmed = tc.unconfirmed
+			source.calls = nil
+			start, end := base+minutes(tc.start), base+minutes(tc.end)
+			result, status, err := cache.query(context.Background(), key, start, end, testRangeStep, tc.noCache, refused, source.eval)
+			if err != nil || status != rangeCacheBypass {
+				t.Fatalf("status %q, error %v", status, err)
+			}
+			if want := source.groups(start, end); !reflect.DeepEqual(result.groups, want) {
+				t.Fatalf("result = %v, want only evaluated steps %v", result.groups, want)
+			}
+			if last := source.calls[len(source.calls)-1]; last != [2]int64{start, end} {
+				t.Fatalf("evaluations = %v, want a last evaluation of every step", source.calls)
+			}
+		})
+	}
+
+	source.unconfirmed = false
 	source.calls = nil
-
-	checks := 0
-	result, status, err := cache.query(context.Background(), key, base-minutes(50), base-minutes(10), testRangeStep, false, func(context.Context) error {
-		checks++
-		return nil
-	}, source.eval)
-	if err != nil || status != rangeCacheHit || len(source.calls) != 0 || checks != 1 {
-		t.Fatalf("settled request: status %q, error %v, evaluations %v, credential checks %d", status, err, source.calls, checks)
+	result, status, err := cache.query(context.Background(), key, base-minutes(50), base-minutes(10), testRangeStep, false, verified, source.eval)
+	if err != nil || status != rangeCacheHit || len(source.calls) != 0 || !reflect.DeepEqual(result.groups, cachedSteps) {
+		t.Fatalf("confirmed request: status %q, error %v, evaluations %v; want the steps stored before the refused requests", status, err, source.calls)
 	}
-	if want := source.groups(base-minutes(50), base-minutes(10)); !reflect.DeepEqual(result.groups, want) {
-		t.Fatalf("settled request result = %v, want %v", result.groups, want)
-	}
+}
 
-	denied := errors.New("authentication failed")
-	result, _, err = cache.query(context.Background(), key, base-minutes(50), base-minutes(10), testRangeStep, false, func(context.Context) error { return denied }, source.eval)
-	if err == nil || !errors.Is(err.err, denied) || len(result.groups) != 0 {
-		t.Fatalf("request with refused credentials returned %v, error %v", result.groups, err)
+// An evaluation that reads ClickHouse proves the credentials of its request.
+// The cache must ask ClickHouse itself only for a request without such an evaluation.
+func TestRangeCacheAsksClickHouseOnlyWhenTheEvaluationDidNot(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		start, end  int64
+		unconfirmed bool
+		want        int
+	}{
+		{name: "every step is cached", start: -50, end: -10, want: 1},
+		{name: "the evaluation read ClickHouse", start: -50, end: 10, want: 0},
+		{name: "the evaluation read nothing from ClickHouse", start: -50, end: 10, unconfirmed: true, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := testRangeNow
+			base := now.UnixMilli()
+			source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(60), value: stepValue}}}
+			cache := newTestRangeCache(&now)
+			key := rangeCacheKey{query: "q"}
+			if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
+				t.Fatal(err)
+			}
+			now = now.Add(10 * time.Minute)
+			source.unconfirmed = tc.unconfirmed
+			checks := 0
+			start, end := base+minutes(tc.start), base+minutes(tc.end)
+			result, status, err := cache.query(context.Background(), key, start, end, testRangeStep, false, func(context.Context) error {
+				checks++
+				return nil
+			}, source.eval)
+			if err != nil || status == rangeCacheBypass || checks != tc.want {
+				t.Fatalf("status %q, error %v, credential checks %d, want %d", status, err, checks, tc.want)
+			}
+			if want := source.groups(start, end); !reflect.DeepEqual(result.groups, want) {
+				t.Fatalf("result = %v, want %v", result.groups, want)
+			}
+		})
 	}
 }
 
@@ -199,7 +267,7 @@ func TestRangeCacheEvaluatesEveryStepWhenTheEntryCannotAnswer(t *testing.T) {
 			base := now.UnixMilli()
 			source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(600), value: stepValue}}}
 			cache := newTestRangeCache(&now)
-			key := rangeCacheKeyParts{query: "q"}.key()
+			key := rangeCacheKey{query: "q"}
 			if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 				t.Fatal(err)
 			}
@@ -245,7 +313,7 @@ func TestRangeCacheDoesNotStoreResultsItCannotJoin(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cache := newTestRangeCache(&now)
-			key := rangeCacheKeyParts{query: "q"}.key()
+			key := rangeCacheKey{query: "q"}
 			var starts []int64
 			eval := func(_ context.Context, start, _ time.Time) (rangeQueryResult, *rangeQueryError) {
 				starts = append(starts, start.UnixMilli())
@@ -277,7 +345,7 @@ func TestRangeCacheAnswersConcurrentRequestsForOneQuery(t *testing.T) {
 	var elapsed atomic.Int64
 	cache := newRangeResultCache(Config{RangeCacheMaxBytes: 1 << 20, RangeCacheOffset: testRangeOffset, RangeCacheTTL: 20 * time.Minute}, nil)
 	cache.now = func() time.Time { return testRangeNow.Add(time.Duration(elapsed.Load()) * time.Minute) }
-	key := rangeCacheKeyParts{query: "q"}.key()
+	key := rangeCacheKey{query: "q"}
 
 	var group sync.WaitGroup
 	failures := make(chan string, 8)
@@ -316,7 +384,7 @@ func TestRangeCacheKeepsARefreshWhenAnOlderRequestFinishesLater(t *testing.T) {
 		return stepValue(t)
 	}}}}
 	cache := newTestRangeCache(&now)
-	key := rangeCacheKeyParts{query: "q"}.key()
+	key := rangeCacheKey{query: "q"}
 	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, source.eval); err != nil {
 		t.Fatal(err)
 	}
@@ -374,7 +442,7 @@ func TestRangeCacheRemovesTheLeastRecentlyUsedEntryAtTheSizeLimit(t *testing.T) 
 	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base, value: stepValue}}}
 	cache := newTestRangeCache(&now)
 	query := func(name string) string {
-		_, status, err := cache.query(context.Background(), rangeCacheKeyParts{query: name}.key(), base-minutes(60), base-minutes(10), testRangeStep, false, verified, source.eval)
+		_, status, err := cache.query(context.Background(), rangeCacheKey{query: name}, base-minutes(60), base-minutes(10), testRangeStep, false, verified, source.eval)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -394,28 +462,6 @@ func TestRangeCacheRemovesTheLeastRecentlyUsedEntryAtTheSizeLimit(t *testing.T) 
 	}
 	if cache.bytes > cache.maxBytes {
 		t.Fatalf("cache holds %d bytes, limit %d", cache.bytes, cache.maxBytes)
-	}
-}
-
-// Each key part separates results that must not answer each other.
-func TestRangeCacheKeySeparatesRequests(t *testing.T) {
-	base := rangeCacheKeyParts{teamID: 1, username: "user", password: "secret", query: "sum(m)", step: 60_000, lookback: 300_000, phase: 0}
-	for name, change := range map[string]func(*rangeCacheKeyParts){
-		"team":     func(p *rangeCacheKeyParts) { p.teamID = 2 },
-		"user":     func(p *rangeCacheKeyParts) { p.username = "other" },
-		"password": func(p *rangeCacheKeyParts) { p.password = "wrong" },
-		"query":    func(p *rangeCacheKeyParts) { p.query = "sum(n)" },
-		"step":     func(p *rangeCacheKeyParts) { p.step = 30_000 },
-		"lookback": func(p *rangeCacheKeyParts) { p.lookback = 60_000 },
-		"phase":    func(p *rangeCacheKeyParts) { p.phase = 15_000 },
-		// A text boundary that moves between two parts must change the key.
-		"user and password boundary": func(p *rangeCacheKeyParts) { p.username, p.password = "users", "ecret" },
-	} {
-		changed := base
-		change(&changed)
-		if changed.key() == base.key() {
-			t.Errorf("a different %s has the same key", name)
-		}
 	}
 }
 

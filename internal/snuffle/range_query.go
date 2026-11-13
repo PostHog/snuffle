@@ -29,6 +29,9 @@ type rangeQueryResult struct {
 	// rangeDependent is true when a step can have another value in another
 	// request range. The range cache does not store such a result.
 	rangeDependent bool
+	// clickHouseAccepted is true when ClickHouse completed a query of the
+	// evaluation, which proves that it accepts the credentials of the request.
+	clickHouseAccepted bool
 }
 
 func (result rangeQueryResult) data() queryData {
@@ -77,7 +80,15 @@ type rangeEvalNotesKey struct{}
 
 // rangeEvalNotes collects facts that the storage layer finds during one range evaluation.
 type rangeEvalNotes struct {
-	rangeDependent atomic.Bool
+	rangeDependent     atomic.Bool
+	clickHouseAccepted atomic.Bool
+}
+
+// markClickHouseAccepted records that ClickHouse completed a query for the evaluation in ctx.
+func markClickHouseAccepted(ctx context.Context) {
+	if notes, ok := ctx.Value(rangeEvalNotesKey{}).(*rangeEvalNotes); ok {
+		notes.clickHouseAccepted.Store(true)
+	}
 }
 
 // markRangeDependent records that the evaluation in ctx read data whose value
@@ -92,6 +103,7 @@ func (s *Server) evalRangeQuery(ctx context.Context, prepared metricsQLQuery, st
 	notes := &rangeEvalNotes{}
 	result, err := s.evalRangeQueryBackends(context.WithValue(ctx, rangeEvalNotesKey{}, notes), prepared, start, end, step)
 	result.rangeDependent = notes.rangeDependent.Load()
+	result.clickHouseAccepted = notes.clickHouseAccepted.Load()
 	return result, err
 }
 
@@ -139,17 +151,15 @@ func (s *Server) cachedRangeQuery(ctx context.Context, query string, prepared me
 		result, err := s.evalRangeQuery(ctx, prepared, start, end, step)
 		return result, rangeCacheBypass, err
 	}
-	username, password := s.client.requestCredentials(ctx)
 	stepMillis := step.Milliseconds()
-	key := rangeCacheKeyParts{
+	key := rangeCacheKey{
 		teamID:   s.cfg.TeamID,
-		username: username,
-		password: password,
+		username: s.client.requestUsername(ctx),
 		query:    prepared.query,
 		step:     stepMillis,
 		lookback: s.cfg.LookbackDelta.Milliseconds(),
 		phase:    start.UnixMilli() % stepMillis,
-	}.key()
+	}
 	eval := func(ctx context.Context, start, end time.Time) (rangeQueryResult, *rangeQueryError) {
 		return s.evalRangeQuery(ctx, prepared, start, end, step)
 	}
