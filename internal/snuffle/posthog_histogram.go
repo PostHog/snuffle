@@ -629,21 +629,13 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 	return out
 }
 
-// finitePostHogDeltaTotals returns the finite points of a running total. It
-// returns the input slice when every point is finite.
+// finitePostHogDeltaTotals returns the finite points of a running total.
 func finitePostHogDeltaTotals(totals []samplePoint) []samplePoint {
-	first := slices.IndexFunc(totals, func(point samplePoint) bool { return !isFiniteSampleValue(point.v) })
-	if first < 0 {
+	notFinite := func(point samplePoint) bool { return !isFiniteSampleValue(point.v) }
+	if !slices.ContainsFunc(totals, notFinite) {
 		return totals
 	}
-	finite := make([]samplePoint, 0, len(totals)-1)
-	finite = append(finite, totals[:first]...)
-	for _, point := range totals[first+1:] {
-		if isFiniteSampleValue(point.v) {
-			finite = append(finite, point)
-		}
-	}
-	return finite
+	return slices.DeleteFunc(slices.Clone(totals), notFinite)
 }
 
 // deltaWindowSum returns the sum of the delta points of a delta series in the
