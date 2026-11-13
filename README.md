@@ -606,6 +606,53 @@ Snuffle does not call ClickHouse `prometheusQuery` or
 For schema design, benchmark methodology, query-shape details, and regression
 workflows, see [PERFORMANCE.md](PERFORMANCE.md).
 
+### Range result cache
+
+A dashboard repeats one range query over a window that moves forward. Most
+steps of the new window are also steps of the previous window. The range
+result cache keeps those steps in memory, so Snuffle evaluates only the steps
+after them. The design follows the rollup result cache of VictoriaMetrics.
+
+The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
+
+- **Settled steps.** Samples can arrive late, so the cache keeps a step only
+  when it is older than `SNUFFLE_RANGE_CACHE_OFFSET` plus one step. Snuffle
+  evaluates newer steps on every request.
+- **Late backfills.** Snuffle cannot see a sample that arrives later than the
+  offset, for example after an ingestion delay. An entry expires after
+  `SNUFFLE_RANGE_CACHE_TTL`, and the next request evaluates every step again.
+  Send `nocache=1` to evaluate every step now and replace the entry.
+- **Step grid.** Two requests share cached steps only when their `start` times
+  are on the same step grid: `start` modulo `step` must be equal. Clients that
+  align `start` to the step, as Grafana does, get this without more work.
+- **Scope.** An entry belongs to one tenant, one ClickHouse user, one query,
+  one step and one lookback. The password is not part of an entry. Snuffle
+  uses or stores cached steps only after ClickHouse accepted a query with the
+  request credentials. When the request evaluates nothing in ClickHouse,
+  Snuffle sends a query that reads no rows, which checks the user, the
+  password and the grant to read samples. A request that ClickHouse does not
+  accept is evaluated in full, as without the cache. A change to a row policy
+  or to the grant on another table reaches fully cached requests when the
+  entry expires.
+- **Queries that are not cached.** A step must have the same value in every
+  request range. Snuffle evaluates these queries in full: `@` modifiers,
+  negative offsets, `running_sum`, `quantiles`, native histogram results,
+  PostHog histograms with delta temporality, and ranges of fewer than three
+  steps.
+- **New steps only.** A request for only the newest steps can differ in two
+  ways from a request for the complete range. A range pushdown estimates the
+  sample interval of a series from the samples that the request reads, so a
+  series with irregular intervals can get a slightly different `rate`. The
+  request can also use another execution path, and it is checked against the
+  series and sample limits for the new steps only.
+
+The `X-Snuffle-Range-Cache` response header and the `range_cache` field of the
+request log report `hit`, `partial`, `miss` or `bypass`.
+`snuffle_range_cache_requests_total{status}`, `snuffle_range_cache_entries`,
+`snuffle_range_cache_bytes` and `snuffle_range_cache_evictions_total` report
+the same on `/metrics`. Series in a result that can use the cache are sorted
+by their labels.
+
 ## Configuration
 
 Snuffle is configured with environment variables.
@@ -675,6 +722,9 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `SNUFFLE_RANGE_PUSHDOWN` | `true` | Enable SQL range fast paths: native selectors, counter and basic over-time rollups, aggregations (including nested counts), scalar arithmetic, plain `or` unions, and outer `running_sum`; PostHog aggregate rollups are also supported. Unsupported expressions and native histogram data use the engine. `false` keeps every range query in the engine |
 | `CH_RANGE_QUERY_MAX_THREADS` | `8` | ClickHouse `max_threads` for range pushdowns and PostHog-layout sample reads; `0` leaves the ClickHouse default |
 | `CH_RANGE_PUSHDOWN_MAX_EXPANSION` | `512` | Maximum sample-to-step expansion for range pushdown (including lookback history for native queries); wider windows use the engine |
+| `SNUFFLE_RANGE_CACHE_MAX_BYTES` | `0` | Memory limit of the [range result cache](#range-result-cache) in bytes; `0` disables the cache |
+| `SNUFFLE_RANGE_CACHE_OFFSET` | `5m` | Age below which the range result cache does not keep a step, because samples can still arrive |
+| `SNUFFLE_RANGE_CACHE_TTL` | `1h` | Time after which a range result cache entry expires and every step is evaluated again |
 | `REMOTE_WRITE_SAMPLE_INTERVAL` | `15s` | Timestamp bucket for float samples and histograms; `0` preserves timestamps |
 | `SNUFFLE_SAMPLE_ATTRIBUTES` | layout-dependent | Store sample label maps on sample rows (`attributes_map_str` in `current`, `attributes` in `posthog`); false for `current`, true for `posthog` |
 | `SNUFFLE_LOG_RETENTION` | `720h` | Expiry assigned to log rows received through Loki push |

@@ -72,18 +72,26 @@ var rangePushdownFunctions = map[string]bool{
 }
 
 func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (queryData, bool, error) {
+	groups, ok, err := s.tryFastRangeGroups(ctx, prepared, start, end, step)
+	if !ok || err != nil {
+		return queryData{}, ok, err
+	}
+	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: rangeAggregateSampleResults(groups)}, true, nil
+}
+
+func (s *Server) tryFastRangeGroups(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) ([]rangeAggregateGroup, bool, error) {
 	if !s.cfg.RangePushdown {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	if !s.cfg.postHogSchemaLayout() {
-		return s.tryNativeRangeQuery(ctx, prepared, start, end, step)
+		return s.tryNativeRangeGroups(ctx, prepared, start, end, step)
 	}
 	if prepared.runningSum {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	expr, err := s.parser.ParseExpr(prepared.query)
 	if err != nil {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	subquery, isSubquery := parseRangeOffsetSubquery(expr, step, s.cfg.LookbackDelta)
 	aggregate, ok := unparenExpr(expr).(*parser.AggregateExpr)
@@ -91,15 +99,15 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery,
 		aggregate, ok = subquery.aggregate, true
 	}
 	if !ok || aggregate.Without || !postHogGroupingSupported(aggregate.Grouping) {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	aggSQL, ok := aggregateSQL(aggregate, "rollup_value")
 	if !ok {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	call, ok := parseRangeRollupCall(aggregate.Expr, step, s.cfg.LookbackDelta)
 	if !ok || !postHogMatchersPushdownSafe(call.selector.LabelMatchers) {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	// The grid holds the step times the aggregate is evaluated at. An offset
 	// subquery evaluates it on the epoch-aligned grid that covers every
@@ -115,29 +123,29 @@ func (s *Server) tryFastRangeQuery(ctx context.Context, prepared metricsQLQuery,
 	}
 	points := (gridEnd-gridStart)/call.step + 1
 	if points <= 0 || points > maxRangePushdownPoints || call.expansion() > int64(s.cfg.RangePushdownMaxExpansion) {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	evalStart := gridStart - call.offset
 	mint := evalStart - call.matrix
 	maxt := evalStart + (points-1)*call.step
 	virtual, err := s.postHogSelectsHistogram(ctx, mint, maxt, call.selector.LabelMatchers)
 	if err != nil {
-		return queryData{}, false, err
+		return nil, false, err
 	}
 	if virtual {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, maxt, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
 	sql := rangeRollupSQL(s.cfg, plan, call, evalStart, gridStart, points, aggSQL, sumContributions)
 	groups, err := s.queryRangeAggregateGroups(ctx, sql, aggregate.Grouping)
 	if err != nil {
-		return queryData{}, true, err
+		return nil, true, err
 	}
 	if isSubquery {
 		groups = rangeOffsetSubqueryRollup(groups, subquery, start.UnixMilli(), end.UnixMilli(), call.step, s.cfg.LookbackDelta.Milliseconds())
 	}
-	return queryData{ResultType: string(parser.ValueTypeMatrix), Result: rangeAggregateSampleResults(groups)}, true, nil
+	return groups, true, nil
 }
 
 // parseRangeOffsetSubquery accepts the rewritten form of `agg(...) offset d`:

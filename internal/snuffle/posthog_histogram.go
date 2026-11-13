@@ -699,7 +699,16 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	if err != nil {
 		return nil, err
 	}
-	return builder.finish(), nil
+	series := builder.finish()
+	for _, meta := range series {
+		if meta.delta && withSamples {
+			// The running total starts at the first point that this request reads,
+			// so a step has another value in a request with another start.
+			markRangeDependent(ctx)
+			break
+		}
+	}
+	return series, nil
 }
 
 func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*seriesMeta, mint, maxt int64, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {

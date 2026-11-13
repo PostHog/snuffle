@@ -32,6 +32,8 @@ type Server struct {
 	// ponytail: exact cache grows for the process lifetime; bound it if series churn makes memory material.
 	knownSeries *knownSeriesCache
 	metrics     *bridgeMetrics
+	// rangeCache is nil when the range result cache is disabled.
+	rangeCache *rangeResultCache
 }
 
 type knownSeriesCache struct {
@@ -103,6 +105,7 @@ func newServer(cfg Config) *Server {
 		seriesMu:    &sync.Mutex{},
 		knownSeries: &knownSeriesCache{ids: make(map[remoteWriteSeriesKey]struct{})},
 		metrics:     metrics,
+		rangeCache:  newRangeResultCache(cfg, metrics),
 	}
 }
 
@@ -293,6 +296,7 @@ func (s *Server) withTeamID(teamID uint64) *Server {
 		seriesMu:    s.seriesMu,
 		knownSeries: s.knownSeries,
 		metrics:     s.metrics,
+		rangeCache:  s.rangeCache,
 	}
 }
 
@@ -428,62 +432,27 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
-	query = prepared.query
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
 
 	queryStarted := time.Now()
-	if !prepared.runningSum {
-		if value, handled, err := s.tryCompactHistogramRange(ctx, query, start, end, step); handled {
-			recordQueryLogBackend(w, "compact_histogram")
-			if err != nil {
-				s.metrics.observePromQLQuery("range", "compact_histogram", "error", time.Since(queryStarted), 0, 0, 0)
-				writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
-				return
-			}
-			series, samples, histograms := valueStats(value)
-			s.metrics.observePromQLQuery("range", "compact_histogram", "ok", time.Since(queryStarted), series, samples, histograms)
-			writeAPISuccess(w, responseDataFromValue(value))
-			return
-		}
-	}
-	recordQueryLogBackend(w, "fastpath_range")
-	if data, ok, err := s.tryFastRangeQuery(ctx, prepared, start, end, step); ok {
-		recordQueryLogPhase(w, "eval", time.Since(queryStarted))
-		if err != nil {
-			s.metrics.observePromQLQuery("range", "fastpath_range", "error", time.Since(queryStarted), 0, 0, 0)
-			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
-			return
-		}
-		series, samples, histograms := queryDataStats(data)
-		s.metrics.observePromQLQuery("range", "fastpath_range", "ok", time.Since(queryStarted), series, samples, histograms)
-		writeAPISuccessTimed(w, data)
-		return
-	}
-	recordQueryLogBackend(w, "prometheus")
-	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
-	if err != nil {
-		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
-		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
-		return
-	}
-	defer q.Close()
-
-	result := q.Exec(ctx)
+	result, cacheStatus, queryErr := s.cachedRangeQuery(ctx, query, prepared, start, end, step, r.Form.Get("nocache") == "1")
+	recordQueryLogBackend(w, result.backend)
 	recordQueryLogPhase(w, "eval", time.Since(queryStarted))
-	if result.Err != nil {
-		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
-		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
+	if cacheStatus != "" {
+		recordQueryLogCache(w, cacheStatus)
+		s.metrics.observeRangeCacheRequest(cacheStatus)
+		w.Header().Set(rangeCacheHeader, cacheStatus)
+	}
+	if queryErr != nil {
+		s.metrics.observePromQLQuery("range", result.backend, "error", time.Since(queryStarted), 0, 0, 0)
+		writeAPIError(w, queryErr.status, queryErr.errorType, queryErr.err)
 		return
 	}
-	value := metricsQLValue(result.Value)
-	if prepared.runningSum {
-		value = metricsQLRunningSum(value)
-	}
-	series, samples, histograms := valueStats(value)
-	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	series, samples, histograms := result.stats()
+	s.metrics.observePromQLQuery("range", result.backend, "ok", time.Since(queryStarted), series, samples, histograms)
+	writeAPISuccessTimed(w, result.data())
 }
 
 // writeAPISuccessTimed writes the API response and times its encoding phase.
