@@ -362,10 +362,22 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	queryStarted = time.Now()
-	recordQueryLogBackend(w, "prometheus")
-	q, err := s.engine.NewInstantQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, ts)
+	backend := "prometheus"
+	var queryable storage.Queryable = s.queryable
+	rewritten, pushdown, pushed, err := s.planHistogramPushdown(ctx, query, []int64{ts.UnixMilli()})
 	if err != nil {
-		s.metrics.observePromQLQuery("instant", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
+		recordQueryLogBackend(w, "histogram_pushdown")
+		s.metrics.observePromQLQuery("instant", "histogram_pushdown", "error", time.Since(queryStarted), 0, 0, 0)
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
+	if pushed {
+		backend, query, queryable = "histogram_pushdown", rewritten, pushdown
+	}
+	recordQueryLogBackend(w, backend)
+	q, err := s.engine.NewInstantQuery(ctx, queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, ts)
+	if err != nil {
+		s.metrics.observePromQLQuery("instant", backend, "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
@@ -374,13 +386,16 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	result := q.Exec(ctx)
 	recordQueryLogPhase(w, "eval", time.Since(queryStarted))
 	if result.Err != nil {
-		s.metrics.observePromQLQuery("instant", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
+		s.metrics.observePromQLQuery("instant", backend, "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
 	value := metricsQLValue(result.Value)
+	if pushed {
+		value = stripHistogramPushdownNames(value)
+	}
 	series, samples, histograms := valueStats(value)
-	s.metrics.observePromQLQuery("instant", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
+	s.metrics.observePromQLQuery("instant", backend, "ok", time.Since(queryStarted), series, samples, histograms)
 	writeAPISuccessTimed(w, responseDataFromValue(value))
 }
 
@@ -434,7 +449,19 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	queryStarted := time.Now()
-	if !prepared.runningSum {
+	backend := "prometheus"
+	var queryable storage.Queryable = s.queryable
+	rewritten, pushdown, pushed, err := s.planHistogramPushdown(ctx, query, rangeEvalTimes(start, end, step))
+	if err != nil {
+		recordQueryLogBackend(w, "histogram_pushdown")
+		s.metrics.observePromQLQuery("range", "histogram_pushdown", "error", time.Since(queryStarted), 0, 0, 0)
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
+	if pushed {
+		backend, query, queryable = "histogram_pushdown", rewritten, pushdown
+	}
+	if !pushed && !prepared.runningSum {
 		if value, handled, err := s.tryCompactHistogramRange(ctx, query, start, end, step); handled {
 			recordQueryLogBackend(w, "compact_histogram")
 			if err != nil {
@@ -448,23 +475,25 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	recordQueryLogBackend(w, "fastpath_range")
-	if data, ok, err := s.tryFastRangeQuery(ctx, prepared, start, end, step); ok {
-		recordQueryLogPhase(w, "eval", time.Since(queryStarted))
-		if err != nil {
-			s.metrics.observePromQLQuery("range", "fastpath_range", "error", time.Since(queryStarted), 0, 0, 0)
-			writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+	if !pushed {
+		recordQueryLogBackend(w, "fastpath_range")
+		if data, ok, err := s.tryFastRangeQuery(ctx, prepared, start, end, step); ok {
+			recordQueryLogPhase(w, "eval", time.Since(queryStarted))
+			if err != nil {
+				s.metrics.observePromQLQuery("range", "fastpath_range", "error", time.Since(queryStarted), 0, 0, 0)
+				writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+				return
+			}
+			series, samples, histograms := queryDataStats(data)
+			s.metrics.observePromQLQuery("range", "fastpath_range", "ok", time.Since(queryStarted), series, samples, histograms)
+			writeAPISuccessTimed(w, data)
 			return
 		}
-		series, samples, histograms := queryDataStats(data)
-		s.metrics.observePromQLQuery("range", "fastpath_range", "ok", time.Since(queryStarted), series, samples, histograms)
-		writeAPISuccessTimed(w, data)
-		return
 	}
-	recordQueryLogBackend(w, "prometheus")
-	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
+	recordQueryLogBackend(w, backend)
+	q, err := s.engine.NewRangeQuery(ctx, queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {
-		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
+		s.metrics.observePromQLQuery("range", backend, "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusBadRequest, "bad_data", err)
 		return
 	}
@@ -473,20 +502,37 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	result := q.Exec(ctx)
 	recordQueryLogPhase(w, "eval", time.Since(queryStarted))
 	if result.Err != nil {
-		s.metrics.observePromQLQuery("range", "prometheus", "error", time.Since(queryStarted), 0, 0, 0)
+		s.metrics.observePromQLQuery("range", backend, "error", time.Since(queryStarted), 0, 0, 0)
 		writeAPIError(w, http.StatusUnprocessableEntity, "execution", result.Err)
 		return
 	}
 	value := metricsQLValue(result.Value)
+	if pushed {
+		value = stripHistogramPushdownNames(value)
+	}
 	if prepared.runningSum {
 		value = metricsQLRunningSum(value)
 	}
 	series, samples, histograms := valueStats(value)
-	s.metrics.observePromQLQuery("range", "prometheus", "ok", time.Since(queryStarted), series, samples, histograms)
+	s.metrics.observePromQLQuery("range", backend, "ok", time.Since(queryStarted), series, samples, histograms)
 	writeAPISuccessTimed(w, responseDataFromValue(value))
 }
 
 // writeAPISuccessTimed writes the API response and times its encoding phase.
+// rangeEvalTimes returns the evaluation times of a range query in
+// milliseconds, as the engine steps them.
+func rangeEvalTimes(start, end time.Time, step time.Duration) []int64 {
+	first, last, interval := start.UnixMilli(), end.UnixMilli(), step.Milliseconds()
+	if interval <= 0 || last < first || (last-first)/interval >= maxRangePushdownPoints {
+		return nil
+	}
+	times := make([]int64, 0, (last-first)/interval+1)
+	for t := first; t <= last; t += interval {
+		times = append(times, t)
+	}
+	return times
+}
+
 func writeAPISuccessTimed(w http.ResponseWriter, data any) {
 	started := time.Now()
 	writeAPISuccess(w, data)

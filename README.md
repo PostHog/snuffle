@@ -569,6 +569,18 @@ quantiles joined with `or` without `on` or `ignoring`. Quantiles of the same
 buckets read the buckets once.
 `CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
 
+Over delta histograms, `rate`, `increase`, `increase_pure`, and `delta` read the
+sum of the points in each window. The histogram pushdown sums those windows in
+ClickHouse, for instant and range queries, so a week of a delta histogram
+returns one point per series and evaluation time instead of every raw row. The
+engine then evaluates the rest of the expression (`and ignoring(le)`, `sum by`,
+`histogram_quantile`, division) over those points. `PROMQL_MAX_SAMPLES` counts
+the cells ClickHouse returns, not raw bucket values. The pushdown needs an exact
+`_bucket`, `_count`, or `_sum` name, an explicit or step window, and no offset
+or subquery around the rollup. Cumulative or exponential histograms, invalid
+bucket layouts, stored series with the generated name, and queries that read
+`__name__` or call label functions use the paths above.
+
 The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native
 histograms, not these OpenTelemetry arrays.
 
@@ -630,6 +642,7 @@ Snuffle is configured with environment variables.
 | `SNUFFLE_TLS_CERT_FILE` | empty | PEM server certificate; omit with the key to generate a self-signed certificate |
 | `SNUFFLE_TLS_KEY_FILE` | empty | PEM private key; required with the certificate |
 | `SNUFFLE_PPROF` | `false` | Expose Go pprof handlers under `/debug/pprof/` |
+| `SNUFFLE_POSTHOG_HISTOGRAM_PUSHDOWN` | `true` | Sum `rate`, `increase`, `increase_pure`, and `delta` windows over delta histogram series in ClickHouse for instant and range queries; unsupported data falls back to the other paths. Set `false` to read raw histogram rows as before |
 | `SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS` | `true` | Evaluate exact histogram quantile range queries over `sum by (le)` of `rate`, `irate`, `increase`, `delta`, or `idelta` without expanding bucket series; unsupported data falls back to the general engine. Set `false` to send every histogram query to the general engine |
 
 ### ClickHouse connection

@@ -59,14 +59,16 @@ type Config struct {
 	QueryTagsHeader             string
 	Pprof                       bool
 	PostHogCompactHistograms    bool
-	SelfScrapeEnabled           bool
-	SelfScrapeInterval          time.Duration
-	SelfScrapeTeamID            uint64
-	SelfScrapeJob               string
-	SelfScrapeInstance          string
-	LogRetention                time.Duration
-	LogQueryMaxRows             int
-	MetricsRetention            time.Duration
+	// PostHogHistogramPushdown sums delta histogram windows in ClickHouse.
+	PostHogHistogramPushdown bool
+	SelfScrapeEnabled        bool
+	SelfScrapeInterval       time.Duration
+	SelfScrapeTeamID         uint64
+	SelfScrapeJob            string
+	SelfScrapeInstance       string
+	LogRetention             time.Duration
+	LogQueryMaxRows          int
+	MetricsRetention         time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -168,6 +170,7 @@ func ConfigFromEnv() Config {
 		QueryTagsHeader:             getenv("SNUFFLE_QUERY_TAGS_HEADER", "X-PostHog-Query-Tags"),
 		Pprof:                       envBool("SNUFFLE_PPROF", false),
 		PostHogCompactHistograms:    envBool("SNUFFLE_POSTHOG_COMPACT_HISTOGRAMS", true),
+		PostHogHistogramPushdown:    envBool("SNUFFLE_POSTHOG_HISTOGRAM_PUSHDOWN", true),
 		SelfScrapeEnabled:           envBool("SNUFFLE_SELF_SCRAPE_ENABLED", true),
 		SelfScrapeInterval:          envDurationAllowZero("SNUFFLE_SELF_SCRAPE_INTERVAL", 15*time.Second),
 		SelfScrapeTeamID:            envUint64("SNUFFLE_SELF_SCRAPE_TEAM_ID", defaultTeamID),
