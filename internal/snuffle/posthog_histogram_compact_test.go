@@ -341,7 +341,9 @@ func TestCompactHistogramFallbackAndLimits(test *testing.T) {
 	for _, limit := range []string{"samples", "series"} {
 		cfg := histogramTestConfig()
 		if limit == "samples" {
-			cfg.MaxSamples = 2
+			// The grid holds 2 steps of 3 buckets, which leaves 2 samples for
+			// the 3 buckets of the first point.
+			cfg.MaxSamples = 8
 		} else {
 			cfg.MaxSeries = 2
 		}
@@ -355,5 +357,40 @@ func TestCompactHistogramFallbackAndLimits(test *testing.T) {
 	evaluator := newCompactHistogramEvaluator(plan, histogramTestConfig())
 	if err := evaluator.add(ctx, histogramTestSample()); !errors.Is(err, context.Canceled) {
 		test.Fatal(err)
+	}
+}
+
+// TestCompactHistogramLimitCountsHeldSamples checks that a long range reads
+// more samples than the limit when it holds fewer at once: one source series
+// keeps only the points inside its selector range.
+func TestCompactHistogramLimitCountsHeldSamples(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	plan, _ := compactTestPlan(test, `histogram_quantile(0.5,sum by(le)(rate(duration_bucket[5m])))`, start, start.Add(time.Hour), time.Minute)
+	if plan == nil {
+		test.Fatal("no compact plan")
+	}
+	read := func(maxSamples int) error {
+		cfg := histogramTestConfig()
+		cfg.MaxSamples = maxSamples
+		evaluator := newCompactHistogramEvaluator(plan, cfg)
+		sample := histogramTestSample()
+		for index := 0; index <= 280; index++ {
+			sample.timestamp = start.Add(-10*time.Minute + time.Duration(index)*15*time.Second).UnixMilli()
+			sample.counts = []uint64{uint64(index), uint64(index), uint64(index)}
+			sample.count = uint64(3 * index)
+			if err := evaluator.add(context.Background(), sample); err != nil {
+				return err
+			}
+		}
+		_, err := evaluator.result(context.Background())
+		return err
+	}
+	// 281 points of 3 buckets read 843 samples. The 61-step grid holds 183
+	// and the 10-minute selector range at most 42 points, or 126 samples.
+	if err := read(400); err != nil {
+		test.Fatalf("read 843 samples holding at most 309: %v", err)
+	}
+	if err := read(250); err == nil || !strings.Contains(err.Error(), "sample limit exceeded") {
+		test.Fatalf("wanted sample limit error, got %v", err)
 	}
 }

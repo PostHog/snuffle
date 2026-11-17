@@ -162,17 +162,17 @@ func (sum *compactHistogramSum) add(value float64) {
 // For each bucket it keeps the points inside the selector range, which are
 // the points that the engine passes to the counter function.
 type compactHistogramEvaluator struct {
-	plan                  *compactHistogramPlan
-	cfg                   Config
-	buckets               map[string][]compactHistogramSum
-	columns               [][]compactHistogramSum
-	bounds                []float64
-	current               []float64
-	history               [][]promql.FPoint
-	sourceID              uint64
-	haveSource            bool
-	grid, samples, series int
-	output                int
+	plan         *compactHistogramPlan
+	cfg          Config
+	buckets      map[string][]compactHistogramSum
+	columns      [][]compactHistogramSum
+	bounds       []float64
+	current      []float64
+	history      [][]promql.FPoint
+	sourceID     uint64
+	haveSource   bool
+	grid, series int
+	output       int
 }
 
 func newCompactHistogramEvaluator(plan *compactHistogramPlan, cfg Config) *compactHistogramEvaluator {
@@ -242,10 +242,6 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 	if len(sample.counts) != len(sample.bounds)+1 {
 		return errCompactHistogramFallback
 	}
-	if evaluator.cfg.MaxSamples > 0 && len(sample.counts) > evaluator.cfg.MaxSamples-evaluator.samples {
-		return fmt.Errorf("histogram sample limit exceeded (%d); shorten the time range or tighten matchers", evaluator.cfg.MaxSamples)
-	}
-	evaluator.samples += len(sample.counts)
 	if !evaluator.haveSource {
 		if len(sample.counts) > evaluator.cfg.MaxSeries-evaluator.series {
 			return fmt.Errorf("histogram series limit exceeded (%d); tighten matchers", evaluator.cfg.MaxSeries)
@@ -281,6 +277,13 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		return err
 	}
 	times := evaluator.history[0]
+	// The limit counts the samples held at once, as the Prometheus engine
+	// does: the in-range points of the current source series and the summed
+	// step grid. Rows stream in one source at a time, so a long range reads
+	// many more samples than it holds.
+	if held := (len(times) + 1) * len(sample.counts); evaluator.cfg.MaxSamples > 0 && held > evaluator.cfg.MaxSamples-len(evaluator.buckets)*evaluator.plan.steps {
+		return fmt.Errorf("histogram sample limit exceeded (%d); shorten the time range or tighten matchers", evaluator.cfg.MaxSamples)
+	}
 	duplicate := len(times) > 0 && times[len(times)-1].T == sample.timestamp
 	if len(times) > 0 && times[len(times)-1].T > sample.timestamp {
 		return errCompactHistogramFallback
