@@ -249,6 +249,12 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		evaluator.series += len(sample.counts)
 		evaluator.bounds = append(evaluator.bounds[:0], sample.bounds...)
 		evaluator.current = make([]float64, len(sample.counts))
+		// A narrower source must not keep a wider one's points reachable
+		// through the backing array: the limit counts only the current
+		// source's history.
+		if retained := evaluator.history[:cap(evaluator.history)]; len(sample.counts) < len(retained) {
+			clear(retained[len(sample.counts):])
+		}
 		evaluator.history = slices.Grow(evaluator.history[:0], len(sample.counts))[:len(sample.counts)]
 		for index := range evaluator.history {
 			evaluator.history[index] = evaluator.history[index][:0]

@@ -394,3 +394,32 @@ func TestCompactHistogramLimitCountsHeldSamples(test *testing.T) {
 		test.Fatalf("wanted sample limit error, got %v", err)
 	}
 }
+
+// TestCompactHistogramReleasesNarrowerSourceHistory checks that a source with
+// fewer buckets does not keep the previous source's points reachable, since
+// the limit counts only the current source's history.
+func TestCompactHistogramReleasesNarrowerSourceHistory(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	plan, _ := compactTestPlan(test, `histogram_quantile(0.5,sum by(le)(rate(duration_bucket[5m])))`, start, start.Add(time.Hour), time.Minute)
+	if plan == nil {
+		test.Fatal("no compact plan")
+	}
+	evaluator := newCompactHistogramEvaluator(plan, histogramTestConfig())
+	wide := histogramTestSample()
+	wide.bounds, wide.counts, wide.count = []float64{0.25, 0.5, 1}, []uint64{1, 2, 3, 4}, 10
+	wide.timestamp = start.UnixMilli()
+	if err := evaluator.add(context.Background(), wide); err != nil {
+		test.Fatal(err)
+	}
+	narrow := histogramTestSample()
+	narrow.id = 2
+	narrow.timestamp = start.UnixMilli()
+	if err := evaluator.add(context.Background(), narrow); err != nil {
+		test.Fatal(err)
+	}
+	for index, points := range evaluator.history[len(narrow.counts):cap(evaluator.history)] {
+		if points != nil {
+			test.Fatalf("history entry %d past the current source still retains capacity for %d points", len(narrow.counts)+index, cap(points))
+		}
+	}
+}
