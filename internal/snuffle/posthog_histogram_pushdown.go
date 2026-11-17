@@ -161,9 +161,12 @@ func (s *Server) planHistogramPushdown(ctx context.Context, query string, times 
 	}
 	replacements := make(map[*parser.Call]parser.Expr, len(candidates))
 	series := make(map[string][]*seriesMeta, len(candidates))
+	// budget is the number of points the candidates may materialize between
+	// them; every series holds one point per evaluation time.
+	budget := s.cfg.MaxSamples
 	for index, candidate := range candidates {
 		name := histogramPushdownPrefix + strconv.Itoa(index) + candidate.alias.suffix
-		metas, ok, err := s.histogramPushdownSeries(ctx, candidate, times, name)
+		metas, ok, err := s.histogramPushdownSeries(ctx, candidate, times, name, &budget)
 		if err != nil {
 			return "", nil, false, err
 		}
@@ -226,7 +229,7 @@ type histogramPushdownSeries struct {
 
 // histogramPushdownSeries evaluates one rollup at every evaluation time. It
 // reports false when the selected data needs the engine.
-func (s *Server) histogramPushdownSeries(ctx context.Context, candidate histogramPushdownCall, times []int64, name string) ([]*seriesMeta, bool, error) {
+func (s *Server) histogramPushdownSeries(ctx context.Context, candidate histogramPushdownCall, times []int64, name string, budget *int) ([]*seriesMeta, bool, error) {
 	first, last := times[0], times[len(times)-1]
 	// One evaluation time needs only the cell (t-w, t]. A grid step of w makes
 	// both grids the same, so every point in the window lands in that cell.
@@ -320,8 +323,19 @@ func (s *Server) histogramPushdownSeries(ctx context.Context, candidate histogra
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
+	// Every series expands to len(times) points, stale markers included, so
+	// charge the expansion before allocating it.
+	if s.cfg.MaxSamples > 0 {
+		if len(keys) > *budget/len(times) {
+			return nil, false, fmt.Errorf("histogram sample limit exceeded (%d); shorten the time range or tighten matchers", s.cfg.MaxSamples)
+		}
+		*budget -= len(keys) * len(times)
+	}
 	out := make([]*seriesMeta, 0, len(keys))
 	for _, key := range keys {
+		if err := ctx.Err(); err != nil {
+			return nil, false, err
+		}
 		series := bySeries[key]
 		samples, present := histogramPushdownWindows(series.cells, times, candidate.window, candidate.name == "rate")
 		if !present {

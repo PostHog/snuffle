@@ -106,3 +106,18 @@ func TestHistogramPushdownRewriteParses(test *testing.T) {
 		test.Fatalf("rewritten query does not parse: %v", err)
 	}
 }
+
+func TestRangeEvalTimesNearInt64Limit(test *testing.T) {
+	// 9223372036854774s is ~1.6s below the int64 millisecond limit, so
+	// stepping past end overflows. The loop must still stop after one point.
+	end := time.UnixMilli(9223372036854774000)
+	times := rangeEvalTimes(end, end, 2*time.Second)
+	if len(times) != 1 || times[0] != end.UnixMilli() {
+		test.Fatalf("want one evaluation time, got %v", times)
+	}
+	start := time.UnixMilli(9223372036854770000)
+	times = rangeEvalTimes(start, end, 2*time.Second)
+	if len(times) != 3 || times[2] != end.UnixMilli() {
+		test.Fatalf("want three evaluation times, got %v", times)
+	}
+}

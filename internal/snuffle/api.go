@@ -527,7 +527,9 @@ func rangeEvalTimes(start, end time.Time, step time.Duration) []int64 {
 		return nil
 	}
 	times := make([]int64, 0, (last-first)/interval+1)
-	for t := first; t <= last; t += interval {
+	// Count iterations instead of comparing t to last: t+interval can
+	// overflow near the int64 limit and wrap below last.
+	for t, remaining := first, (last-first)/interval+1; remaining > 0; t, remaining = t+interval, remaining-1 {
 		times = append(times, t)
 	}
 	return times
