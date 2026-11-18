@@ -68,7 +68,8 @@ func TestCompactHistogramPlans(test *testing.T) {
 	}
 }
 
-func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, query string, start, end time.Time, step time.Duration) {
+// compactHistogramMatrix evaluates query with the compact evaluator.
+func compactHistogramMatrix(test *testing.T, cfg Config, samples []postHogHistogramSample, query string, start, end time.Time, step time.Duration) (promql.Matrix, error) {
 	test.Helper()
 	prepared, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start, end)
 	if err != nil {
@@ -82,8 +83,6 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 	if branches == nil {
 		test.Fatal("missing compact plan")
 	}
-	cfg := histogramTestConfig()
-	cfg.MaxSamples, cfg.MaxSeries = 1000000, 10000
 	evaluators := make(map[string]*compactHistogramEvaluator)
 	var union compactHistogramUnion
 	for _, branch := range branches {
@@ -93,11 +92,11 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 			evaluator = newCompactHistogramEvaluator(branch.plan, cfg)
 			for _, sample := range samples {
 				if err := evaluator.add(context.Background(), sample); err != nil {
-					test.Fatal(err)
+					return nil, err
 				}
 			}
 			if err := evaluator.advance(context.Background(), 0, true); err != nil {
-				test.Fatal(err)
+				return nil, err
 			}
 			evaluators[key] = evaluator
 		}
@@ -106,23 +105,40 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 			matrix, err = applyCompactSeriesFunctions(matrix, branch.functions)
 		}
 		if err != nil {
-			test.Fatal(err)
+			return nil, err
 		}
 		union.add(matrix)
 	}
-	actual := union.matrix()
-	builder := newPostHogHistogramSeriesBuilder(cfg, branches[0].plan.selector.LabelMatchers, true)
+	return union.matrix(), nil
+}
+
+// engineHistogramMatrix evaluates query with the general path: the histogram
+// builder makes the bucket series, and the engine evaluates the query over
+// them. The queryable returns a futureSeriesSet, as CHQuerier.Select does, so
+// counter rollups read the window sums of delta series.
+func engineHistogramMatrix(test *testing.T, cfg Config, samples []postHogHistogramSample, query string, start, end time.Time, step time.Duration) (promql.Matrix, error) {
+	test.Helper()
+	prepared, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start, end)
+	if err != nil {
+		test.Fatal(err)
+	}
+	builder := newPostHogHistogramSeriesBuilder(cfg, nil, true)
 	for _, sample := range samples {
 		if err := builder.add(sample, []string{"_bucket"}); err != nil {
-			test.Fatal(err)
+			return nil, err
 		}
 	}
-	queryable := &storage.MockQueryable{MockQuerier: &storage.MockQuerier{SelectMockFunction: func(_ bool, _ *storage.SelectHints, _ ...*labels.Matcher) storage.SeriesSet {
-		var series []storage.Series
-		for _, meta := range builder.series {
-			series = append(series, meta)
+	series := builder.finish()
+	queryable := &storage.MockQueryable{MockQuerier: &storage.MockQuerier{SelectMockFunction: func(_ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+		var selected []*seriesMeta
+		for _, meta := range series {
+			if matchesAll(meta.labelMap, matchers) {
+				selected = append(selected, meta)
+			}
 		}
-		return &seriesSet{series: series, idx: -1}
+		future := &selectFuture{done: make(chan struct{}), series: selected, delta: newDeltaSeriesIndex(selected)}
+		close(future.done)
+		return &futureSeriesSet{future: future}
 	}}}
 	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: cfg.MaxSamples, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true})
 	engineQuery, err := engine.NewRangeQuery(context.Background(), queryable, promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, start, end, step)
@@ -132,9 +148,13 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 	defer engineQuery.Close()
 	response := engineQuery.Exec(context.Background())
 	if response.Err != nil {
-		test.Fatal(response.Err)
+		return nil, response.Err
 	}
-	expected := metricsQLValue(response.Value).(promql.Matrix)
+	return metricsQLValue(response.Value).(promql.Matrix), nil
+}
+
+func assertSameHistogramMatrix(test *testing.T, actual, expected promql.Matrix) {
+	test.Helper()
 	if len(actual) != len(expected) {
 		test.Fatalf("series count: %d != %d", len(actual), len(expected))
 	}
@@ -154,6 +174,21 @@ func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, 
 			}
 		}
 	}
+}
+
+func compareCompactHistogram(test *testing.T, samples []postHogHistogramSample, query string, start, end time.Time, step time.Duration) {
+	test.Helper()
+	cfg := histogramTestConfig()
+	cfg.MaxSamples, cfg.MaxSeries = 1000000, 10000
+	actual, err := compactHistogramMatrix(test, cfg, samples, query, start, end, step)
+	if err != nil {
+		test.Fatal(err)
+	}
+	expected, err := engineHistogramMatrix(test, cfg, samples, query, start, end, step)
+	if err != nil {
+		test.Fatal(err)
+	}
+	assertSameHistogramMatrix(test, actual, expected)
 }
 
 func TestCompactHistogramMatchesEngine(test *testing.T) {
@@ -249,6 +284,118 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 	}
 }
 
+// deltaHistogramTestSamples returns delta histogram points of three sources
+// with irregular intervals, gaps, and points that share a timestamp, such as
+// points from several clients.
+func deltaHistogramTestSamples(random *rand.Rand, from, until int64) []postHogHistogramSample {
+	var samples []postHogHistogramSample
+	for source := 0; source < 3; source++ {
+		timestamp := from
+		bounds := []float64{0.5, 1}
+		if source == 1 {
+			bounds = []float64{-1, 2}
+		}
+		for point := 0; ; point++ {
+			timestamp += int64(5000 + random.Intn(55000))
+			if point%13 == 0 {
+				timestamp += 180000
+			}
+			// A gap longer than the lookback leaves a window whose baseline
+			// point is outside the selector range.
+			if point%17 == 5 {
+				timestamp += 420000
+			}
+			if timestamp > until {
+				break
+			}
+			for copies := 1 + point%3/2; copies > 0; copies-- {
+				counts := []uint64{uint64(random.Intn(5)), uint64(random.Intn(20)), uint64(random.Intn(3))}
+				sample := histogramTestSample()
+				sample.id, sample.metricName, sample.timestamp, sample.temporality = uint64(source+1), "duration", timestamp, "delta"
+				sample.serviceName = fmt.Sprintf("service-%d", source)
+				sample.bounds, sample.counts = bounds, counts
+				sample.count = counts[0] + counts[1] + counts[2]
+				samples = append(samples, sample)
+			}
+		}
+	}
+	return samples
+}
+
+// TestCompactHistogramDeltaMatchesEngine checks that the compact path gives
+// the general path's result over delta histograms: rate, increase and delta
+// read the sum of the delta points in each window.
+func TestCompactHistogramDeltaMatchesEngine(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	random := rand.New(rand.NewSource(7))
+	for iteration := 0; iteration < 30; iteration++ {
+		samples := deltaHistogramTestSamples(random, start.Add(-10*time.Minute).UnixMilli(), start.Add(20*time.Minute).UnixMilli())
+		window := ""
+		if iteration%2 == 0 {
+			window = "[2m]"
+		}
+		function := []string{"rate", "increase", "delta"}[iteration%3]
+		query := `histogram_quantiles("p", 0, 0.5, 0.95, 1, sum by(le)(` + function + `(duration_bucket` + window + `)))`
+		compareCompactHistogram(test, samples, query, start, start.Add(20*time.Minute), 30*time.Second)
+	}
+	samples := deltaHistogramTestSamples(random, start.Add(-10*time.Minute).UnixMilli(), start.Add(20*time.Minute).UnixMilli())
+	for _, query := range []string{
+		`histogram_quantile(0.95, sum by (le) (rate({__name__="duration_bucket"}[5m])))`,
+		`histogram_quantile(0.5, sum by (le) (increase(duration_bucket[45s])))`,
+		`label_replace(histogram_quantile(0.5, sum by (le) (rate(duration_bucket))), "q", "a", "", "") or label_replace(histogram_quantile(0.9, sum by (le) (rate(duration_bucket))), "q", "b", "", "")`,
+	} {
+		compareCompactHistogram(test, samples, query, start, start.Add(20*time.Minute), time.Minute)
+	}
+}
+
+// TestCompactHistogramDeltaLimitCountsHeldSamples checks that a long range of
+// a delta histogram reads more samples than the limit as long as it holds
+// fewer, while the general path, which keeps every point it reads, fails. The
+// compact result matches the general path with a limit that fits every point.
+func TestCompactHistogramDeltaLimitCountsHeldSamples(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	end := start.Add(6 * time.Hour)
+	query := `histogram_quantile(0.95, sum by (le) (rate({__name__="duration_bucket"}[5m])))`
+	var samples []postHogHistogramSample
+	for source := 0; source < 2; source++ {
+		for timestamp := start.Add(-5 * time.Minute).UnixMilli(); timestamp <= end.UnixMilli(); timestamp += 10000 {
+			sample := histogramTestSample()
+			sample.id, sample.metricName, sample.timestamp, sample.temporality = uint64(source+1), "duration", timestamp, "delta"
+			sample.serviceName = fmt.Sprintf("service-%d", source)
+			sample.counts = []uint64{uint64(timestamp/10000%7) + 1, uint64(timestamp/10000%5) * 3, uint64(source)}
+			sample.count = sample.counts[0] + sample.counts[1] + sample.counts[2]
+			samples = append(samples, sample)
+		}
+	}
+	// Two sources of about 2,200 points and 3 buckets read about 13,000
+	// samples. The 73-step grid holds 219 and the 10-minute selector range at
+	// most 61 points, or 183 samples.
+	limited := histogramTestConfig()
+	limited.MaxSamples, limited.MaxSeries = 2000, 10000
+	if _, err := engineHistogramMatrix(test, limited, samples, query, start, end, 5*time.Minute); err == nil || !strings.Contains(err.Error(), "histogram sample limit exceeded") {
+		test.Fatalf("general path: wanted sample limit error, got %v", err)
+	}
+	actual, err := compactHistogramMatrix(test, limited, samples, query, start, end, 5*time.Minute)
+	if err != nil {
+		test.Fatalf("compact path: %v", err)
+	}
+	if len(actual) != 1 || len(actual[0].Floats) != 73 {
+		test.Fatalf("compact path returned %v", actual)
+	}
+	generous := histogramTestConfig()
+	generous.MaxSamples, generous.MaxSeries = 1000000, 10000
+	expected, err := engineHistogramMatrix(test, generous, samples, query, start, end, 5*time.Minute)
+	if err != nil {
+		test.Fatal(err)
+	}
+	assertSameHistogramMatrix(test, actual, expected)
+	tight := limited
+	tight.MaxSamples = 300
+	if _, err := compactHistogramMatrix(test, tight, samples, query, start, end, 5*time.Minute); err == nil || !strings.Contains(err.Error(), "sample limit exceeded") {
+		test.Fatalf("compact path: wanted sample limit error, got %v", err)
+	}
+}
+
 func TestCompactHistogramUnionKeepsNaNSignatures(test *testing.T) {
 	var union compactHistogramUnion
 	union.add(promql.Matrix{{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 1, F: math.NaN()}, {T: 2, F: 1}}}})
@@ -302,7 +449,7 @@ func TestCompactHistogramUnionPlans(test *testing.T) {
 func TestCompactHistogramFallbackAndLimits(test *testing.T) {
 	start := time.Unix(1700000000, 0)
 	plan, _ := compactTestPlan(test, `histogram_quantile(0.5,sum by(le)(irate(duration_bucket)))`, start, start.Add(time.Minute), time.Minute)
-	for _, change := range []string{"bounds", "signed zero", "delta", "invalid bounds", "invalid counts", "overflow", "order", "duplicate"} {
+	for _, change := range []string{"bounds", "signed zero", "delta", "unknown temporality", "invalid bounds", "invalid counts", "overflow", "order", "duplicate"} {
 		test.Run(change, func(test *testing.T) {
 			evaluator := newCompactHistogramEvaluator(plan, histogramTestConfig())
 			sample := histogramTestSample()
@@ -320,7 +467,10 @@ func TestCompactHistogramFallbackAndLimits(test *testing.T) {
 			case "signed zero":
 				sample.bounds = []float64{math.Copysign(0, -1), 1}
 			case "delta":
+				// A source that mixes temporalities has no running total.
 				sample.temporality = "delta"
+			case "unknown temporality":
+				sample.temporality = "unspecified"
 			case "invalid bounds":
 				sample.bounds = []float64{1, 0.5}
 			case "invalid counts":
@@ -334,6 +484,38 @@ func TestCompactHistogramFallbackAndLimits(test *testing.T) {
 				sample.counts = []uint64{1, 4, 5}
 			}
 			if err := evaluator.add(context.Background(), sample); !errors.Is(err, errCompactHistogramFallback) {
+				test.Fatalf("wanted fallback, got %v", err)
+			}
+		})
+	}
+	// A delta source falls back when it mixes temporalities, which the general
+	// path refuses, and for irate and idelta, which read the running total
+	// from the first point that the request reads.
+	ratePlan, _ := compactTestPlan(test, `histogram_quantile(0.5,sum by(le)(rate(duration_bucket)))`, start, start.Add(time.Minute), time.Minute)
+	for _, testcase := range []struct {
+		name  string
+		plan  *compactHistogramPlan
+		first string
+		then  string
+	}{
+		{"cumulative then delta", ratePlan, "cumulative", "delta"},
+		{"delta then cumulative", ratePlan, "delta", "cumulative"},
+		{"delta irate", plan, "delta", ""},
+	} {
+		test.Run(testcase.name, func(test *testing.T) {
+			evaluator := newCompactHistogramEvaluator(testcase.plan, histogramTestConfig())
+			sample := histogramTestSample()
+			sample.timestamp, sample.temporality = start.UnixMilli(), testcase.first
+			err := evaluator.add(context.Background(), sample)
+			if testcase.then != "" {
+				if err != nil {
+					test.Fatal(err)
+				}
+				sample.timestamp += 1000
+				sample.temporality = testcase.then
+				err = evaluator.add(context.Background(), sample)
+			}
+			if !errors.Is(err, errCompactHistogramFallback) {
 				test.Fatalf("wanted fallback, got %v", err)
 			}
 		})
