@@ -251,10 +251,7 @@ func (s *Server) postHogAggregateUnionPlan(expr *parser.AggregateExpr, start, en
 			seriesWhere = append(seriesWhere, seriesCondition)
 		}
 		plan.seriesSQL = postHogSelectedSeriesWhereSQL(s.cfg, seriesWhere, s.cfg.MaxSeries, plan.seriesGroupSelects())
-		where = append(where,
-			"series_fingerprint IN (SELECT series_id FROM selected_series)",
-			"metric_name IN (SELECT metric_name FROM selected_series)",
-		)
+		where = plan.sampleWhereFrom(where)
 	} else {
 		sampleCondition, ok := postHogUnionMatcherCondition(selectors, postHogSampleLabelExpr)
 		if !ok {

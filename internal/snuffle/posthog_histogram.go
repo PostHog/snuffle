@@ -61,7 +61,11 @@ func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, min
 	series := make([]*seriesMeta, 0, 64)
 	sources := make(map[uint64]postHogHistogramSource, 64)
 	ids := make([]uint64, 0, 64)
+	// Sources and component series share one capped scan, so the limit counts
+	// every row read.
+	rows := 0
 	err := q.queryable.client.QueryRows(ctx, postHogExactHistogramMetadataSQL(q.queryable.cfg, mint, maxt, alias, matchers), func(row clickHouseRow) error {
+		rows++
 		var id uint64
 		var source postHogHistogramSource
 		if err := row.Scan(&id, &source.metricName, &source.serviceName, &source.resource, &source.attributes); err != nil {
@@ -84,8 +88,8 @@ func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, min
 	if len(ids) >= q.queryable.cfg.MaxSeries {
 		return nil, nil, nil, fmt.Errorf("histogram series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	if len(series) >= q.queryable.cfg.MaxSeries {
-		return nil, nil, nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	if rows >= q.queryable.cfg.MaxSeries {
+		return nil, nil, nil, seriesLimitError(q.queryable.cfg.MaxSeries)
 	}
 	return series, sources, ids, nil
 }

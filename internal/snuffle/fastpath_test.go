@@ -78,7 +78,7 @@ func TestPostHogAggregateUnionPlanFactorsSingleVaryingLabel(t *testing.T) {
 		"timeSeriesLastToGrid",
 		"IN ('host_0','host_1')",
 		"metric_name = 'usage_user'",
-		"series_fingerprint IN (SELECT series_id FROM selected_series)",
+		"series_fingerprint IN (SELECT arrayJoin(series_ids) FROM (SELECT groupArray(series_id) AS series_ids FROM selected_series HAVING throwIf(count() >= 1000, 'series limit exceeded (1000); tighten matchers or increase CH_MAX_SERIES') = 0))",
 		"GROUP BY series_id",
 		"INNER JOIN selected_series USING series_id",
 		"x / 5",
@@ -630,7 +630,8 @@ func TestPostHogQueryPlanReadsSeriesTableOnlyForMapLabels(t *testing.T) {
 		t.Fatalf("series SQL must bound by hour bucket and collapse duplicates: %s", plan.seriesSQL)
 	}
 	where := strings.Join(plan.sampleWhere(), " AND ")
-	if !strings.Contains(where, "series_fingerprint IN (SELECT series_id FROM selected_series)") || strings.Contains(where, "metric_name IN (SELECT") {
+	// The LIMIT keeps an arbitrary subset, so reaching it must fail the query.
+	if !strings.Contains(where, "series_fingerprint IN (SELECT arrayJoin(series_ids) FROM (SELECT groupArray(series_id) AS series_ids FROM selected_series HAVING throwIf(count() >= 10, 'series limit exceeded (10); tighten matchers or increase CH_MAX_SERIES') = 0))") || strings.Contains(where, "metric_name IN (SELECT") {
 		t.Fatalf("samples filter with an exact metric name = %s", where)
 	}
 

@@ -744,7 +744,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `PROMQL_QUERY_TIMEOUT_SECONDS` | `30` | PromQL and LogQL query timeout in seconds |
 | `PROMQL_LOOKBACK_DELTA` | `5m` | PromQL lookback limit for automatic selector windows and counter history; also the default instant query step |
 | `PROMQL_MAX_SAMPLES` | `50000000` | Prometheus engine sample limit |
-| `CH_MAX_SERIES` | `1000000` | Maximum matching series selected from ClickHouse |
+| `CH_MAX_SERIES` | `1000000` | Maximum matching series selected from ClickHouse. A query that matches this many fails with `series limit exceeded` (HTTP 422) instead of returning partial results |
 | `CH_ID_CHUNK_SIZE` | `20000` | Series ID batch size for selective reads |
 | `CH_AGGREGATE_MAX_THREADS` | `1` | ClickHouse `max_threads` for pushed-down instant aggregations; `0` leaves the ClickHouse default |
 | `SNUFFLE_RANGE_PUSHDOWN` | `true` | Enable SQL range fast paths: native selectors, counter and basic over-time rollups, aggregations (including nested counts), scalar arithmetic, plain `or` unions, and outer `running_sum`; PostHog aggregate rollups are also supported. Unsupported expressions and native histogram data use the engine. `false` keeps every range query in the engine |
