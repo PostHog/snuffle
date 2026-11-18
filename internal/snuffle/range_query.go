@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/storage"
 )
 
 type rangeQueryError struct {
@@ -108,6 +109,15 @@ func (s *Server) evalRangeQuery(ctx context.Context, prepared metricsQLQuery, st
 }
 
 func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (rangeQueryResult, *rangeQueryError) {
+	// The histogram pushdown goes first: the compact histogram path would read
+	// every raw row of the same rollups.
+	rewritten, pushdown, pushed, err := s.planHistogramPushdown(ctx, prepared.query, rangeEvalTimes(start, end, step))
+	if err != nil {
+		return rangeQueryResult{backend: "histogram_pushdown"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
+	}
+	if pushed {
+		return s.evalRangeEngine(ctx, "histogram_pushdown", pushdown, rewritten, prepared.runningSum, start, end, step)
+	}
 	if !prepared.runningSum {
 		if matrix, handled, err := s.tryCompactHistogramRange(ctx, prepared.query, start, end, step); handled {
 			if err != nil {
@@ -122,21 +132,29 @@ func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQ
 		}
 		return rangeQueryResult{backend: "fastpath_range", floats: true, groups: groups}, nil
 	}
-	q, err := s.engine.NewRangeQuery(ctx, s.queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), prepared.query, start, end, step)
+	return s.evalRangeEngine(ctx, "prometheus", s.queryable, prepared.query, prepared.runningSum, start, end, step)
+}
+
+// evalRangeEngine evaluates query with the PromQL engine over queryable.
+func (s *Server) evalRangeEngine(ctx context.Context, backend string, queryable storage.Queryable, query string, runningSum bool, start, end time.Time, step time.Duration) (rangeQueryResult, *rangeQueryError) {
+	q, err := s.engine.NewRangeQuery(ctx, queryable, promql.NewPrometheusQueryOpts(false, s.cfg.LookbackDelta), query, start, end, step)
 	if err != nil {
-		return rangeQueryResult{backend: "prometheus"}, &rangeQueryError{status: http.StatusBadRequest, errorType: "bad_data", err: err}
+		return rangeQueryResult{backend: backend}, &rangeQueryError{status: http.StatusBadRequest, errorType: "bad_data", err: err}
 	}
 	defer q.Close()
 
 	result := q.Exec(ctx)
 	if result.Err != nil {
-		return rangeQueryResult{backend: "prometheus"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: result.Err}
+		return rangeQueryResult{backend: backend}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: result.Err}
 	}
 	value := metricsQLValue(result.Value)
-	if prepared.runningSum {
+	if backend == "histogram_pushdown" {
+		value = stripHistogramPushdownNames(value)
+	}
+	if runningSum {
 		value = metricsQLRunningSum(value)
 	}
-	return rangeQueryResultFromValue("prometheus", value), nil
+	return rangeQueryResultFromValue(backend, value), nil
 }
 
 // cachedRangeQuery returns an empty cache status when the cache is disabled.
