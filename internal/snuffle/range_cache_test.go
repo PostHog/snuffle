@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
@@ -493,6 +494,43 @@ func TestRangeCacheEvaluatesARequestOverTheSampleLimitWithoutTheCache(t *testing
 			}
 		})
 	}
+}
+
+// The engine can return a short label that is a part of a large buffer. The
+// size limit counts the label text, so an entry must not keep that buffer.
+func TestRangeCacheEntryDoesNotKeepTheBufferBehindALabel(t *testing.T) {
+	now := testRangeNow
+	base := now.UnixMilli()
+	buffer := strings.Repeat("x", 1<<20) + "job" + "api"
+	name, value := buffer[len(buffer)-6:len(buffer)-3], buffer[len(buffer)-3:]
+	eval := func(context.Context, time.Time, time.Time) (rangeQueryResult, *rangeQueryError) {
+		points := []samplePoint{{t: base - minutes(30), v: 1}}
+		return rangeQueryResult{backend: "test", floats: true, clickHouseAccepted: true, groups: []rangeAggregateGroup{{metric: map[string]string{name: value}, points: points}}}, nil
+	}
+	cache := newTestRangeCache(&now)
+	key := rangeCacheKeyParts{query: "q"}.key(0)
+	if _, _, err := cache.query(context.Background(), key, base-minutes(60), base, testRangeStep, false, verified, eval); err != nil {
+		t.Fatal(err)
+	}
+	entry := cache.get(key)
+	if entry == nil || len(entry.series) != 1 || entry.series[0].metric["job"] != "api" {
+		t.Fatalf("entry = %+v, want the series with its label", entry)
+	}
+	first := uintptr(unsafe.Pointer(unsafe.StringData(buffer)))
+	inBuffer := func(text string) bool {
+		address := uintptr(unsafe.Pointer(unsafe.StringData(text)))
+		return address >= first && address < first+uintptr(len(buffer))
+	}
+	for label, labelValue := range entry.series[0].metric {
+		if inBuffer(label) || inBuffer(labelValue) {
+			t.Fatalf("the entry keeps label %s=%s in the buffer of the evaluation", label, labelValue)
+		}
+	}
+	entry.series[0].labels.Range(func(label labels.Label) {
+		if inBuffer(label.Name) || inBuffer(label.Value) {
+			t.Fatalf("the entry keeps label %s=%s in the buffer of the evaluation", label.Name, label.Value)
+		}
+	})
 }
 
 // The cache shares a host with ClickHouse, so it must stay in its size limit.

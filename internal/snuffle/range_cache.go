@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -338,8 +339,16 @@ func (c *rangeResultCache) overSampleLimit(cached, fresh []rangeCacheSeries, sta
 func rangeCacheSeriesFromGroups(groups []rangeAggregateGroup) ([]rangeCacheSeries, bool) {
 	series := make([]rangeCacheSeries, 0, len(groups))
 	for _, group := range groups {
-		set := labels.FromMap(group.metric)
-		series = append(series, rangeCacheSeries{labels: set, id: string(set.Bytes(nil)), metric: group.metric, points: group.points})
+		// A label of an evaluated series can be a part of a much larger buffer of
+		// the engine. An entry that kept such a label would keep the whole
+		// buffer, which the size estimate does not count. The copies hold only
+		// the label text.
+		metric := make(map[string]string, len(group.metric))
+		for name, value := range group.metric {
+			metric[strings.Clone(name)] = strings.Clone(value)
+		}
+		set := labels.FromMap(metric)
+		series = append(series, rangeCacheSeries{labels: set, id: string(set.Bytes(nil)), metric: metric, points: group.points})
 	}
 	sort.Slice(series, func(i, j int) bool { return labels.Compare(series[i].labels, series[j].labels) < 0 })
 	for i := 1; i < len(series); i++ {
