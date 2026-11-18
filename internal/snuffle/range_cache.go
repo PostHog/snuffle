@@ -120,9 +120,11 @@ type rangeCacheItem struct {
 
 type rangeResultCache struct {
 	maxBytes int64
-	offset   time.Duration
-	ttl      time.Duration
-	metrics  *bridgeMetrics
+	// maxSamples is the sample limit of the engine for one query, or 0 for no limit.
+	maxSamples int
+	offset     time.Duration
+	ttl        time.Duration
+	metrics    *bridgeMetrics
 	// now is a field so tests can set the time.
 	now func() time.Time
 
@@ -139,13 +141,14 @@ func newRangeResultCache(cfg Config, metrics *bridgeMetrics) *rangeResultCache {
 		return nil
 	}
 	return &rangeResultCache{
-		maxBytes: int64(cfg.RangeCacheMaxBytes),
-		offset:   cfg.RangeCacheOffset,
-		ttl:      cfg.RangeCacheTTL,
-		metrics:  metrics,
-		now:      time.Now,
-		entries:  make(map[rangeCacheKey]*list.Element),
-		order:    list.New(),
+		maxBytes:   int64(cfg.RangeCacheMaxBytes),
+		maxSamples: cfg.MaxSamples,
+		offset:     cfg.RangeCacheOffset,
+		ttl:        cfg.RangeCacheTTL,
+		metrics:    metrics,
+		now:        time.Now,
+		entries:    make(map[rangeCacheKey]*list.Element),
+		order:      list.New(),
 	}
 }
 
@@ -243,7 +246,7 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	}
 
 	if usable != nil && usable.end >= lastStep {
-		if verify(ctx) != nil {
+		if verify(ctx) != nil || c.overSampleLimit(usable.series, nil, start, lastStep+step, lastStep) {
 			return evalAll()
 		}
 		groups := rangeCacheGroups(usable.series, nil, start, lastStep+step, lastStep)
@@ -278,6 +281,9 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	var cached []rangeCacheSeries
 	if usable != nil {
 		cached = usable.series
+		if c.overSampleLimit(cached, freshSeries, start, evalStart, lastStep) {
+			return evalAll()
+		}
 	}
 	result := rangeQueryResult{backend: fresh.backend, floats: true, groups: rangeCacheGroups(cached, freshSeries, start, evalStart, lastStep)}
 
@@ -305,6 +311,25 @@ func (c *rangeResultCache) query(ctx context.Context, key rangeCacheKey, start, 
 	stored.bytes = rangeCacheEntryBytes(stored.series)
 	c.put(key, stored, usable)
 	return result, status, nil
+}
+
+// overSampleLimit reports whether the cached points before split and the fresh
+// points from split hold more samples than the engine allows for one query.
+// The engine applies its limit only to the steps it evaluates. The caller
+// evaluates such a request without the cache, so the request gets the answer
+// or the refusal that it gets when the cache is disabled.
+func (c *rangeResultCache) overSampleLimit(cached, fresh []rangeCacheSeries, start, split, end int64) bool {
+	if c.maxSamples <= 0 {
+		return false
+	}
+	samples := 0
+	for _, series := range cached {
+		samples += len(rangeCachePointsBetween(series.points, start, min(split-1, end)))
+	}
+	for _, series := range fresh {
+		samples += len(rangeCachePointsBetween(series.points, max(split, start), end))
+	}
+	return samples > c.maxSamples
 }
 
 // rangeCacheSeriesFromGroups returns the series sorted by labels. It returns

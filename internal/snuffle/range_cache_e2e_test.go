@@ -113,6 +113,52 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 		}
 	})
 
+	// The engine refuses a query that returns more samples than PROMQL_MAX_SAMPLES.
+	// The cache must not answer a request that the engine refuses.
+	t.Run("a request over the sample limit is refused as without the cache", func(t *testing.T) {
+		limitedCfg := cachedCfg
+		limitedCfg.MaxSamples = 64
+		limitedServer := newServer(limitedCfg)
+		limitedServer.rangeCache.now = func() time.Time { return clock }
+		limitedMux := http.NewServeMux()
+		limitedServer.routes(limitedMux)
+		limited := httptest.NewServer(limitedMux)
+		defer limited.Close()
+		uncachedCfg := cfg
+		uncachedCfg.MaxSamples = 64
+		uncachedMux := http.NewServeMux()
+		newServer(uncachedCfg).routes(uncachedMux)
+		limitedUncached := httptest.NewServer(uncachedMux)
+		defer limitedUncached.Close()
+
+		get := func(baseURL string, fromMinute, toMinute int) (string, int) {
+			values := url.Values{
+				"query": {"vector(1)"},
+				"start": {strconv.FormatInt(rangeCacheE2EBase/1000+int64(fromMinute)*60, 10)},
+				"end":   {strconv.FormatInt(rangeCacheE2EBase/1000+int64(toMinute)*60, 10)},
+				"step":  {step.String()},
+			}
+			// A request with a user returns its HTTP status and does not stop the test.
+			_, status, code := rangeCacheE2EGet(t, baseURL, e2eTeamID, values, "default", "")
+			return status, code
+		}
+		// Two requests of 61 samples each store more than 64 steps.
+		for _, endMinutes := range []int{60, 90} {
+			clock = time.UnixMilli(rangeCacheE2EBase + int64(endMinutes)*time.Minute.Milliseconds()).Add(30 * time.Second)
+			if status, code := get(limited.URL, endMinutes-60, endMinutes); code != http.StatusOK || status == rangeCacheBypass {
+				t.Fatalf("request in the limit: HTTP %d with cache status %q", code, status)
+			}
+		}
+		for name, minutes := range map[string][2]int{"every step is cached": {0, 80}, "the first steps are cached": {10, 90}} {
+			if _, code := get(limitedUncached.URL, minutes[0], minutes[1]); code == http.StatusOK {
+				t.Fatalf("%s: the server without a cache answered a request over the limit", name)
+			}
+			if status, code := get(limited.URL, minutes[0], minutes[1]); code == http.StatusOK {
+				t.Fatalf("%s: the cache answered a request over the limit with cache status %q", name, status)
+			}
+		}
+	})
+
 	t.Run("a query that depends on the range is not cached", func(t *testing.T) {
 		values := window(60)
 		values.Set("query", rangeCacheE2EMetric+" @ end()")

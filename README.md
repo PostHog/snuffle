@@ -643,8 +643,9 @@ The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
   ways from a request for the complete range. A range pushdown estimates the
   sample interval of a series from the samples that the request reads, so a
   series with irregular intervals can get a slightly different `rate`. The
-  request can also use another execution path, and it is checked against the
-  series and sample limits for the new steps only.
+  request can also use another execution path, and `CH_MAX_SERIES` is checked
+  for the new steps only. A response that would hold more samples than
+  `PROMQL_MAX_SAMPLES` is evaluated in full, so the engine applies its limit.
 
 The `X-Snuffle-Range-Cache` response header and the `range_cache` field of the
 request log report `hit`, `partial`, `miss` or `bypass`.

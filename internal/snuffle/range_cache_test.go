@@ -456,6 +456,45 @@ func TestRangeCacheEntryHoldsNoMemoryForSeriesItLeftOut(t *testing.T) {
 	}
 }
 
+// The engine refuses a query that returns more samples than its limit, but it
+// counts only the steps it evaluates. A response joined from cached steps must
+// not pass that limit, so such a request is evaluated without the cache.
+func TestRangeCacheEvaluatesARequestOverTheSampleLimitWithoutTheCache(t *testing.T) {
+	now := testRangeNow
+	base := now.UnixMilli()
+	source := &rangeSource{series: []rangeSourceSeries{{name: "a", first: 0, last: base + minutes(120), value: stepValue}}}
+	cache := newTestRangeCache(&now)
+	cache.maxSamples = 64
+	key := rangeCacheKeyParts{query: "q"}.key(0)
+	// Each of these two requests returns 61 samples. Together they store more than 64 steps.
+	for _, moved := range []int64{0, 30} {
+		now = testRangeNow.Add(time.Duration(moved) * time.Minute)
+		if _, status, err := cache.query(context.Background(), key, base+minutes(moved-60), base+minutes(moved), testRangeStep, false, verified, source.eval); err != nil || status == rangeCacheBypass {
+			t.Fatalf("request in the limit: status %q, error %v", status, err)
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		start, end int64
+	}{
+		{name: "every step is cached", start: -60, end: 20},
+		{name: "the first steps are cached", start: -50, end: 30},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source.calls = nil
+			start, end := base+minutes(tc.start), base+minutes(tc.end)
+			_, status, err := cache.query(context.Background(), key, start, end, testRangeStep, false, verified, source.eval)
+			if err != nil || status != rangeCacheBypass {
+				t.Fatalf("status %q, error %v", status, err)
+			}
+			if last := source.calls[len(source.calls)-1]; last != [2]int64{start, end} {
+				t.Fatalf("evaluations = %v, want a last evaluation of every step, which the engine can refuse", source.calls)
+			}
+		})
+	}
+}
+
 // The cache shares a host with ClickHouse, so it must stay in its size limit.
 func TestRangeCacheRemovesTheLeastRecentlyUsedEntryAtTheSizeLimit(t *testing.T) {
 	now := testRangeNow
