@@ -58,7 +58,11 @@ func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt i
 func (q *CHQuerier) selectPostHogFloatSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
 	sql := postHogSelectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt, q.queryable.cfg.MaxSeries, nil)
 	series := make([]*seriesMeta, 0, 1024)
+	// The scan stops at the limit, and matchers the SQL cannot express drop
+	// rows here, so the limit counts rows read, not series kept.
+	rows := 0
 	err := q.queryable.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
+		rows++
 		meta, err := scanPostHogSeries(row, matchers)
 		if err != nil || meta == nil {
 			return err
@@ -69,10 +73,16 @@ func (q *CHQuerier) selectPostHogFloatSeries(ctx context.Context, mint, maxt int
 	if err != nil {
 		return nil, err
 	}
-	if len(series) >= q.queryable.cfg.MaxSeries {
-		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
+	if rows >= q.queryable.cfg.MaxSeries {
+		return nil, seriesLimitError(q.queryable.cfg.MaxSeries)
 	}
 	return series, nil
+}
+
+// seriesLimitError is the error for a query that matches at least
+// CH_MAX_SERIES series. The API answers it with 422.
+func seriesLimitError(maxSeries int) error {
+	return fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", maxSeries)
 }
 
 func scanPostHogSeries(row clickHouseRow, matchers []*labels.Matcher) (*seriesMeta, error) {
@@ -498,6 +508,25 @@ func (p *postHogQueryPlan) withSelectedSeries(sql string) string {
 	return "WITH selected_series AS (" + p.seriesSQL + ") " + sql
 }
 
+// postHogSelectedSeriesIDsSQL lists the fingerprints in selected_series and
+// fails the query once the CTE reaches CH_MAX_SERIES. The CTE stops at that
+// limit in no particular order, so without the check a query over more series
+// reads an arbitrary subset of them and returns low numbers that change from
+// run to run. The check runs while ClickHouse builds the IN set, before any
+// sample is read, and adds no series scan: the fingerprints are collected
+// into one array (8 bytes a series) and counted. clickHouseQueryError turns
+// the exception into the series limit error.
+func postHogSelectedSeriesIDsSQL(cfg Config) string {
+	if cfg.MaxSeries <= 0 {
+		return "SELECT series_id FROM selected_series"
+	}
+	return fmt.Sprintf(
+		"SELECT arrayJoin(series_ids) FROM (SELECT groupArray(series_id) AS series_ids FROM selected_series HAVING throwIf(count() >= %d, %s) = 0)",
+		cfg.MaxSeries,
+		sqlString(seriesLimitError(cfg.MaxSeries).Error()),
+	)
+}
+
 // sampleWhere filters the samples scan: team, time, samples-column matchers
 // and, with a series lookup, membership in the selected fingerprints. The
 // metric_name membership keeps the primary key usable when the matchers do
@@ -512,7 +541,7 @@ func (p *postHogQueryPlan) sampleRowWhere() []string {
 
 func (p *postHogQueryPlan) sampleWhereFrom(where []string) []string {
 	if p.useSeries {
-		where = append(where, "series_fingerprint IN (SELECT series_id FROM selected_series)")
+		where = append(where, "series_fingerprint IN ("+postHogSelectedSeriesIDsSQL(p.cfg)+")")
 		if exactMetricName(p.matchers) == "" {
 			where = append(where, "metric_name IN (SELECT metric_name FROM selected_series)")
 		}

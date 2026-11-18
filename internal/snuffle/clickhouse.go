@@ -208,7 +208,7 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 	}
 	result, err := queryWhenNotBusy(ctx, conn, sql)
 	if err != nil {
-		return fmt.Errorf("start clickhouse query: %w", err)
+		return clickHouseQueryError(err, "start clickhouse query")
 	}
 	defer result.Close()
 
@@ -219,9 +219,27 @@ func (c *ClickHouseClient) queryRows(ctx context.Context, sql string, handle fun
 		}
 	}
 	if err := result.Err(); err != nil {
-		return fmt.Errorf("read clickhouse query result after %d rows: %w", rowCount, err)
+		return clickHouseQueryError(err, fmt.Sprintf("read clickhouse query result after %d rows", rowCount))
 	}
 	return nil
+}
+
+const clickHouseThrowIfNonZero = 395
+
+var clickHouseSeriesLimitMessage = regexp.MustCompile(`series limit exceeded \(\d+\); tighten matchers or increase CH_MAX_SERIES`)
+
+// clickHouseQueryError wraps a ClickHouse error with what failed. A series
+// limit check that a query raised with throwIf (postHogSelectedSeriesIDsSQL)
+// becomes the plain series limit error instead, the same one the Go-side
+// checks return, so the API answers 422 with that message.
+func clickHouseQueryError(err error, context string) error {
+	var exception *clickhouse.Exception
+	if errors.As(err, &exception) && exception.Code == clickHouseThrowIfNonZero {
+		if message := clickHouseSeriesLimitMessage.FindString(exception.Message); message != "" {
+			return errors.New(message)
+		}
+	}
+	return fmt.Errorf("%s: %w", context, err)
 }
 
 // clickHouseBusyBackoff is the wait before each retry of a query that
