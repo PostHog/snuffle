@@ -546,7 +546,10 @@ running total with MetricsQL counter rules. Cumulative histograms and other
 counters keep MetricsQL counter rules. A series with both delta and cumulative
 points, or with unspecified temporality, returns an error rather than an
 incorrect counter or rate. The compact histogram path reads cumulative
-histograms only; a delta histogram uses the general engine. Exponential
+histograms, and delta histograms under `rate`, `increase`, and `delta`, which
+it sums over each window as the general engine does. A delta histogram under
+`irate` or `idelta`, or a series with both temporalities, uses the general
+engine. Exponential
 histograms expose `_count` and `_sum` only: the stored flattened arrays do not
 preserve enough information to reconstruct their bucket boundaries. Use explicit
 histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.

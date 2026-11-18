@@ -161,6 +161,13 @@ func (sum *compactHistogramSum) add(value float64) {
 // compactHistogramEvaluator reads the samples of one source series at a time.
 // For each bucket it keeps the points inside the selector range, which are
 // the points that the engine passes to the counter function.
+//
+// A delta source keeps the running total that the general path builds (see
+// accumulatePostHogDeltaSamples): points that share a timestamp become one
+// point. rate, increase and delta read the window sum of that total, as
+// metricsQLRollup does with deltaWindowSum. The total of the last point that
+// left the selector range is the baseline of a window with no earlier point
+// in range.
 type compactHistogramEvaluator struct {
 	plan         *compactHistogramPlan
 	cfg          Config
@@ -173,6 +180,13 @@ type compactHistogramEvaluator struct {
 	haveSource   bool
 	grid, series int
 	output       int
+	// delta is the temporality of the current source. deltaTotal is the
+	// running total before the newest timestamp, and deltaSum the sum of the
+	// points at the newest timestamp.
+	delta                bool
+	deltaTotal, deltaSum []float64
+	trimmedTotal         []float64
+	trimmed              bool
 }
 
 func newCompactHistogramEvaluator(plan *compactHistogramPlan, cfg Config) *compactHistogramEvaluator {
@@ -201,8 +215,12 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 			}
 			if first > 0 {
 				for index, points := range evaluator.history {
+					if evaluator.delta {
+						evaluator.trimmedTotal[index] = points[first-1].F
+					}
 					evaluator.history[index] = points[:copy(points, points[first:])]
 				}
+				evaluator.trimmed = evaluator.trimmed || evaluator.delta
 			}
 		}
 		if len(evaluator.history) > 0 && len(evaluator.history[0]) > 0 {
@@ -215,7 +233,12 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 			start := timestamp - window
 			firstPoint := sort.Search(len(times), func(index int) bool { return times[index].T > start })
 			for index, column := range evaluator.columns {
-				value := metricsQLCounterValue(plan.function, evaluator.history[index], firstPoint, start, maxPrevious, plan.lookback)
+				var value float64
+				if evaluator.delta {
+					value = evaluator.deltaWindowSum(index, firstPoint, window)
+				} else {
+					value = metricsQLCounterValue(plan.function, evaluator.history[index], firstPoint, start, maxPrevious, plan.lookback)
+				}
 				if !math.IsNaN(value) {
 					column[evaluator.grid].add(value)
 				}
@@ -224,6 +247,28 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 		evaluator.grid++
 	}
 	return nil
+}
+
+// deltaWindowSum returns the value of the plan's rollup over the window of a
+// delta bucket, as metricsQLRollup computes it from seriesMeta.deltaWindowSum:
+// the running total at the last point in the window minus the total at the
+// last point before the window. It returns NaN when the window holds no
+// point. first is the index of the first point in the window.
+func (evaluator *compactHistogramEvaluator) deltaWindowSum(index, first int, window int64) float64 {
+	points := evaluator.history[index]
+	if first == len(points) {
+		return math.NaN()
+	}
+	sum := points[len(points)-1].F
+	if first > 0 {
+		sum -= points[first-1].F
+	} else if evaluator.trimmed {
+		sum -= evaluator.trimmedTotal[index]
+	}
+	if evaluator.plan.function == "rate" {
+		sum /= float64(window) / 1000
+	}
+	return sum
 }
 
 func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample postHogHistogramSample) error {
@@ -236,7 +281,11 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		}
 		evaluator.haveSource = false
 	}
-	if sample.temporality != "cumulative" {
+	// Over a delta series, rate, increase and delta read window sums. irate
+	// and idelta read the running total as a cumulative counter, and that
+	// total starts at the first point the request reads.
+	delta := sample.temporality == "delta"
+	if (!delta && sample.temporality != "cumulative") || (delta && !metricsQLDeltaWindowFunctions[evaluator.plan.function]) {
 		return errCompactHistogramFallback
 	}
 	if len(sample.counts) != len(sample.bounds)+1 {
@@ -276,7 +325,16 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 			evaluator.columns = append(evaluator.columns, column)
 		}
 		evaluator.grid, evaluator.sourceID, evaluator.haveSource = 0, sample.id, true
+		evaluator.delta, evaluator.trimmed = delta, false
+		if delta {
+			evaluator.deltaTotal = make([]float64, len(sample.counts))
+			evaluator.deltaSum = make([]float64, len(sample.counts))
+			evaluator.trimmedTotal = make([]float64, len(sample.counts))
+		}
 	} else if !slices.EqualFunc(evaluator.bounds, sample.bounds, func(left, right float64) bool { return math.Float64bits(left) == math.Float64bits(right) }) {
+		return errCompactHistogramFallback
+	} else if evaluator.delta != delta {
+		// The general path refuses a series that mixes temporalities.
 		return errCompactHistogramFallback
 	}
 	if err := evaluator.advance(ctx, sample.timestamp, false); err != nil {
@@ -306,15 +364,32 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 				return errCompactHistogramFallback
 			}
 		}
-		if duplicate && evaluator.current[index] != float64(cumulative) {
+		switch {
+		case evaluator.delta:
+			// Points that share a timestamp add up, as in
+			// accumulatePostHogDeltaSamples: the sum of the timestamp is added to
+			// the total of the earlier timestamps.
+			if duplicate {
+				evaluator.deltaSum[index] += float64(cumulative)
+			} else {
+				evaluator.deltaTotal[index] += evaluator.deltaSum[index]
+				evaluator.deltaSum[index] = float64(cumulative)
+			}
+			evaluator.current[index] = evaluator.deltaTotal[index] + evaluator.deltaSum[index]
+		case duplicate && evaluator.current[index] != float64(cumulative):
 			return errCompactHistogramFallback
+		default:
+			evaluator.current[index] = float64(cumulative)
 		}
-		evaluator.current[index] = float64(cumulative)
 	}
 	if cumulative != sample.count {
 		return errCompactHistogramFallback
 	}
 	for index, value := range evaluator.current {
+		if evaluator.delta && duplicate {
+			evaluator.history[index][len(evaluator.history[index])-1].F = value
+			continue
+		}
 		evaluator.history[index] = append(evaluator.history[index], promql.FPoint{T: sample.timestamp, F: value})
 	}
 	return nil
