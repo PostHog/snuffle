@@ -567,7 +567,11 @@ accepts functions that read each series on its own around a quantile
 `clamp_min`, `clamp_max`, `sgn`, `sqrt`, `exp`, `ln`, `log2`, `log10`), and
 quantiles joined with `or` without `on` or `ignoring`. Quantiles of the same
 buckets read the buckets once.
-`CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion.
+`CH_MAX_SERIES` and `PROMQL_MAX_SAMPLES` also limit histogram expansion. The
+compact path counts the samples it holds at once, as the Prometheus engine
+does: the step grid plus the in-range points of the one source series it is
+reading. A week of a histogram can read more samples than the limit as long as
+it never holds that many.
 
 The separate `CH_HISTOGRAMS_TABLE` setting is for serialized Prometheus native
 histograms, not these OpenTelemetry arrays.
