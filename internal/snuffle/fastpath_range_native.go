@@ -28,13 +28,13 @@ func (p *nativeRangePlan) add(sql string) string {
 	return name
 }
 
-func (s *Server) tryNativeRangeQuery(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (queryData, bool, error) {
+func (s *Server) tryNativeRangeGroups(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) ([]rangeAggregateGroup, bool, error) {
 	if step.Milliseconds() <= 0 || end.Before(start) || (end.UnixMilli()-start.UnixMilli())/step.Milliseconds()+1 > maxRangePushdownPoints {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	expr, err := s.parser.ParseExpr(prepared.query)
 	if err != nil {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	p := nativeRangePlan{cfg: s.cfg, start: start.UnixMilli(), end: end.UnixMilli(), step: step.Milliseconds()}
 	subquery, offset := parseRangeOffsetSubquery(expr, step, s.cfg.LookbackDelta)
@@ -49,7 +49,7 @@ func (s *Server) tryNativeRangeQuery(ctx context.Context, prepared metricsQLQuer
 	}
 	source, ok := p.expression(expr)
 	if !ok {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	sql := "SELECT toJSONString(mapFromArrays(arrayMap(x -> x.1, metric), arrayMap(x -> x.2, metric))) AS labels, ts, value, toUInt8(0) AS status FROM " + source
 	for _, check := range p.checks {
@@ -94,12 +94,12 @@ func (s *Server) tryNativeRangeQuery(ctx context.Context, prepared metricsQLQuer
 		return nil
 	})
 	if err != nil {
-		return queryData{}, true, err
+		return nil, true, err
 	}
 	// Native histogram functions have separate Prometheus semantics. The same
 	// SQL statement checks for matching histogram data before accepting floats.
 	if histograms {
-		return queryData{}, false, nil
+		return nil, false, nil
 	}
 	if offset {
 		groups = rangeOffsetSubqueryRollup(groups, subquery, start.UnixMilli(), end.UnixMilli(), p.step, s.cfg.LookbackDelta.Milliseconds())
@@ -113,7 +113,7 @@ func (s *Server) tryNativeRangeQuery(ctx context.Context, prepared metricsQLQuer
 			}
 		}
 	}
-	return queryData{ResultType: "matrix", Result: rangeAggregateSampleResults(groups)}, true, nil
+	return groups, true, nil
 }
 
 // Each expression returns sorted label tuples, an output timestamp and a value.

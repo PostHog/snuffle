@@ -113,6 +113,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("query log comments", func(t *testing.T) {
 		assertQueryLogComments(t, ctx, rootClient, api.URL)
 	})
+	t.Run("range result cache", func(t *testing.T) {
+		assertRangeCacheMatchesUncachedResults(t, ctx, rootClient, cfg)
+	})
 
 	t.Run("shared label sets across metric names", func(t *testing.T) {
 		assertSharedLabelsetAcrossNames(t, cfg, api.URL)
