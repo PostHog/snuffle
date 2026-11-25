@@ -350,6 +350,17 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewrite(&e.Expr, childStep, instant)
 	case *metricsql.FuncExpr:
+		if e.Name == "" || e.Name == "union" {
+			replacement, err := rewriteUnion(e)
+			if err != nil {
+				return err
+			}
+			*expr = replacement
+			if union, ok := replacement.(*metricsql.FuncExpr); ok && union.Name == metricsQLUnionName {
+				return r.rewriteArgs(union.Args, step, instant)
+			}
+			return r.rewrite(expr, step, instant)
+		}
 		if !instant && strings.HasPrefix(e.Name, "sort_by_label") {
 			// Range results keep label order, so sorting at every step is
 			// wasted work. Validate the call, then drop it.
