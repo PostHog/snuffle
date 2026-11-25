@@ -3,8 +3,10 @@ package snuffle
 import (
 	"fmt"
 	"math"
+	"regexp"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/VictoriaMetrics/metricsql"
 	"github.com/prometheus/prometheus/model/labels"
@@ -224,12 +226,40 @@ func metricsQLLabelTransform(vectors []promql.Vector, _ promql.Matrix, args pars
 	for _, sample := range vectors[0] {
 		metricsQLLabelBuilder(builder, sample)
 		if value := builder.Get(label); pattern.MatchString(value) {
-			builder.Set(label, pattern.ReplaceAllString(value, replacement))
+			replaced, ok := replaceAllLimited(pattern, value, replacement, metricsQLMaxLabelValueBytes)
+			if !ok {
+				panic(fmt.Errorf("label_transform: the value of label %q exceeds %d bytes", label, metricsQLMaxLabelValueBytes))
+			}
+			builder.Set(label, replaced)
 		}
 		sample.Metric, sample.DropName = builder.Labels(), false
 		enh.Out = append(enh.Out, sample)
 	}
 	return enh.Out, nil
+}
+
+// metricsQLMaxLabelValueBytes caps a label_transform result. Nested
+// unanchored replacements multiply the value length at each level.
+// ponytail: one fixed cap; make it configurable if real labels need more.
+const metricsQLMaxLabelValueBytes = 64 << 10
+
+// replaceAllLimited is regexp.ReplaceAllString that stops before the result
+// exceeds limit bytes. Submatches lie within their match, so each expansion
+// adds at most len(replacement) plus the match length per "$" reference.
+func replaceAllLimited(pattern *regexp.Regexp, value, replacement string, limit int) (string, bool) {
+	references := strings.Count(replacement, "$")
+	var out []byte
+	last := 0
+	for _, match := range pattern.FindAllStringSubmatchIndex(value, -1) {
+		if len(out)+match[0]-last+len(replacement)+references*(match[1]-match[0]) > limit {
+			return "", false
+		}
+		out = append(out, value[last:match[0]]...)
+		out = pattern.ExpandString(out, replacement, value, match)
+		last = match[1]
+	}
+	out = append(out, value[last:]...)
+	return string(out), len(out) <= limit
 }
 
 // metricsQLDropCommonLabels joins its arguments and removes each label that

@@ -1,6 +1,8 @@
 package snuffle
 
 import (
+	"context"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -158,5 +160,46 @@ func TestMetricsQLDeploymentVariableQuery(test *testing.T) {
 		if got := labelSets(evaluateMetricsQLBetween(test, queryable, deploymentVariableQuery, start, end, time.Hour)); got != want {
 			test.Fatalf("start=%v: got %s, want %s", start, got, want)
 		}
+	}
+}
+
+func TestReplaceAllLimited(test *testing.T) {
+	for _, testcase := range []struct{ pattern, value, replacement string }{
+		{`[a-c]`, "capture-abc", "X"},
+		{``, "abc", "-"},
+		{`x*`, "axxbx", "<$0>"},
+		{`^(.*)-(.*)$`, "capture-abc", "$2.$1"},
+		{`(b)`, "abcb", "${1}$1$$"},
+	} {
+		pattern := regexp.MustCompile(testcase.pattern)
+		want := pattern.ReplaceAllString(testcase.value, testcase.replacement)
+		got, ok := replaceAllLimited(pattern, testcase.value, testcase.replacement, 1<<10)
+		if !ok || got != want {
+			test.Fatalf("%s on %q: got %q, %v, want %q", testcase.pattern, testcase.value, got, ok, want)
+		}
+	}
+	if _, ok := replaceAllLimited(regexp.MustCompile(`.`), "abcd", "xx", 7); ok {
+		test.Fatal("expected the limit to stop the replacement")
+	}
+	// Nested replacements multiply the value length. The query fails instead
+	// of building a large label.
+	replacement := strings.Repeat("x", 63)
+	query := `label_transform(1, "a", "", "` + replacement + `")`
+	for range 3 {
+		query = `label_transform(` + query + `, "a", ".", "` + replacement + `")`
+	}
+	start := time.Unix(1700000010, 0)
+	prepared, err := prepareMetricsQLQuery(query, 30*time.Second, 5*time.Minute, start, start)
+	if err != nil {
+		test.Fatal(err)
+	}
+	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: 16, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableDelayedNameRemoval: true})
+	instant, err := engine.NewInstantQuery(context.Background(), labelsTestQueryable(), nil, prepared.query, start)
+	if err != nil {
+		test.Fatal(err)
+	}
+	defer instant.Close()
+	if result := instant.Exec(context.Background()); result.Err == nil || !strings.Contains(result.Err.Error(), "exceeds") {
+		test.Fatalf("expected a label size error, got %v", result.Err)
 	}
 }
