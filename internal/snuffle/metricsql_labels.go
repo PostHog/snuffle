@@ -152,10 +152,11 @@ func metricsQLLabelString(sample promql.Sample, name string) string {
 }
 
 // metricsQLLabelBuilder starts a label edit of a sample. A series whose
-// metric name is dropped has no __name__, as in VictoriaMetrics.
+// metric name is dropped has no __name__, as in VictoriaMetrics. A histogram
+// pushdown name replaces a rollup, which drops its name, so it is dropped too.
 func metricsQLLabelBuilder(builder *labels.Builder, sample promql.Sample) *labels.Builder {
 	builder.Reset(sample.Metric)
-	if sample.DropName {
+	if sample.DropName || strings.HasPrefix(sample.Metric.Get(labels.MetricName), histogramPushdownPrefix) {
 		builder.Del(labels.MetricName)
 	}
 	return builder

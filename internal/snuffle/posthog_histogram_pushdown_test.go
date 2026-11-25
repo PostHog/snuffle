@@ -65,6 +65,14 @@ func TestHistogramPushdownCandidates(test *testing.T) {
 		{`increase(a_count[1h]) / on(__name__) increase(a_sum[1h])`, 0},
 		{`label_replace(increase(a_count[1h]), "x", "y", "", "")`, 0},
 		{`timestamp(increase(a_count[1h]))`, 0},
+		{`label_set(increase(a_count[1h]), "x", "y")`, 1},
+		{`label_copy(increase(a_count[1h]), "__name__", "x")`, 1},
+		{`label_move(increase(a_count[1h]), "a", "b")`, 1},
+		{`label_transform(increase(a_count[1h]), "a", "b", "c")`, 1},
+		{`drop_common_labels(increase(a_count[1h]), increase(a_sum[1h]))`, 2},
+		{`union(increase(a_count[1h]), increase(a_sum[1h]))`, 2},
+		{`sum(increase(a_count[1h])) + label_set(vector(1), "x", "y")`, 1},
+		{`label_match(increase(a_count[1h]), "a", "b")`, 0},
 	}
 	for _, item := range cases {
 		prepared, err := prepareMetricsQLQuery(item.query, time.Minute, 5*time.Minute, time.Unix(1_700_000_000, 0), time.Unix(1_700_000_000, 0))
