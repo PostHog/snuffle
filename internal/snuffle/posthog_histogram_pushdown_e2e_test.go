@@ -113,6 +113,13 @@ func TestPostHogHistogramPushdownMatchesEngine(test *testing.T) {
 		`delta(` + metric + `_sum[7m])`,
 		`histogram_quantile(0.9, sum by (le) (rate(` + metric + `_bucket[45m])))`,
 		`sum(increase(` + metric + `_count))`,
+		`label_set(` + quantile("0.5", "1h") + `, "quantile", "p50")`,
+		`label_copy(increase(` + metric + `_count[1h]), "__name__", "copied", "client.timezone", "tz")`,
+		`label_move(increase(` + metric + `_count[1h]), "client.timezone", "tz")`,
+		`label_transform(increase(` + metric + `_count[1h]), "client.timezone", "/", "-")`,
+		`drop_common_labels(increase(` + metric + `_count[1h]), label_set(increase(` + metric + `_sum[1h]), "part", "sum"))`,
+		`union(increase(` + metric + `_count[1h]), increase(` + metric + `_sum[1h]), increase(` + metric + `_count[2h]) * 0 + 7)`,
+		`(label_set(` + quantile("0.5", "1h") + `, "q", "0.5"), label_set(` + quantile("0.99", "1h") + `, "q", "0.99"))`,
 	}
 	rangeQueries := []struct{ query, step string }{
 		{`histogram_quantile(0.5, sum by (le) (rate(` + metric + `_bucket[5m])))`, "60"},
@@ -120,13 +127,15 @@ func TestPostHogHistogramPushdownMatchesEngine(test *testing.T) {
 		{`sum by ("client.timezone") (increase(` + metric + `_count[15m]))`, "300"},
 		{`increase(` + metric + `_bucket{le="500"}[2m])`, "30"},
 		{`sum(rate(` + metric + `_count))`, "60"},
+		{`union(label_set(histogram_quantile(0.5, sum by (le) (rate(` + metric + `_bucket[5m]))), "q", "p50"), label_set(histogram_quantile(0.9, sum by (le) (rate(` + metric + `_bucket[5m]))), "q", "p90"))`, "60"},
+		{`drop_common_labels(increase(` + metric + `_count[15m]))`, "300"},
 	}
 
 	test.Run("pushdown plans the status page queries", func(test *testing.T) {
 		teamCfg := cfg
 		teamCfg.TeamID = e2eTeamID
 		server := newServer(teamCfg)
-		for _, expression := range append(instantQueries, rangeQueries[0].query) {
+		for _, expression := range append(instantQueries, rangeQueries[0].query, rangeQueries[5].query, rangeQueries[6].query) {
 			prepared, err := prepareMetricsQLQuery(expression, 5*time.Minute, teamCfg.LookbackDelta, time.UnixMilli(end), time.UnixMilli(end))
 			if err != nil {
 				test.Fatal(err)

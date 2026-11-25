@@ -477,7 +477,7 @@ func dropCompactHistogramNaNs(matrix promql.Matrix) promql.Matrix {
 
 // compactSeriesFunction is a function call around a compact quantile, applied
 // to the quantile result.
-type compactSeriesFunction func(promql.Matrix) promql.Matrix
+type compactSeriesFunction func(promql.Matrix) (promql.Matrix, error)
 
 // compactSeriesFunctions are the functions that can wrap a compact quantile.
 // Each one reads every series on its own, so running it on the compact result
@@ -499,6 +499,11 @@ var compactSeriesFunctions = map[string]func(*parser.Call) (compactSeriesFunctio
 	"ln":            parseCompactValueFunction,
 	"log2":          parseCompactValueFunction,
 	"log10":         parseCompactValueFunction,
+
+	metricsQLInternalPrefix + "label_set":       parseCompactLabelEdit,
+	metricsQLInternalPrefix + "label_copy":      parseCompactLabelEdit,
+	metricsQLInternalPrefix + "label_move":      parseCompactLabelEdit,
+	metricsQLInternalPrefix + "label_transform": parseCompactLabelEdit,
 }
 
 func compactStringArgs(args parser.Expressions) ([]string, bool) {
@@ -534,7 +539,7 @@ func parseCompactLabelReplace(call *parser.Call) (compactSeriesFunction, bool) {
 	if err != nil {
 		return nil, false
 	}
-	return func(matrix promql.Matrix) promql.Matrix {
+	return func(matrix promql.Matrix) (promql.Matrix, error) {
 		for index := range matrix {
 			value := matrix[index].Metric.Get(source)
 			indexes := regex.FindStringSubmatchIndex(value)
@@ -545,7 +550,7 @@ func parseCompactLabelReplace(call *parser.Call) (compactSeriesFunction, bool) {
 			builder.Set(destination, string(regex.ExpandString(nil, replacement, value, indexes)))
 			matrix[index].Metric = builder.Labels()
 		}
-		return matrix
+		return matrix, nil
 	}, true
 }
 
@@ -564,7 +569,7 @@ func parseCompactLabelJoin(call *parser.Call) (compactSeriesFunction, bool) {
 			return nil, false
 		}
 	}
-	return func(matrix promql.Matrix) promql.Matrix {
+	return func(matrix promql.Matrix) (promql.Matrix, error) {
 		joined := make([]string, len(sources))
 		for index := range matrix {
 			for position, source := range sources {
@@ -574,7 +579,50 @@ func parseCompactLabelJoin(call *parser.Call) (compactSeriesFunction, bool) {
 			builder.Set(destination, strings.Join(joined, separator))
 			matrix[index].Metric = builder.Labels()
 		}
-		return matrix
+		return matrix, nil
+	}, true
+}
+
+// parseCompactLabelEdit accepts a MetricsQL label edit whose label names are
+// valid and not __name__. It calls the engine's implementation once per series.
+func parseCompactLabelEdit(call *parser.Call) (compactSeriesFunction, bool) {
+	function := promql.FunctionCalls[call.Func.Name]
+	values, ok := compactStringArgs(call.Args[1:])
+	if function == nil || !ok || len(values) == 0 {
+		return nil, false
+	}
+	names := values
+	switch strings.TrimPrefix(call.Func.Name, metricsQLInternalPrefix) {
+	case "label_set":
+		names = nil
+		for index := 0; index < len(values); index += 2 {
+			names = append(names, values[index])
+		}
+	case "label_transform":
+		names = values[:1]
+	}
+	for _, name := range names {
+		if !compactLabelDestination(name) {
+			return nil, false
+		}
+	}
+	return func(matrix promql.Matrix) (result promql.Matrix, err error) {
+		// label_transform panics when a value exceeds its limit. The engine
+		// path reports that error.
+		defer func() {
+			if recover() != nil {
+				result, err = nil, errCompactHistogramFallback
+			}
+		}()
+		helper := &promql.EvalNodeHelper{}
+		vectors := []promql.Vector{{{}}}
+		for index := range matrix {
+			vectors[0][0] = promql.Sample{Metric: matrix[index].Metric}
+			helper.Out = helper.Out[:0]
+			output, _ := function(vectors, nil, call.Args, helper)
+			matrix[index].Metric = output[0].Metric
+		}
+		return matrix, nil
 	}, true
 }
 
@@ -593,7 +641,7 @@ func parseCompactValueFunction(call *parser.Call) (compactSeriesFunction, bool) 
 		}
 		vectors[index+1] = promql.Vector{{F: number.Val}}
 	}
-	return func(matrix promql.Matrix) promql.Matrix {
+	return func(matrix promql.Matrix) (promql.Matrix, error) {
 		result := make(promql.Matrix, 0, len(matrix))
 		helper := &promql.EvalNodeHelper{}
 		for _, series := range matrix {
@@ -611,7 +659,7 @@ func parseCompactValueFunction(call *parser.Call) (compactSeriesFunction, bool) 
 				result = append(result, output)
 			}
 		}
-		return result
+		return result, nil
 	}, true
 }
 
@@ -631,6 +679,22 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 	var collect func(parser.Expr) bool
 	collect = func(expr parser.Expr) bool {
 		expr = unparenExpr(expr)
+		// MetricsQL union keeps the first series with each label set. `or`
+		// ignores the metric name, so it matches only quantiles without one.
+		if union, ok := expr.(*parser.Call); ok && union.Func.Name == metricsQLUnionName {
+			first := len(branches)
+			for _, arg := range union.Args {
+				if !collect(arg) {
+					return false
+				}
+			}
+			for _, branch := range branches[first:] {
+				if compactHistogramNamed(branch.plan) {
+					return false
+				}
+			}
+			return true
+		}
 		if binary, ok := expr.(*parser.BinaryExpr); ok {
 			if binary.Op != parser.LOR || binary.VectorMatching == nil || binary.VectorMatching.On || len(binary.VectorMatching.MatchingLabels) != 0 {
 				return false
@@ -638,6 +702,7 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 			return collect(binary.LHS) && collect(binary.RHS)
 		}
 		var functions []compactSeriesFunction
+		labelEdit := false
 		for {
 			call, ok := expr.(*parser.Call)
 			if !ok {
@@ -652,11 +717,12 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 				return false
 			}
 			functions = append(functions, function)
+			labelEdit = labelEdit || strings.HasPrefix(call.Func.Name, metricsQLInternalPrefix)
 			expr = unparenExpr(call.Args[0])
 		}
 		slices.Reverse(functions)
 		plan := planCompactHistogram(expr, start, end, step, lookback)
-		if plan == nil || len(branches) >= maxAggregateUnionSelectors {
+		if plan == nil || len(branches) >= maxAggregateUnionSelectors || (labelEdit && compactHistogramNamed(plan)) {
 			return false
 		}
 		branches = append(branches, compactHistogramBranch{plan: plan, functions: functions})
@@ -668,12 +734,22 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 	return branches
 }
 
+// compactHistogramNamed reports whether the quantile label is __name__. The
+// engine drops such a name at MetricsQL label edits and keeps it at `or`.
+func compactHistogramNamed(plan *compactHistogramPlan) bool {
+	label, ok := plan.call.Args[1].(*parser.StringLiteral)
+	return ok && label.Val == labels.MetricName
+}
+
 // applyCompactSeriesFunctions applies the functions of a branch. When two
 // series end with the same labels, the engine merges them or fails, so that
 // case stays on the general path.
 func applyCompactSeriesFunctions(matrix promql.Matrix, functions []compactSeriesFunction) (promql.Matrix, error) {
 	for _, function := range functions {
-		matrix = function(matrix)
+		var err error
+		if matrix, err = function(matrix); err != nil {
+			return nil, err
+		}
 		seen := make(map[string]bool, len(matrix))
 		for _, series := range matrix {
 			key := series.Metric.String()

@@ -278,6 +278,14 @@ func TestCompactHistogramMatchesEngine(test *testing.T) {
 		`clamp(` + quantile("0.9", "rate") + `, 2, 1) or ` + labelled("0.5", "rate", "b"),
 		`clamp_min(sqrt(` + quantile("0.9", "rate") + `), 0.8) or clamp_max(exp(` + labelled("0.5", "rate", "b") + `), 1.2)`,
 		`floor(log2(` + quantile("0.9", "rate") + `)) or ceil(log10(` + labelled("0.5", "rate", "b") + `))`,
+		`label_set(` + quantile("0.5", "rate") + `, "q", "p50", "service_name", "")`,
+		`label_copy(` + labelled("0.5", "rate", "a") + `, "clause", "q", "missing", "clause")`,
+		`label_move(` + labelled("0.5", "rate", "a") + `, "clause", "q", "q", "q")`,
+		`label_transform(` + labelled("0.5", "rate", "a-b") + `, "clause", "-", "_")`,
+		`label_transform(` + labelled("0.5", "rate", "a") + `, "clause", "a", "")`,
+		`union(label_set(` + quantile("0.5", "rate") + `, "q", "p50"), label_set(` + quantile("0.9", "irate") + `, "q", "p90"), "ignored")`,
+		`(label_set(` + quantile("0.5", "rate") + `, "q", "a"), label_set(` + quantile("0.9", "rate") + `, "q", "a")) or ` + labelled("0.99", "rate", "c"),
+		`union(` + quantile("0.5", "rate") + `, ` + quantile("0.9", "rate") + `)`,
 	} {
 		compareCompactHistogram(test, frequent, query, start, start.Add(time.Minute), 10*time.Second)
 		compareCompactHistogram(test, nil, query, start, start.Add(time.Minute), 10*time.Second)
@@ -439,6 +447,14 @@ func TestCompactHistogramUnionPlans(test *testing.T) {
 		`label_join(` + quantile + `, "__name__", "-", "le")`,
 		`round(` + quantile + `, scalar(up))`,
 		`timestamp(` + quantile + `)`,
+		`label_set(` + quantile + `, "__name__", "x")`,
+		`label_copy(` + quantile + `, "__name__", "x")`,
+		`label_move(` + quantile + `, "x", "__name__")`,
+		`label_transform(` + quantile + `, "__name__", "a", "b")`,
+		`drop_common_labels(` + quantile + `)`,
+		`union(` + quantile + `, sum(rate(duration_count)))`,
+		`union(histogram_quantiles("__name__", 0.5, 0.9, sum by(le)(rate(duration_bucket))), ` + quantile + `)`,
+		`label_set(histogram_quantiles("__name__", 0.5, 0.9, sum by(le)(rate(duration_bucket))), "q", "x")`,
 	} {
 		if branches := plan(query); branches != nil {
 			test.Fatalf("unsafe plan for %s", query)

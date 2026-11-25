@@ -35,8 +35,8 @@ import (
 //
 // The planner leaves a rollup to the engine when it cannot match the engine:
 // cumulative or exponential histograms, invalid bucket layouts, real series
-// with the same name, offsets, subqueries, label functions and anything that
-// reads __name__.
+// with the same name, offsets, subqueries, most label functions and anything
+// that reads __name__.
 
 const histogramPushdownPrefix = "__snuffle_pushdown_"
 
@@ -46,6 +46,17 @@ var histogramPushdownFunctions = map[string]bool{"rate": true, "increase": true,
 // name, or read sample timestamps. The synthetic selector differs from the
 // rollup in both, so queries with these functions keep the engine path.
 var histogramPushdownBlockedFunctions = []string{"label", "absent", "timestamp", "union", "keep_metric_names", "info"}
+
+// histogramPushdownLabelFunctions are not blocked: metricsQLLabelBuilder
+// drops the synthetic name as the rollup drops its name.
+var histogramPushdownLabelFunctions = map[string]bool{
+	metricsQLInternalPrefix + "label_set":          true,
+	metricsQLInternalPrefix + "label_copy":         true,
+	metricsQLInternalPrefix + "label_move":         true,
+	metricsQLInternalPrefix + "label_transform":    true,
+	metricsQLInternalPrefix + "drop_common_labels": true,
+	metricsQLUnionName:                             true,
+}
 
 // errHistogramPushdownUnsupported stops a pushdown query when a row has data
 // the pushdown does not reproduce. The engine path then reads the selector.
@@ -106,7 +117,7 @@ func histogramPushdownCandidates(expr parser.Expr) []histogramPushdownCall {
 				blocked = true
 			}
 		case *parser.Call:
-			if n.Func == nil {
+			if n.Func == nil || histogramPushdownLabelFunctions[n.Func.Name] {
 				return nil
 			}
 			for _, fragment := range histogramPushdownBlockedFunctions {
