@@ -25,6 +25,8 @@ func TestPrepareMetricsQLExpressionOffsets(test *testing.T) {
 		`sum(max_over_time(requests_total[1m])) offset 24h`,
 		`sum(requests_total) @ 1700000010 offset 24h`,
 		`vector(time()) offset 24h`,
+		`sum(rate(requests_total{service="api"}[6h])) * 60 offset 7d`,
+		`60 offset 7d`,
 	} {
 		test.Run(expression, func(test *testing.T) {
 			for _, end := range []time.Time{start, start.Add(time.Minute)} {

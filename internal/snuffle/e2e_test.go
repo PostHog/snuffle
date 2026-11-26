@@ -147,6 +147,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("or with a number", func(t *testing.T) {
 		assertOrWithNumber(t, api.URL)
 	})
+	t.Run("offset after a number", func(t *testing.T) {
+		assertOffsetAfterNumber(t, api.URL)
+	})
 	if cfg.postHogSchemaLayout() {
 		t.Run("filtered label discovery", func(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)
