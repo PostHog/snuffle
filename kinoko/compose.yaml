@@ -24,7 +24,6 @@ services:
       SNUFFLE_ALLOW_UNAUTHENTICATED: "true"
       SNUFFLE_DEFAULT_TEAM_ID: "1"
       SNUFFLE_SELF_SCRAPE_ENABLED: "false"
-    depends_on: [clickhouse]
 
   # Idle; the model's mechanisms run here. No fault may touch it.
   client:
@@ -35,4 +34,3 @@ services:
     entrypoint: ["sleep", "infinity"]
     volumes:
       - /hook:/hook:ro
-    depends_on: [snuffle]

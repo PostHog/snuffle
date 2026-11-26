@@ -50,9 +50,36 @@ It is **not** the right tool for:
   - `snuffle answers queries once faults end` (eventually).
   - `faults never turn into 4xx` and `query answers 200, 5xx or nothing` (reply checks).
 
-`clickhouse-lean.xml` turns off ClickHouse's background system-log tables and shrinks its
-caches. kinoko keeps a snapshot of every guest it explores, so memory the guest keeps
-changing makes those snapshots large.
+Workload details that matter under kinoko:
+
+- `clickhouse-lean.xml` turns off ClickHouse's background system-log tables and shrinks its
+  caches. kinoko keeps a snapshot of every guest it explores, so memory the guest keeps
+  changing makes those snapshots large.
+- `clickhouse-users.xml` turns off ClickHouse's LLVM JIT. It aborts in the guest's CPU model
+  (`64-bit code requested on a subtarget that doesn't support it`), and ClickHouse's
+  watchdog then restarts the server mid-run.
+- No `depends_on`. With it, `podman start snuffle` fails when the kill fault ends while
+  ClickHouse is paused, and Snuffle stays dead. The setup step waits for readiness
+  instead.
+- `settle_s = 30`. A killed ClickHouse takes about 10 s to come back, so `eventually` checks
+  are judged after that.
+
+## What the first runs found
+
+From a 10-minute run plus one probe, before the workload fixes above:
+
+- **Snuffle answers 422 to Loki queries when ClickHouse is unreachable.** The error was
+  `start clickhouse query: handshake: … connection reset by peer`. Every execution error
+  maps to 422 in `internal/snuffle/loki_api.go`. 422 tells clients the query itself is bad,
+  so Grafana won't retry. A backend outage should probably be a 5xx. This is open.
+- **Pushed lines can be returned twice.** The duplicates showed up while Snuffle was killed
+  or slowed with pushes in flight. A push can land in ClickHouse while the client sees a
+  timeout or a dropped connection, and the client then retries. That is normal
+  at-least-once delivery, but Loki deduplicates identical (stream, timestamp, line) entries
+  at query time and Snuffle doesn't. The exact cause is not confirmed yet; probe the
+  finding's node with Snuffle's logs from before the restart.
+- The other failures ("snuffle answers queries once faults end", "could not be judged")
+  traced back to the `depends_on` and JIT problems above.
 
 ## Getting set up (PostHog)
 

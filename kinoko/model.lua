@@ -1,7 +1,8 @@
 -- Loki ingest durability: every push Snuffle acks (2xx) must be readable back through
 -- LogQL, exactly once, whatever happens to ClickHouse or Snuffle. Reference: https://kinoko.sh/docs
 
-config { ready_deadline_s = 180, max_fault_s = 15 }
+-- settle_s: a killed ClickHouse takes ~10 s to come back; judge `eventually` after that.
+config { ready_deadline_s = 180, max_fault_s = 15, settle_s = 30 }
 
 local SNUFFLE = "http://snuffle:9091"
 

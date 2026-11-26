@@ -16,3 +16,4 @@ ENTRYPOINT ["/usr/local/bin/snuffle"]
 FROM clickhouse/clickhouse-server:26.8.3.105 AS clickhouse
 COPY scripts/create_logs_snuffle_schema.sql /docker-entrypoint-initdb.d/
 COPY kinoko/clickhouse-lean.xml /etc/clickhouse-server/config.d/
+COPY kinoko/clickhouse-users.xml /etc/clickhouse-server/users.d/
