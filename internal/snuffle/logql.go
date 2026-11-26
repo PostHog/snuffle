@@ -1733,6 +1733,10 @@ func logQLSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, li
 	return logQLRawSelectSQL(cfg, selector, startNS, endNS, limit, direction)
 }
 
+// logQLPostHogRawAttributesSQL is attributes_map_str with the event_name
+// column folded in, so stages evaluated in Go see the same label as SQL.
+const logQLPostHogRawAttributesSQL = "if(event_name = '', attributes_map_str, mapUpdate(attributes_map_str, map('event_name__str', event_name)))"
+
 func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64, limit int, direction string) string {
 	where := logQLBaseFilters(cfg, selector, startNS, endNS)
 	order := "ASC"
@@ -1748,7 +1752,8 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 	}
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
-			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, %s FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
 			order,
@@ -1787,7 +1792,8 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 	}
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
-			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, %s FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
 			order,
@@ -1811,7 +1817,7 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 func logQLLogsSourceSQL(cfg Config, where []string) string {
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
-			"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, attributes_map_str FROM %s WHERE %s)",
+			"(SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, body, service_name, severity_text, trace_id, span_id, event_name, resource_attributes, attributes_map_str FROM %s WHERE %s)",
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
 		)
@@ -1953,13 +1959,21 @@ func logQLStreamLabelValueExpr(cfg Config, name string) string {
 		return "trace_id"
 	case "span_id":
 		return "span_id"
+	case "event_name":
+		// OTLP eventName is a column, not an attribute; an empty column
+		// falls through to an attribute of the same name.
+		return "if(event_name != '', event_name, " + logQLPostHogAttributeOrResourceExpr(name) + ")"
 	default:
-		// A single-key lookup reads one map bucket; mapContains decodes
-		// every key of the row's map, which is ~6x the bytes on PostHog's
-		// logs table. An empty attribute falls through to the resource.
-		attr := logQLPostHogAttributeExpr(name)
-		return "if(" + attr + " != '', " + attr + ", resource_attributes[" + sqlString(name) + "])"
+		return logQLPostHogAttributeOrResourceExpr(name)
 	}
+}
+
+func logQLPostHogAttributeOrResourceExpr(name string) string {
+	// A single-key lookup reads one map bucket; mapContains decodes
+	// every key of the row's map, which is ~6x the bytes on PostHog's
+	// logs table. An empty attribute falls through to the resource.
+	attr := logQLPostHogAttributeExpr(name)
+	return "if(" + attr + " != '', " + attr + ", resource_attributes[" + sqlString(name) + "])"
 }
 
 func logQLPostHogAttributeExpr(name string) string {

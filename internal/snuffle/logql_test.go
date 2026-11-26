@@ -513,6 +513,49 @@ func TestLogQLLongLabelFilterChainIsFlat(t *testing.T) {
 	}
 }
 
+func TestLogQLSQLOuterAggregationPlans(t *testing.T) {
+	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
+	for query, want := range map[string][]string{
+		`count(sum by (mcp_session_id) (count_over_time({service_name="x"} | mcp_session_id!="" [1h])))`: {},
+		`sum without (b) (sum by (a, b) (count_over_time({service_name="x"} [1h])))`:                     {"a"},
+		`max by (a, c) (sum by (a, b) (rate({service_name="x"} [1h]))) > 1`:                              {"a"},
+		`avg(count by (a) (sum by (a, b) (count_over_time({service_name="x"} [1h]))))`:                   {},
+	} {
+		expr, err := parseLogQL(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, ok := buildLogQLMetricSQLPlan(cfg, expr)
+		if !ok {
+			t.Fatalf("%s was not pushed to SQL", query)
+		}
+		if got := plan.resultLabels(); strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("%s labels = %v, want %v", query, got, want)
+		}
+	}
+	for _, query := range []string{
+		// topk would run before the outer aggregation in SQL
+		`topk(3, count by (a) (sum by (a, b) (count_over_time({service_name="x"} [1h]))))`,
+		// the inner pipeline has no SQL form
+		`count(sum by (a) (count_over_time({service_name="x"} | line_format "{{.a}}" [1h])))`,
+	} {
+		expr, err := parseLogQL(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := buildLogQLMetricSQLPlan(cfg, expr); ok {
+			t.Errorf("%s was pushed to SQL", query)
+		}
+	}
+}
+
+func TestLogQLPostHogEventNameLabel(t *testing.T) {
+	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
+	if got := logQLStreamLabelValueExpr(cfg, "event_name"); !strings.HasPrefix(got, "if(event_name != '', event_name, ") {
+		t.Fatalf("event_name label reads %s, want the event_name column first", got)
+	}
+}
+
 func TestLogQLSQLGroupedLabelFilters(t *testing.T) {
 	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
 	expr, err := parseLogQL(`sum(count_over_time({k8s.namespace.name="ns"} | a="1" and (b="2" or c="3") [5m]))`)
