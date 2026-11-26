@@ -150,6 +150,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("offset after a number", func(t *testing.T) {
 		assertOffsetAfterNumber(t, api.URL)
 	})
+	t.Run("histogram_share", func(t *testing.T) {
+		assertHistogramShare(t, api.URL)
+	})
 	if cfg.postHogSchemaLayout() {
 		t.Run("filtered label discovery", func(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)

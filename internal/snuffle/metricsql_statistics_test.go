@@ -32,6 +32,7 @@ func TestPrepareMetricsQLStatistics(test *testing.T) {
 		`max_over_time(median(value)[5m:1m])`,
 		`median(histogram_quantiles("phi", 0.5, 0.9, bucket))`,
 		`WITH (middle(q) = median(q)) middle(value)`,
+		`1 - histogram_share(8, sum by (environment, le) (cilium_ipam:allocation_duration_seconds_bucket:avg1d))`,
 	} {
 		test.Run(expression, func(test *testing.T) {
 			prepared, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, start.Add(time.Minute))
@@ -54,6 +55,8 @@ func TestPrepareMetricsQLStatistics(test *testing.T) {
 		`median("not a vector")`,
 		`__snuffle_median("{}", value)`,
 		`__snuffle_histogram_quantiles(bucket, "phi", 0.5)`,
+		`histogram_share(bucket)`,
+		`histogram_share(1, bucket, "bounds")`,
 	} {
 		test.Run("invalid "+expression, func(test *testing.T) {
 			prepared, err := prepareMetricsQLQuery(expression, 30*time.Second, 5*time.Minute, start, start)
