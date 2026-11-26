@@ -822,6 +822,10 @@ tests metrics and Loki requests against ClickHouse, including tenant isolation.
 Performance benchmarks remain separate because they need controlled hardware
 and datasets.
 
+Fault-injection testing of the ingest path, where ClickHouse or Snuffle is killed,
+paused, cut off or slowed while clients push, uses
+[kinoko](https://kinoko.sh/docs). See [kinoko/README.md](kinoko/README.md).
+
 Run repeatable metrics and logs regression benchmarks:
 
 ```bash
