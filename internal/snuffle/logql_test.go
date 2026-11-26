@@ -665,7 +665,7 @@ func TestLogQLSelectSQLUsesLogsSchema(t *testing.T) {
 		"match(severity_text, '^(?:error|warn)$')",
 		"trace_id != 'abc'",
 		"position(body, 'failed') > 0",
-		"ORDER BY ts_ns DESC, observed_ns DESC LIMIT 50",
+		"ORDER BY timestamp DESC, observed_timestamp DESC LIMIT 50 SETTINGS query_plan_max_limit_for_top_k_optimization = 10000",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)
@@ -788,7 +788,7 @@ func TestLogQLSelectSQLUsesSnuffleLogsSchema(t *testing.T) {
 		"stream_severity_text != ''",
 		"mapContains(labels, 'trace_id')",
 		"position(body, 'failed') > 0",
-		"ORDER BY ts_ns DESC, observed_ns DESC LIMIT 50",
+		"ORDER BY timestamp DESC, observed_ns DESC LIMIT 50 SETTINGS query_plan_max_limit_for_top_k_optimization = 10000",
 	} {
 		if !strings.Contains(sql, want) {
 			t.Fatalf("SQL %q does not contain %q", sql, want)

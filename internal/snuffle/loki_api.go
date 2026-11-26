@@ -440,7 +440,7 @@ func logQLCandidateLimit(selector logQLSelector, limit, maxRows int) int {
 	if limit <= 0 || limit > maxRows {
 		return maxRows
 	}
-	if !logQLSelectorFullyPushed(selector) {
+	if !logQLSelectorKeepsSQLRows(selector) {
 		return maxRows
 	}
 	extra := 256
@@ -452,6 +452,28 @@ func logQLCandidateLimit(selector logQLSelector, limit, maxRows int) int {
 		return maxRows
 	}
 	return candidateLimit
+}
+
+// logQLSelectorKeepsSQLRows reports whether every row the SQL returns survives
+// the pipeline: line filters are pushed into SQL (up to the first line_format,
+// as in logQLBaseFilters) and the other stages only parse or relabel. Then the
+// SQL limit can be the query limit and parsers such as | json run on those rows
+// only; if a row is still dropped, queryLogQLRows widens the limit and retries.
+func logQLSelectorKeepsSQLRows(selector logQLSelector) bool {
+	linePushed := true
+	for _, stage := range selector.stages {
+		switch stage.kind {
+		case "line_format":
+			linePushed = false
+		case "label_filter":
+			return false
+		case "line_filter":
+			if !linePushed {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func logQLSelectorFullyPushed(selector logQLSelector) bool {

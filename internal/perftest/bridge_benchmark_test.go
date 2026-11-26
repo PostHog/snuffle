@@ -148,6 +148,7 @@ func bridgePostHogLogScenarios() []bridgeScenario {
 		{name: "log_line_error", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench"} |= "error"`)},
 		{name: "log_regex_checkout", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench"} |~ "checkout|failed"`)},
 		{name: "log_host", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench",host="host-42"}`)},
+		{name: "log_json_lines", path: "/loki/api/v1/query_range", params: commonRangeParams(`{app="snuffle-bench",format="json"} | json`)},
 		{name: "log_sum_count", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum(count_over_time({app="snuffle-bench"}[5m]))`)},
 		{name: "log_count_by_service", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (service_name) (count_over_time({app="snuffle-bench"}[5m]))`)},
 		{name: "log_rate_by_region", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (region) (rate({app="snuffle-bench"} |= "message" [5m]))`)},

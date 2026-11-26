@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -128,6 +130,18 @@ func assertLokiRoundTrip(t *testing.T, baseURL string, cfg Config) {
 				name: "line filter", query: selector + ` |= "last"`, direction: "forward", limit: "10",
 				want: [][]string{{lastTimestamp, fmt.Sprintf("last request for team %d", teamID)}},
 			},
+			{
+				// ENG-024: the parser runs on the limited rows only
+				name: "json parser backward limit", query: selector + ` |= "request" | json`, direction: "backward", limit: "1",
+				want: [][]string{{lastTimestamp, fmt.Sprintf("last request for team %d", teamID)}},
+			},
+			{
+				name: "json parser forward", query: selector + ` | json`, direction: "forward", limit: "10",
+				want: [][]string{
+					{firstTimestamp, fmt.Sprintf("first request for team %d", teamID)},
+					{lastTimestamp, fmt.Sprintf("last request for team %d", teamID)},
+				},
+			},
 		} {
 			t.Run(fmt.Sprintf("team %d %s", teamID, test.name), func(t *testing.T) {
 				data := apiGetForTeam[struct {
@@ -168,6 +182,10 @@ func assertLokiRoundTrip(t *testing.T, baseURL string, cfg Config) {
 		}
 	}
 
+	if cfg.postHogLogSchemaLayout() {
+		assertLogQLRawSelectIsTopN(t, cfg, selector+` |= "request"`, start)
+	}
+
 	statsTime := strconv.FormatInt(start.Truncate(time.Minute).Add(2*time.Minute).UnixNano(), 10)
 	assertLokiRangeCount(t, baseURL, selector, statsTime)
 	if !cfg.postHogLogSchemaLayout() {
@@ -177,6 +195,35 @@ func assertLokiRoundTrip(t *testing.T, baseURL string, cfg Config) {
 		withoutLabelIndex := httptest.NewServer(mux)
 		defer withoutLabelIndex.Close()
 		assertLokiRangeCount(t, withoutLabelIndex.URL, selector, statsTime)
+	}
+}
+
+// assertLogQLRawSelectIsTopN checks (ENG-024) that a newest-first line query
+// on the PostHog logs table sorts on the timestamp column, so ClickHouse plans
+// it as a top-N read that skips rows older than the current newest N.
+func assertLogQLRawSelectIsTopN(t *testing.T, cfg Config, query string, start time.Time) {
+	t.Helper()
+	selector, err := parseLogQLSelector(query)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sql := logQLRawStreamSelectSQL(cfg, *selector, start.UnixNano(), start.Add(6*time.Hour).UnixNano(), 1256, "backward")
+	var plan strings.Builder
+	err = NewClickHouseClient(cfg).QueryRows(ctx, "EXPLAIN actions = 1 "+sql, func(row clickHouseRow) error {
+		var line string
+		if err := row.Scan(&line); err != nil {
+			return err
+		}
+		plan.WriteString(line + "\n")
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("EXPLAIN %s: %v", sql, err)
+	}
+	if !strings.Contains(plan.String(), "__topKFilter(timestamp)") {
+		t.Fatalf("raw log query is not planned as a top-N read on timestamp:\n%s\n%s", sql, plan.String())
 	}
 }
 

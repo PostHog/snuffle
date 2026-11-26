@@ -1752,16 +1752,15 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 	}
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
-			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, %s FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, resource_attributes, %s FROM %s WHERE %s %s",
 			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
-			order,
-			limit,
+			logQLRawOrderLimitSQL("observed_timestamp", order, limit),
 		)
 	}
 	return fmt.Sprintf(
-		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, resource_attributes, %s AS attributes_map_str FROM %s WHERE %s %s",
 		logQLSnuffleLabelValueExpr("service_name"),
 		logQLSnuffleLabelValueExpr("severity_text"),
 		logQLSnuffleLabelValueExpr("trace_id"),
@@ -1769,8 +1768,7 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 		logQLSnuffleAttributesMapExpr(),
 		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
-		order,
-		limit,
+		logQLRawOrderLimitSQL("observed_ns", order, limit),
 	)
 }
 
@@ -1792,16 +1790,15 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 	}
 	if cfg.postHogLogSchemaLayout() {
 		return fmt.Sprintf(
-			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, %s FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+			"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, toInt64(toUnixTimestamp64Nano(observed_timestamp)) AS observed_ns, body, service_name, severity_text, trace_id, span_id, %s FROM %s WHERE %s %s",
 			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
-			order,
-			limit,
+			logQLRawOrderLimitSQL("observed_timestamp", order, limit),
 		)
 	}
 	return fmt.Sprintf(
-		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, %s AS attributes_map_str FROM %s WHERE %s ORDER BY ts_ns %s, observed_ns DESC LIMIT %d",
+		"SELECT toInt64(toUnixTimestamp64Nano(timestamp)) AS ts_ns, observed_ns, body, %s AS service_name, %s AS severity_text, %s AS trace_id, %s AS span_id, %s AS attributes_map_str FROM %s WHERE %s %s",
 		logQLSnuffleLabelValueExpr("service_name"),
 		logQLSnuffleLabelValueExpr("severity_text"),
 		logQLSnuffleLabelValueExpr("trace_id"),
@@ -1809,9 +1806,21 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 		logQLSnuffleAttributesMapExpr(),
 		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
-		order,
-		limit,
+		logQLRawOrderLimitSQL("observed_ns", order, limit),
 	)
+}
+
+// logQLRawOrderLimitSQL sorts on the stored timestamp column rather than the
+// ts_ns expression, so ClickHouse can run ORDER BY ... LIMIT as a top-N read:
+// it drops rows and skips granules (minmax index) older than the newest N seen
+// so far instead of reading every matching row first. ClickHouse only does
+// that up to query_plan_max_limit_for_top_k_optimization rows (default 1000,
+// below Grafana's 1000 + the 256 candidate slack and Loki's 5000).
+// ponytail: fixed 10000, the same cap ClickHouse uses for lazy
+// materialization; bigger limits (metric evaluation reads every row) stay off
+// because the top-N filter only adds reads when the limit is never reached.
+func logQLRawOrderLimitSQL(observedColumn, order string, limit int) string {
+	return fmt.Sprintf("ORDER BY timestamp %s, %s DESC LIMIT %d SETTINGS query_plan_max_limit_for_top_k_optimization = 10000", order, observedColumn, limit)
 }
 
 func logQLLogsSourceSQL(cfg Config, where []string) string {
