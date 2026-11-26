@@ -439,6 +439,9 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if e.Name == "histogram_quantiles" {
 		return r.rewriteHistogramQuantiles(e, step, instant)
 	}
+	if e.Name == "histogram_share" {
+		return r.rewriteHistogramShare(e, step, instant)
+	}
 	if renamed, err := rewriteLabelFunction(e); renamed || err != nil {
 		if err != nil {
 			return err
