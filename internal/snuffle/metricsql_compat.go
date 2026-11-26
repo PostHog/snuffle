@@ -27,17 +27,21 @@ const metricsQLCarrierPrefix = metricsQLInternalPrefix + "fn:"
 // The engine keeps metric names only for last_over_time and first_over_time.
 const metricsQLDefaultRollupName = "last_over_time"
 
+const metricsQLTlastOverTimeName = metricsQLInternalPrefix + "tlast_over_time"
+
 var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "idelta"}
 
 // metricsQLPureCounterFunctions are counter functions that only the engine
 // evaluates. increase_pure is increase where a new counter starts from 0.
-var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase"}
+// increase_prometheus is increase from the first sample in the window, as
+// Prometheus computes it without extrapolation.
+var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase", "increase_prometheus": "increase"}
 
 // metricsQLDeltaWindowFunctions return the sum of the points in the window for
 // a delta histogram series. rate divides that sum by the window. The running
 // total of a delta series starts at the query range. The MetricsQL baseline
 // rules therefore miscount a series with no point shortly before the window.
-var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_pure": true, "delta": true, "rate": true}
+var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_pure": true, "increase_prometheus": true, "delta": true, "rate": true}
 
 // deltaSeriesOf returns the delta histogram series that the selector read with
 // these labels. It returns nil for a subquery, which has no storage series set.
@@ -68,6 +72,11 @@ func init() {
 		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[histogramName])
 	}
+	// tlast_over_time is ts_of_last_over_time, which Prometheus marks experimental.
+	tlast := *parser.Functions["ts_of_last_over_time"]
+	tlast.Name, tlast.Experimental = metricsQLTlastOverTimeName, false
+	parser.Functions[tlast.Name] = &tlast
+	promql.FunctionCalls[tlast.Name] = promql.FunctionCalls["ts_of_last_over_time"]
 	runningSum := metricsQLInternalPrefix + "running_sum"
 	parser.Functions[runningSum] = &parser.Function{Name: runningSum, ArgTypes: []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar}, ReturnType: parser.ValueTypeVector}
 	promql.FunctionCalls[runningSum] = func(v []promql.Vector, m promql.Matrix, _ parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
@@ -507,6 +516,9 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 		return err
 	}
 	if !counter {
+		if e.Name == "tlast_over_time" {
+			e.Name = metricsQLTlastOverTimeName
+		}
 		return nil
 	}
 	if len(e.Args) != 1 || e.KeepMetricNames {
@@ -760,12 +772,16 @@ func metricsQLSampleInterval(points []promql.FPoint, fallback int64) int64 {
 
 func metricsQLCounterValue(name string, points []promql.FPoint, first int, start, maxPrev, lookback int64) float64 {
 	prev := first - 1
+	if name == "increase_prometheus" {
+		// Prometheus ignores the sample before the window.
+		prev = -1
+	}
 	havePrev := prev >= 0 && points[prev].T > start-maxPrev
 	isRate := name == "rate" || name == "irate"
 	if first == len(points) {
 		return math.NaN()
 	}
-	isIncrease := name == "increase" || name == "increase_pure"
+	isIncrease := name == "increase" || name == "increase_pure" || name == "increase_prometheus"
 	if !havePrev && (isIncrease || name == "delta") && prev >= 0 && points[first].T-points[prev].T < lookback {
 		havePrev = true
 	}
@@ -776,6 +792,10 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 		baseline = points[prev].F
 	} else if name == "increase_pure" {
 		baseline = 0
+	} else if name == "increase_prometheus" {
+		if first+1 == len(points) {
+			return math.NaN()
+		}
 	} else if !isRate {
 		var delta float64
 		if first+1 < len(points) {

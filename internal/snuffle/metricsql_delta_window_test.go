@@ -131,6 +131,7 @@ func TestDeltaHistogramCounterWindowSum(test *testing.T) {
 		// Both points in the window count. The point 2h earlier does not.
 		{`increase(sparse_seconds_count[5m])`, 2, true},
 		{`increase_pure(sparse_seconds_count[5m])`, 2, true},
+		{`increase_prometheus(sparse_seconds_count[5m])`, 2, true},
 		{`delta(sparse_seconds_count[5m])`, 2, true},
 		{`rate(sparse_seconds_count[5m])`, 2.0 / 300, true},
 		{`increase(sparse_seconds_bucket{le="0.5"}[5m])`, 2, true},
