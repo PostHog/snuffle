@@ -1700,3 +1700,14 @@ func TestLogQLSQLPlanForSumOverRangeAggregations(t *testing.T) {
 		})
 	}
 }
+
+func TestLogQLRawOrderLimitOmitsTopKSettingWhenDisabled(t *testing.T) {
+	on := logQLRawOrderLimitSQL(Config{}, "observed_ns", "DESC", 50)
+	if want := "ORDER BY timestamp DESC, observed_ns DESC LIMIT 50 SETTINGS query_plan_max_limit_for_top_k_optimization = 10000"; on != want {
+		t.Fatalf("got %q, want %q", on, want)
+	}
+	off := logQLRawOrderLimitSQL(Config{LogQueryNoTopKSetting: true}, "observed_ns", "DESC", 50)
+	if want := "ORDER BY timestamp DESC, observed_ns DESC LIMIT 50"; off != want {
+		t.Fatalf("got %q, want %q", off, want)
+	}
+}

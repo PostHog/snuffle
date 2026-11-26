@@ -1756,7 +1756,7 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
-			logQLRawOrderLimitSQL("observed_timestamp", order, limit),
+			logQLRawOrderLimitSQL(cfg, "observed_timestamp", order, limit),
 		)
 	}
 	return fmt.Sprintf(
@@ -1768,7 +1768,7 @@ func logQLRawSelectSQL(cfg Config, selector logQLSelector, startNS, endNS int64,
 		logQLSnuffleAttributesMapExpr(),
 		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
-		logQLRawOrderLimitSQL("observed_ns", order, limit),
+		logQLRawOrderLimitSQL(cfg, "observed_ns", order, limit),
 	)
 }
 
@@ -1794,7 +1794,7 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 			logQLPostHogRawAttributesSQL,
 			tableName(cfg.CHDatabase, cfg.LogsTable),
 			strings.Join(where, " AND "),
-			logQLRawOrderLimitSQL("observed_timestamp", order, limit),
+			logQLRawOrderLimitSQL(cfg, "observed_timestamp", order, limit),
 		)
 	}
 	return fmt.Sprintf(
@@ -1806,7 +1806,7 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 		logQLSnuffleAttributesMapExpr(),
 		logQLLogsTableSQL(cfg),
 		strings.Join(where, " AND "),
-		logQLRawOrderLimitSQL("observed_ns", order, limit),
+		logQLRawOrderLimitSQL(cfg, "observed_ns", order, limit),
 	)
 }
 
@@ -1819,8 +1819,13 @@ func logQLRawStreamSelectSQL(cfg Config, selector logQLSelector, startNS, endNS 
 // ponytail: fixed 10000, the same cap ClickHouse uses for lazy
 // materialization; bigger limits (metric evaluation reads every row) stay off
 // because the top-N filter only adds reads when the limit is never reached.
-func logQLRawOrderLimitSQL(observedColumn, order string, limit int) string {
-	return fmt.Sprintf("ORDER BY timestamp %s, %s DESC LIMIT %d SETTINGS query_plan_max_limit_for_top_k_optimization = 10000", order, observedColumn, limit)
+func logQLRawOrderLimitSQL(cfg Config, observedColumn, order string, limit int) string {
+	sql := fmt.Sprintf("ORDER BY timestamp %s, %s DESC LIMIT %d", order, observedColumn, limit)
+	if cfg.LogQueryNoTopKSetting {
+		// Servers that predate the setting reject it as UNKNOWN_SETTING.
+		return sql
+	}
+	return sql + " SETTINGS query_plan_max_limit_for_top_k_optimization = 10000"
 }
 
 func logQLLogsSourceSQL(cfg Config, where []string) string {

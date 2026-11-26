@@ -761,6 +761,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `SNUFFLE_LOG_RETENTION` | `720h` | Expiry assigned to log rows received through Loki push |
 | `SNUFFLE_METRICS_RETENTION` | `2160h` | Expiry assigned to PostHog metric rows received through remote write |
 | `SNUFFLE_LOG_QUERY_MAX_ROWS` | `100000` | Maximum raw log rows read by a LogQL query |
+| `SNUFFLE_LOG_QUERY_TOP_K_SETTING` | `true` | Send `query_plan_max_limit_for_top_k_optimization` with raw log queries so ClickHouse can stop at the limit; set `false` for a ClickHouse server too old to know the setting (it rejects the query as `UNKNOWN_SETTING`) |
 
 ### Tenancy and self-observability
 
