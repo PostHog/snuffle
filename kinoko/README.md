@@ -64,22 +64,25 @@ Workload details that matter under kinoko:
 - `settle_s = 30`. A killed ClickHouse takes about 10 s to come back, so `eventually` checks
   are judged after that.
 
-## What the first runs found
+## What the runs found
 
-From a 10-minute run plus one probe, before the workload fixes above:
+The latest run (10 minutes, about 16k paths, 185k actions and 9.7k faults) failed exactly two
+checks. Each comes with a minimal reproduction:
 
-- **Snuffle answers 422 to Loki queries when ClickHouse is unreachable.** The error was
-  `start clickhouse query: handshake: … connection reset by peer`. Every execution error
-  maps to 422 in `internal/snuffle/loki_api.go`. 422 tells clients the query itself is bad,
-  so Grafana won't retry. A backend outage should probably be a 5xx. This is open.
-- **Pushed lines can be returned twice.** The duplicates showed up while Snuffle was killed
-  or slowed with pushes in flight. A push can land in ClickHouse while the client sees a
-  timeout or a dropped connection, and the client then retries. That is normal
-  at-least-once delivery, but Loki deduplicates identical (stream, timestamp, line) entries
-  at query time and Snuffle doesn't. The exact cause is not confirmed yet; probe the
-  finding's node with Snuffle's logs from before the restart.
-- The other failures ("snuffle answers queries once faults end", "could not be judged")
-  traced back to the `depends_on` and JIT problems above.
+- **Snuffle answers 422 to Loki queries when ClickHouse is unreachable.** Kill ClickHouse
+  for 45 ms while a `query_range` is in flight, and Snuffle answers 422 (`handshake: …
+  connection reset by peer`). Every execution error maps to 422 in
+  `internal/snuffle/loki_api.go`. 422 tells clients the query itself is bad, so Grafana
+  won't retry. A backend outage should be a 5xx. This is open.
+- **A pushed line is stored twice after a client retry.** Start one push, kill Snuffle for
+  45 ms partway through, and the client sees no answer and retries. The line is then
+  queryable twice: the first attempt had already written the `logs` row before the kill,
+  and the four inserts of a push are not idempotent. Loki deduplicates identical
+  (stream, timestamp, line) entries at query time; Snuffle doesn't. Possible fixes are
+  query-time dedup or an `insert_deduplication_token` derived from the push. This is open.
+
+`every acked push is queryable` and `snuffle answers queries once faults end` held
+throughout: no acked write was lost, and Snuffle always recovered.
 
 ## Getting set up (PostHog)
 
