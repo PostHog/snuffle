@@ -180,7 +180,9 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 			}
 			stats := &promRequestStats{}
 			actual, handled, err := compactServer.tryCompactHistogramRange(withPromRequestStats(ctx, stats), prepared.query, start, end, step)
-			if err != nil || !handled || stats.clickHouseQueries.Load() != 2 {
+			// The histogram lookup, metadata and the summed buckets, or for a
+			// plan the summed read hands back, also the streaming read.
+			if err != nil || !handled || stats.clickHouseQueries.Load() < 3 || stats.clickHouseQueries.Load() > 4 {
 				test.Fatalf("compact query: handled=%v queries=%d error=%v", handled, stats.clickHouseQueries.Load(), err)
 			}
 			engineQuery, err := compactServer.engine.NewRangeQuery(ctx, compactServer.queryable, promql.NewPrometheusQueryOpts(false, serverCfg.LookbackDelta), prepared.query, start, end, step)

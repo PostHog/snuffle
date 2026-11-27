@@ -257,6 +257,20 @@ var clickHouseBusyBackoff = []time.Duration{50 * time.Millisecond, 200 * time.Mi
 
 const clickHouseTooManySimultaneousQueries = 202
 
+// ClickHouse error codes for a query that used more memory or time than its
+// limits allow.
+const (
+	clickHouseTimeoutExceeded     = 159
+	clickHouseMemoryLimitExceeded = 241
+)
+
+// isClickHouseResourceError reports whether err is ClickHouse refusing a
+// query for its memory use or running time.
+func isClickHouseResourceError(err error) bool {
+	var exception *clickhouse.Exception
+	return errors.As(err, &exception) && (exception.Code == clickHouseTimeoutExceeded || exception.Code == clickHouseMemoryLimitExceeded)
+}
+
 // queryWhenNotBusy starts a query, retrying while ClickHouse rejects it for
 // too many simultaneous queries for the user. ClickHouse refuses such a query
 // before it runs, so a retry repeats no work. A dashboard renders many panels

@@ -137,6 +137,9 @@ func (s *Server) tryFastRangeGroups(ctx context.Context, prepared metricsQLQuery
 		return nil, false, err
 	}
 	if virtual {
+		if aggregate.Op == parser.COUNT && len(aggregate.Grouping) == 0 && call.name == "default_rollup" && !isSubquery {
+			return s.countHistogramBuckets(ctx, call, mint, maxt, evalStart, points)
+		}
 		return nil, false, nil
 	}
 	if call.name != "default_rollup" {

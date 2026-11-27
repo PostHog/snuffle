@@ -21,13 +21,21 @@ import (
 
 var errCompactHistogramFallback = errors.New("histogram requires the general evaluation path")
 
+// errCompactHistogramSplit reports that a source changes its bucket layout or
+// temporality inside the range. The streaming read always rejects such a
+// source, so reading every row first only delays the next backend.
+var errCompactHistogramSplit = errors.New("histogram source changes layout or temporality in the range")
+
 // compactHistogramInstantPoints is the number of points that irate and idelta
 // need for each bucket: they read the last two points, and
 // metricsQLSampleInterval reads the last 21 timestamps.
 const compactHistogramInstantPoints = 21
 
 type compactHistogramPlan struct {
+	// call is the quantile call, or nil when the plan is the bare
+	// sum by (le) and returns one series per bucket.
 	call                                              *parser.Call
+	buckets                                           *parser.AggregateExpr
 	selector                                          *parser.VectorSelector
 	alias                                             postHogHistogramAlias
 	function                                          string
@@ -47,42 +55,44 @@ func unparenExpr(expr parser.Expr) parser.Expr {
 }
 
 func planCompactHistogram(expr parser.Expr, start, end time.Time, step, lookback time.Duration) *compactHistogramPlan {
-	call, ok := unparenExpr(expr).(*parser.Call)
-	if !ok {
-		return nil
+	plan := &compactHistogramPlan{start: start.UnixMilli(), end: end.UnixMilli(), step: step.Milliseconds(), lookback: lookback.Milliseconds()}
+	bucketExpr := unparenExpr(expr)
+	if call, ok := bucketExpr.(*parser.Call); ok {
+		plan.call = call
+		switch call.Func.Name {
+		case metricsQLInternalPrefix + "histogram_quantiles":
+			if len(call.Args) < 3 {
+				return nil
+			}
+			if _, ok := call.Args[1].(*parser.StringLiteral); !ok {
+				return nil
+			}
+		case "histogram_quantile":
+			if len(call.Args) != 2 {
+				return nil
+			}
+			plan.bucketArg = 1
+		default:
+			return nil
+		}
+		quantiles := make(map[float64]bool)
+		for index, arg := range call.Args {
+			if index == plan.bucketArg || (plan.bucketArg == 0 && index == 1) {
+				continue
+			}
+			number, ok := unparenExpr(arg).(*parser.NumberLiteral)
+			if !ok || math.IsNaN(number.Val) || math.IsInf(number.Val, 0) || quantiles[number.Val] {
+				return nil
+			}
+			quantiles[number.Val] = true
+		}
+		bucketExpr = unparenExpr(call.Args[plan.bucketArg])
 	}
-	plan := &compactHistogramPlan{call: call, start: start.UnixMilli(), end: end.UnixMilli(), step: step.Milliseconds(), lookback: lookback.Milliseconds()}
-	switch call.Func.Name {
-	case metricsQLInternalPrefix + "histogram_quantiles":
-		if len(call.Args) < 3 {
-			return nil
-		}
-		if _, ok := call.Args[1].(*parser.StringLiteral); !ok {
-			return nil
-		}
-	case "histogram_quantile":
-		if len(call.Args) != 2 {
-			return nil
-		}
-		plan.bucketArg = 1
-	default:
-		return nil
-	}
-	quantiles := make(map[float64]bool)
-	for index, arg := range call.Args {
-		if index == plan.bucketArg || (plan.bucketArg == 0 && index == 1) {
-			continue
-		}
-		number, ok := unparenExpr(arg).(*parser.NumberLiteral)
-		if !ok || math.IsNaN(number.Val) || math.IsInf(number.Val, 0) || quantiles[number.Val] {
-			return nil
-		}
-		quantiles[number.Val] = true
-	}
-	aggregate, ok := unparenExpr(call.Args[plan.bucketArg]).(*parser.AggregateExpr)
+	aggregate, ok := bucketExpr.(*parser.AggregateExpr)
 	if !ok || aggregate.Op != parser.SUM || aggregate.Without || len(aggregate.Grouping) != 1 || aggregate.Grouping[0] != "le" {
 		return nil
 	}
+	plan.buckets = aggregate
 	rate, ok := unparenExpr(aggregate.Expr).(*parser.Call)
 	if !ok || len(rate.Args) != 5 {
 		return nil
@@ -406,13 +416,18 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 	return dropCompactHistogramNaNs(matrix), nil
 }
 
-// evaluate applies the quantile call of plan to the summed buckets. Plans that
-// share the bucket expression share the evaluator, so one read of the buckets
-// serves several quantiles. The result keeps NaN points: in a union they still
-// hide a later operand's series with the same labels, as in the engine.
+// evaluate applies the quantile call of plan to the summed buckets, or
+// returns the buckets themselves for a bare sum by (le). Plans that share the
+// bucket expression share the evaluator, so one read of the buckets serves
+// several quantiles. The result keeps NaN points: in a union they still hide
+// a later operand's series with the same labels, as in the engine.
 func (evaluator *compactHistogramEvaluator) evaluate(ctx context.Context, plan *compactHistogramPlan) (promql.Matrix, error) {
-	vectors := make([]promql.Vector, len(plan.call.Args))
-	for index, arg := range plan.call.Args {
+	args := parser.Expressions{plan.buckets}
+	if plan.call != nil {
+		args = plan.call.Args
+	}
+	vectors := make([]promql.Vector, len(args))
+	for index, arg := range args {
 		if number, ok := unparenExpr(arg).(*parser.NumberLiteral); ok {
 			vectors[index] = promql.Vector{{F: number.Val}}
 		}
@@ -442,7 +457,10 @@ func (evaluator *compactHistogramEvaluator) evaluate(ctx context.Context, plan *
 		}
 		vectors[plan.bucketArg] = vector
 		helper.Ts, helper.Out = plan.start+int64(grid)*plan.step, helper.Out[:0]
-		values, _ := promql.FunctionCalls[plan.call.Func.Name](vectors, nil, plan.call.Args, helper)
+		values := vector
+		if plan.call != nil {
+			values, _ = promql.FunctionCalls[plan.call.Func.Name](vectors, nil, plan.call.Args, helper)
+		}
 		for _, sample := range values {
 			key := sample.Metric.String()
 			index, exists := byLabels[key]
@@ -737,6 +755,9 @@ func planCompactHistogramUnion(expr parser.Expr, start, end time.Time, step, loo
 // compactHistogramNamed reports whether the quantile label is __name__. The
 // engine drops such a name at MetricsQL label edits and keeps it at `or`.
 func compactHistogramNamed(plan *compactHistogramPlan) bool {
+	if plan.call == nil {
+		return false
+	}
 	label, ok := plan.call.Args[1].(*parser.StringLiteral)
 	return ok && label.Val == labels.MetricName
 }
@@ -837,7 +858,7 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 	evaluators := make(map[string]*compactHistogramEvaluator)
 	var union compactHistogramUnion
 	for _, branch := range branches {
-		key := branch.plan.call.Args[branch.plan.bucketArg].String()
+		key := branch.plan.buckets.String()
 		evaluator, exists := evaluators[key]
 		if !exists {
 			var handled bool
@@ -862,26 +883,53 @@ func (server *Server) tryCompactHistogramRange(ctx context.Context, query string
 	return union.matrix(), true, nil
 }
 
-// readCompactHistogram reads the buckets of plan and sums them on the step
-// grid. It reports false when the data needs the general evaluation path.
-func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHistogramPlan) (*compactHistogramEvaluator, bool, error) {
-	querier := &CHQuerier{queryable: server.queryable}
-	// The first step reads the range of the selector, as the engine does. A
-	// rate without a window has a range of one step plus the lookback.
-	mint := plan.start - plan.selectorRange + 1
-	real, sources, ids, err := querier.selectPostHogExactHistogramMetadata(ctx, mint, plan.end, plan.alias, plan.selector.LabelMatchers)
-	if err != nil {
-		return nil, true, err
+// compactReadMode selects which reads readCompactHistogram may run.
+type compactReadMode int
+
+const (
+	// compactReadAll runs the summed read, then the streaming read.
+	compactReadAll compactReadMode = iota
+	// compactReadSummed runs only the summed read, and declines when it
+	// cannot answer, so the histogram pushdown can try before the streaming read.
+	compactReadSummed
+	// compactReadStreaming runs only the streaming read.
+	compactReadStreaming
+)
+
+type compactReadModeKey struct{}
+
+func withCompactReadMode(ctx context.Context, mode compactReadMode) context.Context {
+	return context.WithValue(ctx, compactReadModeKey{}, mode)
+}
+
+func compactReadModeOf(ctx context.Context) compactReadMode {
+	mode, ok := ctx.Value(compactReadModeKey{}).(compactReadMode)
+	if !ok {
+		return compactReadAll
 	}
-	if len(real) > 0 {
-		return nil, false, nil
+	return mode
+}
+
+// compactHistogramSources returns the histogram sources a bucket selector
+// reads, one per label set without le. It reports false when the team stores
+// no histogram with the base name, which a primary key lookup settles before
+// reading the series, or when the selector also finds real series with the
+// name, or two sources share a label set: the engine merges those.
+func (server *Server) compactHistogramSources(ctx context.Context, alias postHogHistogramAlias, matchers []*labels.Matcher, mint, maxt int64) ([]uint64, bool, error) {
+	if found, err := server.postHogSelectsHistogram(ctx, mint, maxt, matchers); err != nil || !found {
+		return nil, false, err
+	}
+	querier := &CHQuerier{queryable: server.queryable}
+	real, sources, ids, err := querier.selectPostHogExactHistogramMetadata(ctx, mint, maxt, alias, matchers)
+	if err != nil || len(real) > 0 {
+		return nil, false, err
 	}
 	seen := make(map[string]bool)
 	selected := make([]uint64, 0, len(ids))
 	for _, id := range ids {
 		source := sources[id]
 		labelMap := postHogLabelMap(source.metricName, source.serviceName, source.resource, source.attributes)
-		if !matchesAll(labelMap, postHogHistogramBaseMatchers(plan.selector.LabelMatchers)) {
+		if !matchesAll(labelMap, postHogHistogramBaseMatchers(matchers)) {
 			continue
 		}
 		delete(labelMap, "le")
@@ -892,7 +940,63 @@ func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHis
 		seen[key] = true
 		selected = append(selected, id)
 	}
+	return selected, true, nil
+}
+
+// rangePushdownBuckets fills an evaluator with the sum by (le) that the range
+// pushdown computes, for a classic histogram stored as plain _bucket series.
+// It reports false when the range pushdown declines, as it does whenever the
+// selector also reaches PostHog histograms.
+func (server *Server) rangePushdownBuckets(ctx context.Context, plan *compactHistogramPlan) (*compactHistogramEvaluator, bool, error) {
+	groups, ok, err := server.tryFastRangeGroups(ctx, metricsQLQuery{query: plan.buckets.String()}, time.UnixMilli(plan.start), time.UnixMilli(plan.end), time.Duration(plan.step)*time.Millisecond)
+	if !ok || err != nil {
+		return nil, ok, err
+	}
 	evaluator := newCompactHistogramEvaluator(plan, server.cfg)
+	for _, group := range groups {
+		// Each le holds a dense column of steps, so the sample budget bounds
+		// the columns before they are allocated, as in the other reads.
+		if server.cfg.MaxSamples > 0 && len(evaluator.buckets)+1 > server.cfg.MaxSamples/plan.steps {
+			return nil, false, nil
+		}
+		column := make([]compactHistogramSum, plan.steps)
+		for _, point := range group.points {
+			if index := (point.t - plan.start) / plan.step; index >= 0 && index < int64(plan.steps) {
+				column[index].add(point.v)
+			}
+		}
+		evaluator.buckets[group.metric["le"]] = column
+	}
+	return evaluator, true, nil
+}
+
+// readCompactHistogram reads the buckets of plan and sums them on the step
+// grid. It reports false when the data needs the general evaluation path.
+func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHistogramPlan) (*compactHistogramEvaluator, bool, error) {
+	// The first step reads the range of the selector, as the engine does. A
+	// rate without a window has a range of one step plus the lookback.
+	mint := plan.start - plan.selectorRange + 1
+	selected, ok, err := server.compactHistogramSources(ctx, plan.alias, plan.selector.LabelMatchers, mint, plan.end)
+	if err != nil {
+		return nil, true, err
+	}
+	if !ok {
+		return server.rangePushdownBuckets(ctx, plan)
+	}
+	evaluator := newCompactHistogramEvaluator(plan, server.cfg)
+	mode := compactReadModeOf(ctx)
+	if mode != compactReadStreaming {
+		summed, err := server.sumCompactHistogram(ctx, plan, evaluator, selected, mint)
+		if errors.Is(err, errCompactHistogramSplit) {
+			return nil, false, nil
+		}
+		if summed || err != nil {
+			return evaluator, true, err
+		}
+		if mode == compactReadSummed {
+			return nil, false, nil
+		}
+	}
 	var sample postHogHistogramSample
 	err = queryPostHogSeriesIDs(ctx, server.client, server.cfg.IDChunkSize, selected, func(_ []uint64, idCondition string) string {
 		return postHogHistogramSamplesWhereSQL(server.cfg, mint, plan.end, idCondition, []postHogHistogramAlias{plan.alias}, plan.selector.LabelMatchers)
@@ -912,4 +1016,306 @@ func (server *Server) readCompactHistogram(ctx context.Context, plan *compactHis
 		return nil, true, err
 	}
 	return evaluator, true, nil
+}
+
+// sumCompactHistogram fills the evaluator from ClickHouse, which evaluates the
+// rollup of every bucket of every source at each step and sums the buckets by
+// bound, so Go receives buckets x steps values instead of every raw row. It
+// reports false, with the evaluator untouched, when the streaming read must
+// evaluate the plan: an implicit window, a rollup other than rate over a
+// cumulative source, a row the streaming read rejects, or no rows at all.
+func (server *Server) sumCompactHistogram(ctx context.Context, plan *compactHistogramPlan, evaluator *compactHistogramEvaluator, ids []uint64, mint int64) (bool, error) {
+	if plan.window == 0 || !metricsQLDeltaWindowFunctions[plan.function] || len(ids) == 0 {
+		return false, nil
+	}
+	rows := 0
+	err := queryPostHogSeriesIDs(ctx, server.client, server.cfg.IDChunkSize, ids, func(_ []uint64, idCondition string) string {
+		return compactHistogramSQL(server.cfg, plan, mint, idCondition)
+	}, func(row clickHouseRow) error {
+		rows++
+		var bounds, sums []float64
+		var present []uint8
+		var bad, split uint8
+		if err := row.Scan(&bounds, &sums, &present, &bad, &split); err != nil {
+			return err
+		}
+		if split != 0 {
+			return errCompactHistogramSplit
+		}
+		if bad != 0 || len(sums) != (len(bounds)+1)*plan.steps || len(present) != plan.steps {
+			return errCompactHistogramFallback
+		}
+		for bucket := 0; bucket <= len(bounds); bucket++ {
+			bound := math.Inf(1)
+			if bucket < len(bounds) {
+				bound = bounds[bucket]
+			}
+			key := formatHistogramPushdownBound(bound)
+			column, exists := evaluator.buckets[key]
+			if !exists {
+				if evaluator.cfg.MaxSamples > 0 && (len(evaluator.buckets)+1) > evaluator.cfg.MaxSamples/plan.steps {
+					return errCompactHistogramFallback
+				}
+				column = make([]compactHistogramSum, plan.steps)
+				evaluator.buckets[key] = column
+			}
+			for index, sum := range sums[bucket*plan.steps : (bucket+1)*plan.steps] {
+				if present[index] != 0 {
+					column[index].add(sum)
+				}
+			}
+		}
+		return nil
+	})
+	if errors.Is(err, errCompactHistogramSplit) {
+		clear(evaluator.buckets)
+		return false, err
+	}
+	// The summed read holds a step grid for every bucket of every source, so a
+	// wide query can exhaust ClickHouse memory or time where the streaming read
+	// succeeds. The read declines when the summed one hits such a limit.
+	if errors.Is(err, errCompactHistogramFallback) || isClickHouseResourceError(err) || (err == nil && rows == 0) {
+		clear(evaluator.buckets)
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// compactHistogramRowsSQL reads the histogram rows of where, one per point. A
+// trailing +Inf bound with an empty overflow bucket is one +Inf bucket, as in
+// normalizePostHogHistogramBounds. row_bad marks a row that the streaming read
+// evaluates differently, and is_stale a stale marker: capture-apm-metrics
+// writes one as a row with a StaleNaN sum and zero bucket counts.
+func compactHistogramRowsSQL(cfg Config, where []string) string {
+	trailingInf := "notEmpty(histogram_bounds) AND histogram_bounds[-1] = inf AND length(histogram_counts) = length(histogram_bounds) + 1 AND histogram_counts[-1] = 0"
+	bad := "aggregation_temporality NOT IN ('delta', 'cumulative') OR metric_type != 'histogram'" +
+		" OR length(counts) != length(bounds) + 1" +
+		" OR arraySum(counts) != observations" +
+		" OR NOT arrayAll(b -> isFinite(b), bounds)" +
+		" OR (length(bounds) > 1 AND arrayMin(arrayPopFront(arrayDifference(bounds))) <= 0)"
+	return fmt.Sprintf(
+		"SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, count AS observations, "+
+			"if(%[1]s, arrayPopBack(histogram_counts), histogram_counts) AS counts, if(%[1]s, arrayPopBack(histogram_bounds), histogram_bounds) AS bounds, "+
+			"aggregation_temporality = 'delta' AS is_delta, cityHash64(bounds) AS layout, toUInt8(%[2]s) AS row_bad, toUInt8(%[4]s) AS is_stale FROM %[3]s",
+		trailingInf, bad, postHogSampleRowsFrom(cfg, where, true), staleSampleSQL("value"),
+	)
+}
+
+// compactStepRunsSQL counts, for no point and then for each point of the
+// sorted times array, the steps whose time minus offset it is the last point
+// at or before.
+func compactStepRunsSQL(start, step int64, steps int, offset string) string {
+	return fmt.Sprintf(
+		"arrayPopFront(arrayDifference(arrayConcat([toInt64(0)], arrayMap(t -> least(greatest(toInt64(ceil((t + %s - %d) / %d)), 0), %d), times), [toInt64(%d)])))",
+		offset, start, step, steps, steps,
+	)
+}
+
+// compactExpandSQL repeats element k of values, which belongs to point k (0
+// to no point), for its run of steps, lining the values up with the grid.
+func compactExpandSQL(values, runs string) string {
+	return "arrayFlatten(arrayMap((x, n) -> arrayWithConstant(n, x), " + values + ", " + runs + "))"
+}
+
+// compactMaxPrevSQL returns, for each step, metricsQLSampleInterval over the
+// points of the sorted times array in (t - history, t], with the step as the
+// fallback, capped at the lookback: the max_prev the engine uses at t. The
+// last 21 points at or before each step come from the end runs, each as a copy
+// of times shifted by its distance, because a lambda that read times itself
+// would copy the array once per step.
+func compactMaxPrevSQL(history, start, step int64, steps int, lookback int64, endRuns string) string {
+	params, arrays, gaps := []string{"i", "p0"}, []string{fmt.Sprintf("range(%d)", steps), compactExpandSQL("arrayPushFront(times, 0)", endRuns)}, []string{}
+	for k := 1; k <= 20; k++ {
+		params = append(params, fmt.Sprintf("p%d", k))
+		arrays = append(arrays, compactExpandSQL(fmt.Sprintf("arrayPushFront(arrayShiftRight(times, %d), 0)", k), endRuns))
+		gaps = append(gaps, fmt.Sprintf("if(p%[1]d > %[2]d + i * %[3]d - %[4]d, p%[5]d - p%[1]d, -1)", k, start, step, history, k-1))
+	}
+	interval := "toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayFilter(g -> g >= 0, [" + strings.Join(gaps, ", ") + "]))))"
+	return fmt.Sprintf(
+		"arrayMap(iv -> least(if(iv <= 0, %d, %s), %d), arrayMap((%s) -> %s, %s))",
+		step, metricsQLSampleIntervalMarginSQL("iv"), lookback, strings.Join(params, ", "), interval, strings.Join(arrays, ", "),
+	)
+}
+
+// compactHistogramSQL returns one row per bucket layout: for each bucket and
+// step, the sum over sources of the rollup, and for each step whether any
+// source had a value there.
+//
+// Each source bucket becomes one series of running totals. A delta bucket
+// adds up its points, so a window sum is the total at the last point in the
+// window minus the total at the last point before it. A cumulative bucket
+// adds up the increase from each point to the next, with the reset rule of
+// metricsQLCounterValue, so a rate is the difference of two totals over the
+// time between their points. How recent a previous point must be follows
+// metricsQLSampleInterval over the selector range at each step, as in the
+// streaming read.
+//
+// The points that end each step and each window start are found without a
+// search: a point is the last one at or before every step from the first
+// step at or after it up to the first step at or after the next point.
+// Repeating each value for its run of steps lines it up with the step grid.
+func compactHistogramSQL(cfg Config, plan *compactHistogramPlan, mint int64, idCondition string) string {
+	matchers := postHogHistogramSampleMatchers([]postHogHistogramAlias{plan.alias}, plan.selector.LabelMatchers)
+	where := postHogSampleFilters(cfg, matchers, mint, plan.end)
+	// A stale marker is not a sample of any window, as in a range selector,
+	// so its zero counts never read as a counter reset.
+	where = append(where, postHogHistogramTypeFilter, idCondition, nonStaleSampleSQL("value"))
+	rows := compactHistogramRowsSQL(cfg, where)
+	// Only rate reads cumulative sources here: a cumulative source under
+	// another rollup marks its layout bad, so the streaming read takes over.
+	// The fingerprint list, which can be a long literal, appears once. Such a
+	// source gathers no points, since none of them can be used.
+	cumulativeBad, gather := "", "1"
+	if plan.function != "rate" {
+		cumulativeBad, gather = " OR min(is_delta) = 0", "is_delta"
+	}
+	// The aggregation gathers each bucket of a source into its own lane, in
+	// the order of the times; the next stage sorts both by time.
+	sources := fmt.Sprintf(
+		"SELECT any(bounds) AS layout_bounds, any(is_delta) AS delta, max(row_bad) OR min(layout) != max(layout) OR min(is_delta) != max(is_delta)%[1]s AS group_bad, "+
+			"min(layout) != max(layout) OR min(is_delta) != max(is_delta) AS layout_split, "+
+			"groupArrayIf(ts, %[2]s) AS read_times, groupArrayForEachIf(arrayMap(c -> toInt64(c), arrayCumSum(counts)), %[2]s) AS read_lanes FROM (%[3]s) GROUP BY series_id",
+		cumulativeBad, gather, rows,
+	)
+	start, step, steps := strconv.FormatInt(plan.start, 10), strconv.FormatInt(plan.step, 10), strconv.Itoa(plan.steps)
+	window := strconv.FormatInt(plan.window, 10)
+	runs := func(offset string) string { return compactStepRunsSQL(plan.start, plan.step, plan.steps, offset) }
+	expand := compactExpandSQL
+	scale := "1"
+	if plan.function == "rate" {
+		scale = "1000 / " + window
+	}
+	// Per step: e is the last point at or before the step, s the last point at
+	// or before its window start. A cumulative rate begins at s when it is
+	// recent enough, as metricsQLCounterValue does, and otherwise at the point
+	// after s, the first in the window. A step without a value adds 0 and is
+	// not present.
+	value := fmt.Sprintf(
+		"(e, s, h, et, bt, ev, sv, fv) -> if(delta, if(e > s, toFloat64(ev - sv) * %s, 0), "+
+			"if(e > s AND (h OR e > s + 1) AND et > bt, toFloat64(ev - if(h, sv, fv)) * 1000 / (et - bt), 0))",
+		scale,
+	)
+	// The buckets of a source are lanes of running totals inside one row, so
+	// the step grid of the source is computed once for all its buckets. A lane
+	// of a bad source can be shorter than its times; arrayResize keeps the
+	// arrays the same size until Go discards the result. A source already
+	// known to be bad gets no times and no lanes, so it builds no step grid
+	// for a result Go discards.
+	series := fmt.Sprintf(
+		"SELECT layout_bounds, layout_split, toUInt8(group_bad OR length(read_lanes) != length(layout_bounds) + 1 OR (NOT delta AND has(arrayPopFront(arrayDifference(times)), 0))) AS bad, "+
+			"arraySort(if(group_bad, emptyArrayInt64(), read_times)) AS times, "+
+			"arrayMap(lane -> arrayCumSum(arrayPushFront(if(delta, lane, arrayMap((c, p) -> if(c >= p, c - p, if((p - c) * 8 < p, 0, c)), lane, arrayPushFront(arrayPopBack(lane), lane[1]))), 0)), "+
+			"arrayMap(lane -> arraySort((v, t) -> t, arrayResize(lane, length(read_times)), read_times), if(group_bad, [], read_lanes))) AS totals, "+
+			"%[4]s AS end_runs, %[5]s AS start_runs, "+
+			"%[6]s AS end_index, %[7]s AS start_index, %[8]s AS end_time, %[9]s AS start_time, "+
+			// max_prev of a step is metricsQLSampleInterval at its last point.
+			"%[19]s AS max_prev, "+
+			"arrayMap((i, s, st, mp) -> s > 0 AND st > %[10]s + i * %[1]s - %[11]s - mp, range(%[12]s), start_index, start_time, max_prev) AS have_prev, "+
+			"arrayMap((h, st, ft) -> if(h, st, ft), have_prev, start_time, %[13]s) AS begin_time, "+
+			"arrayMap((e, s, h, et, bt) -> toUInt8(if(delta, e > s, e > s AND (h OR e > s + 1) AND et > bt)), end_index, start_index, have_prev, end_time, begin_time) AS present, "+
+			"arrayFlatten(arrayMap(lane -> arrayMap(%[14]s, end_index, start_index, have_prev, end_time, begin_time, %[15]s, %[16]s, %[17]s), totals)) AS step_values "+
+			"FROM (%[18]s)",
+		step, "", 0, runs("0"), runs(window),
+		expand("range(length(times) + 1)", "end_runs"), expand("range(length(times) + 1)", "start_runs"),
+		expand("arrayPushFront(times, 0)", "end_runs"), expand("arrayPushFront(times, 0)", "start_runs"),
+		start, window, steps,
+		expand("arrayPushBack(times, 0)", "start_runs"),
+		value, expand("lane", "end_runs"), expand("lane", "start_runs"), expand("arrayPushBack(arrayPopFront(lane), 0)", "start_runs"),
+		sources,
+		compactMaxPrevSQL(plan.selectorRange, plan.start, plan.step, plan.steps, plan.lookback, "end_runs"),
+	)
+	// A layout whose buckets x steps exceed the sample budget is marked bad and
+	// sent without its sums, so Go never decodes an oversized grid; the
+	// streaming read then enforces the limit as before.
+	oversized := "0"
+	if cfg.MaxSamples > 0 {
+		oversized = fmt.Sprintf("(length(layout_bounds) + 1) * %d > %d", plan.steps, cfg.MaxSamples)
+	}
+	return withRangePushdownSettings(fmt.Sprintf(
+		"SELECT layout_bounds, if(%[1]s, emptyArrayFloat64(), sumForEach(step_values)) AS sums, maxForEach(present) AS present, toUInt8(%[1]s OR max(bad)) AS bad, max(layout_split) AS layout_split FROM (%[2]s) GROUP BY layout_bounds",
+		oversized, series,
+	), cfg.RangeQueryThreads)
+}
+
+// countHistogramBuckets answers count(x_bucket{...}) over PostHog histograms:
+// at each step it adds the buckets of every source that the bare selector
+// returns a point for, so ClickHouse reads each source once and Go receives
+// one count per step instead of every bucket series. It reports false when
+// the engine must evaluate the query: an le matcher, real series with the
+// name, sources that share a label set, or a source that changes layout or
+// temporality.
+func (s *Server) countHistogramBuckets(ctx context.Context, call rangeRollupCall, mint, maxt, start, points int64) ([]rangeAggregateGroup, bool, error) {
+	alias, ok := postHogExactHistogramAlias(call.selector.LabelMatchers)
+	if !ok || alias.suffix != "_bucket" || call.window != 0 || call.offset != 0 {
+		return nil, false, nil
+	}
+	for _, matcher := range call.selector.LabelMatchers {
+		if matcher.Name == "le" {
+			return nil, false, nil
+		}
+	}
+	ids, ok, err := s.compactHistogramSources(ctx, alias, call.selector.LabelMatchers, mint, maxt)
+	if !ok || err != nil {
+		return nil, err != nil, err
+	}
+	if len(ids) == 0 {
+		return nil, true, nil
+	}
+	counts := make([]float64, points)
+	bad := false
+	err = queryPostHogSeriesIDs(ctx, s.client, s.cfg.IDChunkSize, ids, func(_ []uint64, idCondition string) string {
+		return histogramBucketCountSQL(s.cfg, alias, call, mint, maxt, start, points, idCondition)
+	}, func(row clickHouseRow) error {
+		var rowCounts []uint64
+		var rowBad uint8
+		if err := row.Scan(&rowCounts, &rowBad); err != nil {
+			return err
+		}
+		bad = bad || rowBad != 0
+		for index := range min(len(rowCounts), len(counts)) {
+			counts[index] += float64(rowCounts[index])
+		}
+		return nil
+	})
+	if err != nil || bad {
+		return nil, err != nil, err
+	}
+	group := rangeAggregateGroup{metric: map[string]string{}}
+	for index, count := range counts {
+		if count > 0 {
+			group.points = append(group.points, samplePoint{t: start + int64(index)*call.step, v: count})
+		}
+	}
+	if len(group.points) == 0 {
+		return nil, true, nil
+	}
+	return []rangeAggregateGroup{group}, true, nil
+}
+
+// histogramBucketCountSQL returns, for each step, the buckets of the sources
+// that have a point in the bare selector's window (t - w, t], where w is
+// min(max(step, interval), lookback) and the interval is metricsQLSampleInterval
+// over the selector matrix at t, as in metricsQLRollup. Delta points that
+// share a time count once, as the engine merges them, and are stale only when
+// every one is; a cumulative source with such points is left to the engine. A
+// source whose last point is a stale marker is absent.
+func histogramBucketCountSQL(cfg Config, alias postHogHistogramAlias, call rangeRollupCall, mint, maxt, start, points int64, idCondition string) string {
+	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers([]postHogHistogramAlias{alias}, call.selector.LabelMatchers), mint, maxt)
+	where = append(where, postHogHistogramTypeFilter, idCondition)
+	sources := fmt.Sprintf(
+		"SELECT any(length(counts)) AS buckets, arraySort(groupArray((ts, 1 - is_stale))) AS read_points, "+
+			"arrayFilter((p, n) -> p.1 != n.1, read_points, arrayPushBack(arrayPopFront(read_points), (toInt64(0), toUInt8(0)))) AS points, "+
+			"arrayMap(p -> p.1, points) AS times, arrayMap(p -> p.2, points) AS live, "+
+			"max(row_bad) OR min(layout) != max(layout) OR min(is_delta) != max(is_delta) OR (min(is_delta) = 0 AND length(times) != count()) AS bad "+
+			"FROM (%s) GROUP BY series_id",
+		compactHistogramRowsSQL(cfg, where),
+	)
+	runs := compactStepRunsSQL(start, call.step, int(points), "0")
+	return withRangePushdownSettings(fmt.Sprintf(
+		"SELECT sumForEach(present) AS counts, toUInt8(max(bad)) AS bad FROM (SELECT bad, %[1]s AS end_runs, "+
+			"arrayMap((i, t, l, mp) -> if(t > 0 AND l AND %[2]d + i * %[3]d - t < least(greatest(%[3]d, mp), %[4]d), toUInt64(buckets), 0), range(%[5]d), %[6]s, %[9]s, %[7]s) AS present FROM (%[8]s))",
+		runs, start, call.step, call.lookback, points,
+		compactExpandSQL("arrayPushFront(times, 0)", "end_runs"), compactMaxPrevSQL(call.matrix, start, call.step, int(points), call.lookback, "end_runs"), sources,
+		compactExpandSQL("arrayPushFront(live, 0)", "end_runs"),
+	), cfg.RangeQueryThreads)
 }

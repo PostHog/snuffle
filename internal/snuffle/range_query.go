@@ -109,17 +109,24 @@ func (s *Server) evalRangeQuery(ctx context.Context, prepared metricsQLQuery, st
 }
 
 func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (rangeQueryResult, *rangeQueryError) {
-	// The histogram pushdown goes first: the compact histogram path would read
-	// every raw row of the same rollups.
-	rewritten, pushdown, pushed, err := s.planHistogramPushdown(ctx, prepared.query, rangeEvalTimes(start, end, step))
-	if err != nil {
-		return rangeQueryResult{backend: "histogram_pushdown"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
-	}
-	if pushed {
-		return s.evalRangeEngine(ctx, "histogram_pushdown", pushdown, rewritten, prepared.runningSum, start, end, step)
-	}
-	if !prepared.runningSum {
-		if matrix, handled, err := s.tryCompactHistogramRange(ctx, prepared.query, start, end, step); handled {
+	// The summed compact histogram read goes first: for a quantile of
+	// sum by (le) it sums the buckets in ClickHouse, while the histogram
+	// pushdown returns every source bucket to Go. When it cannot answer, the
+	// pushdown goes before the compact streaming read, which reads every raw row.
+	for _, mode := range []compactReadMode{compactReadSummed, compactReadStreaming} {
+		if mode == compactReadStreaming {
+			rewritten, pushdown, pushed, err := s.planHistogramPushdown(ctx, prepared.query, rangeEvalTimes(start, end, step))
+			if err != nil {
+				return rangeQueryResult{backend: "histogram_pushdown"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
+			}
+			if pushed {
+				return s.evalRangeEngine(ctx, "histogram_pushdown", pushdown, rewritten, prepared.runningSum, start, end, step)
+			}
+		}
+		if prepared.runningSum {
+			continue
+		}
+		if matrix, handled, err := s.tryCompactHistogramRange(withCompactReadMode(ctx, mode), prepared.query, start, end, step); handled {
 			if err != nil {
 				return rangeQueryResult{backend: "compact_histogram"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
 			}
