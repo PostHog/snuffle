@@ -77,8 +77,9 @@ func (prepared metricsQLQuery) applyRangeOps(ctx context.Context, result rangeQu
 // range cache. It returns an error when the filled result would hold more than
 // maxSamples points (zero means no limit) or ctx ends.
 // ponytail: VictoriaMetrics also fills series whose samples lie up to 5m and
-// the rollup window before the range start but give no point in the range;
-// this fills only series with a point in the range.
+// the rollup window before the range start but give no point in the range,
+// and series whose every point is NaN, such as a quantile without
+// observations; this fills only series with a point in the range.
 func rangeDefault(ctx context.Context, left, right []rangeAggregateGroup, maxSamples int) ([]rangeAggregateGroup, error) {
 	if len(left) == 0 {
 		return right, nil

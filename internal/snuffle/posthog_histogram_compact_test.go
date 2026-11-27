@@ -158,7 +158,7 @@ func engineHistogramMatrix(test *testing.T, cfg Config, samples []postHogHistogr
 		close(future.done)
 		return &futureSeriesSet{future: future}
 	}}}
-	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: cfg.MaxSamples, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true})
+	engine := promql.NewEngine(promql.EngineOpts{Parser: metricsQLEngineParser{newBoundLabelParser()}, MaxSamples: cfg.MaxSamples, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true})
 	engineQuery, err := engine.NewRangeQuery(context.Background(), queryable, promql.NewPrometheusQueryOpts(false, 5*time.Minute), prepared.query, start, end, step)
 	if err != nil {
 		test.Fatal(err)
@@ -422,7 +422,8 @@ func TestCompactHistogramDeltaLimitCountsHeldSamples(test *testing.T) {
 	}
 }
 
-func TestCompactHistogramUnionKeepsNaNSignatures(test *testing.T) {
+// NaN is no value in MetricsQL: it hides no later operand.
+func TestCompactHistogramUnionSkipsNaN(test *testing.T) {
 	var union compactHistogramUnion
 	union.add(promql.Matrix{{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 1, F: math.NaN()}, {T: 2, F: 1}}}})
 	union.add(promql.Matrix{
@@ -430,7 +431,7 @@ func TestCompactHistogramUnionKeepsNaNSignatures(test *testing.T) {
 		{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 0, F: 7}}},
 	})
 	want := promql.Matrix{
-		{Metric: labels.FromStrings("__name__", "x", "job", "a"), Floats: []promql.FPoint{{T: 3, F: 6}}},
+		{Metric: labels.FromStrings("__name__", "x", "job", "a"), Floats: []promql.FPoint{{T: 1, F: 5}, {T: 3, F: 6}}},
 		{Metric: labels.FromStrings("job", "a"), Floats: []promql.FPoint{{T: 0, F: 7}, {T: 2, F: 1}}},
 	}
 	if got := union.matrix(); got.String() != want.String() {

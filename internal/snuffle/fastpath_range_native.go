@@ -173,7 +173,8 @@ func (p *nativeRangePlan) expression(expr parser.Expr) (string, bool) {
 			return "", false
 		}
 		value := scalarTransform{}.append(e.Op, scalar, scalarLeft).apply("value")
-		return p.add("SELECT arrayFilter(x -> x.1 != '__name__', metric) AS metric, ts, " + value + " AS value FROM " + source), true
+		// 0/0 is NaN, which MetricsQL aggregations and `or` skip.
+		return p.add("SELECT metric, ts, value FROM (SELECT arrayFilter(x -> x.1 != '__name__', metric) AS metric, ts, " + value + " AS value FROM " + source + ") WHERE NOT isNaN(value)"), true
 	case *parser.Call:
 		return p.rollup(e, false)
 	}
