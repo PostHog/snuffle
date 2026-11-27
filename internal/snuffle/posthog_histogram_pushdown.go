@@ -420,7 +420,15 @@ func histogramPushdownSQL(cfg Config, alias postHogHistogramAlias, matchers []*l
 		"SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value AS sum_value, count AS observations, histogram_counts, histogram_bounds, aggregation_temporality, metric_type FROM %s",
 		postHogSampleRowsFrom(cfg, where, true),
 	)
-	bad := "aggregation_temporality != 'delta' OR metric_type != 'histogram'"
+	// A row whose bucket counts do not fit its bounds is skipped by every
+	// suffix, so the _count and _sum reads fall back to the general path on it
+	// like the _bucket read does.
+	const layout = "length(histogram_counts) != length(histogram_bounds) + 1" +
+		" OR arraySum(histogram_counts) != observations" +
+		" OR NOT arrayAll(b -> isFinite(b), histogram_bounds)" +
+		" OR (length(histogram_bounds) > 1 AND arrayMin(arrayPopFront(arrayDifference(histogram_bounds))) <= 0)"
+	const other = "aggregation_temporality != 'delta' OR metric_type != 'histogram'"
+	bad := other + " OR (" + layout + ")"
 	f, l, st, w := strconv.FormatInt(first, 10), strconv.FormatInt(last, 10), strconv.FormatInt(step, 10), strconv.FormatInt(window, 10)
 	cell := fmt.Sprintf(
 		"least(%[1]s + toInt64(ceil((ts - %[1]s) / %[2]s)) * %[2]s, %[1]s - %[3]s + toInt64(ceil((ts - %[1]s + %[3]s) / %[2]s)) * %[2]s)",
@@ -429,6 +437,9 @@ func histogramPushdownSQL(cfg Config, alias postHogHistogramAlias, matchers []*l
 	inWindow := fmt.Sprintf("ts > %s - %s AND ts <= %s", f, w, l)
 	const settings = " SETTINGS short_circuit_function_evaluation = 'disable'"
 	if alias.suffix != "_bucket" {
+		// A histogram stored without buckets (empty bounds and counts) is valid
+		// for _count and _sum.
+		bad = other + " OR ((length(histogram_counts) > 0 OR length(histogram_bounds) > 0) AND (" + layout + "))"
 		value := "toFloat64(observations)"
 		if alias.suffix == "_sum" {
 			value = "toFloat64(sum_value)"
@@ -438,10 +449,6 @@ func histogramPushdownSQL(cfg Config, alias postHogHistogramAlias, matchers []*l
 			cell, bad, value, rowsSQL, inWindow, settings,
 		)
 	}
-	bad += " OR length(histogram_counts) != length(histogram_bounds) + 1" +
-		" OR arraySum(histogram_counts) != observations" +
-		" OR NOT arrayAll(b -> isFinite(b), histogram_bounds)" +
-		" OR (length(histogram_bounds) > 1 AND arrayMin(arrayPopFront(arrayDifference(histogram_bounds))) <= 0)"
 	// Bucket counts are integers, so ClickHouse sums the count arrays of each
 	// series, bound layout and cell first and expands buckets only for the
 	// sums. The layout and array length are in the key, so sumForEach always

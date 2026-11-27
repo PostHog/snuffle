@@ -219,7 +219,7 @@ func TestPostHogHistogramEndToEnd(test *testing.T) {
 	})
 	test.Run("packed binary trailing byte", func(test *testing.T) {
 		const count uint64 = 0x0a00000000000000
-		err := client.QueryRows(ctx, fmt.Sprintf("SELECT toUInt64(1), toInt64(1000), toFloat64(0), toUInt64(%d), formatRow('RowBinary', [toFloat64(1)], [toUInt64(0), toUInt64(%d)]), 'cumulative'", count, count), func(row clickHouseRow) error {
+		err := client.QueryRows(ctx, fmt.Sprintf("SELECT toUInt64(1), toInt64(1000), toFloat64(0), toUInt64(%d), formatRow('RowBinary', [toFloat64(1)], [toUInt64(0), toUInt64(%d)]), 'cumulative', toUInt8(0)", count, count), func(row clickHouseRow) error {
 			var sample postHogHistogramSample
 			if err := sample.scanPacked(row); err != nil {
 				return err

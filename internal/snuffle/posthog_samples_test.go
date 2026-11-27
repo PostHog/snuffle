@@ -76,7 +76,7 @@ func TestPostHogHistogramSQLReadsPointArrays(t *testing.T) {
 
 	sql := postHogHistogramSamplesSQL(cfg, 1000, 2000, []uint64{7}, aliases, matchers)
 	assertContainsAll(t, sql, []string{
-		"formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM `test`.`metrics4_samples` ARRAY JOIN timestamp_arr AS timestamp, value_arr AS value, count_arr AS count, histogram_counts_arr AS histogram_counts WHERE",
+		"formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality, toUInt8(metric_type = 'exponential_histogram') AS exponential FROM `test`.`metrics4_samples` ARRAY JOIN timestamp_arr AS timestamp, value_arr AS value, count_arr AS count, histogram_counts_arr AS histogram_counts WHERE",
 		"timestamp >= fromUnixTimestamp64Milli(1000, 'UTC')",
 		"metric_type IN ('histogram', 'exponential_histogram')",
 		"series_fingerprint IN (7)",

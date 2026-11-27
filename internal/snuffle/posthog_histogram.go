@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/prometheus/prometheus/model/labels"
 	promvalue "github.com/prometheus/prometheus/model/value"
@@ -326,7 +327,7 @@ func postHogHistogramSamplesSQL(cfg Config, mint, maxt int64, ids []uint64, alia
 func postHogHistogramSamplesWhereSQL(cfg Config, mint, maxt int64, idCondition string, aliases []postHogHistogramAlias, matchers []*labels.Matcher) string {
 	where := postHogSampleFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
 	where = append(where, postHogHistogramTypeFilter, idCondition)
-	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality FROM %s ORDER BY series_id, timestamp", postHogSampleRowsFrom(cfg, where, true))
+	return fmt.Sprintf("SELECT series_fingerprint AS series_id, toUnixTimestamp64Milli(timestamp) AS ts, value, count, formatRow('RowBinary', histogram_bounds, histogram_counts) AS histogram_arrays, aggregation_temporality, toUInt8(metric_type = 'exponential_histogram') AS exponential FROM %s ORDER BY series_id, timestamp", postHogSampleRowsFrom(cfg, where, true))
 }
 
 // postHogHistogramBoundsSQL reads the distinct bound sets of the selected
@@ -337,7 +338,7 @@ func postHogHistogramBoundsSQL(cfg Config, mint, maxt int64, idCondition string,
 	where := postHogSampleRowFilters(cfg, postHogHistogramSampleMatchers(aliases, matchers), mint, maxt)
 	where = append(where, postHogSampleRowHasPointFilter(mint, maxt))
 	where = append(where, postHogHistogramTypeFilter, idCondition)
-	return fmt.Sprintf("SELECT DISTINCT series_fingerprint AS series_id, toInt64(0) AS ts, toFloat64(0) AS value, toUInt64(0) AS count, formatRow('RowBinary', histogram_bounds, arrayWithConstant(length(histogram_bounds) + 1, toUInt64(0))) AS histogram_arrays, aggregation_temporality FROM %s WHERE %s ORDER BY series_id", postHogSamplesTable(cfg), strings.Join(where, " AND "))
+	return fmt.Sprintf("SELECT DISTINCT series_fingerprint AS series_id, toInt64(0) AS ts, toFloat64(0) AS value, toUInt64(0) AS count, formatRow('RowBinary', histogram_bounds, arrayWithConstant(length(histogram_bounds) + 1, toUInt64(0))) AS histogram_arrays, aggregation_temporality, toUInt8(metric_type = 'exponential_histogram') AS exponential FROM %s WHERE %s ORDER BY series_id", postHogSamplesTable(cfg), strings.Join(where, " AND "))
 }
 
 // postHogHistogramSource is the stored series a virtual histogram series
@@ -361,6 +362,9 @@ type postHogHistogramSample struct {
 	bounds      []float64
 	counts      []uint64
 	temporality string
+	// exponential marks an exponential histogram, whose stored arrays are not
+	// classic bucket layouts, so only _count and _sum read it.
+	exponential bool
 }
 
 type postHogHistogramSeriesBuilder struct {
@@ -373,14 +377,17 @@ type postHogHistogramSeriesBuilder struct {
 	bySource       map[uint64]*postHogHistogramSourceSeries
 	previousBucket map[uint64]map[string]*seriesMeta
 	skipped        map[uint64]struct{}
+	skippedRows    int64
 	temporality    map[string]string
 	samples        int
 }
 
 // invalidPostHogHistogramError reports a stored histogram sample that cannot
-// become Prometheus series. Limit errors are not of this type.
+// become Prometheus series. Limit errors are not of this type. row marks a
+// malformed bucket layout in one stored row.
 type invalidPostHogHistogramError struct {
 	message string
+	row     bool
 }
 
 func (err invalidPostHogHistogramError) Error() string {
@@ -389,6 +396,19 @@ func (err invalidPostHogHistogramError) Error() string {
 
 func invalidPostHogHistogram(format string, args ...any) error {
 	return invalidPostHogHistogramError{message: fmt.Sprintf(format, args...)}
+}
+
+func malformedPostHogHistogramRow(format string, args ...any) error {
+	return invalidPostHogHistogramError{message: fmt.Sprintf(format, args...), row: true}
+}
+
+type skippedHistogramRowsKey struct{}
+
+// withSkippedHistogramRows returns a context in which histogram reads count
+// the malformed rows they skip.
+func withSkippedHistogramRows(ctx context.Context) (context.Context, *atomic.Int64) {
+	skipped := &atomic.Int64{}
+	return context.WithValue(ctx, skippedHistogramRowsKey{}, skipped), skipped
 }
 
 type postHogHistogramSeriesKey struct {
@@ -406,36 +426,66 @@ type postHogHistogramSourceSeries struct {
 
 // newPostHogHistogramSeriesBuilder builds virtual series from stored
 // histogram samples. A selector that names the metric exactly is strict: an
-// invalid sample fails the query. A broader selector reaches every histogram
+// invalid series fails the query. A broader selector reaches every histogram
 // of the team, so one invalid histogram must not fail it; the builder skips
-// that source and logs it once.
+// that source and logs it once. A row whose bucket counts do not fit its
+// bounds never fails the query: the builder skips and counts it. The samples
+// table keeps one bound list per series and hour, so the rows of the other
+// layout in the hour of a bucket layout change read this way.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
 	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), temporality: make(map[string]string)}
 }
 
-func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
+// checkPostHogHistogramRow rejects a row whose bucket counts do not fit its
+// bounds. The _bucket, _count and _sum reads all apply it, so the three agree
+// on which rows exist.
+func checkPostHogHistogramRow(sample postHogHistogramSample) error {
 	if len(sample.counts) != len(sample.bounds)+1 {
-		return nil, invalidPostHogHistogram("histogram %q has %d bounds but %d bucket counts", sample.metricName, len(sample.bounds), len(sample.counts))
+		return malformedPostHogHistogramRow("histogram %q has %d bounds but %d bucket counts", sample.metricName, len(sample.bounds), len(sample.counts))
+	}
+	var cumulative uint64
+	for index, count := range sample.counts {
+		if count > math.MaxUint64-cumulative {
+			return malformedPostHogHistogramRow("histogram %q bucket count overflows uint64", sample.metricName)
+		}
+		cumulative += count
+		if index < len(sample.bounds) {
+			upper := sample.bounds[index]
+			if math.IsNaN(upper) || math.IsInf(upper, 0) || (index > 0 && upper <= sample.bounds[index-1]) {
+				return malformedPostHogHistogramRow("histogram %q bounds must be finite and strictly increasing", sample.metricName)
+			}
+		}
+	}
+	if cumulative != sample.count {
+		return malformedPostHogHistogramRow("histogram %q bucket counts do not match its observation count", sample.metricName)
+	}
+	return nil
+}
+
+// checkPostHogCountSumRow is the layout check for the _count and _sum reads.
+// A histogram stored without buckets has empty bounds and counts, which OTLP
+// allows, and an exponential histogram has no classic bucket layout, so those
+// rows stay readable. The _bucket read still rejects both.
+func checkPostHogCountSumRow(sample postHogHistogramSample) error {
+	if sample.exponential || (len(sample.bounds) == 0 && len(sample.counts) == 0) {
+		return nil
+	}
+	return checkPostHogHistogramRow(sample)
+}
+
+func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64, error) {
+	if err := checkPostHogHistogramRow(sample); err != nil {
+		return nil, err
 	}
 	buckets := make(map[string]float64, len(sample.counts))
 	var cumulative uint64
 	for index, count := range sample.counts {
-		if count > math.MaxUint64-cumulative {
-			return nil, invalidPostHogHistogram("histogram %q bucket count overflows uint64", sample.metricName)
-		}
 		cumulative += count
 		bound := "+Inf"
 		if index < len(sample.bounds) {
-			upper := sample.bounds[index]
-			if math.IsNaN(upper) || math.IsInf(upper, 0) || (index > 0 && upper <= sample.bounds[index-1]) {
-				return nil, invalidPostHogHistogram("histogram %q bounds must be finite and strictly increasing", sample.metricName)
-			}
-			bound = strconv.FormatFloat(upper, 'g', -1, 64)
+			bound = strconv.FormatFloat(sample.bounds[index], 'g', -1, 64)
 		}
 		buckets[bound] = float64(cumulative)
-	}
-	if cumulative != sample.count {
-		return nil, invalidPostHogHistogram("histogram %q bucket counts do not match its observation count", sample.metricName)
 	}
 	return buckets, nil
 }
@@ -443,12 +493,15 @@ func postHogHistogramBuckets(sample postHogHistogramSample) (map[string]float64,
 func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample, suffixes []string) error {
 	err := builder.addSample(sample, suffixes)
 	var invalid invalidPostHogHistogramError
-	if err == nil || builder.strict || !errors.As(err, &invalid) {
+	if err == nil || !errors.As(err, &invalid) || (builder.strict && !invalid.row) {
 		return err
+	}
+	if invalid.row {
+		builder.skippedRows++
 	}
 	if _, seen := builder.skipped[sample.id]; !seen {
 		builder.skipped[sample.id] = struct{}{}
-		slog.Warn("skipping invalid histogram series", "metric", sample.metricName, "service_name", sample.serviceName, "error", err)
+		slog.Warn("skipping invalid histogram data", "metric", sample.metricName, "service_name", sample.serviceName, "error", err)
 	}
 	return nil
 }
@@ -490,10 +543,16 @@ func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramS
 				builder.previousBucket[sample.id] = current
 			}
 		case "_count":
+			if err := checkPostHogCountSumRow(sample); err != nil {
+				return err
+			}
 			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, float64(sample.count)); err != nil {
 				return err
 			}
 		case "_sum":
+			if err := checkPostHogCountSumRow(sample); err != nil {
+				return err
+			}
 			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, sample.sum); err != nil {
 				return err
 			}
@@ -770,6 +829,10 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	})
 	if err != nil {
 		return nil, err
+	}
+	// Discovery reads bounds without counts, so only reads with samples count.
+	if skipped, ok := ctx.Value(skippedHistogramRowsKey{}).(*atomic.Int64); ok && withSamples {
+		skipped.Add(builder.skippedRows)
 	}
 	series := builder.finish()
 	for _, meta := range series {

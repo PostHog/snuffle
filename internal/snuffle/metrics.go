@@ -67,6 +67,8 @@ type bridgeMetrics struct {
 
 	queryTagsRejected *prometheus.CounterVec
 
+	histogramRowsSkipped prometheus.Counter
+
 	selfScrapes       *prometheus.CounterVec
 	selfScrapeLatency *prometheus.HistogramVec
 	selfScrapeSeries  prometheus.Gauge
@@ -272,6 +274,12 @@ func newBridgeMetrics() *bridgeMetrics {
 			Help:      "Caller query tags dropped from log_comment, by reason.",
 		}, []string{"reason"}),
 
+		histogramRowsSkipped: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: "snuffle",
+			Name:      "posthog_histogram_rows_skipped_total",
+			Help:      "Stored histogram rows that queries skipped because their bucket layout is malformed.",
+		}),
+
 		selfScrapes: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Namespace: "snuffle",
 			Name:      "self_scrapes_total",
@@ -339,6 +347,7 @@ func newBridgeMetrics() *bridgeMetrics {
 		m.clickHouseInsertBytes,
 		m.clickHouseInsertInflight,
 		m.queryTagsRejected,
+		m.histogramRowsSkipped,
 		m.selfScrapes,
 		m.selfScrapeLatency,
 		m.selfScrapeSeries,
