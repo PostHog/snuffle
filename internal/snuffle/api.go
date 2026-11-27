@@ -379,6 +379,12 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	recordQueryLogBackend(w, "fastpath")
+	query, err = s.resolveMetricNames(ctx, query, ts, ts, 0)
+	if err != nil {
+		s.metrics.observePromQLQuery("instant", "fastpath", "error", time.Since(queryStarted), 0, 0, 0)
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
 	if data, ok, err := s.tryFastInstantQuery(ctx, query, ts); ok {
 		status := "ok"
 		if err != nil {
@@ -563,6 +569,10 @@ func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
+	if err := s.resolveMetricNameMatcherSets(ctx, start.UnixMilli(), end.UnixMilli(), matchers); err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
 	q, err := s.queryable.Querier(start.UnixMilli(), end.UnixMilli())
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "execution", err)
@@ -616,6 +626,10 @@ func (s *Server) handleLabelValues(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
+	if err := s.resolveMetricNameMatcherSets(ctx, start.UnixMilli(), end.UnixMilli(), matchers); err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
 	q, err := s.queryable.Querier(start.UnixMilli(), end.UnixMilli())
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "execution", err)
@@ -654,6 +668,10 @@ func (s *Server) handleSeries(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
+	if err := s.resolveMetricNameMatcherSets(ctx, start.UnixMilli(), end.UnixMilli(), matcherSets); err != nil {
+		writeAPIError(w, http.StatusUnprocessableEntity, "execution", err)
+		return
+	}
 
 	q := &CHQuerier{queryable: s.queryable, mint: start.UnixMilli(), maxt: end.UnixMilli()}
 	if rawRows, ok, err := q.activeSeriesJSONRows(ctx, start.UnixMilli(), end.UnixMilli(), matcherSets); ok || err != nil {

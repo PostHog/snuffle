@@ -67,6 +67,10 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 	nestedCountHostname := fmt.Sprintf(`count(count(%s) by (hostname))`, metric)
 	nestedCountRegion := fmt.Sprintf(`count(count(%s) by (region))`, metric)
 	nestedCountFilteredHostname := fmt.Sprintf(`count(count(%s{service_environment="production"}) by (hostname))`, metric)
+	// ENG-052: a __name__ regex runs as the plain name does.
+	sumRateName := fmt.Sprintf(`sum(rate(%s{service_environment="production"}[1h]))`, metric)
+	sumRateNameRegex := fmt.Sprintf(`sum(rate({__name__=~%q,service_environment="production"}[1h]))`, metric)
+	sumRateNamePattern := fmt.Sprintf(`sum(rate({__name__=~%q,service_environment="production"}[1h]))`, metric[:len(metric)-1]+".*")
 
 	return []bridgeScenario{
 		{name: "tsbs_one_series", path: "/api/v1/query", params: map[string]string{"query": hostSelector, "time": eval}},
@@ -81,6 +85,9 @@ func bridgeTSBSMetricScenarios() []bridgeScenario {
 		{name: "tsbs_nested_count_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountHostname, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_region", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountRegion, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_nested_count_filtered_hostname", path: "/api/v1/query_range", params: map[string]string{"query": nestedCountFilteredHostname, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_range_sum_rate_name", path: "/api/v1/query_range", params: map[string]string{"query": sumRateName, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_range_sum_rate_name_regex", path: "/api/v1/query_range", params: map[string]string{"query": sumRateNameRegex, "start": rangeStart, "end": rangeEnd, "step": step}},
+		{name: "tsbs_range_sum_rate_name_pattern", path: "/api/v1/query_range", params: map[string]string{"query": sumRateNamePattern, "start": rangeStart, "end": rangeEnd, "step": step}},
 		{name: "tsbs_series_metric", path: "/api/v1/series", params: map[string]string{"match[]": metricSelector, "start": rangeStart, "end": rangeEnd}},
 		{name: "tsbs_label_values_hostname", path: "/api/v1/label/hostname/values", params: map[string]string{"start": rangeStart, "end": rangeEnd}},
 	}

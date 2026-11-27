@@ -121,7 +121,7 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 	if len(series)+len(virtual) > q.queryable.cfg.MaxSeries {
 		return nil, fmt.Errorf("series limit exceeded (%d); tighten matchers or increase CH_MAX_SERIES", q.queryable.cfg.MaxSeries)
 	}
-	return mergePostHogHistogramSeries(series, virtual, true)
+	return mergePostHogHistogramSeries(series, virtual, metricNameEquals(matchers))
 }
 
 // mergePostHogHistogramSeries joins real component series and virtual
@@ -201,16 +201,21 @@ func mergeSamplesPreferFirst(preferred, other []samplePoint) []samplePoint {
 	return out
 }
 
+// postHogMaySelectHistogram reports whether the selector can name a virtual
+// histogram series: without a set of metric names, any name can.
 func postHogMaySelectHistogram(matchers []*labels.Matcher) bool {
-	if name := exactMetricName(matchers); name != "" {
+	names, ok := metricNameSet(matchers)
+	if !ok {
+		return true
+	}
+	for _, name := range names {
 		for _, suffix := range postHogHistogramSuffixes {
 			if strings.HasSuffix(name, suffix) && len(name) > len(suffix) {
 				return true
 			}
 		}
-		return false
 	}
-	return true
+	return false
 }
 
 // postHogHistogramSourceExistsSQL finds one stored histogram series that can
@@ -225,10 +230,11 @@ func postHogHistogramSourceExistsSQL(cfg Config, mint, maxt int64, alias postHog
 }
 
 // postHogSelectsHistogram reports whether the selector can return virtual
-// histogram series inside the query window. Without an exact metric name, any
-// virtual name can match. An exact name with a histogram suffix, such as a
-// classic histogram's _bucket series, only does when the team stores a
-// histogram with the base name in the window.
+// histogram series inside the query window. Without a set of metric names, any
+// virtual name can match; a set can when a name has a histogram suffix. An
+// exact name with a histogram suffix, such as a classic histogram's _bucket
+// series, only does when the team stores a histogram with the base name in the
+// window.
 func (s *Server) postHogSelectsHistogram(ctx context.Context, mint, maxt int64, matchers []*labels.Matcher) (bool, error) {
 	if !postHogMaySelectHistogram(matchers) {
 		return false, nil
@@ -259,13 +265,22 @@ func postHogHistogramAliasesSQL(cfg Config, mint, maxt int64, matchers []*labels
 	where := postHogSeriesFilters(cfg, postHogHistogramBaseMatchers(matchers), mint, maxt)
 	where = append(where, "metric_type IN ('histogram', 'exponential_histogram')")
 	where = append(where, "(metric_type != 'exponential_histogram' OR suffix != '_bucket')")
+	var nameConditions []string
 	for _, matcher := range matchers {
 		if matcher.Name != labels.MetricName {
 			continue
 		}
 		if condition, ok := stringColumnMatcherCondition("concat(metric_name, suffix)", matcher); ok {
-			where = append(where, condition)
+			nameConditions = append(nameConditions, condition)
 		}
+	}
+	where = append(where, nameConditions...)
+	// The series table is keyed by metric name: a name regex looks the base
+	// names up in the metric name index first, so the scan reads only their
+	// rows instead of every series of the team.
+	if cfg.MetricNamesTable != "" && len(nameConditions) > 0 {
+		names := append(append([]string{teamFilter(cfg)}, postHogAttributeTimeFilters(mint, maxt)...), nameConditions...)
+		where = append(where, fmt.Sprintf("metric_name IN (SELECT metric_name FROM %s ARRAY JOIN ['_bucket', '_count', '_sum'] AS suffix WHERE %s)", postHogMetricNamesTable(cfg), strings.Join(names, " AND ")))
 	}
 	if name := exactMetricName(matchers); name != "" {
 		for _, suffix := range postHogHistogramSuffixes {
@@ -438,7 +453,7 @@ type postHogHistogramSourceSeries struct {
 // table keeps one bound list per series and hour, so the rows of the other
 // layout in the hour of a bucket layout change read this way.
 func newPostHogHistogramSeriesBuilder(cfg Config, matchers []*labels.Matcher, withSamples bool) *postHogHistogramSeriesBuilder {
-	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: exactMetricName(matchers) != "", byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), temporality: make(map[string]string)}
+	return &postHogHistogramSeriesBuilder{cfg: cfg, matchers: matchers, withSamples: withSamples, strict: metricNameEquals(matchers), byLabels: make(map[string]*seriesMeta), bySource: make(map[uint64]*postHogHistogramSourceSeries), previousBucket: make(map[uint64]map[string]*seriesMeta), skipped: make(map[uint64]struct{}), temporality: make(map[string]string)}
 }
 
 // checkPostHogHistogramRow rejects a row whose bucket counts do not fit its

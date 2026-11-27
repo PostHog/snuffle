@@ -109,6 +109,11 @@ func (s *Server) evalRangeQuery(ctx context.Context, prepared metricsQLQuery, st
 }
 
 func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQuery, start, end time.Time, step time.Duration) (rangeQueryResult, *rangeQueryError) {
+	query, err := s.resolveMetricNames(ctx, prepared.query, start, end, step)
+	if err != nil {
+		return rangeQueryResult{backend: "prometheus"}, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: err}
+	}
+	prepared.query = query
 	// The summed compact histogram read goes first: for a quantile of
 	// sum by (le) it sums the buckets in ClickHouse, while the histogram
 	// pushdown returns every source bucket to Go. When it cannot answer, the
@@ -139,7 +144,7 @@ func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQ
 		}
 		return rangeQueryResult{backend: "fastpath_range", floats: true, groups: groups}, nil
 	}
-	query := prepared.query
+	query = prepared.query
 	if expr, err := s.parser.ParseExpr(query); err == nil && metricsQLWithNextSample(expr, end) {
 		query = expr.String()
 	}
