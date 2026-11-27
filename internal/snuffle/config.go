@@ -164,7 +164,7 @@ func ConfigFromEnv() Config {
 		RangePushdown:               envBool("SNUFFLE_RANGE_PUSHDOWN", true),
 		RangeQueryThreads:           envInt("CH_RANGE_QUERY_MAX_THREADS", 8, 0),
 		RangePushdownMaxExpansion:   envInt("CH_RANGE_PUSHDOWN_MAX_EXPANSION", 512, 1),
-		RangeCacheMaxBytes:          envInt("SNUFFLE_RANGE_CACHE_MAX_BYTES", 0, 0),
+		RangeCacheMaxBytes:          envInt("SNUFFLE_RANGE_CACHE_MAX_BYTES", 512<<20, 0),
 		RangeCacheOffset:            envDurationAllowZero("SNUFFLE_RANGE_CACHE_OFFSET", 5*time.Minute),
 		RangeCacheTTL:               envDuration("SNUFFLE_RANGE_CACHE_TTL", time.Hour),
 		RemoteWriteInterval:         envDurationAllowZero("REMOTE_WRITE_SAMPLE_INTERVAL", 15*time.Second),

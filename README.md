@@ -642,7 +642,8 @@ steps of the new window are also steps of the previous window. The range
 result cache keeps those steps in memory, so Snuffle evaluates only the steps
 after them. The design follows the rollup result cache of VictoriaMetrics.
 
-The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
+The cache is on by default with a limit of 512 MiB. Set
+`SNUFFLE_RANGE_CACHE_MAX_BYTES` to change the limit, or to `0` to disable it.
 
 - **Settled steps.** Samples can arrive late, so the cache keeps a step only
   when it is older than `SNUFFLE_RANGE_CACHE_OFFSET` plus one step. Snuffle
@@ -651,6 +652,11 @@ The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
   offset, for example after an ingestion delay. An entry expires after
   `SNUFFLE_RANGE_CACHE_TTL`, and the next request evaluates every step again.
   Send `nocache=1` to evaluate every step now and replace the entry.
+- **Memory.** The limit counts the estimated size of the cached results. The Go
+  heap needs headroom above them, so a full cache can raise the memory of the
+  process by more than the limit. When a pod has a tight memory limit, lower
+  `SNUFFLE_RANGE_CACHE_MAX_BYTES`, set `GOMEMLIMIT`, or disable the cache.
+  `snuffle_range_cache_bytes` shows the current size.
 - **Step grid.** Two requests share cached steps only when their `start` times
   are on the same step grid: `start` modulo `step` must be equal. Clients that
   align `start` to the step, as Grafana does, get this without more work.
@@ -753,7 +759,7 @@ accepted as a fallback for `CH_LOG_SCHEMA_LAYOUT`.
 | `SNUFFLE_RANGE_PUSHDOWN` | `true` | Enable SQL range fast paths: native selectors, counter and basic over-time rollups, aggregations (including nested counts), scalar arithmetic, plain `or` unions, and outer `running_sum`; PostHog aggregate rollups are also supported. Unsupported expressions and native histogram data use the engine. `false` keeps every range query in the engine |
 | `CH_RANGE_QUERY_MAX_THREADS` | `8` | ClickHouse `max_threads` for range pushdowns and PostHog-layout sample reads; `0` leaves the ClickHouse default |
 | `CH_RANGE_PUSHDOWN_MAX_EXPANSION` | `512` | Maximum sample-to-step expansion for range pushdown (including lookback history for native queries); wider windows use the engine |
-| `SNUFFLE_RANGE_CACHE_MAX_BYTES` | `0` | Memory limit of the [range result cache](#range-result-cache) in bytes; `0` disables the cache |
+| `SNUFFLE_RANGE_CACHE_MAX_BYTES` | `536870912` (512 MiB) | Memory limit of the [range result cache](#range-result-cache) in bytes; `0` disables the cache |
 | `SNUFFLE_RANGE_CACHE_OFFSET` | `5m` | Age below which the range result cache does not keep a step, because samples can still arrive |
 | `SNUFFLE_RANGE_CACHE_TTL` | `1h` | Time after which a range result cache entry expires and every step is evaluated again |
 | `REMOTE_WRITE_SAMPLE_INTERVAL` | `15s` | Timestamp bucket for float samples and histograms; `0` preserves timestamps |
