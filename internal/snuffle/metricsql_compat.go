@@ -96,6 +96,10 @@ func init() {
 		}
 		return append(enh.Out, promql.Sample{F: sum}), nil
 	}
+	parser.Functions[metricsQLGroupJoinName] = &parser.Function{Name: metricsQLGroupJoinName, ArgTypes: []parser.ValueType{parser.ValueTypeVector, parser.ValueTypeVector, parser.ValueTypeString}, Variadic: -1, ReturnType: parser.ValueTypeVector}
+	promql.FunctionCalls[metricsQLGroupJoinName] = metricsQLGroupJoin
+	parser.Functions[metricsQLGroupJoinEndName] = &parser.Function{Name: metricsQLGroupJoinEndName, ArgTypes: []parser.ValueType{parser.ValueTypeVector}, ReturnType: parser.ValueTypeVector}
+	promql.FunctionCalls[metricsQLGroupJoinEndName] = metricsQLGroupJoinEnd
 	parser.Functions[metricsQLInternalPrefix+"default_rollup"] = &parser.Function{Name: metricsQLDefaultRollupName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
 	original := promql.FunctionCalls[metricsQLDefaultRollupName]
 	rollup := metricsQLRollup("default_rollup", original)
@@ -464,9 +468,225 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		if err := r.rewrite(&e.Left, step, instant); err != nil {
 			return err
 		}
-		return r.rewrite(&e.Right, step, instant)
+		if err := r.rewrite(&e.Right, step, instant); err != nil {
+			return err
+		}
+		rewriteGroupJoin(expr, e, groupJoinPointsBucket(r.pointsPerSeries(step, instant)))
 	}
 	return nil
+}
+
+// metricsQLGroupJoinName pairs each series on the many side of a group_left
+// or group_right join with each one-side series of its match group, and sets
+// the copied labels of that series.
+const metricsQLGroupJoinName = metricsQLInternalPrefix + "group_join"
+
+// metricsQLGroupJoinEndName wraps the rewritten join and removes the label
+// that keeps its many-side series apart, see metricsQLGroupJoin.
+const metricsQLGroupJoinEndName = metricsQLInternalPrefix + "group_join_end"
+
+// metricsQLGroupJoinMarker holds the copied labels a many-side series had
+// before the join overwrote them. Series that differ only in those labels
+// would otherwise share a label set before the operator filters them.
+const metricsQLGroupJoinMarker = metricsQLInternalPrefix + "group_join_origin"
+
+// rewriteGroupJoin applies the VictoriaMetrics rule for group_left(l) and
+// group_right(l): one-side series of a match group that differ in l each give
+// a result, where Prometheus fails with many-to-many matching. The many side
+// becomes __snuffle_group_join(many, one, points, "on"|"ignoring",
+// matching..., "", copied...), where points is how many points the engine may
+// hold for each output series. The join matches on the copied labels too.
+// One-side series that also share l still fail, as in VictoriaMetrics.
+// ponytail: the engine evaluates the one side twice. A join function that also
+// applies the operator would evaluate it once, if that cost shows.
+func rewriteGroupJoin(slot *metricsql.Expr, e *metricsql.BinaryOpExpr, points int) {
+	join, group := strings.ToLower(e.JoinModifier.Op), strings.ToLower(e.GroupModifier.Op)
+	if (join != "group_left" && join != "group_right") || len(e.JoinModifier.Args) == 0 || group == "" || e.JoinModifierPrefix != nil {
+		return
+	}
+	many, one := &e.Left, e.Right
+	if join == "group_right" {
+		many, one = &e.Right, e.Left
+	}
+	// The one side is both an argument and the operand, so it is serialized
+	// twice. A join nested in it would double its whole subtree at every
+	// level and grow the query exponentially. Such a join keeps Prometheus'
+	// rule and still fails when a match group has several one-side series.
+	if containsGroupJoin(one) {
+		return
+	}
+	// A scalar operand is not an instant vector argument. Prometheus joins it
+	// with no matching labels, so the join keeps that rule.
+	if isScalarOperand(*many) || isScalarOperand(one) {
+		return
+	}
+	args := []metricsql.Expr{*many, one, &metricsql.StringExpr{S: strconv.Itoa(points)}, &metricsql.StringExpr{S: group}}
+	for _, name := range e.GroupModifier.Args {
+		args = append(args, &metricsql.StringExpr{S: name})
+	}
+	args = append(args, &metricsql.StringExpr{})
+	for _, name := range e.JoinModifier.Args {
+		args = append(args, &metricsql.StringExpr{S: name})
+	}
+	*many = &metricsql.FuncExpr{Name: metricsQLGroupJoinName, Args: args}
+	// The many side now carries the copied labels. Prometheus rejects a label
+	// in both on() and group_left(), so the join copies none.
+	copied := e.JoinModifier.Args
+	if group == "on" {
+		for _, name := range copied {
+			if !slices.Contains(e.GroupModifier.Args, name) {
+				e.GroupModifier.Args = append(e.GroupModifier.Args, name)
+			}
+		}
+	} else {
+		e.GroupModifier.Args = slices.DeleteFunc(slices.Clone(e.GroupModifier.Args), func(name string) bool { return slices.Contains(copied, name) })
+		// The marker is on the many side only, so the join must not match on it.
+		e.GroupModifier.Args = append(e.GroupModifier.Args, metricsQLGroupJoinMarker)
+	}
+	e.JoinModifier.Args = nil
+	*slot = &metricsql.FuncExpr{Name: metricsQLGroupJoinEndName, Args: []metricsql.Expr{e}}
+}
+
+// groupJoinPointsBucket rounds a point count up to a power of two, at most the
+// engine's cap. The count is written into the query text, and the range cache
+// compares the text for a range shifted by one step, so a count that follows
+// the range exactly would make every such query uncacheable. The budget a
+// bucket gives is at most twice as strict as the exact count.
+func groupJoinPointsBucket(points int) int {
+	bucket := 1
+	for bucket < points && bucket < metricsQLMaxPointsPerSeries {
+		bucket <<= 1
+	}
+	return min(bucket, metricsQLMaxPointsPerSeries)
+}
+
+// isScalarOperand reports whether expr is a number, a calculation on numbers,
+// or time(), pi() or scalar(): an operand Prometheus types as a scalar.
+func isScalarOperand(expr metricsql.Expr) bool {
+	if call, ok := expr.(*metricsql.FuncExpr); ok {
+		switch strings.ToLower(call.Name) {
+		case "scalar", "time", "pi":
+			return true
+		}
+	}
+	scalar := true
+	metricsql.VisitAll(expr, func(node metricsql.Expr) {
+		switch node.(type) {
+		case *metricsql.MetricExpr, *metricsql.RollupExpr, *metricsql.FuncExpr, *metricsql.AggrFuncExpr:
+			scalar = false
+		}
+	})
+	return scalar
+}
+
+func containsGroupJoin(expr metricsql.Expr) bool {
+	found := false
+	metricsql.VisitAll(expr, func(node metricsql.Expr) {
+		if call, ok := node.(*metricsql.FuncExpr); ok && call.Name == metricsQLGroupJoinName {
+			found = true
+		}
+	})
+	return found
+}
+
+func metricsQLGroupJoin(vectors []promql.Vector, _ promql.Matrix, args parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+	points, err := strconv.Atoi(args[2].(*parser.StringLiteral).Val)
+	if err != nil {
+		panic(fmt.Errorf("invalid internal group join points: %w", err))
+	}
+	names := stringArgs(args[3:])
+	separator := slices.Index(names, "")
+	matching, copied := slices.Clone(names[1:separator]), names[separator+1:]
+	on := names[0] == "on"
+	if !on {
+		matching = append(matching, labels.MetricName)
+	}
+	slices.Sort(matching)
+	var buf []byte
+	signature := func(lset labels.Labels) string {
+		if on {
+			buf = lset.BytesWithLabels(buf, matching...)
+		} else {
+			buf = lset.BytesWithoutLabels(buf, matching...)
+		}
+		return string(buf)
+	}
+	// The copied labels of each one-side series, once per distinct value.
+	// Series that share them stay a duplicate for the join to reject.
+	groups := map[string][]labels.Labels{}
+	seen := map[string]map[string]struct{}{}
+	for _, sample := range vectors[1] {
+		key := signature(sample.Metric)
+		values := sample.Metric.MatchLabels(true, copied...)
+		id := values.String()
+		if _, dup := seen[key][id]; dup {
+			continue
+		}
+		if seen[key] == nil {
+			seen[key] = map[string]struct{}{}
+		}
+		seen[key][id] = struct{}{}
+		groups[key] = append(groups[key], values)
+	}
+	// The engine checks MaxSamples only after this function returns, and in a
+	// range query it first preallocates a point slice for each new output
+	// series. Refuse an expansion over the budget before allocating it, with
+	// each added series counted for all its points. A many-side series that
+	// pairs with one one-side series adds nothing: it is the series the engine
+	// already loaded and budgets, so a one-to-one join is never refused here.
+	limit := metricsQLMaxOutputSamples.Load()
+	if limit > 0 {
+		var added int64
+		for _, sample := range vectors[0] {
+			added += int64(max(len(groups[signature(sample.Metric)])-1, 0))
+		}
+		if added > limit/int64(max(points, 1)) {
+			panic(promql.ErrTooManySamples("group_left"))
+		}
+	}
+	var extra []labels.Labels
+	builder := labels.NewBuilder(labels.EmptyLabels())
+	for _, sample := range vectors[0] {
+		origin := sample.Metric.MatchLabels(true, copied...).String()
+		for index, values := range groups[signature(sample.Metric)] {
+			builder.Reset(sample.Metric)
+			builder.Set(metricsQLGroupJoinMarker, origin)
+			for _, name := range copied {
+				if value := values.Get(name); value != "" {
+					builder.Set(name, value)
+				} else {
+					builder.Del(name)
+				}
+			}
+			out := sample
+			out.Metric = builder.Labels()
+			enh.Out = append(enh.Out, out)
+			if index > 0 {
+				extra = append(extra, out.Metric)
+			}
+		}
+	}
+	// The same series at a later step reuses its point slice, so count the
+	// distinct series the join added across all steps of the query.
+	if limit > 0 && len(extra) > 0 {
+		if !quantilesSeriesFor(args[2].(*parser.StringLiteral)).admit(extra, []float64{0}, points, limit) {
+			panic(promql.ErrTooManySamples("group_left"))
+		}
+	}
+	return enh.Out, nil
+}
+
+// metricsQLGroupJoinEnd removes the marker label set by metricsQLGroupJoin.
+func metricsQLGroupJoinEnd(vectors []promql.Vector, _ promql.Matrix, _ parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+	builder := labels.NewBuilder(labels.EmptyLabels())
+	for _, sample := range vectors[0] {
+		builder.Reset(sample.Metric)
+		builder.Del(metricsQLGroupJoinMarker)
+		out := sample
+		out.Metric = builder.Labels()
+		enh.Out = append(enh.Out, out)
+	}
+	return enh.Out, nil
 }
 
 func numberAsVector(expr metricsql.Expr) metricsql.Expr {

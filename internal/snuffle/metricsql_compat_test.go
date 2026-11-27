@@ -224,3 +224,95 @@ func TestPrepareMetricsQLQueryQuotesDottedNames(t *testing.T) {
 		}
 	}
 }
+
+func TestPrepareMetricsQLQueryNestedGroupJoinStaysLinear(t *testing.T) {
+	query := `vector(1)`
+	for range 16 {
+		query = `vector(1) * on() group_left(l) (` + query + `)`
+	}
+	prepared, err := prepareMetricsQLQuery(query, time.Minute, 0, time.Unix(0, 0), time.Unix(600, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.query) > 20*len(query) {
+		t.Errorf("a %d byte query expanded to %d bytes", len(query), len(prepared.query))
+	}
+}
+
+func TestPrepareMetricsQLQueryGroupJoinKeepsScalarOperands(t *testing.T) {
+	p := parser.NewParser(parser.Options{})
+	for _, query := range []string{
+		`1 * on() group_left(l) x`,
+		`x * on() group_right(l) (1 + 2)`,
+		`time() * on() group_left(l) x`,
+	} {
+		prepared, err := prepareMetricsQLQuery(query, time.Minute, 0, time.Unix(0, 0), time.Unix(600, 0))
+		if err != nil {
+			t.Fatalf("prepare %q: %v", query, err)
+		}
+		if strings.Contains(prepared.query, metricsQLGroupJoinName) {
+			t.Errorf("%q was rewritten to %q", query, prepared.query)
+		}
+		if _, err := p.ParseExpr(prepared.query); err != nil {
+			t.Errorf("Prometheus rejected %q (from %q): %v", prepared.query, query, err)
+		}
+	}
+}
+
+func TestPrepareMetricsQLQueryGroupJoinTextIgnoresRangeShift(t *testing.T) {
+	step := 15 * time.Second
+	start, end := time.Unix(3600, 0), time.Unix(3600+100*15, 0)
+	query := `up * on(pod) group_left(node) kube_pod_info`
+	prepared, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start, end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prepared.query, metricsQLGroupJoinName) {
+		t.Fatalf("%q was not rewritten: %q", query, prepared.query)
+	}
+	shifted, err := prepareMetricsQLQuery(query, step, 5*time.Minute, start.Add(step), end)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if shifted.query != prepared.query {
+		t.Errorf("a one-step shift of the range changed the query:\n%s\n%s", prepared.query, shifted.query)
+	}
+}
+
+func TestMetricsQLGroupJoinBudgetChargesOnlyAddedSeries(t *testing.T) {
+	// Each added series counts for 2 points, so a budget of 4 allows 2.
+	metricsQLMaxOutputSamples.Store(4)
+	defer metricsQLMaxOutputSamples.Store(0)
+	sample := func(kv ...string) promql.Sample {
+		return promql.Sample{Metric: labels.FromStrings(kv...)}
+	}
+	join := func(many, one promql.Vector) (out promql.Vector, panicked bool) {
+		defer func() { panicked = recover() != nil }()
+		args := parser.Expressions{nil, nil}
+		for _, val := range []string{"2", "on", "pod", "", "node"} {
+			args = append(args, &parser.StringLiteral{Val: val})
+		}
+		out, _ = metricsQLGroupJoin([]promql.Vector{many, one}, nil, args, &promql.EvalNodeHelper{})
+		return out, false
+	}
+
+	// Three one-to-one pairs add no series, whatever the budget.
+	many := promql.Vector{sample("pod", "a"), sample("pod", "b"), sample("pod", "c")}
+	one := promql.Vector{sample("pod", "a", "node", "n1"), sample("pod", "b", "node", "n1"), sample("pod", "c", "node", "n2")}
+	if out, panicked := join(many, one); panicked || len(out) != 3 {
+		t.Errorf("one-to-one join: %d samples, panicked %v; want 3, false", len(out), panicked)
+	}
+
+	// One many-side series paired with three adds two series: within budget.
+	many = promql.Vector{sample("pod", "a")}
+	one = promql.Vector{sample("pod", "a", "node", "n1"), sample("pod", "a", "node", "n2"), sample("pod", "a", "node", "n3")}
+	if out, panicked := join(many, one); panicked || len(out) != 3 {
+		t.Errorf("one-to-three join: %d samples, panicked %v; want 3, false", len(out), panicked)
+	}
+
+	// Four one-side series add three, over the budget.
+	one = append(one, sample("pod", "a", "node", "n4"))
+	if _, panicked := join(many, one); !panicked {
+		t.Error("one-to-four join was not refused")
+	}
+}
