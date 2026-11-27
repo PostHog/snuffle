@@ -135,6 +135,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("replaced series end at their stale marker", func(t *testing.T) {
 		assertReplacedSeriesStaleness(t, cfg)
 	})
+	t.Run("group joins copy labels from each one-side series", func(t *testing.T) {
+		assertGroupJoinCopiedLabels(t, cfg, api.URL)
+	})
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
