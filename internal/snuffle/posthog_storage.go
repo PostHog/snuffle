@@ -692,6 +692,13 @@ func postHogLabelNamesSQL(cfg Config, mint, maxt int64, limit int, matchers []*l
 }
 
 func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit int, matchers ...*labels.Matcher) ([]string, error) {
+	return q.postHogLabelValuesCapped(ctx, name, limit, 0, matchers...)
+}
+
+// postHogLabelValuesCapped is postHogLabelValues that skips the virtual
+// histogram lookup when the stored values already number virtualCap (0: never
+// skip).
+func (q *CHQuerier) postHogLabelValuesCapped(ctx context.Context, name string, limit, virtualCap int, matchers ...*labels.Matcher) ([]string, error) {
 	sql, ok := postHogLabelValuesSQL(q.queryable.cfg, name, q.mint, q.maxt, limit, matchers)
 	if !ok {
 		series, err := q.selectPostHogSeries(ctx, q.mint, q.maxt, matchers...)
@@ -709,6 +716,9 @@ func (q *CHQuerier) postHogLabelValues(ctx context.Context, name string, limit i
 	values := make(map[string]struct{})
 	if err := q.addStringRows(ctx, values, sql); err != nil {
 		return nil, err
+	}
+	if virtualCap > 0 && len(values) >= virtualCap {
+		return sortedLimited(values, limit), nil
 	}
 	virtual, err := q.postHogHistogramLabelValues(ctx, name, matchers)
 	if err != nil {

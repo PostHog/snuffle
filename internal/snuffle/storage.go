@@ -732,7 +732,9 @@ func seriesPreFilters(cfg Config, matchers []*labels.Matcher) []string {
 func metricNameConstraints(matchers []*labels.Matcher) []string {
 	var filters []string
 	for _, m := range matchers {
-		if m.Name != labels.MetricName || m.Matches("") {
+		// Every series has a name, so = and =~ that match "" filter nothing,
+		// but != and !~ that match "" still drop the names they reject.
+		if m.Name != labels.MetricName || postHogMatcherCanSkip(m) {
 			continue
 		}
 		if condition, ok := metricMatcherCondition(m); ok {
@@ -757,13 +759,63 @@ func metricMatcherCondition(m *labels.Matcher) (string, bool) {
 	}
 }
 
+// exactMetricName returns the one metric name the matchers allow, as a
+// __name__="m" or __name__=~"m" matcher names it, or "".
 func exactMetricName(matchers []*labels.Matcher) string {
 	for _, m := range matchers {
 		if m.Name == labels.MetricName && m.Type == labels.MatchEqual && m.Value != "" {
 			return m.Value
 		}
 	}
+	if names, ok := metricNameSet(matchers); ok && len(names) == 1 && names[0] != "" {
+		return names[0]
+	}
 	return ""
+}
+
+// metricNameEquals reports whether a __name__="m" matcher names the metric, as
+// the user wrote it. A literal =~ regex bounds the names too (exactMetricName)
+// but stays a broad selector.
+func metricNameEquals(matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if m.Name == labels.MetricName && m.Type == labels.MatchEqual && m.Value != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// metricNameSet lists the metric names the __name__ matchers allow when an =
+// or a literal =~ ("a|b") matcher bounds them to a set. It reports false when
+// no matcher does.
+func metricNameSet(matchers []*labels.Matcher) ([]string, bool) {
+	var names []string
+	bounded := false
+	for _, m := range matchers {
+		if m.Name != labels.MetricName || bounded {
+			continue
+		}
+		switch m.Type {
+		case labels.MatchEqual:
+			names, bounded = []string{m.Value}, true
+		case labels.MatchRegexp:
+			names = m.SetMatches()
+			bounded = len(names) > 0
+		}
+	}
+	if !bounded {
+		return nil, false
+	}
+	return slices.DeleteFunc(names, func(name string) bool { return !matchesAllMetricName(name, matchers) }), true
+}
+
+func matchesAllMetricName(name string, matchers []*labels.Matcher) bool {
+	for _, m := range matchers {
+		if m.Name == labels.MetricName && !m.Matches(name) {
+			return false
+		}
+	}
+	return true
 }
 
 func labelIndexMembershipCondition(m *labels.Matcher) (string, string, bool) {
