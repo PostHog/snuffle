@@ -140,6 +140,20 @@ func (rewriter metricsQLRewriter) rewriteHistogramQuantiles(expr *metricsql.Func
 	return rewriter.rewriteArgs(expr.Args, step, instant)
 }
 
+// rewriteHistogramShare rewrites histogram_share(le, buckets) into
+// histogram_fraction(-Inf, le, buckets): both interpolate linearly within the
+// bucket holding le and count nothing from the +Inf bucket.
+// Reference: transformHistogramShare in VictoriaMetrics app/vmselect/promql/transform.go.
+// ponytail: no bounds-label third argument and no vmrange buckets; add when a query needs them.
+func (rewriter metricsQLRewriter) rewriteHistogramShare(expr *metricsql.FuncExpr, step time.Duration, instant bool) error {
+	if len(expr.Args) != 2 {
+		return fmt.Errorf("histogram_share requires exactly two arguments: le and a histogram vector")
+	}
+	expr.Name = "histogram_fraction"
+	expr.Args = []metricsql.Expr{&metricsql.NumberExpr{N: math.Inf(-1)}, expr.Args[0], expr.Args[1]}
+	return rewriter.rewriteArgs(expr.Args, step, instant)
+}
+
 func metricsQLHistogramQuantiles(vectors []promql.Vector, matrix promql.Matrix, args parser.Expressions, helper *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
 	result, warnings := promql.FunctionCalls["histogram_quantiles"](vectors, matrix, args, helper)
 	labelName := args[1].(*parser.StringLiteral).Val
