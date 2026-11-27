@@ -16,6 +16,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 	promvalue "github.com/prometheus/prometheus/model/value"
+	"github.com/prometheus/prometheus/promql"
 )
 
 var postHogHistogramSuffixes = []string{"_bucket", "_count", "_sum"}
@@ -50,7 +51,9 @@ func postHogExactHistogramMetadataSQL(cfg Config, mint, maxt int64, alias postHo
 		"metric_name IN (" + sqlString(name) + ", " + sqlString(alias.baseName) + ")",
 		"((" + strings.Join(realWhere, " AND ") + ") OR (" + strings.Join(virtualWhere, " AND ") + "))",
 	}
-	return postHogSelectedSeriesWhereSQL(cfg, where, cfg.MaxSeries, nil)
+	// The temporality column marks stored delta counters named like a histogram
+	// component, so counter functions over them read the running total.
+	return postHogSelectedSeriesWhereSQL(cfg, where, cfg.MaxSeries, []string{"aggregation_temporality = 'delta' AS delta"})
 }
 
 func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, mint, maxt int64, alias postHogHistogramAlias, matchers []*labels.Matcher) ([]*seriesMeta, map[uint64]postHogHistogramSource, []uint64, error) {
@@ -69,7 +72,8 @@ func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, min
 		rows++
 		var id uint64
 		var source postHogHistogramSource
-		if err := row.Scan(&id, &source.metricName, &source.serviceName, &source.resource, &source.attributes); err != nil {
+		var delta uint8
+		if err := row.Scan(&id, &source.metricName, &source.serviceName, &source.resource, &source.attributes, &delta); err != nil {
 			return err
 		}
 		if source.metricName == alias.baseName {
@@ -79,7 +83,7 @@ func (q *CHQuerier) selectPostHogExactHistogramMetadata(ctx context.Context, min
 		}
 		labelMap := postHogLabelMap(source.metricName, source.serviceName, source.resource, source.attributes)
 		if matchesAll(labelMap, matchers) {
-			series = append(series, &seriesMeta{id: id, metricName: source.metricName, labelMap: labelMap, labels: labels.FromMap(labelMap)})
+			series = append(series, &seriesMeta{id: id, metricName: source.metricName, labelMap: labelMap, labels: labels.FromMap(labelMap), delta: delta == 1})
 		}
 		return nil
 	})
@@ -107,6 +111,7 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 		if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
 			return nil, err
 		}
+		setPostHogDeltaTotals(series)
 		series = slices.DeleteFunc(series, func(meta *seriesMeta) bool { return len(meta.samples) == 0 })
 	}
 	virtual, err := q.readPostHogHistogramSamples(ctx, mint, maxt, []postHogHistogramAlias{alias}, matchers, sources, ids, withSamples)
@@ -126,8 +131,8 @@ func (q *CHQuerier) selectPostHogExactHistogramSeries(ctx context.Context, mint,
 // labels. Samples of a shared series merge by timestamp. Where both forms have
 // a sample at one timestamp, the real sample wins, which removes the stale
 // marker the virtual builder writes for a bucket missing from a native row.
-// A delta virtual series holds a running total that starts at the query range,
-// so it cannot merge with a stored series. An exact selector fails on that
+// A delta virtual series carries the running total of its own points, so it
+// cannot merge with a stored series. An exact selector fails on that
 // pair. A broad selector keeps the stored series and drops the delta one.
 func mergePostHogHistogramSeries(real, virtual []*seriesMeta, strict bool) ([]*seriesMeta, error) {
 	if len(real) == 0 {
@@ -644,29 +649,28 @@ func postHogMixedTemporality(metricName string) error {
 	return invalidPostHogHistogram("histogram %q mixes delta and cumulative aggregation temporality in one series", metricName)
 }
 
-// finish sorts the samples of each series by time. A series built from delta
-// points becomes a running total. rate and increase read window sums from
-// it. irate and idelta read it as a cumulative counter.
+// finish sorts the samples of each series by time. A delta series keeps its
+// points as sent, and its running total in deltaTotals: rate and increase read
+// window sums from the total, and irate and idelta read it as a cumulative
+// counter.
 func (builder *postHogHistogramSeriesBuilder) finish() []*seriesMeta {
 	for _, meta := range builder.series {
 		sortSamples(meta.samples)
 		if meta.delta {
-			meta.samples = accumulatePostHogDeltaSamples(meta.samples)
-			meta.deltaTotals = finitePostHogDeltaTotals(meta.samples)
+			meta.samples = mergePostHogDeltaSamples(meta.samples)
+			meta.deltaTotals = postHogDeltaTotals(meta.samples)
 		}
 	}
 	return builder.series
 }
 
-// accumulatePostHogDeltaSamples turns time-sorted delta points into a running
-// total that starts at the first point. It sums points that share a
+// mergePostHogDeltaSamples sums time-sorted delta points that share a
 // timestamp, such as points from several clients, into one point. A NaN or
-// infinite point does not change the total. When no finite point shares its
+// infinite point is dropped from the sum. When no finite point shares its
 // timestamp, it is returned as is. A stale marker stays only when no other
-// point shares its timestamp. The total does not reset after a stale marker.
-func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
+// point shares its timestamp.
+func mergePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 	out := samples[:0]
-	var total float64
 	for index := 0; index < len(samples); {
 		timestamp := samples[index].t
 		var sum float64
@@ -684,21 +688,26 @@ func accumulatePostHogDeltaSamples(samples []samplePoint) []samplePoint {
 			}
 		}
 		if finite {
-			total += sum
-			value = total
+			value = sum
 		}
 		out = append(out, samplePoint{t: timestamp, v: value})
 	}
 	return out
 }
 
-// finitePostHogDeltaTotals returns the finite points of a running total.
-func finitePostHogDeltaTotals(totals []samplePoint) []samplePoint {
-	notFinite := func(point samplePoint) bool { return !isFiniteSampleValue(point.v) }
-	if !slices.ContainsFunc(totals, notFinite) {
-		return totals
+// postHogDeltaTotals returns the running total of the finite points of a
+// time-sorted delta series, starting at its first point. The total does not
+// reset after a stale marker.
+func postHogDeltaTotals(samples []samplePoint) []samplePoint {
+	totals := make([]samplePoint, 0, len(samples))
+	var total float64
+	for _, point := range samples {
+		if isFiniteSampleValue(point.v) {
+			total += point.v
+			totals = append(totals, samplePoint{t: point.t, v: total})
+		}
 	}
-	return slices.DeleteFunc(slices.Clone(totals), notFinite)
+	return totals
 }
 
 // deltaWindowSum returns the sum of the delta points of a delta series in the
@@ -717,6 +726,39 @@ func (meta *seriesMeta) deltaWindowSum(start, end int64) (float64, bool) {
 		sum -= totals[first-1].v
 	}
 	return sum, true
+}
+
+// deltaLastValue returns the value of the last finite point of a delta series
+// in the window (start, end]. Points that share its timestamp add up, as the
+// histogram builder merges them. It reports false when no finite point is in
+// the window.
+func (meta *seriesMeta) deltaLastValue(start, end int64) (float64, bool) {
+	totals := meta.deltaTotals
+	last := sort.Search(len(totals), func(i int) bool { return totals[i].t > end }) - 1
+	if last < 0 || totals[last].t <= start {
+		return 0, false
+	}
+	first := sort.Search(len(totals), func(i int) bool { return totals[i].t >= totals[last].t })
+	value := totals[last].v
+	if first > 0 {
+		value -= totals[first-1].v
+	}
+	return value, true
+}
+
+// deltaTotalPoints returns the running total of a delta series at its last two
+// finite points in [start, end], which is all irate reads. Copying the whole
+// window on every step would cost memory in proportion to window times steps.
+func (meta *seriesMeta) deltaTotalPoints(start, end int64) []promql.FPoint {
+	totals := meta.deltaTotals
+	first := sort.Search(len(totals), func(i int) bool { return totals[i].t >= start })
+	last := sort.Search(len(totals), func(i int) bool { return totals[i].t > end })
+	first = max(first, last-2)
+	points := make([]promql.FPoint, 0, max(last-first, 0))
+	for _, total := range totals[first:max(last, first)] {
+		points = append(points, promql.FPoint{T: total.t, F: total.v})
+	}
+	return points
 }
 
 func isFiniteSampleValue(value float64) bool {
@@ -834,16 +876,10 @@ func (q *CHQuerier) readPostHogHistogramSamples(ctx context.Context, mint, maxt 
 	if skipped, ok := ctx.Value(skippedHistogramRowsKey{}).(*atomic.Int64); ok && withSamples {
 		skipped.Add(builder.skippedRows)
 	}
-	series := builder.finish()
-	for _, meta := range series {
-		if meta.delta && withSamples {
-			// The running total starts at the first point that this request reads,
-			// so a step has another value in a request with another start.
-			markRangeDependent(ctx)
-			break
-		}
-	}
-	return series, nil
+	// Delta points read back as sent, and counter functions read differences
+	// of their running total, so no step depends on the request start and the
+	// range cache can serve delta histograms.
+	return builder.finish(), nil
 }
 
 func (q *CHQuerier) appendPostHogHistogramSeries(ctx context.Context, series []*seriesMeta, mint, maxt int64, matchers []*labels.Matcher, withSamples bool) ([]*seriesMeta, error) {

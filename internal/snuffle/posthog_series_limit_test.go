@@ -187,6 +187,8 @@ func (r *fixedRows) Scan(dest ...any) error {
 		switch target := dest[i].(type) {
 		case *uint64:
 			*target = value.(uint64)
+		case *uint8:
+			*target = value.(uint8)
 		case *string:
 			*target = value.(string)
 		case *map[string]string:

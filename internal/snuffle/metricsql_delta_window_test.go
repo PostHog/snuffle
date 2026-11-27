@@ -166,6 +166,10 @@ func TestDeltaHistogramCounterWindowSum(test *testing.T) {
 		// irate and idelta read the last two points of the running total.
 		{`idelta(sparse_seconds_count[5m])`, 1, true},
 		{`irate(sparse_seconds_count[5m])`, 0.25, true},
+		// A window with one point returns that point's own value, not the
+		// total since the first point read.
+		{`idelta(sparse_seconds_count[5s] offset 94s)`, 1, true},
+		{`idelta(sparse_seconds_count[3h])`, 1, true},
 	})
 }
 
@@ -298,15 +302,11 @@ func TestDeltaWindowSum(test *testing.T) {
 
 // The window sum binary-searches the finite totals. A long run of NaN points
 // therefore adds no work per step.
-func TestFinitePostHogDeltaTotals(test *testing.T) {
-	finite := []samplePoint{{t: 1000, v: 1}, {t: 2000, v: 3}}
-	if got := finitePostHogDeltaTotals(finite); len(got) != len(finite) || &got[0] != &finite[0] {
-		test.Fatalf("all-finite totals = %v, want the same slice", got)
-	}
+func TestPostHogDeltaTotals(test *testing.T) {
 	stale := math.Float64frombits(promvalue.StaleNaN)
 	mixed := []samplePoint{{t: 1000, v: 1}, {t: 2000, v: math.NaN()}, {t: 3000, v: stale}, {t: 4000, v: math.Inf(1)}, {t: 5000, v: 4}}
-	if got := finitePostHogDeltaTotals(mixed); len(got) != 2 || got[0] != mixed[0] || got[1] != mixed[4] {
-		test.Fatalf("mixed totals = %v, want only the finite points", got)
+	if got := postHogDeltaTotals(mixed); len(got) != 2 || got[0] != mixed[0] || got[1] != (samplePoint{t: 5000, v: 5}) {
+		test.Fatalf("mixed totals = %v, want the running total of the finite points", got)
 	}
 	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), nil, true)
 	for timestamp := int64(1000); timestamp <= 500000; timestamp += 1000 {

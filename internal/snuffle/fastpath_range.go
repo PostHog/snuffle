@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 )
@@ -137,6 +138,15 @@ func (s *Server) tryFastRangeGroups(ctx context.Context, prepared metricsQLQuery
 	}
 	if virtual {
 		return nil, false, nil
+	}
+	if call.name != "default_rollup" {
+		delta, err := s.postHogSelectsDelta(ctx, mint, maxt, call.selector.LabelMatchers)
+		if err != nil {
+			return nil, false, err
+		}
+		if delta {
+			return nil, false, nil
+		}
 	}
 	plan := newPostHogQueryPlanWithHistory(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, sampleMint, maxt, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
@@ -580,4 +590,17 @@ func rangeAggregateSampleResults(groups []rangeAggregateGroup) []sampleResult {
 		results = append(results, sampleResult{Metric: group.metric, Values: values})
 	}
 	return results
+}
+
+// postHogSelectsDelta reports whether the selector can read a series with
+// delta temporality in the window. Counter functions read such a series as
+// window sums (see metricsQLRollup), which the range pushdown does not compute.
+func (s *Server) postHogSelectsDelta(ctx context.Context, mint, maxt int64, matchers []*labels.Matcher) (bool, error) {
+	where := append(postHogSeriesFilters(s.cfg, matchers, mint, maxt), "aggregation_temporality = 'delta'")
+	found := false
+	err := s.client.QueryRows(ctx, fmt.Sprintf("SELECT 1 FROM %s WHERE %s LIMIT 1", postHogSeriesTable(s.cfg), strings.Join(where, " AND ")), func(clickHouseRow) error {
+		found = true
+		return nil
+	})
+	return found, err
 }
