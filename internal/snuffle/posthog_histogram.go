@@ -526,6 +526,21 @@ func (builder *postHogHistogramSeriesBuilder) add(sample postHogHistogramSample,
 	return nil
 }
 
+// isPostHogStaleHistogram reports whether sample is the stale marker that
+// capture-apm-metrics writes for a classic histogram whose target went away
+// (PostHog/posthog#133926): one row with a StaleNaN sum and zero counts.
+func isPostHogStaleHistogram(sample postHogHistogramSample) bool {
+	if !isStaleSampleValue(sample.sum) || sample.count != 0 {
+		return false
+	}
+	for _, count := range sample.counts {
+		if count != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramSample, suffixes []string) error {
 	source := builder.bySource[sample.id]
 	if source == nil {
@@ -535,6 +550,9 @@ func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramS
 		}
 		builder.bySource[sample.id] = source
 	}
+	// The stale row of a classic histogram ends every component series. Its
+	// _sum is already StaleNaN.
+	stale := isPostHogStaleHistogram(sample)
 	for _, suffix := range suffixes {
 		switch suffix {
 		case "_bucket":
@@ -544,6 +562,9 @@ func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramS
 			}
 			current := make(map[string]*seriesMeta, len(buckets))
 			for bound, count := range buckets {
+				if stale {
+					count = math.Float64frombits(promvalue.StaleNaN)
+				}
 				meta, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix, bound: bound}, count)
 				if err != nil {
 					return err
@@ -566,7 +587,11 @@ func (builder *postHogHistogramSeriesBuilder) addSample(sample postHogHistogramS
 			if err := checkPostHogCountSumRow(sample); err != nil {
 				return err
 			}
-			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, float64(sample.count)); err != nil {
+			count := float64(sample.count)
+			if stale {
+				count = math.Float64frombits(promvalue.StaleNaN)
+			}
+			if _, err := builder.addPoint(source, sample, postHogHistogramSeriesKey{suffix: suffix}, count); err != nil {
 				return err
 			}
 		case "_sum":

@@ -349,6 +349,35 @@ func TestPostHogHistogramMalformedRowSkippedForEverySuffix(test *testing.T) {
 	}
 }
 
+// Capture's stale row (StaleNaN sum, zero counts) is a well-formed row: it
+// ends every component series with a stale marker and is never skipped.
+func TestPostHogHistogramStaleRowEndsEverySuffix(test *testing.T) {
+	live := histogramTestSample()
+	stale := histogramTestSample()
+	stale.timestamp += 1000
+	stale.sum, stale.count = math.Float64frombits(promvalue.StaleNaN), 0
+	stale.counts = make([]uint64, len(live.counts))
+	for _, suffix := range []string{"_bucket", "_count", "_sum"} {
+		test.Run(suffix, func(test *testing.T) {
+			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds"+suffix)}
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			for _, sample := range []postHogHistogramSample{live, stale} {
+				if err := builder.add(sample, []string{suffix}); err != nil {
+					test.Fatal(err)
+				}
+			}
+			if builder.skippedRows != 0 || len(builder.skipped) != 0 || len(builder.series) == 0 {
+				test.Fatalf("skipped rows = %d, skipped sources = %d, series = %d", builder.skippedRows, len(builder.skipped), len(builder.series))
+			}
+			for _, meta := range builder.series {
+				if len(meta.samples) != 2 || isStaleSampleValue(meta.samples[0].v) || !isStaleSampleValue(meta.samples[1].v) {
+					test.Fatalf("%s: %v, want a point then a stale marker", meta.labels, meta.samples)
+				}
+			}
+		})
+	}
+}
+
 func TestPostHogHistogramExponentialRowKeepsCountAndSum(test *testing.T) {
 	sample := histogramTestSample()
 	sample.counts = append(sample.counts, 0)

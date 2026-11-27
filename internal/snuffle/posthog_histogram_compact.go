@@ -285,6 +285,12 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// A stale marker is not a sample of any range, so the counter functions
+	// never see it, and points after it follow the points before it, as in
+	// the engine.
+	if isPostHogStaleHistogram(sample) {
+		return nil
+	}
 	if evaluator.haveSource && evaluator.sourceID != sample.id {
 		if err := evaluator.advance(ctx, 0, true); err != nil {
 			return err
