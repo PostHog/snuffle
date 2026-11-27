@@ -30,31 +30,7 @@ func TestLogQLPostHogLayoutMatchesReferenceSQL(t *testing.T) {
 	defer cancel()
 
 	const teamID = 42
-	dbName := fmt.Sprintf("snuffle_logql_posthog_%d", time.Now().UnixNano())
-	rootCfg := ConfigFromEnv()
-	rootCfg.CHAddr = getenv("SNUFFLE_E2E_CH_ADDR", "127.0.0.1:9000")
-	rootCfg.CHDatabase = ""
-	rootCfg.CHTimeout = 10 * time.Second
-	rootClient := NewClickHouseClient(rootCfg)
-	waitForClickHouse(t, ctx, rootClient)
-	if err := rootClient.Exec(ctx, "CREATE DATABASE "+quoteIdent(dbName)); err != nil {
-		t.Fatalf("create database: %v", err)
-	}
-	defer func() {
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cleanupCancel()
-		_ = rootClient.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" SYNC")
-	}()
-
-	cfg := rootCfg
-	cfg.CHDatabase = dbName
-	cfg.LogSchemaLayout = string(logSchemaLayoutPostHog)
-	cfg.LogsTable = "logs34"
-	cfg.HTTPHost = "127.0.0.1"
-	cfg.QueryTimeout = 15 * time.Second
-	cfg.LogQueryMaxRows = 100000
-	client := NewClickHouseClient(cfg)
-	loadE2ESchema(t, ctx, client, filepath.Join(repoRoot(t), "scripts", "create_logs_posthog_schema.sql"))
+	cfg, client := newLogQLPostHogE2E(t, ctx)
 
 	// 1200 rows, one every 3s over an hour. Most are JSON "committed" lines
 	// in the target namespace; some are plain-text committed lines without
@@ -219,6 +195,201 @@ FROM numbers(1200)`, start.Unix(), teamID)); err != nil {
 			t.Fatalf("capped query status %d: %s", resp.StatusCode, body)
 		}
 	})
+}
+
+// TestLogQLPostHogAttributeLabelsInSQL covers ENG-043 and ENG-044: label
+// filters and groupings on log attributes and on the event_name column run in
+// ClickHouse, so an hour of one busy service (more lines than
+// SNUFFLE_LOG_QUERY_MAX_ROWS) still answers, with the same numbers as a
+// hand-written ClickHouse query.
+func TestLogQLPostHogAttributeLabelsInSQL(t *testing.T) {
+	if os.Getenv("SNUFFLE_E2E") != "1" {
+		t.Skip("set SNUFFLE_E2E=1 to run the ClickHouse e2e test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const teamID = 43
+	cfg, client := newLogQLPostHogE2E(t, ctx)
+
+	// 120k mcp-analytics-bridge lines over an hour (one every 30ms), plus
+	// 12k lines of another service carrying the same attributes.
+	start := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	end := start.Add(time.Hour)
+	if err := client.Exec(ctx, fmt.Sprintf(`INSERT INTO logs34 (team_id, original_expiry_timestamp, uuid, timestamp, observed_timestamp, body, severity_text, service_name, resource_attributes, event_name, attributes_map_str)
+WITH
+    number AS n,
+    n < 120000 AS bridge,
+    toDateTime64(%d, 6, 'UTC') + toIntervalMillisecond(if(bridge, n * 30, (n - 120000) * 300)) AS ts,
+    if(bridge, 'mcp-analytics-bridge', 'other-service') AS service,
+    arrayElement(['claude-code', 'cursor', 'vscode', '', ''], (n %% 5) + 1) AS mcp_client,
+    if(n %% 11 = 0, '', concat('sess-', toString(n %% 1009))) AS session
+SELECT %d, now() + toIntervalDay(30), toString(n), ts, ts, 'tool call', 'info', service,
+    map('service.name', service),
+    if(n %% 3 = 0, 'mcp.session_start', 'mcp.tool_call'),
+    mapFilter((k, v) -> v != '', map('mcp_client__str', mcp_client, 'mcp_session_id__str', session))
+FROM numbers(132000)`, start.Unix(), teamID)); err != nil {
+		t.Fatalf("seed logs: %v", err)
+	}
+
+	mux := http.NewServeMux()
+	newServer(cfg).routes(mux)
+	api := httptest.NewServer(mux)
+	defer api.Close()
+
+	const selector = `{service_name="mcp-analytics-bridge"}`
+	where := fmt.Sprintf(`team_id = %d AND service_name = 'mcp-analytics-bridge'`, teamID)
+	instantRef := func(label, value, extraWhere string) string {
+		return fmt.Sprintf(
+			`SELECT toString(%s) AS label, toInt64(%d) AS t, %s AS value FROM logs34 WHERE %s AND timestamp > toDateTime64(%d, 6, 'UTC') AND timestamp <= toDateTime64(%d, 6, 'UTC')%s GROUP BY label`,
+			label, end.Unix(), value, where, start.Unix(), end.Unix(), extraWhere,
+		)
+	}
+	for _, test := range []struct {
+		name      string
+		query     string
+		groupBy   string
+		reference string
+	}{
+		{
+			name:      "sum by attribute",
+			query:     `sum by (mcp_client) (count_over_time(` + selector + ` [1h]))`,
+			groupBy:   "mcp_client",
+			reference: instantRef("attributes_map_str['mcp_client__str']", "toFloat64(count())", ""),
+		},
+		{
+			name:      "count of sum by attribute with filter",
+			query:     `count(sum by (mcp_session_id) (count_over_time(` + selector + ` | mcp_session_id!="" [1h])))`,
+			reference: instantRef("''", "toFloat64(uniqExact(attributes_map_str['mcp_session_id__str']))", " AND attributes_map_str['mcp_session_id__str'] != ''"),
+		},
+		{
+			name:      "sum without over sum by",
+			query:     `sum without (mcp_session_id) (sum by (mcp_client, mcp_session_id) (count_over_time(` + selector + ` [1h])))`,
+			groupBy:   "mcp_client",
+			reference: instantRef("attributes_map_str['mcp_client__str']", "toFloat64(count())", ""),
+		},
+		{
+			name:      "max of sum by attribute",
+			query:     `max(sum by (mcp_client) (count_over_time(` + selector + ` | mcp_client=~"c.*" [1h])))`,
+			reference: fmt.Sprintf(`SELECT '' AS label, t, max(value) AS value FROM (%s) GROUP BY t`, instantRef("attributes_map_str['mcp_client__str']", "toFloat64(count())", " AND match(attributes_map_str['mcp_client__str'], '^(?:c.*)$')")),
+		},
+		{
+			name:      "event_name label filter",
+			query:     `sum(count_over_time(` + selector + ` | event_name="mcp.tool_call" [1h]))`,
+			reference: instantRef("''", "toFloat64(count())", " AND event_name = 'mcp.tool_call'"),
+		},
+		{
+			name:      "event_name stream matcher",
+			query:     `sum(count_over_time({service_name="mcp-analytics-bridge", event_name="mcp.tool_call"} [1h]))`,
+			reference: instantRef("''", "toFloat64(count())", " AND event_name = 'mcp.tool_call'"),
+		},
+		{
+			name:      "sum by event_name",
+			query:     `sum by (event_name) (count_over_time(` + selector + ` [1h]))`,
+			groupBy:   "event_name",
+			reference: instantRef("event_name", "toFloat64(count())", ""),
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			want := logQLReferenceSeries(t, ctx, client, test.reference, test.groupBy)
+			if len(want) == 0 {
+				t.Fatal("reference query returned no rows")
+			}
+			data := apiGetForTeam[queryDataDTO](t, api.URL, teamID, "/loki/api/v1/query", url.Values{
+				"query": {test.query},
+				"time":  {strconv.FormatInt(end.Unix(), 10)},
+			})
+			got := map[string]float64{}
+			for _, sample := range data.Result {
+				value, err := strconv.ParseFloat(sampleString(sample.Value), 64)
+				if err != nil {
+					t.Fatalf("parse sample %v: %v", sample.Value, err)
+				}
+				got[logQLReferenceKey(sample.Metric, int64(sample.Value[0].(float64)))] = value
+			}
+			assertLogQLSeriesEqual(t, got, want)
+		})
+	}
+
+	t.Run("count of sum by attribute over a range", func(t *testing.T) {
+		want := logQLReferenceSeries(t, ctx, client, fmt.Sprintf(
+			`SELECT '' AS label, intDiv(toInt64(toUnixTimestamp64Nano(timestamp)) + 299999999999, 300000000000) * 300 AS t, toFloat64(uniqExact(attributes_map_str['mcp_session_id__str'])) AS value FROM logs34 WHERE %s AND attributes_map_str['mcp_session_id__str'] != '' GROUP BY t HAVING t >= %d AND t <= %d`,
+			where, start.Unix(), end.Unix(),
+		), "")
+		data := apiGetForTeam[queryDataDTO](t, api.URL, teamID, "/loki/api/v1/query_range", url.Values{
+			"query": {`count(sum by (mcp_session_id) (count_over_time(` + selector + ` | mcp_session_id!="" [5m])))`},
+			"start": {strconv.FormatInt(start.Unix(), 10)},
+			"end":   {strconv.FormatInt(end.Unix(), 10)},
+			"step":  {"300"},
+		})
+		got := map[string]float64{}
+		for _, series := range data.Result {
+			for _, point := range series.Values {
+				value, err := strconv.ParseFloat(sampleString(point), 64)
+				if err != nil {
+					t.Fatalf("parse sample %v: %v", point, err)
+				}
+				got[logQLReferenceKey(series.Metric, int64(point[0].(float64)))] = value
+			}
+		}
+		assertLogQLSeriesEqual(t, got, want)
+	})
+
+	t.Run("event_name label on raw log lines", func(t *testing.T) {
+		data := apiGetForTeam[struct {
+			Result []struct {
+				Stream map[string]string `json:"stream"`
+				Values [][]string        `json:"values"`
+			} `json:"result"`
+		}](t, api.URL, teamID, "/loki/api/v1/query_range", url.Values{
+			"query": {selector + ` | event_name="mcp.session_start"`},
+			"start": {strconv.FormatInt(start.Unix(), 10)},
+			"end":   {strconv.FormatInt(end.Unix(), 10)},
+			"limit": {"20"},
+		})
+		lines := 0
+		for _, stream := range data.Result {
+			if stream.Stream["event_name"] != "mcp.session_start" {
+				t.Errorf("stream %v: want event_name=mcp.session_start", stream.Stream)
+			}
+			lines += len(stream.Values)
+		}
+		if lines != 20 {
+			t.Fatalf("got %d lines, want 20", lines)
+		}
+	})
+}
+
+// newLogQLPostHogE2E creates a database with the PostHog logs schema, dropped
+// when the test ends, and a config pointing at it.
+func newLogQLPostHogE2E(t *testing.T, ctx context.Context) (Config, *ClickHouseClient) {
+	t.Helper()
+	dbName := fmt.Sprintf("snuffle_logql_posthog_%d", time.Now().UnixNano())
+	rootCfg := ConfigFromEnv()
+	rootCfg.CHAddr = getenv("SNUFFLE_E2E_CH_ADDR", "127.0.0.1:9000")
+	rootCfg.CHDatabase = ""
+	rootCfg.CHTimeout = 10 * time.Second
+	rootClient := NewClickHouseClient(rootCfg)
+	waitForClickHouse(t, ctx, rootClient)
+	if err := rootClient.Exec(ctx, "CREATE DATABASE "+quoteIdent(dbName)); err != nil {
+		t.Fatalf("create database: %v", err)
+	}
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = rootClient.Exec(cleanupCtx, "DROP DATABASE IF EXISTS "+quoteIdent(dbName)+" SYNC")
+	})
+
+	cfg := rootCfg
+	cfg.CHDatabase = dbName
+	cfg.LogSchemaLayout = string(logSchemaLayoutPostHog)
+	cfg.LogsTable = "logs34"
+	cfg.HTTPHost = "127.0.0.1"
+	cfg.QueryTimeout = 15 * time.Second
+	cfg.LogQueryMaxRows = 100000
+	client := NewClickHouseClient(cfg)
+	loadE2ESchema(t, ctx, client, filepath.Join(repoRoot(t), "scripts", "create_logs_posthog_schema.sql"))
+	return cfg, client
 }
 
 // logQLReferenceSeries runs a reference query returning (label, t, value)

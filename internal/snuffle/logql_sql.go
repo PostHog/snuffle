@@ -23,6 +23,38 @@ type logQLMetricSQLPlan struct {
 	topKIsTop       bool
 	unwrapValueExpr string
 	selectorFilters []string
+	// outer are aggregations over this plan's series, innermost first, as
+	// the count in count(sum by (x) (...)).
+	outer []logQLSQLOuterAgg
+}
+
+// logQLSQLOuterAgg aggregates the series below it by the labels at keep
+// (indexes into those series' labels), then applies comparison.
+type logQLSQLOuterAgg struct {
+	fn         string
+	keep       []int
+	labels     []string
+	comparison *logQLComparison
+}
+
+// logQLSQLOuterAggExprs are the outer aggregations ClickHouse runs over a
+// SQL plan's series, matching aggregateValues.
+var logQLSQLOuterAggExprs = map[string]string{
+	"sum":    "sum(value)",
+	"count":  "count()",
+	"avg":    "avg(value)",
+	"min":    "min(value)",
+	"max":    "max(value)",
+	"stddev": "stddevPop(value)",
+	"stdvar": "varPop(value)",
+}
+
+// resultLabels are the labels of the series the plan returns.
+func (plan *logQLMetricSQLPlan) resultLabels() []string {
+	if len(plan.outer) > 0 {
+		return plan.outer[len(plan.outer)-1].labels
+	}
+	return plan.groupLabels
 }
 
 func (s *Server) tryLogQLRangeMetricSQL(ctx context.Context, expr *logQLExpr, start, end time.Time, step time.Duration) (lokiQueryData, bool, error) {
@@ -73,9 +105,23 @@ func buildLogQLMetricSQLPlan(cfg Config, expr *logQLExpr) (*logQLMetricSQLPlan, 
 			return nil, false
 		}
 		plan = buildLogQLRangeAggSQLPlan(cfg, expr.aggregation.expr.rangeAgg, expr.aggregation.grouping, expr.aggregation.fn)
+	} else if expr.aggregation != nil && expr.aggregation.expr != nil && logQLSQLOuterAggExprs[expr.aggregation.fn] != "" {
+		child, ok := buildLogQLMetricSQLPlan(cfg, expr.aggregation.expr)
+		if !ok || child == nil {
+			return nil, false
+		}
+		outer := logQLSQLOuterAgg{fn: expr.aggregation.fn, comparison: expr.comparison}
+		for i, label := range child.resultLabels() {
+			if _, ok := groupingLabels(map[string]string{label: "x"}, expr.aggregation.grouping)[label]; ok {
+				outer.keep = append(outer.keep, i)
+				outer.labels = append(outer.labels, label)
+			}
+		}
+		child.outer = append(child.outer, outer)
+		return child, true
 	} else if expr.topK != nil && expr.topK.expr != nil && expr.topK.expr.comparison == nil {
 		child, ok := buildLogQLMetricSQLPlan(cfg, expr.topK.expr)
-		if !ok || child == nil || child.hasTopK {
+		if !ok || child == nil || child.hasTopK || len(child.outer) > 0 {
 			return nil, false
 		}
 		plan = child
@@ -555,39 +601,7 @@ func (s *Server) queryLogQLMetricSQL(ctx context.Context, plan *logQLMetricSQLPl
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
-
-	seriesByKey := map[string]*logMetricMatrixResult{}
-	groupValues := make([]string, len(plan.groupLabels))
-	dest := make([]any, 0, 2+len(groupValues))
-	var evalNS int64
-	var value float64
-	dest = append(dest, &evalNS)
-	for i := range groupValues {
-		dest = append(dest, &groupValues[i])
-	}
-	dest = append(dest, &value)
-	err := s.client.QueryRows(ctx, sql, func(row clickHouseRow) error {
-		if err := row.Scan(dest...); err != nil {
-			return err
-		}
-		key := logQLGroupValuesKey(groupValues)
-		result := seriesByKey[key]
-		if result == nil {
-			result = &logMetricMatrixResult{Metric: logQLLabelsFromGroupValues(plan.groupLabels, groupValues)}
-			seriesByKey[key] = result
-		}
-		result.Values = append(result.Values, []any{float64(evalNS) / 1e9, formatSample(value)})
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	results := make([]logMetricMatrixResult, 0, len(seriesByKey))
-	for _, result := range seriesByKey {
-		results = append(results, *result)
-	}
-	sort.Slice(results, func(i, j int) bool { return labelsKey(results[i].Metric) < labelsKey(results[j].Metric) })
-	return results, nil
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 }
 
 func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetricSQLPlan, startNS, endNS int64, step time.Duration) ([]logMetricMatrixResult, error) {
@@ -632,7 +646,7 @@ func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetri
 			strings.Join(groupBy, ", "),
 			strings.Join(orderBy, ", "),
 		)
-		return s.scanLogQLMetricSQLResults(ctx, logQLMetricResultSQL(sql, plan), plan.groupLabels)
+		return s.scanLogQLMetricSQLResults(ctx, logQLMetricResultSQL(sql, plan), plan.resultLabels())
 	}
 
 	sql := fmt.Sprintf(
@@ -647,7 +661,7 @@ func (s *Server) queryLogQLUnwrapMetricSQL(ctx context.Context, plan *logQLMetri
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
-	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 }
 
 func logQLUnwrapMetricBucketSQLSafe(plan *logQLMetricSQLPlan, step time.Duration) bool {
@@ -710,7 +724,7 @@ func (s *Server) queryLogQLUnwrapMetricBucketSQL(ctx context.Context, plan *logQ
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
-	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 }
 
 func logQLMetricBaseFilters(cfg Config, plan *logQLMetricSQLPlan, startNS, endNS int64) []string {
@@ -787,7 +801,7 @@ func logQLUnwrapBucketAggregateExpr(fn string) string {
 }
 
 func logQLMetricResultSQL(sql string, plan *logQLMetricSQLPlan) string {
-	if plan == nil || (plan.comparison == nil && !plan.hasTopK) {
+	if plan == nil || (plan.comparison == nil && !plan.hasTopK && len(plan.outer) == 0) {
 		return sql
 	}
 	current := sql
@@ -801,6 +815,27 @@ func logQLMetricResultSQL(sql string, plan *logQLMetricSQLPlan) string {
 		}
 		current = fmt.Sprintf("SELECT * FROM (SELECT * FROM (%s) ORDER BY eval_ns ASC, value %s LIMIT %d BY eval_ns)", current, direction, plan.topK)
 	}
+	for _, outer := range plan.outer {
+		inner := []string{"eval_ns"}
+		groupBy := []string{"eval_ns"}
+		selects := []string{"eval_ns"}
+		for j, i := range outer.keep {
+			inner = append(inner, fmt.Sprintf("label_%d AS group_%d", i, j))
+			groupBy = append(groupBy, fmt.Sprintf("group_%d", j))
+			selects = append(selects, fmt.Sprintf("group_%d AS label_%d", j, j))
+		}
+		current = fmt.Sprintf(
+			"SELECT %s, outer_value AS value FROM (SELECT %s, toFloat64(%s) AS outer_value FROM (%s) GROUP BY %s)",
+			strings.Join(selects, ", "),
+			strings.Join(inner, ", "),
+			logQLSQLOuterAggExprs[outer.fn],
+			current,
+			strings.Join(groupBy, ", "),
+		)
+		if outer.comparison != nil {
+			current = "SELECT * FROM (" + current + ") WHERE " + logQLSQLComparisonCondition(outer.comparison)
+		}
+	}
 	return "SELECT * FROM (" + current + ") ORDER BY " + logQLMetricResultOrderBy(plan)
 }
 
@@ -812,8 +847,9 @@ func logQLSQLComparisonCondition(cmp *logQLComparison) string {
 }
 
 func logQLMetricResultOrderBy(plan *logQLMetricSQLPlan) string {
-	orderBy := make([]string, 0, len(plan.groupLabels)+1)
-	for i := range plan.groupLabels {
+	labels := plan.resultLabels()
+	orderBy := make([]string, 0, len(labels)+1)
+	for i := range labels {
 		orderBy = append(orderBy, fmt.Sprintf("label_%d", i))
 	}
 	orderBy = append(orderBy, "eval_ns")
@@ -1023,7 +1059,7 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 			strings.Join(orderBy, ", "),
 		)
 		sql = logQLMetricResultSQL(sql, plan)
-		return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+		return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 	}
 
 	windowFrame := int64(windowSteps) - 1
@@ -1074,7 +1110,7 @@ func (s *Server) queryLogQLMetricSnuffleStatsSQL(ctx context.Context, plan *logQ
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
-	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 }
 
 func logQLSnuffleStatsTableSQL(cfg Config) string {
@@ -1167,7 +1203,7 @@ func (s *Server) queryLogQLMetricBucketSQL(ctx context.Context, plan *logQLMetri
 		strings.Join(orderBy, ", "),
 	)
 	sql = logQLMetricResultSQL(sql, plan)
-	return s.scanLogQLMetricSQLResults(ctx, sql, plan.groupLabels)
+	return s.scanLogQLMetricSQLResults(ctx, sql, plan.resultLabels())
 }
 
 // logQLWindowFanoutSQL repeats each row of source, which carries a

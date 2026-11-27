@@ -183,12 +183,18 @@ func assertLokiRoundTrip(t *testing.T, baseURL string, cfg Config) {
 func assertLokiRangeCount(t *testing.T, baseURL, selector, timestamp string) {
 	t.Helper()
 	for _, teamID := range []uint64{e2eTeamID, e2eTeamID + 1} {
-		data := apiGetForTeam[queryDataDTO](t, baseURL, teamID, "/loki/api/v1/query_range", url.Values{
-			"query": {"sum(count_over_time(" + selector + "[5m]))"},
-			"start": {timestamp}, "end": {timestamp}, "step": {"60s"},
-		})
-		if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) != 1 || sampleString(data.Result[0].Values[0]) != "2" {
-			t.Fatalf("team %d Loki range count = %#v, want 2", teamID, data)
+		for query, want := range map[string]string{
+			"sum(count_over_time(" + selector + "[5m]))": "2",
+			// an aggregation over a SQL plan's series runs in SQL too
+			"count(sum by (level) (count_over_time(" + selector + "[5m])))": "1",
+		} {
+			data := apiGetForTeam[queryDataDTO](t, baseURL, teamID, "/loki/api/v1/query_range", url.Values{
+				"query": {query},
+				"start": {timestamp}, "end": {timestamp}, "step": {"60s"},
+			})
+			if data.ResultType != "matrix" || len(data.Result) != 1 || len(data.Result[0].Values) != 1 || sampleString(data.Result[0].Values[0]) != want {
+				t.Fatalf("team %d Loki range %s = %#v, want %s", teamID, query, data, want)
+			}
 		}
 	}
 }

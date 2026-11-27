@@ -153,6 +153,8 @@ func bridgePostHogLogScenarios() []bridgeScenario {
 		{name: "log_rate_by_region", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (region) (rate({app="snuffle-bench"} |= "message" [5m]))`)},
 		{name: "log_bytes_by_format", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (format) (bytes_over_time({app="snuffle-bench"}[5m]))`)},
 		{name: "log_topk_rate", path: "/loki/api/v1/query_range", params: commonRangeParams(`topk(5, sum by (service_name) (rate({app="snuffle-bench"}[5m])))`)},
+		{name: "log_count_by_attr_filtered", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (route) (count_over_time({service_name="svc-1"} | status!="200" [1h]))`)},
+		{name: "log_count_of_attr_groups", path: "/loki/api/v1/query_range", params: commonRangeParams(`count(sum by (pod) (count_over_time({app="snuffle-bench"} | route="/checkout" [5m])))`)},
 		{name: "log_comparison", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum by (service_name) (count_over_time({app="snuffle-bench"}[5m])) > 10`)},
 		{name: "log_logfmt_sum_duration", path: "/loki/api/v1/query_range", params: commonRangeParams(`sum_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap duration(duration) [5m]) by (service_name)`)},
 		{name: "log_logfmt_avg_size", path: "/loki/api/v1/query_range", params: commonRangeParams(`avg_over_time({app="snuffle-bench",format="logfmt"} | logfmt | unwrap bytes(size) [5m]) by (region)`)},
