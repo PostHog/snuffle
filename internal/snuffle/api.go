@@ -350,6 +350,29 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	queryStarted := time.Now()
+	if len(prepared.rangeOps) > 0 {
+		// The range ops rank series on their points, which is the single
+		// point here, so evaluate a range of one step.
+		result, queryErr := s.evalRangeQuery(ctx, prepared, ts, ts, step)
+		if queryErr == nil {
+			result, queryErr = prepared.applyRangeOps(ctx, result)
+		}
+		recordQueryLogBackend(w, result.backend)
+		if queryErr != nil {
+			s.metrics.observePromQLQuery("instant", result.backend, "error", time.Since(queryStarted), 0, 0, 0)
+			writeAPIError(w, queryErr.status, queryErr.errorType, queryErr.err)
+			return
+		}
+		samples := make([]sampleResult, 0, len(result.groups))
+		for _, group := range result.groups {
+			for _, point := range group.points {
+				samples = append(samples, sampleResult{Metric: group.metric, Value: []any{float64(point.t) / 1000, formatSample(point.v)}})
+			}
+		}
+		s.metrics.observePromQLQuery("instant", result.backend, "ok", time.Since(queryStarted), len(samples), len(samples), 0)
+		writeAPISuccessTimed(w, queryData{ResultType: string(parser.ValueTypeVector), Result: samples})
+		return
+	}
 	recordQueryLogBackend(w, "fastpath")
 	if data, ok, err := s.tryFastInstantQuery(ctx, query, ts); ok {
 		status := "ok"
@@ -453,6 +476,9 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 
 	queryStarted := time.Now()
 	result, cacheStatus, queryErr := s.cachedRangeQuery(ctx, query, prepared, start, end, step, r.Form.Get("nocache") == "1")
+	if queryErr == nil {
+		result, queryErr = prepared.applyRangeOps(ctx, result)
+	}
 	recordQueryLogBackend(w, result.backend)
 	recordQueryLogPhase(w, "eval", time.Since(queryStarted))
 	if cacheStatus != "" {

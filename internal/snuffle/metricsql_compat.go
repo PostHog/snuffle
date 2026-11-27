@@ -117,6 +117,9 @@ type metricsQLQuery struct {
 	query string
 	// runningSum applies a running sum to the range result.
 	runningSum bool
+	// rangeOps transform the result of query over the whole range, innermost
+	// first, after runningSum and the range cache.
+	rangeOps []metricsQLRangeOp
 }
 
 // prepareMetricsQLQuery expands MetricsQL syntax before either execution path.
@@ -139,6 +142,22 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 	restoreCarriedFunctions(expr)
 
 	var prepared metricsQLQuery
+	for {
+		op, inner, err := prepareRangeTopK(expr)
+		if err != nil {
+			return metricsQLQuery{}, err
+		}
+		if op == nil {
+			break
+		}
+		if len(prepared.rangeOps) >= maxRangeOps {
+			return metricsQLQuery{}, fmt.Errorf("topk_* and bottomk_* calls nest at most %d deep", maxRangeOps)
+		}
+		prepared.rangeOps = append([]metricsQLRangeOp{op}, prepared.rangeOps...)
+		// Like the argument of any aggregate, a range selector or subquery
+		// reads its last sample.
+		expr = metricsQLImplicitRollup(inner)
+	}
 	if fe, ok := expr.(*metricsql.FuncExpr); ok && fe.Name == "running_sum" {
 		if len(fe.Args) != 1 || fe.KeepMetricNames {
 			return metricsQLQuery{}, fmt.Errorf("running_sum requires one series argument; keep_metric_names is not supported")
@@ -385,6 +404,9 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewriteFunc(e, step, instant)
 	case *metricsql.AggrFuncExpr:
+		if isRangeTopK(e.Name) {
+			return fmt.Errorf("%s is supported only as the outermost function of a query", e.Name)
+		}
 		if e.Name == "quantiles" {
 			replacement, err := r.rewriteQuantiles(e, step, instant)
 			if err != nil {
