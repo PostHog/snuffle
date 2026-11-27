@@ -2,6 +2,7 @@ package snuffle
 
 import (
 	"math"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -256,6 +257,51 @@ func TestPrepareMetricsQLQueryGroupJoinKeepsScalarOperands(t *testing.T) {
 		if _, err := p.ParseExpr(prepared.query); err != nil {
 			t.Errorf("Prometheus rejected %q (from %q): %v", prepared.query, query, err)
 		}
+	}
+}
+
+// TestMetricsQLSkipsNaN checks that NaN is no value (ENG-051). Expectations are
+// VictoriaMetrics (Docker, victoriametrics/victoria-metrics:latest) answers to
+// the same instant queries.
+func TestMetricsQLSkipsNaN(test *testing.T) {
+	const (
+		nan  = `label_replace(vector(0)/vector(0), "a", "nan", "", "")`
+		two  = `label_replace(vector(2), "a", "two", "", "")`
+		four = `label_replace(vector(4), "a", "four", "", "")`
+	)
+	for _, testcase := range []struct{ query, want string }{
+		{`avg(` + nan + ` or ` + two + `)`, `{} => 2`},
+		{`sum(` + nan + ` or ` + two + `)`, `{} => 2`},
+		{`min(` + nan + ` or ` + two + `)`, `{} => 2`},
+		{`max(` + nan + ` or ` + two + `)`, `{} => 2`},
+		{`count(` + nan + ` or ` + two + `)`, `{} => 1`},
+		{`group(` + nan + ` or ` + two + `)`, `{} => 1`},
+		{`quantile(0.5, ` + nan + ` or ` + two + ` or ` + four + `)`, `{} => 3`},
+		{`stddev(` + nan + ` or ` + two + ` or ` + four + `)`, `{} => 1`},
+		{`count_values("v", ` + nan + ` or ` + two + `)`, `{v="2"} => 1`},
+		{`topk(2, ` + nan + ` or ` + two + `)`, `{a="two"} => 2`},
+		{`median(` + nan + ` or ` + two + `)`, `{} => 2`},
+		{`avg(vector(0)/vector(0))`, ``},
+		{`count(vector(0)/vector(0))`, ``},
+		{`vector(0)/vector(0)`, ``},
+		{`(vector(0)/vector(0)) or vector(3)`, `{} => 3`},
+		{`union(vector(0)/vector(0), vector(3))`, `{} => 3`},
+		{`vector(1) and (vector(0)/vector(0))`, ``},
+		{`vector(1) unless (vector(0)/vector(0))`, `{} => 1`},
+		{`absent(vector(0)/vector(0))`, `{} => 1`},
+		// The group_left rewrite (ENG-049) sits inside the aggregation.
+		{`sum((` + nan + ` or ` + two + `) * on() group_left(l) label_set(vector(3), "l", "v"))`, `{} => 6`},
+		{`count((` + nan + ` or ` + two + `) * on() group_left(l) (label_set(vector(3), "l", "v") or label_set(vector(5), "l", "w")))`, `{} => 2`},
+	} {
+		test.Run(testcase.query, func(test *testing.T) {
+			var got []string
+			for _, sample := range evaluateMetricsQL(test, labelsTestQueryable(), testcase.query, false).(promql.Vector) {
+				got = append(got, sample.Metric.String()+" => "+strconv.FormatFloat(sample.F, 'g', -1, 64))
+			}
+			if strings.Join(got, ";") != testcase.want {
+				test.Fatalf("got %q, want %q", strings.Join(got, ";"), testcase.want)
+			}
+		})
 	}
 }
 

@@ -76,7 +76,7 @@ func newServer(cfg Config) *Server {
 	promQLParser := newBoundLabelParser()
 	metricsQLMaxOutputSamples.Store(int64(cfg.MaxSamples))
 	engine := promql.NewEngine(promql.EngineOpts{
-		Parser:               promQLParser,
+		Parser:               metricsQLEngineParser{promQLParser},
 		Logger:               slog.Default(),
 		MaxSamples:           cfg.MaxSamples,
 		Timeout:              cfg.QueryTimeout,

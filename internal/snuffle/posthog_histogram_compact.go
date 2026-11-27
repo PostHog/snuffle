@@ -419,8 +419,7 @@ func (evaluator *compactHistogramEvaluator) result(ctx context.Context) (promql.
 // evaluate applies the quantile call of plan to the summed buckets, or
 // returns the buckets themselves for a bare sum by (le). Plans that share the
 // bucket expression share the evaluator, so one read of the buckets serves
-// several quantiles. The result keeps NaN points: in a union they still hide
-// a later operand's series with the same labels, as in the engine.
+// several quantiles. The result keeps NaN points; callers drop them.
 func (evaluator *compactHistogramEvaluator) evaluate(ctx context.Context, plan *compactHistogramPlan) (promql.Matrix, error) {
 	args := parser.Expressions{plan.buckets}
 	if plan.call != nil {
@@ -805,13 +804,11 @@ func (union *compactHistogramUnion) add(matrix promql.Matrix) {
 		signature := series.Metric.DropMetricName().String()
 		key := series.Metric.String()
 		for _, point := range series.Floats {
-			if union.present[point.T][signature] {
+			// NaN is no value in MetricsQL, so it hides no later operand.
+			if math.IsNaN(point.F) || union.present[point.T][signature] {
 				continue
 			}
 			marks = append(marks, mark{point.T, signature})
-			if math.IsNaN(point.F) {
-				continue
-			}
 			index, exists := union.byLabels[key]
 			if !exists {
 				index = len(union.result)

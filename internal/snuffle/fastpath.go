@@ -1342,14 +1342,16 @@ func transformValueSQL(source string, transform scalarTransform) string {
 	if transform.identity() {
 		return source
 	}
-	return fmt.Sprintf("SELECT id, %s AS value FROM (%s)", transform.apply("value"), source)
+	// 0/0 is NaN, which MetricsQL aggregations skip.
+	return fmt.Sprintf("SELECT id, value FROM (SELECT id, %s AS value FROM (%s)) WHERE NOT isNaN(value)", transform.apply("value"), source)
 }
 
 func transformGridValsSQL(gridExpr string, transform scalarTransform) string {
 	if transform.identity() {
 		return gridExpr
 	}
-	return fmt.Sprintf("arrayMap(x -> if(isNull(x), NULL, %s), %s)", transform.apply("x"), gridExpr)
+	value := transform.apply("x")
+	return fmt.Sprintf("arrayMap(x -> if(isNull(x) OR isNaN(%s), NULL, %s), %s)", value, value, gridExpr)
 }
 
 func aggregateSQL(expr *parser.AggregateExpr, valueColumn string) (string, bool) {

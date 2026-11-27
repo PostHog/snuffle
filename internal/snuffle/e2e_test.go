@@ -165,6 +165,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("histogram_share", func(t *testing.T) {
 		assertHistogramShare(t, api.URL)
 	})
+	t.Run("aggregations skip NaN", func(t *testing.T) {
+		assertNaNSkipped(t, api.URL)
+	})
 	if cfg.postHogSchemaLayout() {
 		t.Run("filtered label discovery", func(t *testing.T) {
 			assertPostHogFilteredLabels(t, ctx, client, cfg)

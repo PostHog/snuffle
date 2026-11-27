@@ -62,7 +62,7 @@ func evaluateMetricsQLBetween(test *testing.T, queryable storage.Queryable, expr
 	if err != nil {
 		test.Fatal(err)
 	}
-	engine := promql.NewEngine(promql.EngineOpts{MaxSamples: 100000, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true, EnableDelayedNameRemoval: true})
+	engine := promql.NewEngine(promql.EngineOpts{Parser: metricsQLEngineParser{newBoundLabelParser()}, MaxSamples: 100000, Timeout: 5 * time.Second, LookbackDelta: 5 * time.Minute, EnableAtModifier: true, EnableNegativeOffset: true, EnableDelayedNameRemoval: true})
 	ctx := context.Background()
 	options := promql.NewPrometheusQueryOpts(false, 5*time.Minute)
 	var query promql.Query

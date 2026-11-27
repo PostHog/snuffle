@@ -1229,6 +1229,101 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 	return value
 }
 
+const metricsQLDropNaNName = metricsQLInternalPrefix + "drop_nan"
+
+func init() {
+	parser.Functions[metricsQLDropNaNName] = &parser.Function{Name: metricsQLDropNaNName, ArgTypes: []parser.ValueType{parser.ValueTypeVector}, ReturnType: parser.ValueTypeVector}
+	promql.FunctionCalls[metricsQLDropNaNName] = func(vectors []promql.Vector, _ promql.Matrix, _ parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+		for _, sample := range vectors[0] {
+			if sample.H != nil || !math.IsNaN(sample.F) {
+				enh.Out = append(enh.Out, sample)
+			}
+		}
+		return enh.Out, nil
+	}
+	// MetricsQL rollups return no value where Prometheus returns NaN. Dropping it
+	// inside the rollup spares the aggregation operand another pass over its
+	// whole matrix, which would double the sample count the engine holds.
+	for name, function := range parser.Functions {
+		if strings.HasPrefix(name, metricsQLInternalPrefix) || name == metricsQLDefaultRollupName || function.ReturnType != parser.ValueTypeVector || !slices.Contains(function.ArgTypes, parser.ValueTypeMatrix) {
+			continue
+		}
+		if call := promql.FunctionCalls[name]; call != nil {
+			promql.FunctionCalls[name] = metricsQLRollupWithoutNaN(call)
+			metricsQLNaNFreeRollups[name] = true
+		}
+	}
+}
+
+// metricsQLNaNFreeRollups are the matrix-argument functions that return no
+// sample where the result would be NaN. The engine parser leaves them unwrapped.
+var metricsQLNaNFreeRollups = map[string]bool{}
+
+func metricsQLRollupWithoutNaN(call promql.FunctionCall) promql.FunctionCall {
+	return func(vectors []promql.Vector, matrix promql.Matrix, args parser.Expressions, enh *promql.EvalNodeHelper) (promql.Vector, annotations.Annotations) {
+		out, warnings := call(vectors, matrix, args, enh)
+		kept := out[:0]
+		for _, sample := range out {
+			if sample.H != nil || !math.IsNaN(sample.F) {
+				kept = append(kept, sample)
+			}
+		}
+		return kept, warnings
+	}
+}
+
+// metricsQLEngineParser parses queries for the engine. VictoriaMetrics treats
+// NaN as no value: aggregations skip it, `or` and union fill it from a later
+// operand, `and` does not match it and absent counts it as absent. Prometheus
+// keeps NaN, so one NaN series makes avg or sum NaN, which the response drops.
+// The parser wraps those operands in drop_nan. The fast paths parse with the
+// inner parser, so they still recognise their shapes.
+type metricsQLEngineParser struct {
+	parser.Parser
+}
+
+func (p metricsQLEngineParser) ParseExpr(input string) (parser.Expr, error) {
+	expr, err := p.Parser.ParseExpr(input)
+	if err != nil {
+		return nil, err
+	}
+	parser.Inspect(expr, func(node parser.Node, _ []parser.Node) error {
+		switch n := node.(type) {
+		case *parser.AggregateExpr:
+			n.Expr = metricsQLDropNaN(n.Expr)
+		case *parser.BinaryExpr:
+			if n.Op.IsSetOperator() {
+				n.LHS, n.RHS = metricsQLDropNaN(n.LHS), metricsQLDropNaN(n.RHS)
+			}
+		case *parser.Call:
+			if n.Func.Name == "absent" || n.Func.Name == metricsQLUnionName {
+				for index, arg := range n.Args {
+					n.Args[index] = metricsQLDropNaN(arg)
+				}
+			}
+		}
+		return nil
+	})
+	return expr, nil
+}
+
+// metricsQLDropNaN wraps expr in drop_nan unless it cannot return NaN. The
+// MetricsQL rollups drop NaN values, and leaving them unwrapped keeps
+// sum(rate(...)) and avg(deriv(...)) free of another pass. Selectors stay bare because absent
+// reads its labels from them.
+func metricsQLDropNaN(expr parser.Expr) parser.Expr {
+	switch e := unparenExpr(expr).(type) {
+	case *parser.VectorSelector, *parser.NumberLiteral:
+		return expr
+	case *parser.Call:
+		name, internal := strings.CutPrefix(e.Func.Name, metricsQLInternalPrefix)
+		if e.Func.Name == metricsQLDefaultRollupName || metricsQLNaNFreeRollups[e.Func.Name] || (internal && (slices.Contains(metricsQLCounterFunctions, name) || metricsQLPureCounterFunctions[name] != "")) {
+			return expr
+		}
+	}
+	return &parser.Call{Func: parser.Functions[metricsQLDropNaNName], Args: parser.Expressions{expr}, PosRange: expr.PositionRange()}
+}
+
 // MetricsQL returns numeric constants as vectors and removes NaN output points.
 // The result never aliases the input slices: the engine returns the input
 // matrix to its buffer pools when the query closes.
