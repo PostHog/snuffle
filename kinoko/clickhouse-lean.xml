@@ -1,0 +1,28 @@
+<!-- Keep ClickHouse from churning guest memory: kinoko snapshots every guest it keeps,
+     so background system-log flushes and big caches multiply across the search. -->
+<clickhouse>
+    <logger><level>warning</level><console>1</console></logger>
+    <query_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <query_metric_log remove="1"/>
+    <part_log remove="1"/>
+    <trace_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <asynchronous_insert_log remove="1"/>
+    <text_log remove="1"/>
+    <session_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <error_log remove="1"/>
+    <latency_log remove="1"/>
+    <backup_log remove="1"/>
+    <blob_storage_log remove="1"/>
+    <background_schedule_pool_log remove="1"/>
+    <user_query_log remove="1"/>
+    <mark_cache_size>67108864</mark_cache_size>
+    <index_mark_cache_size>0</index_mark_cache_size>
+    <uncompressed_cache_size>0</uncompressed_cache_size>
+    <max_server_memory_usage>2147483648</max_server_memory_usage>
+</clickhouse>

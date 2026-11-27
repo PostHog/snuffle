@@ -1,0 +1,36 @@
+# Snuffle + ClickHouse under kinoko: Loki pushes from `client`, faults on the other two.
+# Build first: docker compose -f kinoko/compose.yaml build   (then kinoko push kinoko)
+services:
+  clickhouse:
+    image: snuffle-kinoko-clickhouse:latest
+    build: { context: .., dockerfile: kinoko/Dockerfile, target: clickhouse }
+    platform: linux/amd64
+    pull_policy: never
+    container_name: clickhouse
+    environment:
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+
+  snuffle:
+    image: snuffle-kinoko:latest
+    build: { context: .., dockerfile: kinoko/Dockerfile, target: snuffle }
+    platform: linux/amd64
+    pull_policy: never
+    container_name: snuffle
+    restart: on-failure
+    environment:
+      CH_ADDR: clickhouse:9000
+      SNUFFLE_ALLOW_UNAUTHENTICATED: "true"
+      SNUFFLE_DEFAULT_TEAM_ID: "1"
+      SNUFFLE_SELF_SCRAPE_ENABLED: "false"
+
+  # Idle; the model's mechanisms run here. No fault may touch it.
+  client:
+    image: curlimages/curl:8.17.0
+    platform: linux/amd64
+    pull_policy: never
+    container_name: client
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - /hook:/hook:ro

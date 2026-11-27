@@ -11,3 +11,4 @@ promql-sidecar
 *.json
 !perf-results.json
 autoresearch.*
+kinoko/images.tar

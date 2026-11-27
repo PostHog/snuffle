@@ -1,0 +1,12 @@
+<!-- ClickHouse's LLVM expression JIT aborts in kinoko's guest ("64-bit code requested on a
+     subtarget that doesn't support it"), and the watchdog restarts the server. Interpret instead. -->
+<clickhouse>
+    <profiles>
+        <default>
+            <compile_expressions>0</compile_expressions>
+            <compile_aggregate_expressions>0</compile_aggregate_expressions>
+            <compile_sort_description>0</compile_sort_description>
+            <compile_regular_expressions>0</compile_regular_expressions>
+        </default>
+    </profiles>
+</clickhouse>
