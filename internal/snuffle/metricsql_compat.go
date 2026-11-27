@@ -38,12 +38,12 @@ var metricsQLCounterFunctions = []string{"increase", "rate", "delta", "irate", "
 var metricsQLPureCounterFunctions = map[string]string{"increase_pure": "increase", "increase_prometheus": "increase"}
 
 // metricsQLDeltaWindowFunctions return the sum of the points in the window for
-// a delta histogram series. rate divides that sum by the window. The running
-// total of a delta series starts at the query range. The MetricsQL baseline
-// rules therefore miscount a series with no point shortly before the window.
+// a delta series. rate divides that sum by the window. The running total of a
+// delta series starts at the query range. The MetricsQL baseline rules
+// therefore miscount a series with no point shortly before the window.
 var metricsQLDeltaWindowFunctions = map[string]bool{"increase": true, "increase_pure": true, "increase_prometheus": true, "delta": true, "rate": true}
 
-// deltaSeriesOf returns the delta histogram series that the selector read with
+// deltaSeriesOf returns the delta series that the selector read with
 // these labels. It returns nil for a subquery, which has no storage series set.
 // It reads the series set that the engine leaves on the selector after it
 // expands the series. If the engine stops keeping it, delta series fall back
@@ -737,19 +737,41 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 			}
 		}
 		start := end - window
-		if metricsQLDeltaWindowFunctions[name] {
+		series := seriesAfter(input, start)
+		first := len(points) - len(series.Floats)
+		if name != "default_rollup" {
 			if meta := deltaSeriesOf(vs, input.Metric); meta != nil {
-				value, ok := meta.deltaWindowSum(start, end)
-				if !ok {
-					return enh.Out, nil
+				if metricsQLDeltaWindowFunctions[name] {
+					// The window sum is the delta series' own increment: the
+					// first-sample rule for new counters (next) does not apply.
+					value, ok := meta.deltaWindowSum(start, end)
+					if !ok {
+						return enh.Out, nil
+					}
+					if name == "rate" {
+						value /= float64(window) / 1000
+					}
+					return append(enh.Out, promql.Sample{F: value}), nil
 				}
-				if name == "rate" {
-					value /= float64(window) / 1000
+				if name == "idelta" {
+					// The difference of the last two running totals is the
+					// last point's own value. Reading it from the totals, not
+					// from the matrix, keeps a lone point from returning the
+					// total since the start of the request.
+					value, ok := meta.deltaLastValue(start, end)
+					if !ok {
+						return enh.Out, nil
+					}
+					return append(enh.Out, promql.Sample{F: value}), nil
 				}
-				return append(enh.Out, promql.Sample{F: value}), nil
+				// irate reads the running total, as it reads the cumulative
+				// equivalent of the series.
+				if len(points) > 0 {
+					points = meta.deltaTotalPoints(points[0].T, end)
+					first = sort.Search(len(points), func(i int) bool { return points[i].T > start })
+				}
 			}
 		}
-		series := seriesAfter(input, start)
 		if name == "default_rollup" {
 			if len(series.Floats)+len(series.Histograms) == 0 || endsWithStaleMarker(series) {
 				return enh.Out, nil
@@ -768,7 +790,6 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 			}
 			return histogramFallback(nil, promql.Matrix{series}, parser.Expressions{&copySelector}, enh)
 		}
-		first := len(points) - len(series.Floats)
 		value := metricsQLCounterValue(name, points, first, start, maxPrev, lookback, next)
 		if math.IsNaN(value) {
 			return enh.Out, nil

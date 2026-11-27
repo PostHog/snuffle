@@ -162,9 +162,9 @@ func (sum *compactHistogramSum) add(value float64) {
 // For each bucket it keeps the points inside the selector range, which are
 // the points that the engine passes to the counter function.
 //
-// A delta source keeps the running total that the general path builds (see
-// accumulatePostHogDeltaSamples): points that share a timestamp become one
-// point. rate, increase and delta read the window sum of that total, as
+// A delta source keeps the running total that the general path keeps in
+// deltaTotals (see mergePostHogDeltaSamples and postHogDeltaTotals): points
+// that share a timestamp become one point. rate, increase and delta read the window sum of that total, as
 // metricsQLRollup does with deltaWindowSum. The total of the last point that
 // left the selector range is the baseline of a window with no earlier point
 // in range.
@@ -367,7 +367,7 @@ func (evaluator *compactHistogramEvaluator) add(ctx context.Context, sample post
 		switch {
 		case evaluator.delta:
 			// Points that share a timestamp add up, as in
-			// accumulatePostHogDeltaSamples: the sum of the timestamp is added to
+			// mergePostHogDeltaSamples: the sum of the timestamp is added to
 			// the total of the earlier timestamps.
 			if duplicate {
 				evaluator.deltaSum[index] += float64(cumulative)

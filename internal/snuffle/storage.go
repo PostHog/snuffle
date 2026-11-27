@@ -381,9 +381,10 @@ type seriesMeta struct {
 	samples    []samplePoint
 	histograms []histogramPoint
 	exemplars  []exemplarPoint
-	delta      bool
-	// deltaTotals holds the finite points of a delta series' running total.
-	// It shares samples' backing array when every point is finite.
+	// delta marks a series of OTLP delta points. samples holds the points as
+	// sent, and deltaTotals the running total of the finite ones, which
+	// counter functions read (see metricsQLRollup).
+	delta       bool
 	deltaTotals []samplePoint
 }
 

@@ -74,6 +74,35 @@ func TestPostHogExactHistogramMetadataSQL(test *testing.T) {
 	}
 }
 
+// A stored delta counter whose name ends in _count, _sum or _bucket takes the
+// exact histogram alias path. Its series must carry the temporality flag, as
+// the float path does, so counter functions read its running total.
+func TestPostHogExactHistogramMetadataMarksDeltaSeries(test *testing.T) {
+	cfg := Config{CHDatabase: "default", SchemaLayout: "posthog", SeriesTable: "metrics4_series", SamplesTable: "metrics4_samples", MaxSeries: 10, TeamID: 42}
+	alias := postHogHistogramAlias{baseName: "calls", suffix: "_count"}
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "calls_count")}
+	if sql := postHogExactHistogramMetadataSQL(cfg, 1000, 2000, alias, matchers); !strings.Contains(sql, "aggregation_temporality = 'delta' AS delta") {
+		test.Fatalf("exact metadata must select the temporality: %s", sql)
+	}
+	for _, testCase := range []struct {
+		name  string
+		delta uint8
+	}{{"delta", 1}, {"cumulative", 0}} {
+		test.Run(testCase.name, func(test *testing.T) {
+			conn := &failingConn{rows: [][]any{{uint64(1), "calls_count", "api", map[string]string{}, map[string]string{}, testCase.delta}}}
+			withClickHouseConn(test, conn)
+			querier := &CHQuerier{queryable: NewCHQueryable(NewClickHouseClient(cfg), cfg)}
+			series, _, _, err := querier.selectPostHogExactHistogramMetadata(context.Background(), 1000, 2000, alias, matchers)
+			if err != nil || len(series) != 1 {
+				test.Fatalf("got %d series, %v; want 1", len(series), err)
+			}
+			if series[0].delta != (testCase.delta == 1) {
+				test.Fatalf("delta = %v, want %v", series[0].delta, testCase.delta == 1)
+			}
+		})
+	}
+}
+
 func TestPostHogExactHistogramConflictingNames(test *testing.T) {
 	querier := &CHQuerier{}
 	for _, matcher := range []*labels.Matcher{

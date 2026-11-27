@@ -685,16 +685,33 @@ func TestPostHogHistogramDeltaRunningTotal(test *testing.T) {
 			test.Fatal(err)
 		}
 	}
-	got := histogramSeriesByName(builder.finish())
+	series := builder.finish()
+	// Samples are the points as sent, with points that share a timestamp
+	// summed. deltaTotals is their running total.
+	got := histogramSeriesByName(series)
 	want := map[string][]samplePoint{
+		"test_duration_seconds_bucket|0.5":  {{t: 1000, v: 1}, {t: 2000, v: 1}, {t: 3000, v: 2}},
+		"test_duration_seconds_bucket|1":    {{t: 1000, v: 3}, {t: 2000, v: 3}, {t: 3000, v: 2}},
+		"test_duration_seconds_bucket|+Inf": {{t: 1000, v: 6}, {t: 2000, v: 6}, {t: 3000, v: 2}},
+		"test_duration_seconds_count|":      {{t: 1000, v: 6}, {t: 2000, v: 6}, {t: 3000, v: 2}},
+		"test_duration_seconds_sum|":        {{t: 1000, v: 3}, {t: 2000, v: 3}, {t: 3000, v: 1}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		test.Fatalf("delta samples = %v, want %v", got, want)
+	}
+	totals := make(map[string][]samplePoint, len(series))
+	for _, meta := range series {
+		totals[meta.metricName+"|"+meta.labelMap["le"]] = meta.deltaTotals
+	}
+	wantTotals := map[string][]samplePoint{
 		"test_duration_seconds_bucket|0.5":  {{t: 1000, v: 1}, {t: 2000, v: 2}, {t: 3000, v: 4}},
 		"test_duration_seconds_bucket|1":    {{t: 1000, v: 3}, {t: 2000, v: 6}, {t: 3000, v: 8}},
 		"test_duration_seconds_bucket|+Inf": {{t: 1000, v: 6}, {t: 2000, v: 12}, {t: 3000, v: 14}},
 		"test_duration_seconds_count|":      {{t: 1000, v: 6}, {t: 2000, v: 12}, {t: 3000, v: 14}},
 		"test_duration_seconds_sum|":        {{t: 1000, v: 3}, {t: 2000, v: 6}, {t: 3000, v: 7}},
 	}
-	if !reflect.DeepEqual(got, want) {
-		test.Fatalf("delta running totals = %v, want %v", got, want)
+	if !reflect.DeepEqual(totals, wantTotals) {
+		test.Fatalf("delta running totals = %v, want %v", totals, wantTotals)
 	}
 }
 
@@ -719,7 +736,7 @@ func TestPostHogHistogramDeltaBucketRemoval(test *testing.T) {
 		}
 	}
 	got := histogramSeriesByName(builder.finish())["test_duration_seconds_bucket|0.5"]
-	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 1}) || got[1].t != 2000 || !isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 4000, v: 3}) || got[3] != (samplePoint{t: 5000, v: 6}) {
+	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 1}) || got[1].t != 2000 || !isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 4000, v: 2}) || got[3] != (samplePoint{t: 5000, v: 3}) {
 		test.Fatalf("removed delta bucket = %v", got)
 	}
 }
@@ -827,7 +844,7 @@ func TestPostHogHistogramDeltaNaNSum(test *testing.T) {
 		}
 	}
 	got := histogramSeriesByName(builder.finish())["test_duration_seconds_sum|"]
-	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 2}) || got[1].t != 2000 || !math.IsNaN(got[1].v) || isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 3000, v: 3}) || got[3] != (samplePoint{t: 4000, v: 4}) {
+	if len(got) != 4 || got[0] != (samplePoint{t: 1000, v: 2}) || got[1].t != 2000 || !math.IsNaN(got[1].v) || isStaleSampleValue(got[1].v) || got[2] != (samplePoint{t: 3000, v: 1}) || got[3] != (samplePoint{t: 4000, v: 1}) {
 		test.Fatalf("delta sum with NaN = %v", got)
 	}
 }

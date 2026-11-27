@@ -524,33 +524,54 @@ discovery also reads histogram names and types from the series table. Bucket
 label discovery reads the distinct stored bound sets within the requested time
 range, not the samples.
 
-Cumulative and delta histogram samples can be read as virtual counters. For a
-delta histogram, Snuffle sorts the points of each virtual series by time, sums
-points that share a timestamp, such as points from several clients, and returns
-the running total of the points. The total starts at the first point in the
-query range, so the raw value of a delta series, such as a bare selector,
-depends on the query range. `increase`, `increase_pure`, and `delta` over a
-delta series return the sum of its points in the window `(t-w, t]`, and `rate`
-returns that sum divided by `w`. A series with one point in the window, or with
-a pause before it longer than `PROMQL_LOOKBACK_DELTA`, therefore counts each of
-its points once, and `histogram_quantile` over `sum by (le) (rate(...))` weights
-each series by its observations in the window. Snuffle computes the window sum
-as the difference of two running totals, which are 64-bit floats. Once a `_sum`
-total passes about 2^53 (9e15) within the query range, adding a small point no
-longer changes it, so the window sum can miss small points. Bucket and count
-totals stay exact below 2^53 observations. A window with no point returns no
-value. Stale markers, such as those for a removed bucket bound, do not count as
-points. `irate` and `idelta` read the last two points of the running total. A
-counter function over a subquery, such as `rate(x_bucket[5m:1m])`, reads the
-running total with MetricsQL counter rules. Cumulative histograms and other
-counters keep MetricsQL counter rules. A series with both delta and cumulative
-points, or with unspecified temporality, returns an error rather than an
-incorrect counter or rate. The compact histogram path reads cumulative
-histograms, and delta histograms under `rate`, `increase`, and `delta`, which
-it sums over each window as the general engine does. A delta histogram under
-`irate` or `idelta`, or a series with both temporalities, uses the general
-engine. Exponential
-histograms expose `_count` and `_sum` only: the stored flattened arrays do not
+Cumulative and delta histogram samples can be read as virtual counters.
+
+Delta series follow one rule, for counters and for the `_bucket`, `_count`,
+and `_sum` series of histograms alike. A delta series, such as a counter or
+histogram from posthog-js, posthog-node, or another OTLP exporter with delta
+temporality, reads back as sent: one point per export, holding what changed
+since the previous export.
+
+- A bare selector, or a range selector such as `x[5m]`, returns the points as
+  sent. Histogram points of one series that share a timestamp, such as points
+  from several clients, are summed into one point.
+- `sum_over_time(x[5m])` returns the sum of the points in the window, for
+  example the number of calls.
+- `increase`, `increase_pure`, `increase_prometheus`, and `delta` return the
+  sum of the points in the window `(t-w, t]`, and `rate` returns that sum
+  divided by `w`. For a series that reports regularly throughout the window,
+  this is what `increase`, `delta`, and `rate` return for the cumulative
+  equivalent of the series. `increase_prometheus` over the cumulative
+  equivalent leaves out the first point in the window, which for a delta
+  series is a real increment. A series that starts inside the range counts
+  its first point, as `increase` does for a new cumulative counter. A series
+  with one point in the window,
+  or with a pause before it longer than `PROMQL_LOOKBACK_DELTA`, counts each of
+  its points once, where MetricsQL counter rules over the cumulative series
+  would drop the first, and `histogram_quantile` over
+  `sum by (le) (rate(...))` weights each series by its observations in the
+  window. A window with no point returns no value.
+- `irate` and `idelta` read the last two points of the running total of the
+  series, as they read the cumulative equivalent.
+- A counter function over a subquery, such as `rate(x[5m:1m])`, reads the
+  points as sent with MetricsQL counter rules, as VictoriaMetrics does for a
+  series stored as sent. Use `sum_over_time` or a counter function on the
+  selector instead.
+
+Snuffle computes window sums as the difference of two running totals, which
+are 64-bit floats. Once a `_sum` total passes about 2^53 (9e15) within the
+query range, adding a small point no longer changes it, so the window sum can
+miss small points. Bucket and count totals stay exact below 2^53 observations.
+Stale markers, such as those for a removed bucket bound, do not count as
+points. Cumulative series keep MetricsQL counter rules. A histogram series
+with both delta and cumulative points, or with unspecified temporality,
+returns an error rather than an incorrect counter or rate. The compact
+histogram path reads cumulative histograms, and delta histograms under `rate`,
+`increase`, and `delta`, which it sums over each window as the general engine
+does. A delta histogram under `irate` or `idelta`, or a series with both
+temporalities, uses the general engine. The range pushdown leaves counter
+functions over delta series to the general engine. Exponential histograms
+expose `_count` and `_sum` only: the stored flattened arrays do not
 preserve enough information to reconstruct their bucket boundaries. Use explicit
 histograms for `_bucket` queries. Invalid explicit bucket arrays return an error.
 These errors apply to selectors that name the metric exactly. A selector that
@@ -666,8 +687,7 @@ The cache is off by default. Set `SNUFFLE_RANGE_CACHE_MAX_BYTES` to enable it.
 - **Queries that are not cached.** A step must have the same value in every
   request range. Snuffle evaluates these queries in full: `@` modifiers,
   negative offsets, `running_sum`, `quantiles`, native histogram results,
-  PostHog histograms with delta temporality, and ranges of fewer than three
-  steps.
+  and ranges of fewer than three steps.
 - **New steps only.** A request for only the newest steps can differ in two
   ways from a request for the complete range. A range pushdown estimates the
   sample interval of a series from the samples that the request reads, so a

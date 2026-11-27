@@ -46,6 +46,7 @@ func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt i
 	if err := q.loadPostHogSamples(ctx, series, mint, maxt, latestOnly, matchers); err != nil {
 		return nil, err
 	}
+	setPostHogDeltaTotals(series)
 	// A series can be selected by its hour bucket and still have no sample in the
 	// window (a query in the past, or a stale latest sample). Drop it, as the
 	// former join did.
@@ -53,10 +54,20 @@ func (q *CHQuerier) selectPostHogSeriesSamples(ctx context.Context, mint, maxt i
 	return q.appendPostHogHistogramSeries(ctx, series, mint, maxt, matchers, true)
 }
 
+// setPostHogDeltaTotals builds the running total that counter functions read
+// for each delta series whose samples are loaded.
+func setPostHogDeltaTotals(series []*seriesMeta) {
+	for _, meta := range series {
+		if meta.delta {
+			meta.deltaTotals = postHogDeltaTotals(meta.samples)
+		}
+	}
+}
+
 // selectPostHogFloatSeries returns the float series matching the matchers,
 // with labels but without samples.
 func (q *CHQuerier) selectPostHogFloatSeries(ctx context.Context, mint, maxt int64, matchers ...*labels.Matcher) ([]*seriesMeta, error) {
-	sql := postHogSelectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt, q.queryable.cfg.MaxSeries, nil)
+	sql := postHogSelectedSeriesSQL(q.queryable.cfg, matchers, mint, maxt, q.queryable.cfg.MaxSeries, []string{"aggregation_temporality = 'delta' AS delta"})
 	series := make([]*seriesMeta, 0, 1024)
 	// The scan stops at the limit, and matchers the SQL cannot express drop
 	// rows here, so the limit counts rows read, not series kept.
@@ -91,7 +102,8 @@ func scanPostHogSeries(row clickHouseRow, matchers []*labels.Matcher) (*seriesMe
 	var serviceName string
 	var resourceAttrs map[string]string
 	var attrs map[string]string
-	if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs); err != nil {
+	var delta uint8
+	if err := row.Scan(&id, &metricName, &serviceName, &resourceAttrs, &attrs, &delta); err != nil {
 		return nil, err
 	}
 	labelMap := postHogLabelMap(metricName, serviceName, resourceAttrs, attrs)
@@ -103,6 +115,7 @@ func scanPostHogSeries(row clickHouseRow, matchers []*labels.Matcher) (*seriesMe
 		metricName: metricName,
 		labelMap:   labelMap,
 		labels:     labels.FromMap(labelMap),
+		delta:      delta == 1,
 	}, nil
 }
 
