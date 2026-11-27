@@ -3,6 +3,7 @@ package snuffle
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"reflect"
 	"strings"
@@ -100,6 +101,112 @@ func TestRangeTopK(test *testing.T) {
 	}
 }
 
+func TestPrepareMetricsQLDefault(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	prepare := func(query string) (metricsQLQuery, error) {
+		return prepareMetricsQLQuery(query, time.Minute, 5*time.Minute, start, start.Add(time.Hour))
+	}
+	for query, want := range map[string]struct {
+		left, right string
+		topK        bool
+	}{
+		`sum by (name) (rate(cpu[5m])) default 0`:              {left: `sum by (name) (rate(cpu[5m]))`, right: `0`},
+		`topk_avg(5, sum by (name) (rate(cpu[5m])) default 0)`: {left: `sum by (name) (rate(cpu[5m]))`, right: `0`, topK: true},
+		// default binds looser than + and or. The parser folds 0 + 1.
+		`cpu default 0 + 1`:                 {left: `cpu`, right: `1`},
+		`cpu default 0 or other`:            {left: `cpu`, right: `0 or other`},
+		`cpu default max by (name) (other)`: {left: `cpu`, right: `max(other) by(name)`},
+	} {
+		prepared, err := prepare(query)
+		if err != nil {
+			test.Fatalf("%s: %v", query, err)
+		}
+		left, err := prepare(want.left)
+		if err != nil {
+			test.Fatal(err)
+		}
+		if prepared.query != left.query || prepared.defaultQuery != want.right || prepared.defaultRight == nil || want.topK != (len(prepared.rangeOps) > 0) {
+			test.Errorf("%s: query %q, default %q, %d range ops", query, prepared.query, prepared.defaultQuery, len(prepared.rangeOps))
+		}
+	}
+	for query, wantErr := range map[string]string{
+		`(cpu default 0) * 2`:         "outermost",
+		`sum(cpu default 0)`:          "outermost",
+		`cpu default on(name) other`:  "does not support on",
+		`cpu default sum(x[5m:] @ 1)`: "",
+	} {
+		_, err := prepare(query)
+		if (err == nil) != (wantErr == "") || (err != nil && !strings.Contains(err.Error(), wantErr)) {
+			test.Errorf("%s: error %v, want %q", query, err, wantErr)
+		}
+	}
+}
+
+func TestRangeDefault(test *testing.T) {
+	const gap = -1
+	group := func(metric map[string]string, values ...float64) rangeAggregateGroup {
+		g := rangeAggregateGroup{metric: metric}
+		for i, v := range values {
+			if v != gap {
+				g.points = append(g.points, samplePoint{t: int64(i), v: v})
+			}
+		}
+		return g
+	}
+	nan := math.NaN()
+	a := group(map[string]string{"__name__": "m", "p": "a"}, 1, gap, nan, 1)
+	b := group(map[string]string{"p": "b"}, gap, 2, gap, gap)
+	left := []rangeAggregateGroup{a, b}
+	format := func(groups []rangeAggregateGroup) []string {
+		var out []string
+		for _, g := range groups {
+			out = append(out, fmt.Sprint(g.metric, g.points))
+		}
+		return out
+	}
+	for name, c := range map[string]struct {
+		left, right, want []rangeAggregateGroup
+	}{
+		"scalar": {left, []rangeAggregateGroup{group(nil, 0, 0, 0, 0)}, []rangeAggregateGroup{
+			group(a.metric, 1, 0, 0, 1), group(b.metric, 0, 2, 0, 0),
+		}},
+		// The metric name takes no part in the match. The first right series
+		// with a value fills; z matches nothing.
+		"vector": {left, []rangeAggregateGroup{
+			group(map[string]string{"p": "a"}, 7, gap, 7, 7),
+			group(map[string]string{"__name__": "other", "p": "a"}, 8, 8, 8, 8),
+			group(map[string]string{"p": "z"}, 9, 9, 9, 9),
+		}, []rangeAggregateGroup{group(a.metric, 1, 8, 7, 1), b}},
+		"empty left": {nil, []rangeAggregateGroup{b}, []rangeAggregateGroup{b}},
+	} {
+		filled, err := rangeDefault(context.Background(), c.left, c.right, 0)
+		if err != nil {
+			test.Fatalf("%s: %v", name, err)
+		}
+		if got, want := format(filled), format(c.want); !reflect.DeepEqual(got, want) {
+			test.Errorf("%s: got %v, want %v", name, got, want)
+		}
+	}
+	if !math.IsNaN(a.points[1].v) {
+		test.Errorf("rangeDefault modified its input: %v", a.points)
+	}
+
+	// The scalar fill of left makes 4 + 4 points. A budget below that fails,
+	// as does a canceled context.
+	scalar := []rangeAggregateGroup{group(nil, 0, 0, 0, 0)}
+	if _, err := rangeDefault(context.Background(), left, scalar, 7); err == nil || !strings.Contains(err.Error(), "sample limit") {
+		test.Errorf("budget of 7: error %v", err)
+	}
+	if _, err := rangeDefault(context.Background(), left, scalar, 8); err != nil {
+		test.Errorf("budget of 8: %v", err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := rangeDefault(canceled, left, scalar, 0); !errors.Is(err, context.Canceled) {
+		test.Errorf("canceled context: error %v", err)
+	}
+}
+
 func TestRangeOpsBounds(test *testing.T) {
 	start := time.Unix(1700000000, 0)
 	prepare := func(depth int) error {
@@ -117,6 +224,21 @@ func TestRangeOpsBounds(test *testing.T) {
 		test.Errorf("%d nested calls: error %v", maxRangeOps+1, err)
 	}
 
+	prepareDefaults := func(depth int) error {
+		query := "alloc"
+		for range depth {
+			query = "alloc default (" + query + ")"
+		}
+		_, err := prepareMetricsQLQuery(query, time.Minute, 5*time.Minute, start, start.Add(time.Hour))
+		return err
+	}
+	if err := prepareDefaults(maxRangeOps); err != nil {
+		test.Errorf("%d nested defaults: %v", maxRangeOps, err)
+	}
+	if err := prepareDefaults(maxRangeOps + 1); err == nil || !strings.Contains(err.Error(), "nest at most") {
+		test.Errorf("%d nested defaults: error %v", maxRangeOps+1, err)
+	}
+
 	prepared, err := prepareMetricsQLQuery(`topk_max(1, alloc)`, time.Minute, 5*time.Minute, start, start.Add(time.Hour))
 	if err != nil {
 		test.Fatal(err)
@@ -124,7 +246,7 @@ func TestRangeOpsBounds(test *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
 	groups := []rangeAggregateGroup{{metric: map[string]string{"a": "1"}, points: []samplePoint{{t: 0, v: 1}}}}
-	if _, queryErr := prepared.applyRangeOps(canceled, rangeQueryResult{floats: true, groups: groups}); queryErr == nil || !errors.Is(queryErr.err, context.Canceled) {
+	if _, queryErr := prepared.applyRangeOps(canceled, rangeQueryResult{floats: true, groups: groups}, nil); queryErr == nil || !errors.Is(queryErr.err, context.Canceled) {
 		test.Errorf("canceled applyRangeOps error = %v", queryErr)
 	}
 }
