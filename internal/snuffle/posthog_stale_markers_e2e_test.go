@@ -33,32 +33,48 @@ type staleTestPoint struct {
 var staleTestBounds = []float64{0.1, 0.5, 1}
 
 // staleTestPods returns pod a, scraped every 15 s until it ends with a stale
-// marker at minute 20, and pod b, which keeps going to minute 30.
+// marker at minute 20; pod b, which keeps going to minute 30; and pod c,
+// which ends with a marker at minute 15 and restarts from zero at minute 20.
 func staleTestPods(base int64) map[string][]staleTestPoint {
 	pods := map[string][]staleTestPoint{}
-	for _, pod := range []string{"a", "b"} {
+	for _, pod := range []string{"a", "b", "c"} {
 		last := 120
 		if pod == "a" {
 			last = 80
 		}
 		for m := 0; m <= last; m++ {
 			p := staleTestPoint{t: base + int64(m)*15000}
-			if pod == "a" && m == last {
+			if (pod == "a" && m == last) || (pod == "c" && m == 60) {
 				p.stale = true
 				pods[pod] = append(pods[pod], p)
-				break
+				if pod == "a" {
+					break
+				}
+				continue
+			}
+			if pod == "c" && m > 60 && m < 80 {
+				continue
+			}
+			// Pod c restarts at minute 20: its counters start again from zero.
+			n := m
+			if pod == "c" && m >= 80 {
+				n = m - 80
 			}
 			p.buckets = make([]uint64, len(staleTestBounds)+1)
 			for b := range p.buckets {
-				if pod == "a" {
-					p.buckets[b] = uint64((m + 1) * (b + 4))
-				} else {
-					p.buckets[b] = uint64((m + 1) * (b + 1))
+				switch pod {
+				case "a":
+					p.buckets[b] = uint64((n + 1) * (b + 4))
+				case "b":
+					p.buckets[b] = uint64((n + 1) * (b + 1))
+				default:
+					p.buckets[b] = uint64((n + 1) * (2*b + 2))
 				}
 			}
-			p.counter, p.gauge, p.sum = float64(5*m+m%3), float64(10+m%7), float64(m)*0.7
-			if pod == "b" {
-				p.counter, p.gauge = float64(3*m), float64(20+m%5)
+			p.counter, p.gauge, p.sum = float64(5*n+n%3), float64(10+n%7), float64(n)*0.7
+			switch pod {
+			case "b":
+				p.counter, p.gauge = float64(3*n), float64(20+n%5)
 			}
 			pods[pod] = append(pods[pod], p)
 		}
@@ -73,7 +89,8 @@ func staleTestPods(base int64) map[string][]staleTestPoint {
 // a StaleNaN sum, zero bucket counts and a zero count, on the live fingerprint.
 // Capture writes no stale delta histogram: remote write carries cumulative
 // series only. Every read path must answer as VictoriaMetrics does for the
-// same Prometheus samples, which end pod a with StaleNaN on every series. With
+// same Prometheus samples, which end pods a and c with StaleNaN on every
+// series; pod c's histogram then resumes on the same series from zero. With
 // SNUFFLE_E2E_VM_URL set, the test writes the samples to that VictoriaMetrics
 // and records its answers in testdata.
 func TestPostHogStaleMarkers(test *testing.T) {
@@ -121,9 +138,14 @@ func TestPostHogStaleMarkers(test *testing.T) {
 		attributes := fmt.Sprintf("map('instance', %s)", sqlString(pod))
 		for _, p := range points {
 			ts := chTimeMillis(p.t)
-			rows = append(rows,
-				fmt.Sprintf("(%d, 'stale_requests_total', cityHash64('counter', %s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'sum', 'cumulative', true, %s, 1, [], [], true, map('region', 'us'), %s)", e2eTeamID, sqlString(pod), ts, value(p.counter, p.stale), attributes),
-				fmt.Sprintf("(%d, 'stale_temperature', cityHash64('gauge', %s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'gauge', '', false, %s, 1, [], [], true, map('region', 'us'), %s)", e2eTeamID, sqlString(pod), ts, value(p.gauge, p.stale), attributes))
+			// Pod c restarts only its histogram: a counter whose window holds only
+			// the gap after its marker reads 0 in VictoriaMetrics and no point
+			// here, which is the counter rollup's rule, not the histogram's.
+			if pod != "c" {
+				rows = append(rows,
+					fmt.Sprintf("(%d, 'stale_requests_total', cityHash64('counter', %s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'sum', 'cumulative', true, %s, 1, [], [], true, map('region', 'us'), %s)", e2eTeamID, sqlString(pod), ts, value(p.counter, p.stale), attributes),
+					fmt.Sprintf("(%d, 'stale_temperature', cityHash64('gauge', %s), %s, now64(6), now64(6) + INTERVAL 1 DAY, 'api', 'gauge', '', false, %s, 1, [], [], true, map('region', 'us'), %s)", e2eTeamID, sqlString(pod), ts, value(p.gauge, p.stale), attributes))
+			}
 			// A stale native row keeps the bounds, with zero counts.
 			counts, total := make([]string, len(staleTestBounds)+1), uint64(0)
 			for b := range counts {
@@ -144,7 +166,7 @@ func TestPostHogStaleMarkers(test *testing.T) {
 		test.Fatal(err)
 	}
 
-	start, end := base+10*60000, base+30*60000
+	start, end := base+5*60000, base+30*60000
 	rangeValues := func() url.Values {
 		return url.Values{"start": {strconv.FormatInt(start/1000, 10)}, "end": {strconv.FormatInt(end/1000, 10)}, "step": {"60"}, "nocache": {"1"}}
 	}
@@ -187,38 +209,6 @@ func TestPostHogStaleMarkers(test *testing.T) {
 		}
 	}
 
-	// The histogram series builder (posthog_histogram.go) and the compact
-	// streaming read below the summed read turn the stale native row into a
-	// point with zero bucket counts and a zero count, not a stale marker. A
-	// rate then reads a counter reset at the stop, and a bare selector still
-	// returns the stopped pod at the stop. These cases fail for that reason,
-	// below this change; they stay out until the builder writes stale markers.
-	builder := "the histogram series builder reads a stale native row as zero counts"
-	streaming := "the compact streaming read reads a stale native row as zero counts"
-	lowerLayer := map[string]map[string]string{
-		"engine": {
-			`sum by (le) (rate(stale_latency_bucket[5m]))`: builder,
-			`sum by (le) (rate(stale_latency_bucket))`:     builder,
-			`count(stale_latency_bucket)`:                  builder,
-			`sum(rate(stale_latency_count[5m]))`:           builder,
-		},
-		"range pushdown": {
-			`sum by (le) (rate(stale_latency_bucket[5m]))`: builder,
-			`sum by (le) (rate(stale_latency_bucket))`:     builder,
-			`sum(rate(stale_latency_count[5m]))`:           builder,
-		},
-		"compact": {
-			`sum by (le) (rate(stale_latency_bucket))`: streaming,
-			`count(stale_latency_bucket)`:              builder,
-			`sum(rate(stale_latency_count[5m]))`:       builder,
-		},
-		"histogram pushdown": {
-			`sum by (le) (rate(stale_latency_bucket[5m]))`: builder,
-			`sum by (le) (rate(stale_latency_bucket))`:     builder,
-			`count(stale_latency_bucket)`:                  builder,
-			`sum(rate(stale_latency_count[5m]))`:           builder,
-		},
-	}
 	for _, path := range []struct {
 		name                                      string
 		compact, histogramPushdown, rangePushdown bool
@@ -239,15 +229,7 @@ func TestPostHogStaleMarkers(test *testing.T) {
 			values := rangeValues()
 			values.Set("query", query)
 			got := getQueryData(test, api.URL+e2eAPIPath("/api/v1/query_range")+"?"+values.Encode())
-			problem := staleMarkerMismatch(got, want[query])
-			if reason, known := lowerLayer[path.name][query]; known {
-				if problem == "" {
-					test.Errorf("%s: %s now matches VictoriaMetrics; drop it from lowerLayer", path.name, query)
-				}
-				test.Logf("%s: %s: skipped, %s: %s", path.name, query, reason, problem)
-				continue
-			}
-			if problem != "" {
+			if problem := staleMarkerMismatch(got, want[query]); problem != "" {
 				test.Errorf("%s: %s: %s", path.name, query, problem)
 			}
 		}
@@ -344,8 +326,10 @@ func writeStaleTestPodsToVictoriaMetrics(test *testing.T, vm string, pods map[st
 		request.Timeseries = append(request.Timeseries, series)
 	}
 	for pod := range pods {
-		add("stale_requests_total", pod, nil, func(p staleTestPoint) float64 { return p.counter })
-		add("stale_temperature", pod, nil, func(p staleTestPoint) float64 { return p.gauge })
+		if pod != "c" {
+			add("stale_requests_total", pod, nil, func(p staleTestPoint) float64 { return p.counter })
+			add("stale_temperature", pod, nil, func(p staleTestPoint) float64 { return p.gauge })
+		}
 		add("stale_latency_sum", pod, nil, func(p staleTestPoint) float64 { return p.sum })
 		add("stale_latency_count", pod, nil, func(p staleTestPoint) float64 { return float64(p.buckets[len(p.buckets)-1]) })
 		for b := range len(staleTestBounds) + 1 {
