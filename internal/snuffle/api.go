@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/prometheus/model/labels"
@@ -348,6 +349,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
+	ctx, skipped := withSkippedHistogramRows(ctx)
 
 	queryStarted := time.Now()
 	if prepared.hasRangeOps() {
@@ -373,7 +375,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.metrics.observePromQLQuery("instant", result.backend, "ok", time.Since(queryStarted), len(samples), len(samples), 0)
-		writeAPISuccessTimed(w, queryData{ResultType: string(parser.ValueTypeVector), Result: samples})
+		writeAPISuccessTimed(w, queryData{ResultType: string(parser.ValueTypeVector), Result: samples}, s.skippedHistogramRowWarnings(skipped))
 		return
 	}
 	recordQueryLogBackend(w, "fastpath")
@@ -426,7 +428,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := valueStats(value)
 	s.metrics.observePromQLQuery("instant", backend, "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, responseDataFromValue(value))
+	writeAPISuccessTimed(w, responseDataFromValue(value), s.skippedHistogramRowWarnings(skipped))
 }
 
 func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
@@ -476,6 +478,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.QueryTimeout)
 	defer cancel()
+	ctx, skipped := withSkippedHistogramRows(ctx)
 
 	queryStarted := time.Now()
 	result, cacheStatus, queryErr := s.cachedRangeQuery(ctx, query, prepared, start, end, step, r.Form.Get("nocache") == "1")
@@ -499,7 +502,7 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	}
 	series, samples, histograms := result.stats()
 	s.metrics.observePromQLQuery("range", result.backend, "ok", time.Since(queryStarted), series, samples, histograms)
-	writeAPISuccessTimed(w, result.data())
+	writeAPISuccessTimed(w, result.data(), s.skippedHistogramRowWarnings(skipped))
 }
 
 // writeAPISuccessTimed writes the API response and times its encoding phase.
@@ -519,10 +522,23 @@ func rangeEvalTimes(start, end time.Time, step time.Duration) []int64 {
 	return times
 }
 
-func writeAPISuccessTimed(w http.ResponseWriter, data any) {
+func writeAPISuccessTimed(w http.ResponseWriter, data any, warnings []string) {
 	started := time.Now()
-	writeAPISuccess(w, data)
+	writeJSON(w, http.StatusOK, apiResponse{Status: "success", Data: data, Warnings: warnings})
 	recordQueryLogPhase(w, "encode", time.Since(started))
+}
+
+// skippedHistogramRowWarnings counts the malformed histogram rows that the
+// request skipped and reports them as a response warning.
+func (s *Server) skippedHistogramRowWarnings(skipped *atomic.Int64) []string {
+	rows := skipped.Load()
+	if rows == 0 {
+		return nil
+	}
+	if s.metrics != nil {
+		s.metrics.histogramRowsSkipped.Add(float64(rows))
+	}
+	return []string{fmt.Sprintf("skipped %d malformed histogram row(s) whose bucket counts do not match their bounds", rows)}
 }
 
 func (s *Server) handleLabels(w http.ResponseWriter, r *http.Request) {
@@ -883,10 +899,11 @@ func (s *Server) parseMatcherParams(r *http.Request) ([][]*labels.Matcher, error
 }
 
 type apiResponse struct {
-	Status    string `json:"status"`
-	Data      any    `json:"data,omitempty"`
-	ErrorType string `json:"errorType,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Status    string   `json:"status"`
+	Data      any      `json:"data,omitempty"`
+	ErrorType string   `json:"errorType,omitempty"`
+	Error     string   `json:"error,omitempty"`
+	Warnings  []string `json:"warnings,omitempty"`
 }
 
 type queryData struct {

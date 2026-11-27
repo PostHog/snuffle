@@ -8,9 +8,11 @@ import (
 
 func (sample *postHogHistogramSample) scanPacked(row clickHouseRow) error {
 	var payload []byte
-	if err := row.Scan(&sample.id, &sample.timestamp, &sample.sum, &sample.count, &payload, &sample.temporality); err != nil {
+	var exponential uint8
+	if err := row.Scan(&sample.id, &sample.timestamp, &sample.sum, &sample.count, &payload, &sample.temporality, &exponential); err != nil {
 		return err
 	}
+	sample.exponential = exponential != 0
 	var err error
 	sample.bounds, sample.counts, err = decodePostHogHistogramArrays(payload, sample.bounds, sample.counts)
 	if err != nil {

@@ -327,14 +327,89 @@ func TestPostHogHistogramBucketReappears(test *testing.T) {
 	}
 }
 
+// A row whose bucket counts do not fit its bounds is skipped by _bucket,
+// _count and _sum alike, so ratios between them keep the same rows.
+func TestPostHogHistogramMalformedRowSkippedForEverySuffix(test *testing.T) {
+	malformed := histogramTestSample()
+	malformed.counts = append(malformed.counts, 0)
+	for _, suffix := range []string{"_bucket", "_count", "_sum"} {
+		test.Run(suffix, func(test *testing.T) {
+			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds"+suffix)}
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			if err := builder.add(malformed, []string{suffix}); err != nil {
+				test.Fatalf("exact selector must skip the malformed row: %v", err)
+			}
+			if builder.skippedRows != 1 {
+				test.Fatalf("skipped rows = %d, want 1", builder.skippedRows)
+			}
+			if len(builder.series) != 0 {
+				test.Fatalf("malformed row produced %d series", len(builder.series))
+			}
+		})
+	}
+}
+
+func TestPostHogHistogramExponentialRowKeepsCountAndSum(test *testing.T) {
+	sample := histogramTestSample()
+	sample.counts = append(sample.counts, 0)
+	sample.exponential = true
+	for _, suffix := range []string{"_count", "_sum"} {
+		test.Run(suffix, func(test *testing.T) {
+			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds"+suffix)}
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			if err := builder.add(sample, []string{suffix}); err != nil {
+				test.Fatal(err)
+			}
+			if builder.skippedRows != 0 || len(builder.series) != 1 {
+				test.Fatalf("skipped = %d, series = %d, want an exponential row kept", builder.skippedRows, len(builder.series))
+			}
+		})
+	}
+}
+
+func TestPostHogHistogramExponentialRowRejectedForBuckets(test *testing.T) {
+	sample := histogramTestSample()
+	sample.counts = append(sample.counts, 0)
+	sample.exponential = true
+	exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_bucket")}
+	builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+	if err := builder.add(sample, []string{"_bucket"}); err != nil {
+		test.Fatal(err)
+	}
+	if builder.skippedRows != 1 || len(builder.series) != 0 {
+		test.Fatalf("skipped = %d, series = %d, want the exponential row skipped for _bucket", builder.skippedRows, len(builder.series))
+	}
+}
+
+func TestPostHogHistogramNoBucketRowKeepsCountAndSum(test *testing.T) {
+	sample := histogramTestSample()
+	sample.bounds, sample.counts = nil, nil
+	for _, suffix := range []string{"_count", "_sum"} {
+		test.Run(suffix, func(test *testing.T) {
+			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds"+suffix)}
+			builder := newPostHogHistogramSeriesBuilder(histogramTestConfig(), exact, true)
+			if err := builder.add(sample, []string{suffix}); err != nil {
+				test.Fatal(err)
+			}
+			if builder.skippedRows != 0 || len(builder.series) != 1 {
+				test.Fatalf("skipped = %d, series = %d, want a bucketless row kept", builder.skippedRows, len(builder.series))
+			}
+		})
+	}
+}
+
 func TestPostHogHistogramRepeatedSampleChecks(test *testing.T) {
 	for _, testcase := range []struct {
-		name   string
+		name string
+		// row is true for a malformed row, which an exact selector skips
+		// and counts instead of failing.
+		row    bool
 		change func(*postHogHistogramSample)
 	}{
-		{"temporality", func(sample *postHogHistogramSample) { sample.temporality = "delta" }},
-		{"count", func(sample *postHogHistogramSample) { sample.count++ }},
-		{"bounds", func(sample *postHogHistogramSample) { sample.bounds = []float64{1, 0.5} }},
+		{"temporality", false, func(sample *postHogHistogramSample) { sample.temporality = "delta" }},
+		{"count", true, func(sample *postHogHistogramSample) { sample.count++ }},
+		{"bounds", true, func(sample *postHogHistogramSample) { sample.bounds = []float64{1, 0.5} }},
+		{"bucket counts", true, func(sample *postHogHistogramSample) { sample.counts = append(sample.counts, 0) }},
 	} {
 		test.Run(testcase.name, func(test *testing.T) {
 			exact := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_duration_seconds_bucket")}
@@ -344,8 +419,21 @@ func TestPostHogHistogramRepeatedSampleChecks(test *testing.T) {
 				test.Fatal(err)
 			}
 			testcase.change(&sample)
-			if err := builder.add(sample, []string{"_bucket"}); err == nil {
-				test.Fatal("invalid repeated sample accepted")
+			sample.timestamp += 1000
+			err := builder.add(sample, []string{"_bucket"})
+			if !testcase.row {
+				if err == nil {
+					test.Fatal("invalid repeated sample accepted")
+				}
+				return
+			}
+			if err != nil || builder.skippedRows != 1 {
+				test.Fatalf("malformed row: error %v, skipped %d; want it skipped and counted", err, builder.skippedRows)
+			}
+			for _, meta := range builder.series {
+				if len(meta.samples) != 1 {
+					test.Fatalf("malformed row added samples: %v", meta.samples)
+				}
 			}
 		})
 	}
@@ -451,8 +539,11 @@ func TestPostHogHistogramInvalidSourcesSkippedForBroadSelectors(test *testing.T)
 	if len(builder.series) != 4 {
 		test.Fatalf("valid histogram produced %d series, want three buckets and a count", len(builder.series))
 	}
-	strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_broken_seconds_bucket")}, true)
-	if err := strict.add(invalid, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "observation count") {
+	if builder.skippedRows != 2 {
+		test.Fatalf("skipped rows = %d, want the two malformed rows", builder.skippedRows)
+	}
+	strict := newPostHogHistogramSeriesBuilder(histogramTestConfig(), []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, labels.MetricName, "test_unspecified_seconds_bucket")}, true)
+	if err := strict.add(unspecified, []string{"_bucket"}); err == nil || !strings.Contains(err.Error(), "aggregation temporality") {
 		test.Fatalf("exact selector must report the invalid histogram: %v", err)
 	}
 }

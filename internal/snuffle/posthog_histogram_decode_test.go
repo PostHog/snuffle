@@ -69,6 +69,7 @@ func (row packedHistogramRow) Scan(dest ...any) error {
 	*dest[3].(*uint64) = row.count
 	*dest[4].(*[]byte) = row.payload
 	*dest[5].(*string) = "cumulative"
+	*dest[6].(*uint8) = 0
 	return nil
 }
 
