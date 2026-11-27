@@ -29,6 +29,24 @@ func compactTestPlan(test testing.TB, query string, start, end time.Time, step t
 	return planCompactHistogram(expr, start, end, step, 5*time.Minute), prepared.query
 }
 
+// The fingerprint list can be a literal of thousands of ids, so the summed
+// SQL must name it once for every rollup, or a query that the streaming read
+// answers exceeds the ClickHouse max_query_size.
+func TestCompactHistogramSQLNamesFingerprintsOnce(test *testing.T) {
+	start := time.Unix(1700000000, 0)
+	for _, query := range []string{
+		`histogram_quantile(0.5, sum by(le)(rate(duration_bucket[5m])))`,
+		`histogram_quantile(0.5, sum by(le)(increase(duration_bucket[5m])))`,
+		`histogram_quantile(0.5, sum by(le)(delta(duration_bucket[5m])))`,
+	} {
+		plan, _ := compactTestPlan(test, query, start, start.Add(time.Hour), time.Minute)
+		sql := compactHistogramSQL(ConfigFromEnv(), plan, plan.start-plan.selectorRange+1, "FINGERPRINT_LIST")
+		if count := strings.Count(sql, "FINGERPRINT_LIST"); count != 1 {
+			test.Errorf("%s: the fingerprint list appears %d times", query, count)
+		}
+	}
+}
+
 func TestCompactHistogramPlans(test *testing.T) {
 	start := time.Unix(1700000000, 0)
 	for _, query := range []string{

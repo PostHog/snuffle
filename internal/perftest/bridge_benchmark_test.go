@@ -20,7 +20,26 @@ type bridgeScenario struct {
 }
 
 func bridgePostHogMetricScenarios() []bridgeScenario {
-	return bridgeTSBSMetricScenarios()
+	return append(bridgeTSBSMetricScenarios(), bridgePostHogHistogramScenarios()...)
+}
+
+// bridgePostHogHistogramScenarios query the histograms that
+// scripts/seed_metrics_posthog_histograms.sql writes from the TSBS start.
+func bridgePostHogHistogramScenarios() []bridgeScenario {
+	start, err := time.Parse(time.RFC3339, envString("BRIDGE_BENCH_HISTOGRAM_START", "2016-01-01T00:00:00Z"))
+	if err != nil {
+		panic(err)
+	}
+	at := func(offset time.Duration) string { return fmt.Sprint(start.Add(offset).Unix()) }
+	quantile := func(metric string) string {
+		return fmt.Sprintf(`histogram_quantile(0.95, sum by (le) (rate(%s_bucket[5m])))`, metric)
+	}
+	django, llm := quantile("django_http_requests_latency_seconds_by_view_method"), quantile("llm_call_duration_seconds")
+	return []bridgeScenario{
+		{name: "posthog_histogram_quantile_6h", path: "/api/v1/query_range", params: map[string]string{"query": django, "start": at(18 * time.Hour), "end": at(24 * time.Hour), "step": "60s"}},
+		{name: "posthog_histogram_quantile_24h", path: "/api/v1/query_range", params: map[string]string{"query": django, "start": at(0), "end": at(24 * time.Hour), "step": "5m"}},
+		{name: "posthog_delta_histogram_quantile_7d", path: "/api/v1/query_range", params: map[string]string{"query": llm, "start": at(0), "end": at(7 * 24 * time.Hour), "step": "5m"}},
+	}
 }
 
 func bridgeSnuffleMetricScenarios() []bridgeScenario {

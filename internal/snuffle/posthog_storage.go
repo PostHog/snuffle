@@ -183,12 +183,18 @@ func decodeDeltaSamples(firstTS int64, deltas []int64, values []float64, samples
 
 const postHogSeriesIDsTable = "series_ids"
 
+// postHogLiteralIDLimit caps a literal fingerprint list. 4,000 fingerprints of
+// up to 20 digits take about 84 KB, so a query that repeats the list twice
+// stays under the 256 KiB default max_query_size; the 20,000 default chunk
+// size does not.
+const postHogLiteralIDLimit = 4000
+
 // queryPostHogSeriesIDs runs the SQL from sqlFor over the fingerprints in ids.
-// Small sets go as literal IN lists in chunks. A literal list of more than
-// chunkSize fingerprints can exceed the ClickHouse max_query_size, so larger
-// sets are sent once as an external table that the SQL reads with a subquery.
+// Small sets go as literal IN lists in chunks. A long literal list can exceed
+// the ClickHouse max_query_size, so larger sets are sent once as an external
+// table that the SQL reads with a subquery.
 func queryPostHogSeriesIDs(ctx context.Context, client *ClickHouseClient, chunkSize int, ids []uint64, sqlFor func(batch []uint64, idCondition string) string, handle func(clickHouseRow) error) error {
-	if len(ids) > chunkSize {
+	if len(ids) > min(chunkSize, postHogLiteralIDLimit) {
 		sql := sqlFor(ids, "series_fingerprint IN (SELECT id FROM "+postHogSeriesIDsTable+")")
 		return client.QueryRowsWithExternalUInt64s(ctx, postHogSeriesIDsTable, "id", ids, sql, handle)
 	}

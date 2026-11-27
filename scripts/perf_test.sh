@@ -458,6 +458,7 @@ run_bridge_bench() {
     BRIDGE_BENCH_LOG_END_NS="$POSTHOG_LOG_END_NS" \
     BRIDGE_BENCH_LOG_STEP="$POSTHOG_LOG_STEP" \
     BRIDGE_BENCH_LOG_LIMIT="$POSTHOG_LOG_LIMIT" \
+    BRIDGE_BENCH_HISTOGRAM_START="$TSBS_START" \
     go test -run '^$' -bench '^BenchmarkBridgeHTTP$' ./internal/perftest -benchtime="$BRIDGE_BENCHTIME" -timeout="$BRIDGE_BENCH_GO_TEST_TIMEOUT" | tee "$bench_output"
   bench_status="${PIPESTATUS[0]}"
   set -e
@@ -583,6 +584,10 @@ run_tsbs_metrics() {
     exit 1
   fi
   wait_for_table_rows "$samples_table" "$expected_rows"
+  if [[ "$schema_layout" == "posthog" ]]; then
+    echo "==> $run_name: seed histograms"
+    ch_client --param_tenant="$SNUFFLE_DEFAULT_TEAM_ID" --param_start="$TSBS_START" --multiquery < "$ROOT/scripts/seed_metrics_posthog_histograms.sql"
+  fi
 
   run_bridge_bench "$run_dir" "$run_name"
   report_run_attempt "$run_name" "$run_dir" "$load_results" "$bench_output" "$expected_rows" "$source_name" "$TSBS_VERSION" "$TSBS_USE_CASE" "$TSBS_SCALE" "$TSBS_START" "$TSBS_END" "$TSBS_INTERVAL" "$TSBS_SEED" "$TSBS_WORKERS" "$TSBS_BATCH_SIZE" "$attempt"
