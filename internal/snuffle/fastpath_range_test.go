@@ -121,7 +121,7 @@ func rangeTestSQL(t *testing.T, query string, step time.Duration) string {
 		t.Fatalf("%s: aggregate not supported", query)
 	}
 	start := int64(1_700_000_000_000)
-	plan := newPostHogQueryPlan(cfg, call.selector.LabelMatchers, aggregate.Grouping, start-call.matrix, start+3_600_000, len(aggregate.Grouping) > 0)
+	plan := newPostHogQueryPlanWithHistory(cfg, call.selector.LabelMatchers, aggregate.Grouping, start-call.matrix, start-call.matrix-call.intervalHistory(), start+3_600_000, len(aggregate.Grouping) > 0)
 	sum := aggregate.Op == parser.SUM && call.windowTotal()
 	return rangeRollupSQL(cfg, plan, call, start, start, 61, aggSQL, sum)
 }
@@ -135,7 +135,6 @@ func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
 		"metric_name = 'http_requests_total'",
 		"reinterpretAsUInt64(p.2) != 9218868437227405314",
 		"arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts",
-		"quantileExactInclusiveOrDefault(0.6)",
 		"toInt64(60000) AS window_ms",
 		"ARRAY JOIN range(step_lo, step_hi) AS idx",
 		"least(toInt64(ceil((ts - 1700000000000 + window_ms) / 60000)) + 1, 62)",
@@ -150,7 +149,8 @@ func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
 			t.Fatalf("SQL does not contain %q:\n%s", want, sql)
 		}
 	}
-	for _, notWant := range []string{"rollup_value", "max_prev)", "HAVING isNotNull"} {
+	// increase does not use the sample interval.
+	for _, notWant := range []string{"rollup_value", "max_prev)", "HAVING isNotNull", "quantileExactInclusiveOrDefault"} {
 		if strings.Contains(sql, notWant) {
 			t.Fatalf("SQL contains %q:\n%s", notWant, sql)
 		}
@@ -160,6 +160,11 @@ func TestRangeRollupSQLSumsIncreaseContributionsDirectly(t *testing.T) {
 func TestRangeRollupSQLRatePerSeries(t *testing.T) {
 	sql := rangeTestSQL(t, `max(rate(http_requests_total{job="api"}[5m])) by (code)`, time.Minute)
 	for _, want := range []string{
+		// Series are selected from the matrix. Samples reach back one more
+		// window, so the first sample in each window has its interval estimate.
+		"time_bucket >= toStartOfHour(fromUnixTimestamp64Milli(1699999400000, 'UTC'))",
+		"p.1 >= 1699999100000 AND",
+		"next_vs AS next_v, max_prevs AS max_prev",
 		"toUInt8(p_ts > t_i - 600000 AND p_ts > t_i - window_ms - max_prev) AS has_prev",
 		"if(count() + max(first_has_prev) < 2 OR sum(gap_contribution) <= 0, NULL, sum(contribution) / (sum(gap_contribution) / 1000)) AS rollup_value",
 		"GROUP BY series_id, idx HAVING isNotNull(rollup_value) AND NOT isNaN(rollup_value)",
@@ -177,7 +182,15 @@ func TestRangeRollupSQLRatePerSeries(t *testing.T) {
 func TestRangeRollupSQLSelectorKeepsStaleMarkersAndAutoWindow(t *testing.T) {
 	sql := rangeTestSQL(t, `avg(http_requests_total)`, 30*time.Second)
 	for _, want := range []string{
-		"toInt64(least(greatest(30000, max_prev), 300000)) AS window_ms",
+		// Each sample estimates its interval from the samples in the matrix before it.
+		"if(p1 > p0 - 630000, p0 - p1, -1), if(p2 > p0 - 630000, p1 - p2, -1)",
+		"if(p20 > p0 - 630000, p19 - p20, -1)",
+		// The matrix (step and two lookbacks) plus the span of a sample (step and one lookback).
+		"p.1 >= 1699999040000 AND",
+		"arrayShiftRight(interval_tss, 20)",
+		"quantileExactInclusiveOrDefault(0.6)",
+		"arrayMap(gap -> toInt64(least(greatest(30000, least(if(gap <= 0, toInt64(30000), ",
+		"ARRAY JOIN tss AS ts, vs AS v, prev_tss AS prev_ts, prev_vs AS prev_v, next_tss AS next_ts, next_vs AS next_v, window_mss AS window_ms",
 		"least(330000, ifNull(next_ts - ts, 330000))",
 		"any(if(t_i - ts < window_ms AND reinterpretAsUInt64(v) != 9218868437227405314, v, NULL)) AS rollup_value",
 		"avg(rollup_value) AS value",

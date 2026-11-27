@@ -116,6 +116,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("range result cache", func(t *testing.T) {
 		assertRangeCacheMatchesUncachedResults(t, ctx, rootClient, cfg)
 	})
+	t.Run("range steps independent of the start", func(t *testing.T) {
+		assertRangeStepsIndependentOfStart(t, cfg)
+	})
 
 	t.Run("shared label sets across metric names", func(t *testing.T) {
 		assertSharedLabelsetAcrossNames(t, cfg, api.URL)

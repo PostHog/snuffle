@@ -484,10 +484,18 @@ type postHogQueryPlan struct {
 }
 
 func newPostHogQueryPlan(cfg Config, matchers []*labels.Matcher, grouping []string, mint, maxt int64, needLabels bool) *postHogQueryPlan {
-	plan := &postHogQueryPlan{cfg: cfg, matchers: matchers, grouping: grouping, mint: mint, maxt: maxt}
+	return newPostHogQueryPlanWithHistory(cfg, matchers, grouping, mint, mint, maxt, needLabels)
+}
+
+// newPostHogQueryPlanWithHistory selects the series that have samples in
+// [seriesMint, maxt] and reads samples from [sampleMint, maxt]. sampleMint may
+// be earlier than seriesMint: the extra samples only refine the estimates of
+// series already selected, so they must not count toward CH_MAX_SERIES.
+func newPostHogQueryPlanWithHistory(cfg Config, matchers []*labels.Matcher, grouping []string, seriesMint, sampleMint, maxt int64, needLabels bool) *postHogQueryPlan {
+	plan := &postHogQueryPlan{cfg: cfg, matchers: matchers, grouping: grouping, mint: sampleMint, maxt: maxt}
 	plan.useSeries = needLabels || postHogNeedsSeriesLookup(matchers, grouping)
 	if plan.useSeries {
-		plan.seriesSQL = postHogSelectedSeriesSQL(cfg, matchers, mint, maxt, cfg.MaxSeries, plan.seriesGroupSelects())
+		plan.seriesSQL = postHogSelectedSeriesSQL(cfg, matchers, seriesMint, maxt, cfg.MaxSeries, plan.seriesGroupSelects())
 	}
 	return plan
 }

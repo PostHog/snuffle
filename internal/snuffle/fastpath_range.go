@@ -126,7 +126,10 @@ func (s *Server) tryFastRangeGroups(ctx context.Context, prepared metricsQLQuery
 		return nil, false, nil
 	}
 	evalStart := gridStart - call.offset
+	// Series are selected, and histograms looked for, from the first matrix
+	// as before; only the samples reach back intervalHistory further.
 	mint := evalStart - call.matrix
+	sampleMint := mint - call.intervalHistory()
 	maxt := evalStart + (points-1)*call.step
 	virtual, err := s.postHogSelectsHistogram(ctx, mint, maxt, call.selector.LabelMatchers)
 	if err != nil {
@@ -135,7 +138,7 @@ func (s *Server) tryFastRangeGroups(ctx context.Context, prepared metricsQLQuery
 	if virtual {
 		return nil, false, nil
 	}
-	plan := newPostHogQueryPlan(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, maxt, len(aggregate.Grouping) > 0)
+	plan := newPostHogQueryPlanWithHistory(s.cfg, call.selector.LabelMatchers, aggregate.Grouping, mint, sampleMint, maxt, len(aggregate.Grouping) > 0)
 	sumContributions := aggregate.Op == parser.SUM && call.windowTotal()
 	sql := rangeRollupSQL(s.cfg, plan, call, evalStart, gridStart, points, aggSQL, sumContributions)
 	groups, err := s.queryRangeAggregateGroups(ctx, sql, aggregate.Grouping)
@@ -237,6 +240,18 @@ func (c rangeRollupCall) span() int64 {
 	return c.window
 }
 
+// intervalHistory returns how much further back than the matrix the samples
+// must reach so that every sample a step reads has its sample interval
+// estimate: a sample applies to steps up to span after it, and its estimate
+// reads the samples in the matrix before it. It is zero when the rollup does
+// not use the estimate.
+func (c rangeRollupCall) intervalHistory() int64 {
+	if c.bareSelector() || c.name == "rate" || c.name == "irate" || c.name == "idelta" {
+		return c.span()
+	}
+	return 0
+}
+
 // expansion returns the maximum number of steps that can use one sample.
 func (c rangeRollupCall) expansion() int64 {
 	return (c.span()+c.step-1)/c.step + 1
@@ -304,14 +319,15 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 // The two differ by the selector offset.
 // Read the query from the inner stage to the outer stage:
 //
-//  1. samples reads samples from [start - matrix, end].
+//  1. samples reads samples from [start - matrix - intervalHistory, end].
 //     It removes stale markers for counters but keeps them for default_rollup.
 //  2. series sorts each series into arrays.
 //     It adds the previous and next sample for each sample.
-//     metricsQLSampleInterval estimates one interval across the complete range.
-//     VictoriaMetrics also estimates one interval for each series.
-//     The engine estimates an interval for each step.
-//     Thus, irregular series can produce different results.
+//     It estimates the interval of each sample as metricsQLSampleInterval does
+//     for the samples in the matrix that ends at the sample. The engine
+//     estimates it for the matrix that ends at the step instead, so irregular
+//     series can produce different results. Either way the estimate does not
+//     depend on where the request range starts or ends.
 //  3. steps joins each sample to its applicable steps.
 //     Counters use the window.
 //     default_rollup stops using a sample when the next sample arrives.
@@ -336,23 +352,57 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 		strings.Join(plan.sampleRowWhere(), " AND "),
 	)
 
-	windowExpr := strconv.FormatInt(call.window, 10)
-	if call.window == 0 {
-		windowExpr = "least(greatest(" + step + ", max_prev), " + lookback + ")"
+	// Each sample of a rollup that uses the sample interval gets its own
+	// estimate: a bare selector its window, and rate, irate and idelta the
+	// max_prev that a previous sample must be within. Other rollups use none.
+	intervals := fmt.Sprintf("toInt64(0) AS max_prev, toInt64(%d) AS window_ms", call.window)
+	intervalJoin := ""
+	if call.intervalHistory() > 0 {
+		// interval_tss holds the samples to estimate: the last ones of tss.
+		// The samples before them get no estimate.
+		estimated, pad := "tss", "0"
+		if !defaultRollup {
+			// A previous sample is within max_prev of the window when its gap
+			// to the next sample is. When every gap of the series is at most
+			// the smallest max_prev any estimate can give, every sample uses
+			// its previous sample, so no sample needs its estimate. Those
+			// samples use the lookback, which keeps them.
+			estimated = fmt.Sprintf(
+				"if(least(%s, %s) >= arrayMax(arrayPopFront(arrayDifference(tss))), emptyArrayInt64(), tss)",
+				metricsQLSampleIntervalMarginSQL("arrayMin(arrayPopFront(arrayDifference(tss)))"), lookback,
+			)
+			pad = lookback
+		} else {
+			// A bare selector uses its window only at a step at least one step
+			// after its sample and before the next sample. Without such a step
+			// for any sample but the last, only the last sample needs its
+			// estimate, and the last 21 samples hold it.
+			estimated = fmt.Sprintf(
+				"if(arrayExists((ts, next_ts) -> %[1]s + toInt64(ceil((ts + %[2]s - %[1]s) / %[2]s)) * %[2]s < next_ts, arrayPopBack(tss), arrayPopFront(tss)), tss, arraySlice(tss, -21))",
+				start, step,
+			)
+		}
+		gaps := "arrayConcat(arrayResize(emptyArrayInt64(), length(tss) - length(interval_tss), toInt64(" + pad + ")), " + sampleIntervalsSQL("interval_tss", call.matrix) + ")"
+		maxPrev := fmt.Sprintf("least(if(gap <= 0, toInt64(%s), %s), %s)", step, metricsQLSampleIntervalMarginSQL("gap"), lookback)
+		if defaultRollup {
+			intervals = fmt.Sprintf("%s AS interval_tss, toInt64(0) AS max_prev, arrayMap(gap -> toInt64(least(greatest(%s, %s), %s)), %s) AS window_mss", estimated, step, maxPrev, lookback, gaps)
+			intervalJoin = ", window_mss AS window_ms"
+		} else {
+			intervals = fmt.Sprintf("%s AS interval_tss, arrayMap(gap -> %s, %s) AS max_prevs, toInt64(%d) AS window_ms", estimated, maxPrev, gaps, call.window)
+			intervalJoin = ", max_prevs AS max_prev"
+		}
 	}
 	series := fmt.Sprintf(
 		"SELECT series_id, arraySort(x -> x.1, groupArrayArray(pts_part)) AS pts, arrayMap(p -> p.1, pts) AS tss, arrayMap(p -> p.2, pts) AS vs, "+
 			"arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), tss)), NULL) AS prev_tss, arrayPushFront(arrayPopBack(arrayMap(x -> toNullable(x), vs)), NULL) AS prev_vs, "+
 			"arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), tss)), NULL) AS next_tss, arrayPushBack(arrayPopFront(arrayMap(x -> toNullable(x), vs)), NULL) AS next_vs, "+
-			"toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayPopFront(arrayDifference(tss))))) AS series_gap, "+
-			"least(if(series_gap <= 0, toInt64(%s), %s), %s) AS max_prev, toInt64(%s) AS window_ms "+
-			"FROM (%s) GROUP BY series_id HAVING notEmpty(pts)",
-		step, metricsQLSampleIntervalMarginSQL("series_gap"), lookback, windowExpr, samples,
+			"%s FROM (%s) GROUP BY series_id HAVING notEmpty(pts)",
+		intervals, samples,
 	)
 	neighbours := fmt.Sprintf(
 		"SELECT series_id, max_prev, window_ms, ts, v, prev_ts, prev_v, next_ts, next_v FROM (%s) "+
-			"ARRAY JOIN tss AS ts, vs AS v, prev_tss AS prev_ts, prev_vs AS prev_v, next_tss AS next_ts, next_vs AS next_v",
-		series,
+			"ARRAY JOIN tss AS ts, vs AS v, prev_tss AS prev_ts, prev_vs AS prev_v, next_tss AS next_ts, next_vs AS next_v%s",
+		series, intervalJoin,
 	)
 
 	// A sample applies when ts <= t_i and t_i < ts + span.
@@ -456,6 +506,25 @@ func rangeRollupValueSQL(name string) string {
 		// This branch returns the last sample unless it is stale or too old.
 		return "any(if(t_i - ts < window_ms AND " + nonStaleSampleSQL("v") + ", v, NULL))"
 	}
+}
+
+// sampleIntervalsSQL returns the interval of each sample in the sorted Int64
+// array tss before the margin: the 0.6 quantile of the last 20 intervals
+// between the samples in (ts - history, ts], or 0 without such an interval.
+// This is metricsQLSampleInterval for the matrix that ends at the sample. Each
+// interval reads a copy of tss shifted by its distance, because a lambda that
+// read tss itself would copy the array once per sample.
+func sampleIntervalsSQL(tss string, history int64) string {
+	params, shifted, gaps := []string{"p0"}, []string{tss}, []string{}
+	for k := 1; k <= 20; k++ {
+		params = append(params, fmt.Sprintf("p%d", k))
+		shifted = append(shifted, fmt.Sprintf("arrayShiftRight(%s, %d)", tss, k))
+		gaps = append(gaps, fmt.Sprintf("if(p%[1]d > p0 - %[2]d, p%[3]d - p%[1]d, -1)", k, history, k-1))
+	}
+	return fmt.Sprintf(
+		"arrayMap((%s) -> toInt64(floor(arrayReduce('quantileExactInclusiveOrDefault(0.6)', arrayFilter(g -> g >= 0, [%s])))), %s)",
+		strings.Join(params, ", "), strings.Join(gaps, ", "), strings.Join(shifted, ", "),
+	)
 }
 
 // metricsQLSampleIntervalMarginSQL implements the metricsQLSampleInterval margin table.
