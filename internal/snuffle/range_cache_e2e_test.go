@@ -29,8 +29,11 @@ const (
 // of a server without it, while it evaluates only the steps that are not settled.
 func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, root *ClickHouseClient, cfg Config) {
 	t.Helper()
+	// The cache is on in the default config, so the baseline turns it off.
+	uncachedCfg := cfg
+	uncachedCfg.RangeCacheMaxBytes = 0
 	uncachedMux := http.NewServeMux()
-	newServer(cfg).routes(uncachedMux)
+	newServer(uncachedCfg).routes(uncachedMux)
 	uncached := httptest.NewServer(uncachedMux)
 	defer uncached.Close()
 
@@ -125,6 +128,7 @@ func assertRangeCacheMatchesUncachedResults(t *testing.T, ctx context.Context, r
 		limited := httptest.NewServer(limitedMux)
 		defer limited.Close()
 		uncachedCfg := cfg
+		uncachedCfg.RangeCacheMaxBytes = 0
 		uncachedCfg.MaxSamples = 64
 		uncachedMux := http.NewServeMux()
 		newServer(uncachedCfg).routes(uncachedMux)
