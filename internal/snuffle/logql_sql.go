@@ -98,7 +98,10 @@ func buildLogQLMetricSQLPlan(cfg Config, expr *logQLExpr) (*logQLMetricSQLPlan, 
 	var plan *logQLMetricSQLPlan
 	if expr.rangeAgg != nil {
 		plan = buildLogQLRangeAggSQLPlan(cfg, expr.rangeAgg, nil, "")
-	} else if expr.aggregation != nil && expr.aggregation.expr != nil && expr.aggregation.expr.rangeAgg != nil && expr.aggregation.expr.comparison == nil {
+	} else if expr.aggregation != nil && expr.aggregation.expr != nil && expr.aggregation.expr.rangeAgg != nil && expr.aggregation.expr.rangeAgg.grouping == nil && expr.aggregation.expr.comparison == nil {
+		// A grouped range aggregation (sum(avg_over_time(...) by (pod)))
+		// takes the outer-aggregation branch below: its series are
+		// aggregated per group first, then by the outer grouping.
 		switch expr.aggregation.fn {
 		case "sum":
 		default:
@@ -142,7 +145,9 @@ func buildLogQLRangeAggSQLPlan(cfg Config, rangeAgg *logQLRangeAggregation, grou
 	if rangeAgg == nil {
 		return nil
 	}
-	if grouping == nil {
+	if outerAgg == "" {
+		// with an outer aggregation, grouping is its by (...) and nil is
+		// one total; the range aggregation's own grouping never stands in
 		grouping = rangeAgg.grouping
 	}
 	if grouping != nil && grouping.without {
@@ -805,15 +810,16 @@ func logQLMetricResultSQL(sql string, plan *logQLMetricSQLPlan) string {
 		return sql
 	}
 	current := sql
-	if plan.comparison != nil {
-		current = "SELECT * FROM (" + current + ") WHERE " + logQLSQLComparisonCondition(plan.comparison)
-	}
 	if plan.hasTopK {
 		direction := "DESC"
 		if !plan.topKIsTop {
 			direction = "ASC"
 		}
 		current = fmt.Sprintf("SELECT * FROM (SELECT * FROM (%s) ORDER BY eval_ns ASC, value %s LIMIT %d BY eval_ns)", current, direction, plan.topK)
+	}
+	// topk(k, x) < n ranks first, then filters, as the engine does
+	if plan.comparison != nil {
+		current = "SELECT * FROM (" + current + ") WHERE " + logQLSQLComparisonCondition(plan.comparison)
 	}
 	for _, outer := range plan.outer {
 		inner := []string{"eval_ns"}
