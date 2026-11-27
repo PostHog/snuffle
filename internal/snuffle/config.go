@@ -71,7 +71,10 @@ type Config struct {
 	SelfScrapeInstance       string
 	LogRetention             time.Duration
 	LogQueryMaxRows          int
-	MetricsRetention         time.Duration
+	// LogQueryNoTopKSetting omits query_plan_max_limit_for_top_k_optimization
+	// from raw log queries, for ClickHouse servers that do not know it.
+	LogQueryNoTopKSetting bool
+	MetricsRetention      time.Duration
 }
 
 func ConfigFromEnv() Config {
@@ -184,6 +187,7 @@ func ConfigFromEnv() Config {
 		SelfScrapeInstance:          getenv("SNUFFLE_SELF_SCRAPE_INSTANCE", defaultSelfScrapeInstance(httpPort)),
 		LogRetention:                envDuration("SNUFFLE_LOG_RETENTION", 30*24*time.Hour),
 		LogQueryMaxRows:             envInt("SNUFFLE_LOG_QUERY_MAX_ROWS", 100000, 1),
+		LogQueryNoTopKSetting:       !envBool("SNUFFLE_LOG_QUERY_TOP_K_SETTING", true),
 		MetricsRetention:            envDuration("SNUFFLE_METRICS_RETENTION", 90*24*time.Hour),
 	}
 }
