@@ -21,20 +21,20 @@ func TestPrepareMetricsQLQueryRewrites(t *testing.T) {
 		// metricsQLOnly marks syntax the Prometheus parser does not accept.
 		metricsQLOnly bool
 	}{
-		{name: "bare selector range", query: "sum(m)", want: "sum(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0))"},
+		{name: "bare selector range", query: "sum(m)", want: "sum(__snuffle_default_rollup(m[615000ms], 0, 15000, 300000, 0))"},
 		{name: "bare selector instant reads the lookback only", query: "m", instant: true, want: "__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)"},
 		{name: "counter keeps explicit window", query: "rate(m[1m])", want: "__snuffle_rate(m[360000ms], 60000, 15000, 300000, 0)"},
 		{name: "timestamp keeps its selector", query: "timestamp(m)", want: "timestamp(m)"},
 		{name: "timestamp with offset keeps its selector", query: "timestamp(m offset 1m)", want: "timestamp(m offset 60000ms)"},
 		{name: "absent keeps its selector", query: `absent(m{job="x"})`, want: `absent(m{job="x"})`},
-		{name: "absent wraps inner expressions", query: "absent(sum(m))", want: "absent(sum(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0)))"},
-		{name: "prometheus function unknown to metricsql", query: "histogram_count(m)", want: "histogram_count(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0))"},
+		{name: "absent wraps inner expressions", query: "absent(sum(m))", want: "absent(sum(__snuffle_default_rollup(m[615000ms], 0, 15000, 300000, 0)))"},
+		{name: "prometheus function unknown to metricsql", query: "histogram_count(m)", want: "histogram_count(__snuffle_default_rollup(m[615000ms], 0, 15000, 300000, 0))"},
 		{name: "unknown function with spaces and nested call", query: "histogram_sum (rate(m[5m]))", want: "histogram_sum(__snuffle_rate(m[600000ms], 300000, 15000, 300000, 0))"},
 		{name: "zero argument prometheus function", query: "pi()", want: "pi()"},
-		{name: "function name inside a string", query: `label_replace(m, "a", "info(", "b", ".*")`, want: `label_replace(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0), "a", "info(", "b", ".*")`},
+		{name: "function name inside a string", query: `label_replace(m, "a", "info(", "b", ".*")`, want: `label_replace(__snuffle_default_rollup(m[615000ms], 0, 15000, 300000, 0), "a", "info(", "b", ".*")`},
 		{name: "rollup argument index", query: "hoeffding_bound_lower(0.9, m[5m])", want: "hoeffding_bound_lower(0.9, m[300000ms])", metricsQLOnly: true},
 		{name: "quantile rollup argument index", query: "quantile_over_time(0.9, m)", want: "quantile_over_time(0.9, m[15000ms])"},
-		{name: "subquery uses its own step", query: "rate(sum(m)[5m:1m])", want: "__snuffle_rate(sum(__snuffle_default_rollup(m[360000ms], 0, 60000, 300000, 0))[600000ms:60000ms], 300000, 15000, 300000, 0)"},
+		{name: "subquery uses its own step", query: "rate(sum(m)[5m:1m])", want: "__snuffle_rate(sum(__snuffle_default_rollup(m[660000ms], 0, 60000, 300000, 0))[600000ms:60000ms], 300000, 15000, 300000, 0)"},
 		{name: "subquery step units resolve against the subquery step", query: "max_over_time(rate(m)[1h:1m])", instant: true, want: "max_over_time(__snuffle_rate(m[360000ms], 0, 60000, 300000, 0)[3600000ms:60000ms])"},
 		{name: "numeric argument becomes a vector", query: "abs(-1)", want: "abs(vector(-1))"},
 		{name: "or with a number uses a vector", query: "sum(m) or 0", instant: true, want: "sum(__snuffle_default_rollup(m[300000ms], 0, 15000, 300000, 1)) or vector(0)"},
@@ -71,7 +71,7 @@ func TestPrepareMetricsQLQueryRunningSum(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
 	}
-	if !prepared.runningSum || prepared.query != "sum(__snuffle_default_rollup(m[315000ms], 0, 15000, 300000, 0))" {
+	if !prepared.runningSum || prepared.query != "sum(__snuffle_default_rollup(m[615000ms], 0, 15000, 300000, 0))" {
 		t.Fatalf("unexpected result: %#v", prepared)
 	}
 	for _, tc := range []struct{ query, wantErr string }{

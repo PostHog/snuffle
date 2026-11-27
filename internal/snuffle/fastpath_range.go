@@ -36,7 +36,7 @@ type rangeRollupCall struct {
 	window   int64 // Zero selects the MetricsQL automatic window.
 	step     int64
 	lookback int64
-	matrix   int64 // History before each step: window or step, plus lookback.
+	matrix   int64 // History before each step: window plus lookback, or step plus two lookbacks for a bare selector.
 	offset   int64 // Selector offset: samples are read this long before each step.
 }
 
@@ -220,13 +220,26 @@ func rangeOffsetSubqueryRollup(groups []rangeAggregateGroup, subquery rangeOffse
 	return out
 }
 
+// bareSelector reports whether this is the default_rollup of a bare selector.
+// Its matrix holds a second lookback of history for the sample interval only.
+func (c rangeRollupCall) bareSelector() bool {
+	return c.name == "default_rollup" && c.window == 0
+}
+
+// span returns how long after its timestamp a sample can apply to a step.
+func (c rangeRollupCall) span() int64 {
+	switch {
+	case c.bareSelector():
+		return c.step + c.lookback
+	case c.name == "default_rollup":
+		return c.matrix
+	}
+	return c.window
+}
+
 // expansion returns the maximum number of steps that can use one sample.
 func (c rangeRollupCall) expansion() int64 {
-	span := c.window
-	if c.name == "default_rollup" {
-		span = c.matrix
-	}
-	return (span+c.step-1)/c.step + 1
+	return (c.span()+c.step-1)/c.step + 1
 }
 
 // parseRangeRollupCall parses this rewritten form:
@@ -270,11 +283,11 @@ func parseRangeRollupCall(expr parser.Expr, step, lookback time.Duration) (range
 		return rangeRollupCall{}, false
 	}
 	out.matrix = matrix.Range.Milliseconds()
-	explicit := out.window
-	if explicit == 0 {
-		explicit = out.step
+	want := out.window + out.lookback
+	if out.bareSelector() {
+		want = defaultRollupHistory(step, lookback).Milliseconds()
 	}
-	if out.matrix != explicit+out.lookback {
+	if out.matrix != want {
 		return rangeRollupCall{}, false
 	}
 	selector, ok := matrix.VectorSelector.(*parser.VectorSelector)
@@ -345,7 +358,8 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 	// A sample applies when ts <= t_i and t_i < ts + span.
 	span := "window_ms"
 	if defaultRollup {
-		span = "least(" + matrix + ", ifNull(next_ts - ts, " + matrix + "))"
+		applies := strconv.FormatInt(call.span(), 10)
+		span = "least(" + applies + ", ifNull(next_ts - ts, " + applies + "))"
 	}
 	steps := fmt.Sprintf(
 		"SELECT series_id, max_prev, window_ms, ts, v, prev_ts, prev_v, next_ts, next_v, idx, %[1]s + (toInt64(idx) - 1) * %[2]s AS t_i "+

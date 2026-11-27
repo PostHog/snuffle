@@ -576,13 +576,23 @@ func (r metricsQLRewriter) rewriteFunc(e *metricsql.FuncExpr, step time.Duration
 	if len(e.Args) != 1 || e.KeepMetricNames {
 		return fmt.Errorf("%s requires one series argument; keep_metric_names is not supported", e.Name)
 	}
-	if window > time.Duration(math.MaxInt64)-r.lookback {
+	if window > time.Duration(math.MaxInt64)-2*r.lookback {
 		return fmt.Errorf("the query window is too large")
 	}
+	_, raw := roll.Expr.(*metricsql.MetricExpr)
 	switch {
 	case e.Name == "default_rollup" && instant && implicit:
 		// A bare selector in an instant query reads only the lookback window.
 		roll.Window = metricsQLDuration(r.lookback)
+	case e.Name == "default_rollup" && implicit && raw:
+		// A bare selector in a range query keeps its last sample for the
+		// sample interval, up to the lookback. A series written about once
+		// per lookback has a single sample in step + lookback at most steps,
+		// so the interval fell back to the step (ENG-029). Over two lookbacks
+		// it has two samples whenever its last sample is within the lookback.
+		// A lone sample still falls back to the step, as in VictoriaMetrics,
+		// so a stopped series ends as it does there.
+		roll.Window = metricsQLDuration(defaultRollupHistory(window, r.lookback))
 	default:
 		// Fetch history before the window for the previous sample and
 		// the sample interval. Explicit windows keep their original size.
@@ -658,6 +668,12 @@ func (r metricsQLRewriter) resolveRollupDurations(e *metricsql.RollupExpr, step 
 		return 0, fmt.Errorf("the subquery step must be at least 1ms")
 	}
 	return childStep, nil
+}
+
+// defaultRollupHistory is the matrix range of a bare selector in a range
+// query: the step and two lookbacks.
+func defaultRollupHistory(step, lookback time.Duration) time.Duration {
+	return step + 2*lookback
 }
 
 func metricsQLDuration(d time.Duration) *metricsql.DurationExpr {
