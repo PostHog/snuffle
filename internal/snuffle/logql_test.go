@@ -538,6 +538,9 @@ func TestLogQLSQLOuterAggregationPlans(t *testing.T) {
 		`topk(3, count by (a) (sum by (a, b) (count_over_time({service_name="x"} [1h]))))`,
 		// the inner pipeline has no SQL form
 		`count(sum by (a) (count_over_time({service_name="x"} | line_format "{{.a}}" [1h])))`,
+		// avg per stream, then sum by pod: SQL would average across a pod's streams
+		`max(sum by (pod) (avg_over_time({service_name="x"} | json | unwrap latency [5m])))`,
+		`sum by (pod) (avg_over_time({service_name="x"} | json | unwrap latency [5m]))`,
 	} {
 		expr, err := parseLogQL(query)
 		if err != nil {
@@ -546,6 +549,19 @@ func TestLogQLSQLOuterAggregationPlans(t *testing.T) {
 		if _, ok := buildLogQLMetricSQLPlan(cfg, expr); ok {
 			t.Errorf("%s was pushed to SQL", query)
 		}
+	}
+}
+
+func TestLogQLSQLSumOverMatchingInnerGrouping(t *testing.T) {
+	cfg := Config{LogSchemaLayout: string(logSchemaLayoutPostHog)}
+	// the inner by (pod) leaves one series per pod, so the outer sum by (pod)
+	// is the identity and SQL's per-group average matches Loki
+	expr, err := parseLogQL(`sum by (pod) (avg_over_time({service_name="x"} | json | unwrap latency [5m]) by (pod))`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := buildLogQLMetricSQLPlan(cfg, expr); !ok {
+		t.Fatal("sum by over avg_over_time with the same inner grouping was not pushed to SQL")
 	}
 }
 
