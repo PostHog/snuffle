@@ -360,6 +360,105 @@ FROM numbers(132000)`, start.Unix(), teamID)); err != nil {
 	})
 }
 
+// TestLogQLSQLMatchesEngineOnTopKAndOuterAggregations runs metric queries
+// that compile to SQL and compares every point with the Go engine over the
+// same raw lines: a comparison on topk filters after ranking, and an outer
+// aggregation without by () over a grouped range aggregation is one total.
+func TestLogQLSQLMatchesEngineOnTopKAndOuterAggregations(t *testing.T) {
+	if os.Getenv("SNUFFLE_E2E") != "1" {
+		t.Skip("set SNUFFLE_E2E=1 to run the ClickHouse e2e test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	const teamID = 44
+	cfg, client := newLogQLPostHogE2E(t, ctx)
+	cfg.TeamID = teamID
+
+	// One line every 2s for an hour. Every 5m window holds 50/40/30/20/10
+	// lines of pods p0..p4, so topk has no ties.
+	start := time.Now().UTC().Truncate(time.Hour).Add(-2 * time.Hour)
+	end := start.Add(time.Hour)
+	if err := client.Exec(ctx, fmt.Sprintf(`INSERT INTO logs34 (team_id, original_expiry_timestamp, uuid, timestamp, observed_timestamp, body, severity_text, service_name, resource_attributes, attributes_map_str)
+WITH
+    number AS n,
+    toDateTime64(%d, 6, 'UTC') + toIntervalSecond(n * 2 + 1) AS ts,
+    concat('p', toString(multiIf(n %% 15 < 5, 0, n %% 15 < 9, 1, n %% 15 < 12, 2, n %% 15 < 14, 3, 4))) AS pod
+SELECT %d, now() + toIntervalDay(30), toString(n), ts, ts, 'handled', 'info', 'api',
+    map('service.name', 'api'),
+    map('pod__str', pod, 'x__str', toString(n %% 2), 'v__str', toString(n %% 7 + 1))
+FROM numbers(1800)`, start.Unix(), teamID)); err != nil {
+		t.Fatalf("seed logs: %v", err)
+	}
+
+	server := newServer(cfg)
+	mux := http.NewServeMux()
+	server.routes(mux)
+	api := httptest.NewServer(mux)
+	defer api.Close()
+
+	const s = `{service_name="api"}`
+	const counts = `sum by (pod) (count_over_time(` + s + ` [5m]))`
+	step := 5 * time.Minute
+	for _, query := range []string{
+		`topk(2, ` + counts + `) < 45`,
+		`count(topk(2, ` + counts + `) < 45)`,
+		`bottomk(2, ` + counts + `) > 15`,
+		`sum(count_over_time(` + s + ` [5m]))`,
+		`max(` + counts + `)`,
+		`sum(sum_over_time(` + s + ` | unwrap v [5m]) by (pod))`,
+		`max(sum(sum_over_time(` + s + ` | unwrap v [5m]) by (pod)))`,
+		`count(sum(sum_over_time(` + s + ` | unwrap v [5m]) by (pod)))`,
+		`sum(avg_over_time(` + s + ` | unwrap v [5m]) by (pod))`,
+		`sum by (pod) (max_over_time(` + s + ` | unwrap v [5m]) by (pod, x))`,
+	} {
+		t.Run(query, func(t *testing.T) {
+			expr, err := parseLogQL(query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, ok := buildLogQLMetricSQLPlan(cfg, expr); !ok {
+				t.Fatal("query does not compile to SQL")
+			}
+			fetchStart, fetchEnd := logQLMetricFetchBounds(expr, start.UnixNano(), end.UnixNano())
+			rows, err := server.queryLogQLMetricRows(ctx, expr, fetchStart, fetchEnd)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[string]float64{}
+			for _, series := range evaluateLogQLRangeMetric(expr, rows, start.UnixNano(), end.UnixNano(), step) {
+				for _, point := range series.Values {
+					value, err := strconv.ParseFloat(point[1].(string), 64)
+					if err != nil {
+						t.Fatal(err)
+					}
+					want[logQLReferenceKey(series.Metric, int64(point[0].(float64)))] = value
+				}
+			}
+			if len(want) == 0 {
+				t.Fatal("engine returned no points")
+			}
+			data := apiGetForTeam[queryDataDTO](t, api.URL, teamID, "/loki/api/v1/query_range", url.Values{
+				"query": {query},
+				"start": {strconv.FormatInt(start.Unix(), 10)},
+				"end":   {strconv.FormatInt(end.Unix(), 10)},
+				"step":  {"300"},
+			})
+			got := map[string]float64{}
+			for _, series := range data.Result {
+				for _, point := range series.Values {
+					value, err := strconv.ParseFloat(sampleString(point), 64)
+					if err != nil {
+						t.Fatal(err)
+					}
+					got[logQLReferenceKey(series.Metric, int64(point[0].(float64)))] = value
+				}
+			}
+			assertLogQLSeriesEqual(t, got, want)
+		})
+	}
+}
+
 // newLogQLPostHogE2E creates a database with the PostHog logs schema, dropped
 // when the test ends, and a config pointing at it.
 func newLogQLPostHogE2E(t *testing.T, ctx context.Context) (Config, *ClickHouseClient) {

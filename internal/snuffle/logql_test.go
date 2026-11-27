@@ -1661,3 +1661,42 @@ func TestLogQLWindowFanoutSQLCapsRepeatsAtPointCount(t *testing.T) {
 		t.Fatalf("fanout = %s, want window/step when under the point count", sql)
 	}
 }
+
+func TestLogQLSQLPlanForSumOverRangeAggregations(t *testing.T) {
+	tests := []struct {
+		query      string
+		wantPlan   bool
+		wantOuters int
+		wantTopK   bool
+	}{
+		// distributive, outer labels within the range grouping: one pass
+		{`sum by (pod) (sum_over_time({app="x"} | json | unwrap v [5m]) by (pod))`, true, 0, false},
+		{`sum(count_over_time({app="x"} [5m]) by (pod))`, true, 0, false},
+		{`topk(2, sum by (pod) (sum_over_time({app="x"} | json | unwrap v [5m]) by (pod)))`, true, 0, true},
+		// outer labels outside the range grouping: per-series stage first
+		{`sum by (x) (sum_over_time({app="x"} | json | unwrap v [5m]) by (pod))`, true, 1, false},
+		// non-distributive and grouped: per-series stage first
+		{`sum(avg_over_time({app="x"} | json | unwrap v [5m]) by (pod))`, true, 1, false},
+		// non-distributive and ungrouped: the engine evaluates it per stream
+		{`sum by (pod) (avg_over_time({app="x"} | json | unwrap v [5m]))`, false, 0, false},
+		{`sum(max_over_time({app="x"} | json | unwrap v [5m]))`, false, 0, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.query, func(t *testing.T) {
+			expr, err := parseLogQL(tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			plan, ok := buildLogQLMetricSQLPlan(Config{}, expr)
+			if ok != tt.wantPlan {
+				t.Fatalf("plan ok = %v, want %v", ok, tt.wantPlan)
+			}
+			if !ok {
+				return
+			}
+			if len(plan.outer) != tt.wantOuters || plan.hasTopK != tt.wantTopK {
+				t.Fatalf("outer stages = %d, topk = %v; want %d, %v", len(plan.outer), plan.hasTopK, tt.wantOuters, tt.wantTopK)
+			}
+		})
+	}
+}

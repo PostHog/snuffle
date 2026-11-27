@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -98,7 +99,11 @@ func buildLogQLMetricSQLPlan(cfg Config, expr *logQLExpr) (*logQLMetricSQLPlan, 
 	var plan *logQLMetricSQLPlan
 	if expr.rangeAgg != nil {
 		plan = buildLogQLRangeAggSQLPlan(cfg, expr.rangeAgg, nil, "")
-	} else if expr.aggregation != nil && expr.aggregation.expr != nil && expr.aggregation.expr.rangeAgg != nil && expr.aggregation.expr.comparison == nil {
+	} else if expr.aggregation != nil && expr.aggregation.expr != nil && expr.aggregation.expr.rangeAgg != nil && logQLSQLDirectSumOverRangeAgg(expr.aggregation.grouping, expr.aggregation.expr.rangeAgg) && expr.aggregation.expr.comparison == nil {
+		// Only a sum over a distributive range aggregation is computed in
+		// one pass. Anything else (sum(avg_over_time(...) by (pod)))
+		// takes the outer-aggregation branch below, which aggregates per
+		// range grouping first, then by the outer grouping.
 		switch expr.aggregation.fn {
 		case "sum":
 		default:
@@ -138,11 +143,40 @@ func buildLogQLMetricSQLPlan(cfg Config, expr *logQLExpr) (*logQLMetricSQLPlan, 
 	return plan, plan != nil
 }
 
+// logQLSQLDirectSumOverRangeAgg reports whether sum by (outer) (rangeAgg)
+// equals the range aggregation computed once, grouped by the outer labels.
+// That holds for functions whose per-series values add up to the pooled
+// value, when the outer labels are among the range aggregation's own.
+func logQLSQLDirectSumOverRangeAgg(outer *logQLGrouping, rangeAgg *logQLRangeAggregation) bool {
+	switch rangeAgg.fn {
+	case "count_over_time", "rate", "bytes_over_time", "bytes_rate", "sum_over_time":
+	default:
+		return false
+	}
+	if rangeAgg.grouping == nil {
+		return true
+	}
+	if rangeAgg.grouping.without || (outer != nil && outer.without) {
+		return false
+	}
+	if outer == nil {
+		return true
+	}
+	for _, label := range outer.labels {
+		if !slices.Contains(rangeAgg.grouping.labels, label) {
+			return false
+		}
+	}
+	return true
+}
+
 func buildLogQLRangeAggSQLPlan(cfg Config, rangeAgg *logQLRangeAggregation, grouping *logQLGrouping, outerAgg string) *logQLMetricSQLPlan {
 	if rangeAgg == nil {
 		return nil
 	}
-	if grouping == nil {
+	if outerAgg == "" {
+		// with an outer aggregation, grouping is its by (...) and nil is
+		// one total; the range aggregation's own grouping never stands in
 		grouping = rangeAgg.grouping
 	}
 	if grouping != nil && grouping.without {
@@ -805,15 +839,16 @@ func logQLMetricResultSQL(sql string, plan *logQLMetricSQLPlan) string {
 		return sql
 	}
 	current := sql
-	if plan.comparison != nil {
-		current = "SELECT * FROM (" + current + ") WHERE " + logQLSQLComparisonCondition(plan.comparison)
-	}
 	if plan.hasTopK {
 		direction := "DESC"
 		if !plan.topKIsTop {
 			direction = "ASC"
 		}
 		current = fmt.Sprintf("SELECT * FROM (SELECT * FROM (%s) ORDER BY eval_ns ASC, value %s LIMIT %d BY eval_ns)", current, direction, plan.topK)
+	}
+	// topk(k, x) < n ranks first, then filters, as the engine does
+	if plan.comparison != nil {
+		current = "SELECT * FROM (" + current + ") WHERE " + logQLSQLComparisonCondition(plan.comparison)
 	}
 	for _, outer := range plan.outer {
 		inner := []string{"eval_ns"}
