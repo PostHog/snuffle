@@ -129,6 +129,9 @@ func TestEndToEndClickHouse(t *testing.T) {
 	t.Run("binary operators keep the lookback", func(t *testing.T) {
 		assertBinaryOpLookback(t, cfg, api.URL)
 	})
+	t.Run("replaced series end at their stale marker", func(t *testing.T) {
+		assertReplacedSeriesStaleness(t, cfg)
+	})
 	if !cfg.postHogSchemaLayout() {
 		assertMetricsQLRunningSumQuery(t, api.URL)
 		assertMetricsQLSumOverTimeSubqueryQuery(t, api.URL)
