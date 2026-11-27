@@ -237,7 +237,7 @@ func (evaluator *compactHistogramEvaluator) advance(ctx context.Context, until i
 				if evaluator.delta {
 					value = evaluator.deltaWindowSum(index, firstPoint, window)
 				} else {
-					value = metricsQLCounterValue(plan.function, evaluator.history[index], firstPoint, start, maxPrevious, plan.lookback)
+					value = metricsQLCounterValue(plan.function, evaluator.history[index], firstPoint, start, maxPrevious, plan.lookback, math.NaN())
 				}
 				if !math.IsNaN(value) {
 					column[evaluator.grid].add(value)

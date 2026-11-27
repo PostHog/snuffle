@@ -132,7 +132,11 @@ func (s *Server) evalRangeQueryBackends(ctx context.Context, prepared metricsQLQ
 		}
 		return rangeQueryResult{backend: "fastpath_range", floats: true, groups: groups}, nil
 	}
-	return s.evalRangeEngine(ctx, "prometheus", s.queryable, prepared.query, prepared.runningSum, start, end, step)
+	query := prepared.query
+	if expr, err := s.parser.ParseExpr(query); err == nil && metricsQLWithNextSample(expr, end) {
+		query = expr.String()
+	}
+	return s.evalRangeEngine(ctx, "prometheus", s.queryable, query, prepared.runningSum, start, end, step)
 }
 
 // evalRangeEngine evaluates query with the PromQL engine over queryable.

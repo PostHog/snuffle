@@ -64,7 +64,8 @@ func init() {
 	rollupArgTypes := []parser.ValueType{parser.ValueTypeMatrix, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar, parser.ValueTypeScalar}
 	for _, name := range metricsQLCounterFunctions {
 		internalName := metricsQLInternalPrefix + name
-		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: rollupArgTypes, ReturnType: parser.ValueTypeVector}
+		// metricsQLWithNextSample adds an optional sixth argument.
+		parser.Functions[internalName] = &parser.Function{Name: internalName, ArgTypes: append(slices.Clone(rollupArgTypes), parser.ValueTypeScalar), Variadic: 1, ReturnType: parser.ValueTypeVector}
 		promql.FunctionCalls[internalName] = metricsQLRollup(name, promql.FunctionCalls[name])
 	}
 	for name, histogramName := range metricsQLPureCounterFunctions {
@@ -704,7 +705,21 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 		step := int64(vectors[1][0].F)
 		lookback := int64(vectors[2][0].F)
 		instant := vectors[3][0].F != 0
-		points := matrix[0].Floats
+		// metricsQLWithNextSample moved the selector a lookback ahead.
+		ahead := int64(0)
+		if len(vectors) > 4 {
+			ahead = lookback
+		}
+		end := enh.Ts - vs.Offset.Milliseconds() - ahead
+		if vs.Timestamp != nil {
+			end = *vs.Timestamp - vs.OriginalOffset.Milliseconds()
+		}
+		input, after := seriesSplit(matrix[0], end)
+		next := math.NaN()
+		if ahead > 0 && len(after.Floats) > 0 && after.Floats[0].T <= int64(vectors[4][0].F) {
+			next = after.Floats[0].F
+		}
+		points := input.Floats
 		maxPrev := step
 		if !instant {
 			maxPrev = metricsQLSampleInterval(points, step)
@@ -721,13 +736,9 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 				window = min(max(step, maxPrev), lookback)
 			}
 		}
-		end := enh.Ts - vs.Offset.Milliseconds()
-		if vs.Timestamp != nil {
-			end = *vs.Timestamp - vs.OriginalOffset.Milliseconds()
-		}
 		start := end - window
 		if metricsQLDeltaWindowFunctions[name] {
-			if meta := deltaSeriesOf(vs, matrix[0].Metric); meta != nil {
+			if meta := deltaSeriesOf(vs, input.Metric); meta != nil {
 				value, ok := meta.deltaWindowSum(start, end)
 				if !ok {
 					return enh.Out, nil
@@ -738,7 +749,7 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 				return append(enh.Out, promql.Sample{F: value}), nil
 			}
 		}
-		series := seriesAfter(matrix[0], start)
+		series := seriesAfter(input, start)
 		if name == "default_rollup" {
 			if len(series.Floats)+len(series.Histograms) == 0 || endsWithStaleMarker(series) {
 				return enh.Out, nil
@@ -749,15 +760,81 @@ func metricsQLRollup(name string, histogramFallback promql.FunctionCall) promql.
 			// Native histograms retain the existing Prometheus calculations.
 			copySelector := *ms
 			copySelector.Range = time.Duration(window) * time.Millisecond
+			if ahead > 0 {
+				// Prometheus reads the window end from the selector offset.
+				original := *vs
+				original.Offset += time.Duration(ahead) * time.Millisecond
+				copySelector.VectorSelector = &original
+			}
 			return histogramFallback(nil, promql.Matrix{series}, parser.Expressions{&copySelector}, enh)
 		}
 		first := len(points) - len(series.Floats)
-		value := metricsQLCounterValue(name, points, first, start, maxPrev, lookback)
+		value := metricsQLCounterValue(name, points, first, start, maxPrev, lookback, next)
 		if math.IsNaN(value) {
 			return enh.Out, nil
 		}
 		return append(enh.Out, promql.Sample{F: value}), nil
 	}
+}
+
+// metricsQLWithNextSample lets increase and delta in a range query see the
+// sample after each window. VictoriaMetrics uses it to decide whether a
+// series' first sample starts the counter (realNextValue in rollupDelta), and
+// reads no sample after the query end. Each selector reads a lookback past
+// the step, and a sixth argument holds the last time the next sample may have.
+// ponytail: looks one lookback ahead; a series scraped less often keeps the
+// old rule for its first sample.
+func metricsQLWithNextSample(expr parser.Expr, end time.Time) bool {
+	changed := false
+	defaultRollup := metricsQLInternalPrefix + "default_rollup"
+	parser.Inspect(expr, func(node parser.Node, path []parser.Node) error {
+		call, ok := node.(*parser.Call)
+		if ok && call.Func == parser.Functions[defaultRollup] {
+			// The caller prints expr, and this function's name is the engine name last_over_time.
+			named := *call.Func
+			named.Name = defaultRollup
+			call.Func = &named
+		}
+		if !ok || len(call.Args) != 5 || (call.Func.Name != metricsQLInternalPrefix+"increase" && call.Func.Name != metricsQLInternalPrefix+"delta") {
+			return nil
+		}
+		matrix, ok := call.Args[0].(*parser.MatrixSelector)
+		if !ok {
+			return nil
+		}
+		vs, ok := matrix.VectorSelector.(*parser.VectorSelector)
+		lookback, isLookback := call.Args[3].(*parser.NumberLiteral)
+		instant, isInstant := call.Args[4].(*parser.NumberLiteral)
+		if !ok || !isLookback || !isInstant || instant.Val != 0 || vs.Timestamp != nil || vs.StartOrEnd != 0 {
+			return nil
+		}
+		last := end.UnixMilli() - vs.OriginalOffset.Milliseconds()
+		for _, parent := range path {
+			if subquery, ok := parent.(*parser.SubqueryExpr); ok {
+				if subquery.Timestamp != nil || subquery.StartOrEnd != 0 {
+					return nil
+				}
+				last -= subquery.OriginalOffset.Milliseconds()
+			}
+		}
+		ahead := time.Duration(lookback.Val) * time.Millisecond
+		vs.OriginalOffset -= ahead
+		matrix.Range += ahead
+		call.Args = append(call.Args, &parser.NumberLiteral{Val: float64(last)})
+		changed = true
+		return nil
+	})
+	return changed
+}
+
+// seriesSplit splits series into the points at or before end and those after.
+func seriesSplit(series promql.Series, end int64) (promql.Series, promql.Series) {
+	after := series
+	floats := sort.Search(len(series.Floats), func(i int) bool { return series.Floats[i].T > end })
+	histograms := sort.Search(len(series.Histograms), func(i int) bool { return series.Histograms[i].T > end })
+	series.Floats, after.Floats = series.Floats[:floats], series.Floats[floats:]
+	series.Histograms, after.Histograms = series.Histograms[:histograms], series.Histograms[histograms:]
+	return series, after
 }
 
 // seriesAfter keeps the points after start. Range windows are left-open.
@@ -838,7 +915,8 @@ func metricsQLSampleInterval(points []promql.FPoint, fallback int64) int64 {
 	}
 }
 
-func metricsQLCounterValue(name string, points []promql.FPoint, first int, start, maxPrev, lookback int64) float64 {
+// next is the series' first sample after the window, or NaN.
+func metricsQLCounterValue(name string, points []promql.FPoint, first int, start, maxPrev, lookback int64, next float64) float64 {
 	prev := first - 1
 	if name == "increase_prometheus" {
 		// Prometheus ignores the sample before the window.
@@ -868,6 +946,8 @@ func metricsQLCounterValue(name string, points []promql.FPoint, first int, start
 		var delta float64
 		if first+1 < len(points) {
 			delta = points[first+1].F - points[first].F
+		} else if !math.IsNaN(next) {
+			delta = next - points[first].F
 		}
 		if math.Abs(baseline) < 10*(math.Abs(delta)+1) {
 			baseline = 0
