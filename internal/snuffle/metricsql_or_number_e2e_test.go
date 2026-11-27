@@ -57,6 +57,16 @@ func assertOrWithNumber(t *testing.T, baseURL string) {
 	}
 }
 
+// assertOffsetAfterNumber checks that offset after a number binds to the
+// number and leaves it unchanged, as in VictoriaMetrics.
+func assertOffsetAfterNumber(t *testing.T, baseURL string) {
+	t.Helper()
+	running := `sum(` + e2eRunningMetric + `)`
+	rate := `sum(rate(` + e2eRunningMetric + `[30s]))`
+	assertSameResult(t, baseURL, running+` * 60 offset 20s`, running+` * 60`)
+	assertSameResult(t, baseURL, rate+` * 60 offset 7d`, rate+` * 60`)
+}
+
 // assertSameResult checks that query returns the same single series values as
 // reference, both instant and over a range.
 func assertSameResult(t *testing.T, baseURL, query, reference string) {

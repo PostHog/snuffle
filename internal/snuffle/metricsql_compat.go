@@ -879,6 +879,11 @@ func metricsQLDefaultSelectors(expr metricsql.Expr) metricsql.Expr {
 	case *metricsql.MetricExpr:
 		return &metricsql.FuncExpr{Name: "default_rollup", Args: []metricsql.Expr{e}}
 	case *metricsql.RollupExpr:
+		if number, ok := e.Expr.(*metricsql.NumberExpr); ok && e.Window == nil && !e.ForSubquery() {
+			// VictoriaMetrics binds `60 offset 7d` to the number and leaves
+			// it unchanged. Prometheus rejects offset on a number.
+			return number
+		}
 		if _, raw := e.Expr.(*metricsql.MetricExpr); !raw {
 			e.Expr = metricsQLDefaultSelectors(e.Expr)
 		}
