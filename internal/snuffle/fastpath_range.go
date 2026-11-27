@@ -374,11 +374,12 @@ func rangeRollupSQL(cfg Config, plan *postHogQueryPlan, call rangeRollupCall, ev
 		// MetricsQL treats a drop below one eighth of the previous value as a partial reset.
 		diff = "if(v >= p_v, v - p_v, if((p_v - v) * 8 < p_v, 0, v))"
 	}
-	// Without a valid previous sample, increase and delta start at zero when the value appears to start a new counter.
+	// Without a valid previous sample, increase and delta start at zero when the value appears to start a new counter:
+	// it is below ten times the step to the next sample, even one after the window, as in VictoriaMetrics.
 	// rate starts at the first sample.
 	first := "0"
 	if call.windowTotal() {
-		first = "if(abs(v) < 10 * (abs(if(ifNull(next_ts, t_i + 1) <= t_i, ifNull(next_v, v) - v, 0)) + 1), v, 0)"
+		first = "if(abs(v) < 10 * (abs(ifNull(next_v, v) - v) + 1), v, 0)"
 	}
 	// increase and delta use a previous sample that is inside the matrix.
 	// The sample must also be inside the lookback from the window start.

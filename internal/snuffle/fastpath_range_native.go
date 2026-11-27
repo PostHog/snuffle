@@ -280,8 +280,13 @@ func (p *nativeRangePlan) rollup(expr *parser.Call, sumContributions bool) (stri
 
 func (p *nativeRangePlan) windowRollup(samples string, call rangeRollupCall) string {
 	points := (p.end-p.start)/p.step + 1
-	expanded := p.add(fmt.Sprintf("SELECT id, sample_ts, sample_value, idx, toInt64(%d) + toInt64(idx)*%d AS ts FROM %s ARRAY JOIN range(toUInt64(greatest(0, ceil((sample_ts + %d - %d) / %d))), toUInt64(greatest(0, least(%d, ceil((sample_ts + %d + %d - %d) / %d))))) AS idx", p.start, p.step, samples, call.offset, p.start, p.step, points, call.offset, call.matrix, p.start, p.step))
-	arrays := p.add(fmt.Sprintf("SELECT id, ts, ts - %d AS eval_ts, arraySort(x -> x.1, groupArray((sample_ts, sample_value))) AS points FROM %s GROUP BY id, ts", call.offset, expanded))
+	expanded := p.add(fmt.Sprintf("SELECT *, toInt64(%d) + toInt64(idx)*%d AS ts FROM %s ARRAY JOIN range(toUInt64(greatest(0, ceil((sample_ts + %d - %d) / %d))), toUInt64(greatest(0, least(%d, ceil((sample_ts + %d + %d - %d) / %d))))) AS idx", p.start, p.step, samples, call.offset, p.start, p.step, points, call.offset, call.matrix, p.start, p.step))
+	sample := "(sample_ts, sample_value)"
+	if call.windowTotal() {
+		// totalRollup's samples carry their next sample's value.
+		sample = "(sample_ts, sample_value, next_value)"
+	}
+	arrays := p.add(fmt.Sprintf("SELECT id, ts, ts - %d AS eval_ts, arraySort(x -> x.1, groupArray(%s)) AS points FROM %s GROUP BY id, ts", call.offset, sample, expanded))
 	return p.rollupValues(arrays, call)
 }
 
@@ -316,7 +321,8 @@ func (p *nativeRangePlan) rollupValues(source string, call rangeRollupCall) stri
 	}
 	baseline := "points[begin].2"
 	if call.windowTotal() {
-		baseline = "if(has_prev, points[begin].2, if(abs(current[1].2) < 10*(abs(if(length(current)>1, current[2].2-current[1].2, 0))+1), 0, current[1].2))"
+		// current[1].3 is the sample after current[1], in this window or after it.
+		baseline = "if(has_prev, points[begin].2, if(abs(current[1].2) < 10*(abs(current[1].3-current[1].2)+1), 0, current[1].2))"
 	}
 	if call.name == "idelta" {
 		baseline = "if(length(points)-begin=0, 0, points[begin].2)"
@@ -344,14 +350,16 @@ func (p *nativeRangePlan) totalRollup(samples string, call rangeRollupCall, sumC
 	if call.counter() {
 		diff = "if(v>=prev_v,v-prev_v,if((prev_v-v)*8<prev_v,0,v))"
 	}
-	baseline := "if(abs(v)<10*(abs(if(next_ts<=eval_ts,next_v-v,0))+1),v,0)"
+	// The next sample may be after the window, as in VictoriaMetrics.
+	baseline := "if(abs(v)<10*(abs(if(next_ts<9223372036854775807,next_v-v,0))+1),v,0)"
 	contribution := fmt.Sprintf("if(prev_ts > eval_ts-%d, %s, %s)", call.matrix, diff, baseline)
 	fastSQL := "SELECT id, ts, " + contribution + " AS value FROM " + expanded
 	if !sumContributions {
 		fastSQL = "SELECT id, ts, sum(" + contribution + ") AS value FROM " + expanded + " GROUP BY id, ts"
 	}
 	fast := p.add(fastSQL)
-	sparse := p.add("SELECT id, sample.1 AS sample_ts, sample.2 AS sample_value FROM " + arrays + " ARRAY JOIN points AS sample WHERE long_gap")
+	// next_value is the series' following sample; the last sample uses its own value.
+	sparse := p.add("SELECT id, sample.1 AS sample_ts, sample.2 AS sample_value, next_value FROM " + arrays + " ARRAY JOIN points AS sample, arrayPushBack(arrayPopFront(arrayMap(x -> x.2, points)), points[-1].2) AS next_value WHERE long_gap")
 	exact := p.windowRollup(sparse, call)
 	return p.add("SELECT * FROM " + fast + " UNION ALL SELECT * FROM " + exact)
 }

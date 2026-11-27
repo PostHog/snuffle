@@ -150,10 +150,10 @@ func TestMetricsQLValueDoesNotAliasEngineMatrix(t *testing.T) {
 
 func TestMetricsQLCounterValueGuardsZeroDuration(t *testing.T) {
 	points := []promql.FPoint{{T: 1000, F: 1}, {T: 1000, F: 5}}
-	if got := metricsQLCounterValue("rate", points, 0, 0, 1000, 300000); !math.IsNaN(got) {
+	if got := metricsQLCounterValue("rate", points, 0, 0, 1000, 300000, math.NaN()); !math.IsNaN(got) {
 		t.Fatalf("rate over a zero duration = %v, want NaN", got)
 	}
-	if got := metricsQLCounterValue("increase", points, 0, 0, 1000, 300000); got != 5 {
+	if got := metricsQLCounterValue("increase", points, 0, 0, 1000, 300000, math.NaN()); got != 5 {
 		t.Fatalf("increase = %v, want 5", got)
 	}
 }
