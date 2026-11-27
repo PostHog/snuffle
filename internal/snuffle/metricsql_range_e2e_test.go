@@ -88,6 +88,18 @@ func assertMetricsQLRangeTopK(test *testing.T) {
 		add("topk_e2e_alloc", []string{"nodepool", "p3", "node", node}, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
 		add("topk_e2e_alloc", []string{"nodepool", "p4", "node", node}, nan, nan, nan, 3, 3, 3)
 	}
+	// For default: b has a gap and c starts late. The fallback has no c, a
+	// gap in b and an extra z.
+	add("default_e2e_depth", []string{"p", "a"}, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
+	add("default_e2e_depth", []string{"p", "b"}, 2, 2, 2, nan, nan, nan, nan, 2, 2, 2, 2)
+	add("default_e2e_depth", []string{"p", "c"}, nan, nan, nan, nan, nan, nan, 3, 3, 3, 3, 3)
+	add("default_e2e_fallback", []string{"p", "a"}, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7)
+	add("default_e2e_fallback", []string{"p", "b"}, 8, 8, 8, 8, 8, nan, nan, nan, 8, 8, 8)
+	add("default_e2e_fallback", []string{"p", "z"}, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9, 9)
+	add("default_e2e_cpu_seconds_total", []string{"name", "a", "tid", "1"}, 0, 6, 12, 18, 24, 30, 36, 42, 48, 54, 60)
+	add("default_e2e_cpu_seconds_total", []string{"name", "b", "tid", "2"}, nan, nan, nan, nan, nan, nan, 0, 12, 24, 36, 48)
+	add("default_e2e_cpu_seconds_total", []string{"name", "c", "tid", "3"}, 0, 3, 6, 9)
+	add("default_e2e_cpu_seconds_total", []string{"name", "d", "tid", "4"}, 0, 30, 60, nan, nan, nan, nan, 0, 30, 60, 90)
 	postRemoteWrite(test, api.URL, write)
 
 	// Results as sorted lines `{labels} minute:value ...`.
@@ -128,6 +140,13 @@ func assertMetricsQLRangeTopK(test *testing.T) {
 	const depth = `max by (partition) (topk_e2e_depth)`
 	const alloc = `sum by (nodepool) (topk_e2e_alloc)`
 	const ratio = `(` + depth + ` - 1) / (` + depth + ` - 1)`
+	const gapped = `max by (p) (default_e2e_depth)`
+	const fallback = `max by (p) (default_e2e_fallback)`
+	const missing = `max by (p) (default_e2e_missing)`
+	const cpu = `sum by (name, tid) (rate(default_e2e_cpu_seconds_total[2m]))`
+	da := flat(`{p="a"}`, 1, 10, "1")
+	dc := flat(`{p="c"}`, 6, 10, "3")
+	cpuD := `{name="d", tid="4"} 1:0.5 2:0.5 3:0.5 4:0 5:0 6:0 7:0 8:0.5 9:0.5 10:0.5`
 
 	for query, want := range map[string][]string{
 		// The repros of ENG-006, with k above the series count.
@@ -148,11 +167,32 @@ func assertMetricsQLRangeTopK(test *testing.T) {
 		// d and e tie at 5. VictoriaMetrics keeps either, by its internal
 		// series order; Snuffle keeps the first by labels.
 		`topk_max(2, ` + depth + `)`: {b, d},
+
+		// default (ENG-009).
+		gapped + ` default 0`:                     {da, `{p="b"} 1:2 2:2 3:2 4:0 5:0 6:0 7:2 8:2 9:2 10:2`, `{p="c"}` + flat("", 1, 5, "0") + flat("", 6, 10, "3")},
+		gapped + ` default 0 + 1`:                 {da, `{p="b"} 1:2 2:2 3:2 4:1 5:1 6:1 7:2 8:2 9:2 10:2`, `{p="c"}` + flat("", 1, 5, "1") + flat("", 6, 10, "3")},
+		gapped + ` default ` + fallback:           {da, `{p="b"} 1:2 2:2 3:2 4:8 5:8 7:2 8:2 9:2 10:2`, dc},
+		gapped + ` default 0 or ` + fallback:      {da, `{p="b"} 1:2 2:2 3:2 4:8 5:8 7:2 8:2 9:2 10:2`, dc},
+		gapped + ` default sum(` + fallback + `)`: {da, `{p="b"} 1:2 2:2 3:2 4:24 5:24 6:16 7:2 8:2 9:2 10:2`, `{p="c"}` + flat("", 1, 5, "24") + flat("", 6, 10, "3")},
+		`default_e2e_depth{p="b"} default 0`:      {`{__name__="default_e2e_depth", p="b"} 1:2 2:2 3:2 4:0 5:0 6:0 7:2 8:2 9:2 10:2`},
+		missing + ` default 0`:                    {flat(`{}`, 1, 10, "0")},
+		missing + ` default ` + fallback:          {flat(`{p="a"}`, 1, 10, "7"), `{p="b"}` + flat("", 1, 5, "8") + flat("", 8, 10, "8"), flat(`{p="z"}`, 1, 10, "9")},
+		cpu + ` default 0`: {
+			flat(`{name="a", tid="1"}`, 1, 10, "0.1"), `{name="b", tid="2"}` + flat("", 1, 6, "0") + flat("", 7, 10, "0.2"),
+			`{name="c", tid="3"}` + flat("", 1, 4, "0.05") + flat("", 5, 10, "0"), cpuD,
+		},
+		// The repro of ENG-009.
+		`topk_avg(2, ` + cpu + ` default 0)`: {flat(`{name="a", tid="1"}`, 1, 10, "0.1"), cpuD},
 	} {
-		got := format(apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {query}, "start": {"1700000060"}, "end": {"1700000600"}, "step": {"60"}}).Result)
 		slices.Sort(want)
-		if !reflect.DeepEqual(got, want) {
-			test.Errorf("range %s\n got %q\nwant %q", query, got, want)
+		// The second pass reads the inner queries and the right side of
+		// default from the range cache; the ops must not change the cached
+		// series.
+		for pass := 1; pass <= 2; pass++ {
+			got := format(apiGet[queryDataDTO](test, api.URL, "/api/v1/query_range", url.Values{"query": {query}, "start": {"1700000060"}, "end": {"1700000600"}, "step": {"60"}}).Result)
+			if !reflect.DeepEqual(got, want) {
+				test.Errorf("range %s (pass %d)\n got %q\nwant %q", query, pass, got, want)
+			}
 		}
 	}
 
@@ -164,6 +204,9 @@ func assertMetricsQLRangeTopK(test *testing.T) {
 		`topk_min(1, ` + alloc + `)`:                         {`{nodepool="p2"} 5:9`},
 		`TOPK_MAX(1, ` + depth + `)`:                         {`{partition="d"} 5:5`},
 		`topk_max(10, ` + ratio + `)`:                        {`{partition="b"} 5:1`, `{partition="c"} 5:1`, `{partition="d"} 5:1`, `{partition="f"} 5:1`},
+		gapped + ` default 0`:                                {`{p="a"} 5:1`, `{p="b"} 5:2`},
+		missing + ` default 0`:                               {`{} 5:0`},
+		missing + ` default ` + fallback:                     {`{p="a"} 5:7`, `{p="b"} 5:8`, `{p="z"} 5:9`},
 	} {
 		result := apiGet[queryDataDTO](test, api.URL, "/api/v1/query", url.Values{"query": {query}, "time": {"1700000300"}})
 		if result.ResultType != "vector" {

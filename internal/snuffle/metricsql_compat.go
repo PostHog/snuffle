@@ -120,12 +120,23 @@ type metricsQLQuery struct {
 	// rangeOps transform the result of query over the whole range, innermost
 	// first, after runningSum and the range cache.
 	rangeOps []metricsQLRangeOp
+	// defaultQuery is the right side of an outermost `query default right`,
+	// in MetricsQL, and defaultRight its preparation. It fills the gaps of
+	// the result before the range ops.
+	defaultQuery string
+	defaultRight *metricsQLQuery
 }
 
 // prepareMetricsQLQuery expands MetricsQL syntax before either execution path.
 // Counter functions use separate names so Prometheus SQL optimizations cannot
 // replace their calculations with extrapolated PromQL results.
 func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, end time.Time) (metricsQLQuery, error) {
+	return prepareMetricsQLQueryDepth(query, step, lookback, start, end, 0)
+}
+
+// prepareMetricsQLQueryDepth prepares query, the right side of depth nested
+// default operators.
+func prepareMetricsQLQueryDepth(query string, step, lookback time.Duration, start, end time.Time, depth int) (metricsQLQuery, error) {
 	expr, err := metricsql.Parse(carryUnsupportedFunctions(query))
 	if err != nil {
 		return metricsQLQuery{}, err
@@ -157,6 +168,22 @@ func prepareMetricsQLQuery(query string, step, lookback time.Duration, start, en
 		// Like the argument of any aggregate, a range selector or subquery
 		// reads its last sample.
 		expr = metricsQLImplicitRollup(inner)
+	}
+	if be, ok := expr.(*metricsql.BinaryOpExpr); ok && strings.EqualFold(be.Op, "default") {
+		if be.GroupModifier.Op != "" || be.JoinModifier.Op != "" {
+			return metricsQLQuery{}, fmt.Errorf("default does not support on, ignoring, group_left or group_right")
+		}
+		// Each level parses the rest of the query again, so bound the nesting.
+		if depth >= maxRangeOps {
+			return metricsQLQuery{}, fmt.Errorf("default operators nest at most %d deep", maxRangeOps)
+		}
+		prepared.defaultQuery = string(be.Right.AppendString(nil))
+		right, err := prepareMetricsQLQueryDepth(prepared.defaultQuery, step, lookback, start, end, depth+1)
+		if err != nil {
+			return metricsQLQuery{}, err
+		}
+		prepared.defaultRight = &right
+		expr = be.Left
 	}
 	if fe, ok := expr.(*metricsql.FuncExpr); ok && fe.Name == "running_sum" {
 		if len(fe.Args) != 1 || fe.KeepMetricNames {
@@ -425,6 +452,9 @@ func (r metricsQLRewriter) rewrite(expr *metricsql.Expr, step time.Duration, ins
 		}
 		return r.rewriteArgs(e.Args, step, instant)
 	case *metricsql.BinaryOpExpr:
+		if strings.EqualFold(e.Op, "default") {
+			return fmt.Errorf("default is supported only as the outermost operator of a query or of the argument of topk_* and bottomk_*")
+		}
 		if strings.EqualFold(e.Op, "or") {
 			// MetricsQL reads a number in `x or 0` as a series without
 			// labels. Prometheus only accepts set operators between vectors.

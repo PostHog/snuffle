@@ -350,12 +350,15 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	queryStarted := time.Now()
-	if len(prepared.rangeOps) > 0 {
+	if prepared.hasRangeOps() {
 		// The range ops rank series on their points, which is the single
 		// point here, so evaluate a range of one step.
-		result, queryErr := s.evalRangeQuery(ctx, prepared, ts, ts, step)
+		evalQuery := func(_ string, prepared metricsQLQuery) (rangeQueryResult, *rangeQueryError) {
+			return s.evalRangeQuery(ctx, prepared, ts, ts, step)
+		}
+		result, queryErr := evalQuery(query, prepared)
 		if queryErr == nil {
-			result, queryErr = prepared.applyRangeOps(ctx, result)
+			result, queryErr = prepared.applyRangeOps(ctx, result, evalQuery)
 		}
 		recordQueryLogBackend(w, result.backend)
 		if queryErr != nil {
@@ -477,7 +480,10 @@ func (s *Server) handleQueryRange(w http.ResponseWriter, r *http.Request) {
 	queryStarted := time.Now()
 	result, cacheStatus, queryErr := s.cachedRangeQuery(ctx, query, prepared, start, end, step, r.Form.Get("nocache") == "1")
 	if queryErr == nil {
-		result, queryErr = prepared.applyRangeOps(ctx, result)
+		result, queryErr = prepared.applyRangeOps(ctx, result, func(query string, prepared metricsQLQuery) (rangeQueryResult, *rangeQueryError) {
+			result, _, err := s.cachedRangeQuery(ctx, query, prepared, start, end, step, r.Form.Get("nocache") == "1")
+			return result, err
+		})
 	}
 	recordQueryLogBackend(w, result.backend)
 	recordQueryLogPhase(w, "eval", time.Since(queryStarted))

@@ -25,13 +25,39 @@ type metricsQLRangeOp func(ctx context.Context, groups []rangeAggregateGroup) ([
 // maxRangeOps bounds the nesting of topk_* and bottomk_* calls in one query.
 const maxRangeOps = 8
 
-// applyRangeOps runs the range ops of the query, innermost first.
-func (prepared metricsQLQuery) applyRangeOps(ctx context.Context, result rangeQueryResult) (rangeQueryResult, *rangeQueryError) {
-	if len(prepared.rangeOps) == 0 {
+// hasRangeOps reports whether the query needs applyRangeOps.
+func (prepared metricsQLQuery) hasRangeOps() bool {
+	return len(prepared.rangeOps) > 0 || prepared.defaultRight != nil
+}
+
+// applyRangeOps fills the gaps of result with the right side of default,
+// which evalQuery evaluates over the same range, then runs the range ops of
+// the query, innermost first.
+func (prepared metricsQLQuery) applyRangeOps(ctx context.Context, result rangeQueryResult, evalQuery func(query string, prepared metricsQLQuery) (rangeQueryResult, *rangeQueryError)) (rangeQueryResult, *rangeQueryError) {
+	if !prepared.hasRangeOps() {
 		return result, nil
 	}
+	errFloats := &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: errors.New("default, topk_* and bottomk_* support only float series")}
 	if !result.floats {
-		return result, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: errors.New("topk_* and bottomk_* functions support only float series")}
+		return result, errFloats
+	}
+	if prepared.defaultRight != nil {
+		right, err := evalQuery(prepared.defaultQuery, *prepared.defaultRight)
+		if err != nil {
+			return result, err
+		}
+		if !right.floats {
+			return result, errFloats
+		}
+		// The right side can have a default or topk_* of its own.
+		if right, err = prepared.defaultRight.applyRangeOps(ctx, right, evalQuery); err != nil {
+			return result, err
+		}
+		groups, fillErr := rangeDefault(ctx, result.groups, right.groups, int(metricsQLMaxOutputSamples.Load()))
+		if fillErr != nil {
+			return result, &rangeQueryError{status: http.StatusUnprocessableEntity, errorType: "execution", err: fillErr}
+		}
+		result.groups = groups
 	}
 	for _, op := range prepared.rangeOps {
 		groups, err := op(ctx, result.groups)
@@ -41,6 +67,92 @@ func (prepared metricsQLQuery) applyRangeOps(ctx context.Context, result rangeQu
 		result.groups = groups
 	}
 	return result, nil
+}
+
+// rangeDefault is MetricsQL's `left default right`: each step where a series
+// of left has no point (or NaN) takes the value of the series of right with
+// the same labels, apart from the metric name. A right side of one series
+// without labels, such as a number, fills every series. Without left series
+// the result is right. It does not modify its input, which can belong to the
+// range cache. It returns an error when the filled result would hold more than
+// maxSamples points (zero means no limit) or ctx ends.
+// ponytail: VictoriaMetrics also fills series whose samples lie up to 5m and
+// the rollup window before the range start but give no point in the range;
+// this fills only series with a point in the range.
+func rangeDefault(ctx context.Context, left, right []rangeAggregateGroup, maxSamples int) ([]rangeAggregateGroup, error) {
+	if len(left) == 0 {
+		return right, nil
+	}
+	scalar := len(right) == 1 && len(right[0].metric) == 0
+	key := func(metric map[string]string) string {
+		if scalar {
+			return ""
+		}
+		return labels.FromMap(metric).DropReserved(func(name string) bool { return name == labels.MetricName }).String()
+	}
+	// VictoriaMetrics takes the first right series with a value at the step.
+	fills := map[string]map[int64]float64{}
+	for _, group := range right {
+		k := key(group.metric)
+		if fills[k] == nil {
+			fills[k] = map[int64]float64{}
+		}
+		for _, point := range group.points {
+			if _, ok := fills[k][point.t]; !ok && !math.IsNaN(point.v) {
+				fills[k][point.t] = point.v
+			}
+		}
+	}
+	out := make([]rangeAggregateGroup, 0, len(left))
+	total := 0
+	for _, group := range left {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		fill := fills[key(group.metric)]
+		if len(fill) == 0 {
+			total += len(group.points)
+			if maxSamples > 0 && total > maxSamples {
+				return nil, errDefaultSamples(maxSamples)
+			}
+			out = append(out, group)
+			continue
+		}
+		seen := make(map[int64]bool, len(group.points))
+		for _, point := range group.points {
+			seen[point.t] = true
+		}
+		added := 0
+		for t := range fill {
+			if !seen[t] {
+				added++
+			}
+		}
+		// Check the budget before allocating the filled series.
+		total += len(group.points) + added
+		if maxSamples > 0 && total > maxSamples {
+			return nil, errDefaultSamples(maxSamples)
+		}
+		points := make([]samplePoint, 0, len(group.points)+added)
+		for _, point := range group.points {
+			if v, ok := fill[point.t]; ok && math.IsNaN(point.v) {
+				point.v = v
+			}
+			points = append(points, point)
+		}
+		for t, v := range fill {
+			if !seen[t] {
+				points = append(points, samplePoint{t: t, v: v})
+			}
+		}
+		slices.SortFunc(points, func(a, b samplePoint) int { return cmp.Compare(a.t, b.t) })
+		out = append(out, rangeAggregateGroup{metric: group.metric, points: points})
+	}
+	return out, nil
+}
+
+func errDefaultSamples(maxSamples int) error {
+	return fmt.Errorf("default sample limit exceeded (%d); shorten the time range or tighten matchers", maxSamples)
 }
 
 // metricsQLRangeStats rank the series of topk_<stat> and bottomk_<stat>.
